@@ -24,6 +24,12 @@ pub fn run() {
             sql: include_str!("../../src/db/migrations/003_demo_products.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 4,
+            description: "multi_uom",
+            sql: include_str!("../../src/db/migrations/004_uom.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
