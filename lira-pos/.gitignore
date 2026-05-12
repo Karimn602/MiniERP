@@ -23,8 +23,8 @@ dist-ssr
 *.sln
 *.sw?
 # Tauri / SQLite
-  *.db
-  *.db-journal
-  *.db-wal
-  *.db-shm
-  src-tauri/target/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+src-tauri/target/
