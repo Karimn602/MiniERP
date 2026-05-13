@@ -8,7 +8,6 @@ export function AppShell() {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden">
-      {/* Sidebar */}
       <aside className="flex w-60 flex-col border-r border-slate-200 bg-white">
         <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
           <span className="text-lg font-semibold text-brand">Lira POS</span>
@@ -25,13 +24,14 @@ export function AppShell() {
           <NavLink to="/manager" disabled={!online}>
             Manager Dashboard {online ? "" : "🔒"}
           </NavLink>
+          {/* TEMP: remove before Phase 3 */}
+          <NavLink to="/_dev">🔧 Dev probe</NavLink>
         </nav>
         <div className="border-t border-slate-200 p-3 text-xs text-slate-500">
-          v0.1.0 · Phase 1
+          v0.1.0 · Phase 2A.2 + 2B
         </div>
       </aside>
 
-      {/* Main */}
       <div className="flex flex-1 flex-col">
         <header className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
           <h1 className="text-base font-medium text-slate-800">Workspace</h1>

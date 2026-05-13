@@ -234,7 +234,7 @@ export function resolvePriceForUom(args: {
 export function parseQuantityInput(
   raw: string,
   factor: Factor,
-): { quantityInUom: number; quantityBase: number } {
+): { quantityInUom: number | null; quantityBase: number } {
   assertValidFactor(factor);
 
   const trimmed = raw.trim();
@@ -243,43 +243,21 @@ export function parseQuantityInput(
   }
 
   const [whole, frac = ""] = trimmed.split(".");
-  // Scale to an integer in 10^-N units where N = frac length.
-  // Then multiply by factor.num / factor.den and divide by 10^N to get base.
-  // But we want integer base, so the whole pipeline must land on an integer.
-  const scale = Math.pow(10, frac.length);              // 10, 100, 1000, ...
+  const scale = Math.pow(10, frac.length);
   const scaledInput = Number(whole) * scale + Number(frac || "0");
-  // baseInt = scaledInput * num / (den * scale)
-  // For this to be a whole number with no rounding, (scaledInput * num) must
-  // divide evenly by (den * scale). If not, we throw.
+
   const numerator = scaledInput * factor.num;
   const denominator = factor.den * scale;
   if (numerator % denominator !== 0) {
     throw new Error(
-      `Quantity "${raw}" can't be expressed as a whole number of base units ` +
-        `with conversion ${factor.num}/${factor.den}. ` +
-        `Try a finer-grained UoM (e.g. grams instead of kilograms).`,
+      `Quantity "${raw}" doesn't fit conversion ${factor.num}/${factor.den}. ` +
+        `Try a finer-grained UoM.`,
     );
   }
   const quantityBase = numerator / denominator;
-  // quantity_in_uom: the user typed "1.5" — we store 1500 (in 10^-N) so it
-  // round-trips. Actually no — we should store the integer count of the UoM,
-  // and if the user typed a decimal, the UoM must be subdividable through
-  // its factor. We've already verified that above. So:
-  //   quantityInUom = scaledInput (in 10^-N of the UoM)
-  // But the DB column is INTEGER, not "INTEGER scaled by some power of 10".
-  // Compromise: we store the BASE quantity in `quantity` and also store
-  // (whole-number) `quantity_in_uom` only if `frac === ""`. If the user typed
-  // a decimal, quantity_in_uom is rebuilt at display time from base + factor.
-  //
-  // → For Phase 2 the simplest contract:
-  //   * If frac === "", quantityInUom = Number(whole)
-  //   * Else, quantityInUom is meaningless (return -1) and display layer
-  //     reconstructs it from quantityBase + factor.
-  // We'll formalize this in the repos.
-  const quantityInUom = frac === "" ? Number(whole) : -1;
+  const quantityInUom = frac === "" ? Number(whole) : null;
   return { quantityInUom, quantityBase };
 }
-
 // ---------- Display ----------
 
 /**
