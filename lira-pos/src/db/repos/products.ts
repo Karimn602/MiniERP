@@ -1,4 +1,5 @@
-import { query } from "../client";
+import { execute, query } from "../client";
+import { newId } from "../../lib/ids";
 import { barcodesRepo } from "./barcodes";
 import type {
   BarcodeScanResult,
@@ -149,6 +150,37 @@ async function enrich(p: Product): Promise<ProductWithUoms> {
   };
 }
 
+// ---------- Create ----------
+
+export type CreateProductInput = {
+  storeId: string;
+  name: string;
+  sku: string | null;
+  description: string | null;
+  vatRateId: string;
+  vatPricingMode: VatPricingMode;
+  /** Pre-computed by the caller using `addVat`/`stripVat` so both sides agree exactly. */
+  priceExclVatCents: number;
+  priceInclVatCents: number;
+  /** UoM code (must exist in units_of_measure). Becomes the product's base UoM with factor (1,1). */
+  baseUomCode: string;
+  reorderPoint: number | null;
+  isService: boolean;
+};
+
+/**
+ * Thrown when the SKU collides with an existing product in the same store.
+ * The UI catches this specifically to highlight the SKU field.
+ */
+export class DuplicateSkuError extends Error {
+  readonly sku: string;
+  constructor(sku: string) {
+    super(`A product with SKU "${sku}" already exists in this store.`);
+    this.name = "DuplicateSkuError";
+    this.sku = sku;
+  }
+}
+
 // ---------- Repo ----------
 type ProductListArgs = {
   storeId: string;
@@ -251,5 +283,88 @@ export const productsRepo = {
     return rows[0]?.n ?? 0;
   },
 
-  // Mutations (create/update) land in Phase 2C.
+ /**
+   * Create a new product plus its base UoM row.
+   *
+   * NOTE on atomicity: we do NOT use BEGIN/COMMIT because tauri-plugin-sql's
+   * connection pool dispatches each execute() to potentially-different
+   * connections, which makes SQL-level transactions unreliable across calls
+   * (COMMIT ends up on a connection that never saw BEGIN, raising
+   * "cannot commit - no transaction is active").
+   *
+   * Instead we use a saga pattern: do INSERT 1, then INSERT 2, and if INSERT 2
+   * fails we compensate with a DELETE of the product. The `product_uoms`
+   * table has `ON DELETE CASCADE` on `product_id`, so the delete cleans up
+   * any partial UoM rows automatically.
+   *
+   * The only window of inconsistency is between the two INSERTs — if the
+   * app process dies right there, we'd leave an orphan product. We accept
+   * that for now; a periodic integrity check (Phase 5) can scrub orphans.
+   */
+  async create(input: CreateProductInput): Promise<Product> {
+    const productId = newId();
+    const baseUomRowId = newId();
+
+    // INSERT 1: the product itself.
+    try {
+      await execute(
+        `INSERT INTO products (
+           id, store_id, sku, name, description,
+           vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents,
+           reorder_point, is_service
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          productId,
+          input.storeId,
+          input.sku,
+          input.name,
+          input.description,
+          input.vatRateId,
+          input.vatPricingMode,
+          input.priceExclVatCents,
+          input.priceInclVatCents,
+          input.reorderPoint,
+          input.isService ? 1 : 0,
+        ],
+      );
+    } catch (e) {
+      // Nothing was written; no cleanup needed.
+      if (
+        e instanceof Error &&
+        /UNIQUE constraint failed/i.test(e.message) &&
+        /sku/i.test(e.message)
+      ) {
+        throw new DuplicateSkuError(input.sku ?? "(empty)");
+      }
+      throw e;
+    }
+
+    // INSERT 2: the base UoM. If this fails, compensate by deleting the product.
+    try {
+      await execute(
+        `INSERT INTO product_uoms (
+           id, store_id, product_id, uom_code,
+           factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active
+         ) VALUES (?, ?, ?, ?, 1, 1, 1, 1, 1, 1)`,
+        [baseUomRowId, input.storeId, productId, input.baseUomCode],
+      );
+    } catch (e) {
+      try {
+        await execute(`DELETE FROM products WHERE id = ?`, [productId]);
+      } catch {
+        // Best effort; surface the original error.
+      }
+      throw e;
+    }
+
+    const created = await this.findById(productId);
+    if (!created) {
+      throw new Error(
+        "Product was created but could not be re-fetched. The database may be in an inconsistent state.",
+      );
+    }
+    return created;
+  },
 };
