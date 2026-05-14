@@ -6,6 +6,8 @@ import { hydrateActiveContext } from "./state/activeContext";
 import PosRegister from "./pages/PosRegister";
 import Products from "./pages/Products";
 import Inventory from "./pages/Inventory";
+import Purchases from "./pages/Purchases";
+import Suppliers from "./pages/Suppliers";
 import ExchangeRate from "./pages/ExchangeRate";
 import ShiftSummary from "./pages/ShiftSummary";
 import SalesHistory from "./pages/SalesHistory";
@@ -59,12 +61,16 @@ export default function App() {
           <Route index element={<PosRegister />} />
           <Route path="products" element={<Products />} />
           <Route path="inventory" element={<Inventory />} />
+          <Route path="purchases" element={<Purchases />} />
+          <Route path="suppliers" element={<Suppliers />} />
           <Route path="exchange-rate" element={<ExchangeRate />} />
           <Route path="shift" element={<ShiftSummary />} />
           <Route path="sales" element={<SalesHistory />} />
           <Route path="reports" element={<LocalReports />} />
           <Route path="manager" element={<ManagerDashboard />} />
-          <Route path="_dev" element={<DevProbe />} />
+          {import.meta.env.DEV && (
+            <Route path="_dev" element={<DevProbe />} />
+          )}
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>
       </Routes>

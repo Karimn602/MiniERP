@@ -24,3 +24,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-sql = { version = "2.4.0", features = ["sqlite"] }
 
+# Phase 2C — direct sqlx pool for transactional posting commands.
+# tauri-plugin-sql brings sqlx 0.8 as a transitive dep; we pin to the same
+# major to share the underlying SQLite driver and avoid two copies.
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+

@@ -16,6 +16,8 @@ export function AppShell() {
           <NavLink to="/">POS Register</NavLink>
           <NavLink to="/products">Products</NavLink>
           <NavLink to="/inventory">Inventory</NavLink>
+          <NavLink to="/purchases">Purchases</NavLink>
+          <NavLink to="/suppliers">Suppliers</NavLink>
           <NavLink to="/exchange-rate">Exchange Rate</NavLink>
           <NavLink to="/shift">Shift Summary</NavLink>
           <NavLink to="/sales">Sales History</NavLink>
@@ -24,11 +26,10 @@ export function AppShell() {
           <NavLink to="/manager" disabled={!online}>
             Manager Dashboard {online ? "" : "🔒"}
           </NavLink>
-          {/* TEMP: remove before Phase 3 */}
-          <NavLink to="/_dev">🔧 Dev probe</NavLink>
+          {import.meta.env.DEV && <NavLink to="/_dev">🔧 Dev probe</NavLink>}
         </nav>
         <div className="border-t border-slate-200 p-3 text-xs text-slate-500">
-          v0.1.0 · Phase 2A.2 + 2B
+          v0.1.0 · Phase 2C
         </div>
       </aside>
 

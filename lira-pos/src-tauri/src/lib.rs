@@ -1,4 +1,8 @@
+// src-tauri/src/lib.rs
 use tauri_plugin_sql::{Migration, MigrationKind};
+
+mod posting;
+use posting::DbState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -30,14 +34,25 @@ pub fn run() {
             sql: include_str!("../../src/db/migrations/004_uom.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 5,
+            description: "suppliers_and_purchases",
+            sql: include_str!("../../src/db/migrations/005_purchases.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
+        .manage(DbState::new())
         .plugin(
             tauri_plugin_sql::Builder::default()
                 .add_migrations("sqlite:lira-pos.db", migrations)
                 .build(),
         )
+        .invoke_handler(tauri::generate_handler![
+            posting::post_purchase,
+            posting::post_adjustment,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

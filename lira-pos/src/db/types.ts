@@ -137,3 +137,70 @@ export interface ExchangeRate {
   notes: string | null;
   createdAt: string;
 }
+
+// ---------- Phase 2C: Suppliers ----------
+
+export interface Supplier {
+  id: string;
+  storeId: string;
+  name: string;
+  contactName: string | null;
+  phone: string | null;
+  email: string | null;
+  notes: string | null;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ---------- Phase 2C: Purchases ----------
+
+export type PurchaseStatus = "draft" | "posted" | "voided";
+export type PurchaseType = "normal" | "opening";
+
+export interface Purchase {
+  id: string;
+  storeId: string;
+  supplierId: string | null;
+  purchaseType: PurchaseType;
+  supplierReference: string | null;
+  purchaseNumber: number;
+  purchaseDate: string; // YYYY-MM-DD
+  subtotalExclVatCents: UsdCents;
+  vatTotalCents: UsdCents;
+  totalInclVatCents: UsdCents;
+  status: PurchaseStatus;
+  createdByUserId: string | null;
+  deviceId: string | null;
+  createdAt: string;
+  postedAt: string | null;
+  voidedAt: string | null;
+  voidedByUserId: string | null;
+  voidReason: string | null;
+  notes: string | null;
+}
+
+export interface PurchaseItem {
+  id: string;
+  purchaseId: string;
+  storeId: string;
+  productId: string;
+  productNameSnapshot: string;
+  productSkuSnapshot: string | null;
+  productUomIdSnapshot: string | null;
+  uomCodeSnapshot: string;
+  factorNumSnapshot: number;
+  factorDenSnapshot: number;
+  quantityInUom: number;
+  quantityBase: number;
+  unitCostExclVatInUomCents: UsdCents;
+  unitCostInclVatInUomCents: UsdCents;
+  unitCostExclVatBaseCents: UsdCents;
+  unitCostInclVatBaseCents: UsdCents;
+  vatRateIdSnapshot: string;
+  vatRateBpsSnapshot: number;
+  lineSubtotalExclVatCents: UsdCents;
+  lineVatCents: UsdCents;
+  lineTotalInclVatCents: UsdCents;
+  relatedMovementId: string | null;
+}
