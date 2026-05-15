@@ -367,4 +367,88 @@ export const productsRepo = {
     }
     return created;
   },
+  /**
+   * Patch-style update of an existing product. Pass only the fields you want
+   * to change. Throws DuplicateSkuError on UNIQUE collision (same as create).
+   *
+   * Does NOT modify product_uoms — UoM management is a separate concern
+   * (Phase 2E). Changing baseUomCode here would be incoherent with all the
+   * historical quantity_on_hand and avg_cost values that are denominated in
+   * the existing base. If you need to rebase a product's UoM, do it via a
+   * deliberate migration, not a UI patch.
+   */
+  async update(
+    id: string,
+    patch: {
+      name?: string;
+      sku?: string | null;
+      description?: string | null;
+      vatRateId?: string;
+      vatPricingMode?: VatPricingMode;
+      priceExclVatCents?: number;
+      priceInclVatCents?: number;
+      reorderPoint?: number | null;
+      isService?: boolean;
+    },
+  ): Promise<Product> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+
+    const map: Record<string, [string, unknown]> = {
+      name:               ["name = ?",                  patch.name],
+      sku:                ["sku = ?",                   patch.sku],
+      description:        ["description = ?",           patch.description],
+      vatRateId:          ["vat_rate_id = ?",           patch.vatRateId],
+      vatPricingMode:     ["vat_pricing_mode = ?",      patch.vatPricingMode],
+      priceExclVatCents:  ["price_excl_vat_cents = ?",  patch.priceExclVatCents],
+      priceInclVatCents:  ["price_incl_vat_cents = ?",  patch.priceInclVatCents],
+      reorderPoint:       ["reorder_point = ?",         patch.reorderPoint],
+      isService:          ["is_service = ?",            patch.isService === undefined ? undefined : (patch.isService ? 1 : 0)],
+    };
+
+    for (const key of Object.keys(map) as Array<keyof typeof map>) {
+      const [clause, value] = map[key];
+      if (value !== undefined) {
+        sets.push(clause);
+        params.push(value);
+      }
+    }
+
+    if (sets.length === 0) {
+      // No-op update is fine — just return the current row.
+      const cur = await this.findById(id);
+      if (!cur) throw new Error(`Product ${id} not found`);
+      return cur;
+    }
+
+    params.push(id);
+
+    try {
+      await execute(
+        `UPDATE products SET ${sets.join(", ")} WHERE id = ?`,
+        params,
+      );
+    } catch (e) {
+      if (
+        e instanceof Error &&
+        /UNIQUE constraint failed/i.test(e.message) &&
+        /sku/i.test(e.message)
+      ) {
+        throw new DuplicateSkuError(patch.sku ?? "(empty)");
+      }
+      throw e;
+    }
+
+    const updated = await this.findById(id);
+    if (!updated) throw new Error(`Product ${id} vanished after update`);
+    return updated;
+  },
+
+  /** Block (is_active=0) or unblock (is_active=1) — affects sale/list visibility. */
+  async setActive(id: string, active: boolean): Promise<void> {
+    await execute(`UPDATE products SET is_active = ? WHERE id = ?`, [
+      active ? 1 : 0,
+      id,
+    ]);
+  },
 };

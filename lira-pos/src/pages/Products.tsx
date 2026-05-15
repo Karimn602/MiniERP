@@ -25,10 +25,12 @@ function useDebouncedValue<T>(value: T, delayMs: number): T {
   return debounced;
 }
 
+/** What the form is doing: creating a new product, or editing this one. */
+type FormMode = { kind: "closed" } | { kind: "new" } | { kind: "edit"; product: ProductWithUoms };
+
 export default function Products() {
   const { storeId } = useActiveContext();
 
-  // --- List state ---
   const [products, setProducts] = useState<ProductWithUoms[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -37,11 +39,9 @@ export default function Products() {
   const debouncedSearch = useDebouncedValue(searchInput, 250);
   const [includeInactive, setIncludeInactive] = useState(false);
 
-  // --- Form state ---
-  const [formOpen, setFormOpen] = useState(false);
-  const [justSaved, setJustSaved] = useState(false);
+  const [formMode, setFormMode] = useState<FormMode>({ kind: "closed" });
+  const [toast, setToast] = useState<string | null>(null);
 
-  // --- Reference data for dropdowns (loaded once) ---
   const [vatRates, setVatRates] = useState<VatRate[]>([]);
   const [uoms, setUoms] = useState<UnitOfMeasure[]>([]);
   const [refDataReady, setRefDataReady] = useState(false);
@@ -85,11 +85,25 @@ export default function Products() {
     void reload();
   }, [reload]);
 
-  function handleProductCreated() {
-    setFormOpen(false);
-    setJustSaved(true);
-    setTimeout(() => setJustSaved(false), 2500);
+  function flashToast(msg: string) {
+    setToast(msg);
+    setTimeout(() => setToast(null), 2500);
+  }
+
+  function handleSaved(mode: "new" | "edit") {
+    setFormMode({ kind: "closed" });
+    flashToast(mode === "new" ? "✓ Product saved" : "✓ Changes saved");
     void reload();
+  }
+
+  async function handleToggleActive(p: ProductWithUoms) {
+    try {
+      await productsRepo.setActive(p.id, !p.isActive);
+      flashToast(p.isActive ? "✓ Product blocked" : "✓ Product unblocked");
+      void reload();
+    } catch (e) {
+      flashToast(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   if (loading && products.length === 0 && !loadError) {
@@ -106,27 +120,30 @@ export default function Products() {
           </p>
         </div>
         <div className="flex items-center gap-3">
-          {justSaved && (
-            <span className="text-sm text-emerald-700">✓ Product saved</span>
-          )}
+          {toast && <span className="text-sm text-emerald-700">{toast}</span>}
           <Button
-            variant={formOpen ? "ghost" : "primary"}
-            onClick={() => setFormOpen((o) => !o)}
+            variant={formMode.kind !== "closed" ? "ghost" : "primary"}
+            onClick={() =>
+              setFormMode((m) =>
+                m.kind === "closed" ? { kind: "new" } : { kind: "closed" },
+              )
+            }
             disabled={!refDataReady}
             title={!refDataReady ? "Loading VAT rates / UoMs…" : undefined}
           >
-            {formOpen ? "Close form" : "New product"}
+            {formMode.kind === "closed" ? "New product" : "Close form"}
           </Button>
         </div>
       </div>
 
-      {formOpen && refDataReady && storeId && (
-        <NewProductForm
+      {formMode.kind !== "closed" && refDataReady && storeId && (
+        <ProductForm
+          mode={formMode}
           storeId={storeId}
           vatRates={vatRates}
           uoms={uoms}
-          onCreated={handleProductCreated}
-          onCancel={() => setFormOpen(false)}
+          onSaved={handleSaved}
+          onCancel={() => setFormMode({ kind: "closed" })}
         />
       )}
 
@@ -185,6 +202,7 @@ export default function Products() {
                   <th className="px-5 py-2 font-medium">VAT</th>
                   <th className="px-5 py-2 font-medium text-right">Stock</th>
                   <th className="px-5 py-2 font-medium">Barcode</th>
+                  <th className="px-5 py-2"></th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -192,9 +210,14 @@ export default function Products() {
                   <tr
                     key={p.id}
                     className={clsx(
-                      "transition-colors hover:bg-slate-50",
+                      "cursor-pointer transition-colors hover:bg-slate-50",
                       !p.isActive && "bg-slate-50/60 text-slate-500",
                     )}
+                    onClick={(e) => {
+                      // Don't trigger edit if the click landed on an action button.
+                      if ((e.target as HTMLElement).closest("button")) return;
+                      setFormMode({ kind: "edit", product: p });
+                    }}
                   >
                     <td className="px-5 py-2">
                       <div className="font-medium text-slate-900">
@@ -246,6 +269,15 @@ export default function Products() {
                         <span className="text-xs text-slate-400">—</span>
                       )}
                     </td>
+                    <td className="px-5 py-2 text-right">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void handleToggleActive(p)}
+                      >
+                        {p.isActive ? "Block" : "Unblock"}
+                      </Button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -258,53 +290,70 @@ export default function Products() {
 }
 
 // ============================================================================
-// New Product Form
+// Product form — handles both "new" and "edit" modes
 // ============================================================================
 
-function NewProductForm({
+function ProductForm({
+  mode,
   storeId,
   vatRates,
   uoms,
-  onCreated,
+  onSaved,
   onCancel,
 }: {
+  mode: Exclude<FormMode, { kind: "closed" }>;
   storeId: string;
   vatRates: VatRate[];
   uoms: UnitOfMeasure[];
-  onCreated: () => void;
+  onSaved: (mode: "new" | "edit") => void;
   onCancel: () => void;
 }) {
-  // Smart defaults: prefer lowest positive non-exempt VAT (Standard 11% in the seed).
+  const isEdit = mode.kind === "edit";
+  const existing = isEdit ? mode.product : null;
+
+  // Smart defaults for the "new" case.
   const defaultVatRateId = useMemo(() => {
+    if (existing) return existing.vatRateId;
     const candidate =
       [...vatRates]
         .filter((r) => !r.isExempt && r.rateBps > 0)
         .sort((a, b) => a.rateBps - b.rateBps)[0] ?? vatRates[0];
     return candidate?.id ?? "";
-  }, [vatRates]);
+  }, [vatRates, existing]);
 
-  // Prefer 'pcs', then 'each', then first.
   const defaultUomCode = useMemo(() => {
+    if (existing) return existing.baseUom.uomCode;
     return (
       uoms.find((u) => u.code === "pcs")?.code ??
       uoms.find((u) => u.code === "each")?.code ??
       uoms[0]?.code ??
       ""
     );
-  }, [uoms]);
+  }, [uoms, existing]);
 
-  // --- Fields ---
-  const [name, setName] = useState("");
-  const [sku, setSku] = useState("");
-  const [description, setDescription] = useState("");
+  // Initial price input depends on pricing mode.
+  const defaultPriceInput = useMemo(() => {
+    if (!existing) return "";
+    const cents =
+      existing.vatPricingMode === "inclusive"
+        ? existing.priceInclVatCents
+        : existing.priceExclVatCents;
+    return (cents / 100).toFixed(2);
+  }, [existing]);
+
+  const [name, setName] = useState(existing?.name ?? "");
+  const [sku, setSku] = useState(existing?.sku ?? "");
+  const [description, setDescription] = useState(existing?.description ?? "");
   const [vatRateId, setVatRateId] = useState(defaultVatRateId);
-  const [baseUomCode, setBaseUomCode] = useState(defaultUomCode);
-  const [vatPricingMode, setVatPricingMode] = useState<VatPricingMode>("inclusive");
-  const [priceInput, setPriceInput] = useState("");
-  const [reorderPointInput, setReorderPointInput] = useState("");
-  const [isService, setIsService] = useState(false);
+  const [vatPricingMode, setVatPricingMode] = useState<VatPricingMode>(
+    existing?.vatPricingMode ?? "inclusive",
+  );
+  const [priceInput, setPriceInput] = useState(defaultPriceInput);
+  const [reorderPointInput, setReorderPointInput] = useState(
+    existing?.reorderPoint != null ? String(existing.reorderPoint) : "",
+  );
+  const [isService, setIsService] = useState(existing?.isService ?? false);
 
-  // --- Validation / submission ---
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{ [k: string]: string }>({});
@@ -316,14 +365,9 @@ function NewProductForm({
 
   const parsedPriceCents = useMemo(() => {
     if (priceInput.trim() === "") return null;
-    try {
-      return parseUsdInput(priceInput);
-    } catch {
-      return null;
-    }
+    try { return parseUsdInput(priceInput); } catch { return null; }
   }, [priceInput]);
 
-  // Derive the opposite side of incl/excl using the chosen VAT rate.
   const derivedPrices = useMemo(() => {
     if (parsedPriceCents === null || !selectedVatRate) return null;
     const bps = selectedVatRate.rateBps;
@@ -338,18 +382,14 @@ function NewProductForm({
 
   function validate(): boolean {
     const errors: { [k: string]: string } = {};
-
     const trimmedName = name.trim();
     if (trimmedName === "") errors.name = "Name is required.";
     else if (trimmedName.length > 200) errors.name = "Max 200 characters.";
 
-    const trimmedSku = sku.trim();
-    if (trimmedSku.length > 100) errors.sku = "Max 100 characters.";
-
+    if (sku.trim().length > 100) errors.sku = "Max 100 characters.";
     if (description.length > 1000) errors.description = "Max 1000 characters.";
 
     if (vatRateId === "") errors.vatRateId = "Select a VAT rate.";
-    if (baseUomCode === "") errors.baseUomCode = "Select a base UoM.";
 
     if (priceInput.trim() === "") errors.price = "Price is required.";
     else if (parsedPriceCents === null) errors.price = "Invalid amount. Use e.g. 9.99.";
@@ -367,11 +407,9 @@ function NewProductForm({
   async function handleSubmit() {
     setFormError(null);
     if (!validate() || !derivedPrices) return;
-
     setSubmitting(true);
     try {
-      await productsRepo.create({
-        storeId,
+      const payload = {
         name: name.trim(),
         sku: sku.trim() === "" ? null : sku.trim(),
         description: description.trim() === "" ? null : description.trim(),
@@ -379,14 +417,24 @@ function NewProductForm({
         vatPricingMode,
         priceExclVatCents: derivedPrices.exclVatCents,
         priceInclVatCents: derivedPrices.inclVatCents,
-        baseUomCode,
         reorderPoint:
           isService || reorderPointInput.trim() === ""
             ? null
             : Number(reorderPointInput),
         isService,
-      });
-      onCreated();
+      };
+
+      if (existing) {
+        await productsRepo.update(existing.id, payload);
+        onSaved("edit");
+      } else {
+        await productsRepo.create({
+          storeId,
+          ...payload,
+          baseUomCode: defaultUomCode,
+        });
+        onSaved("new");
+      }
     } catch (e) {
       if (e instanceof DuplicateSkuError) {
         setFieldErrors((prev) => ({ ...prev, sku: e.message }));
@@ -401,8 +449,12 @@ function NewProductForm({
   return (
     <Card>
       <CardHeader
-        title="New product"
-        subtitle="Add a new item or service to your catalog."
+        title={isEdit ? `Edit "${existing!.name}"` : "New product"}
+        subtitle={
+          isEdit
+            ? "Changes apply going forward. Historical sales and inventory movements keep their original snapshots."
+            : "Add a new item or service to your catalog."
+        }
         actions={
           <Button variant="ghost" size="sm" onClick={onCancel} disabled={submitting}>
             Cancel
@@ -464,19 +516,34 @@ function NewProductForm({
             ))}
           </SelectField>
 
-          <SelectField
-            label="Base unit of measure *"
-            value={baseUomCode}
-            onChange={setBaseUomCode}
-            error={fieldErrors.baseUomCode}
-            hint="The canonical unit stock is tracked in."
-          >
-            {uoms.map((u) => (
-              <option key={u.code} value={u.code}>
-                {u.name} ({u.symbol})
-              </option>
-            ))}
-          </SelectField>
+          {isEdit ? (
+            <div>
+              <label className="block text-xs font-medium text-slate-700">
+                Base unit of measure
+              </label>
+              <div className="mt-1 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700">
+                {existing!.baseUom.uomCode}
+                <span className="ml-2 text-xs text-slate-500">(locked after creation)</span>
+              </div>
+              <p className="mt-1 text-xs text-slate-500">
+                Stock and cost values are denominated in this UoM. Changing it
+                would invalidate history.
+              </p>
+            </div>
+          ) : (
+            <SelectField
+              label="Base unit of measure *"
+              value={defaultUomCode}
+              onChange={() => { /* fixed for now; multi-UoM mgmt is its own phase */ }}
+              hint="The canonical unit stock is tracked in."
+            >
+              {uoms.map((u) => (
+                <option key={u.code} value={u.code}>
+                  {u.name} ({u.symbol})
+                </option>
+              ))}
+            </SelectField>
+          )}
         </div>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-[auto_1fr]">
@@ -560,14 +627,25 @@ function NewProductForm({
             onClick={handleSubmit}
             disabled={submitting || derivedPrices === null}
           >
-            {submitting ? "Saving…" : "Save product"}
+            {submitting
+              ? "Saving…"
+              : isEdit
+                ? "Save changes"
+                : "Save product"}
           </Button>
           <Button variant="ghost" onClick={onCancel} disabled={submitting}>
             Cancel
           </Button>
-          <p className="ml-auto text-xs text-slate-500">
-            Starting stock: 0 — add stock via Inventory after creating.
-          </p>
+          {!isEdit && (
+            <p className="ml-auto text-xs text-slate-500">
+              Starting stock: 0 — add stock via Inventory after creating.
+            </p>
+          )}
+          {isEdit && (
+            <p className="ml-auto text-xs text-slate-500">
+              Editing #{existing!.sku ?? existing!.id.slice(0, 6)} · stock {existing!.quantityOnHand} {existing!.baseUom.uomCode}
+            </p>
+          )}
         </div>
       </CardBody>
     </Card>
