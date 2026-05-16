@@ -7,26 +7,18 @@
 // (see plugins-workspace issue #886, still open). Multi-row writes that
 // must atomically succeed-or-fail go through this module instead.
 //
-// We acquire one sqlx connection from the pool, run everything inside a
-// single sqlx::Transaction, and commit or roll back as a unit. The frontend
-// invokes these via tauri::command and sees a single all-or-nothing result.
-//
 // Money convention (mirrors the JS side):
 //   - All USD values are INTEGER cents.
 //   - All quantities are INTEGER in the product's BASE UoM.
 //   - All rate/bps are INTEGER.
 
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Row, Sqlite, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
 
 // ============================================================================
-// State — a shared sqlx pool we open ourselves, so we can run real
-// transactions. The tauri-plugin-sql plugin opens its own pool for the
-// regular query/execute path; this is a SECOND pool against the same file.
-// SQLite is happy with multiple connections in WAL mode (which we set in
-// ensureDbReady on the JS side).
+// State
 // ============================================================================
 
 pub struct DbState {
@@ -41,8 +33,6 @@ impl DbState {
     }
 }
 
-/// Resolve the sqlite file the plugin uses. The plugin stores it in
-/// `BaseDirectory::App` under the bare filename from the "sqlite:..." URL.
 fn resolve_db_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app
         .path()
@@ -51,11 +41,9 @@ fn resolve_db_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String>
     Ok(dir.join("lira-pos.db"))
 }
 
-/// Lazily open the pool on first call. Idempotent — the plugin has already
-/// run migrations before we get here, so we just connect.
-async fn pool<'a>(
+async fn pool(
     app: &tauri::AppHandle,
-    state: &'a State<'_, DbState>,
+    state: &State<'_, DbState>,
 ) -> Result<SqlitePool, String> {
     let mut guard = state.pool.lock().await;
     if let Some(p) = &*guard {
@@ -66,7 +54,6 @@ async fn pool<'a>(
     let p = SqlitePool::connect(&url)
         .await
         .map_err(|e| format!("failed to open db pool at {}: {e}", path.display()))?;
-    // Match the JS-side PRAGMAs.
     sqlx::query("PRAGMA foreign_keys = ON;")
         .execute(&p)
         .await
@@ -76,7 +63,7 @@ async fn pool<'a>(
 }
 
 // ============================================================================
-// Shared payload types
+// Payload types — purchase
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -85,9 +72,9 @@ pub struct PostPurchasePayload {
     pub purchase_id: String,
     pub store_id: String,
     pub supplier_id: Option<String>,
-    pub purchase_type: String,        // 'normal' | 'opening'
+    pub purchase_type: String,
     pub supplier_reference: Option<String>,
-    pub purchase_date: String,        // YYYY-MM-DD
+    pub purchase_date: String,
     pub created_by_user_id: Option<String>,
     pub device_id: Option<String>,
     pub notes: Option<String>,
@@ -130,7 +117,12 @@ pub struct PostPurchaseResult {
     pub purchase_number: i64,
     pub posted_at: String,
     pub movement_ids: Vec<String>,
+    pub ledger_entry_id: Option<String>,
 }
+
+// ============================================================================
+// Payload types — adjustment
+// ============================================================================
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,7 +130,7 @@ pub struct PostAdjustmentPayload {
     pub store_id: String,
     pub created_by_user_id: Option<String>,
     pub device_id: Option<String>,
-    pub reason: String,           // mandatory — UI enforces non-empty
+    pub reason: String,
     pub lines: Vec<PostAdjustmentLine>,
 }
 
@@ -150,8 +142,8 @@ pub struct PostAdjustmentLine {
     pub uom_code_snapshot: String,
     pub factor_num_snapshot: i64,
     pub factor_den_snapshot: i64,
-    pub quantity_in_uom_signed: i64,   // signed; +5 added, -3 removed
-    pub quantity_base_signed: i64,     // signed; ditto, in base UoM
+    pub quantity_in_uom_signed: i64,
+    pub quantity_base_signed: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,12 +153,36 @@ pub struct PostAdjustmentResult {
 }
 
 // ============================================================================
+// Payload types — supplier payment (Phase 2D.6)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostSupplierPaymentPayload {
+    pub ledger_entry_id: String,
+    pub store_id: String,
+    pub supplier_id: String,
+    pub entry_type: String,        // 'payment' | 'credit_note' | 'opening_balance' | 'adjustment'
+    pub amount_cents: i64,         // SIGNED — caller decides the sign
+    pub entry_date: String,        // YYYY-MM-DD
+    pub payment_reference: Option<String>,
+    pub notes: Option<String>,
+    pub created_by_user_id: Option<String>,
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostSupplierPaymentResult {
+    pub ledger_entry_id: String,
+    pub posted_at: String,
+    pub new_balance_cents: i64,
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
-/// Atomically grab and increment the next purchase number for a store.
-/// We use a separate row per store in app_settings — for the MVP there's
-/// only one store, but the function is forward-compatible.
 async fn next_purchase_number(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     _store_id: &str,
@@ -189,9 +205,6 @@ async fn next_purchase_number(
     Ok(current)
 }
 
-/// Weighted-average cost recompute, integer math:
-///   new_avg = round((old_qty * old_avg + new_qty * new_cost) / total_qty)
-/// Mirrors `newWeightedAvgCost` in src/lib/money.ts — keep them in sync.
 fn new_weighted_avg(
     old_qty: i64,
     old_avg_cents: i64,
@@ -206,7 +219,6 @@ fn new_weighted_avg(
         .checked_mul(old_avg_cents)
         .and_then(|v| v.checked_add(new_qty.checked_mul(new_cost_cents)?))
         .ok_or_else(|| "weighted-avg overflow".to_string())?;
-    // Half-away-from-zero rounding to match JS Math.round
     let rounded = if total_value >= 0 {
         (total_value + total_qty / 2) / total_qty
     } else {
@@ -215,8 +227,23 @@ fn new_weighted_avg(
     Ok(rounded)
 }
 
+async fn current_supplier_balance(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    supplier_id: &str,
+) -> Result<i64, String> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS bal FROM supplier_ledger WHERE supplier_id = ?",
+    )
+    .bind(supplier_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("read supplier balance: {e}"))?;
+    let bal: i64 = row.try_get("bal").map_err(|e| format!("decode balance: {e}"))?;
+    Ok(bal)
+}
+
 // ============================================================================
-// Commands
+// post_purchase
 // ============================================================================
 
 #[tauri::command]
@@ -225,7 +252,6 @@ pub async fn post_purchase(
     state: State<'_, DbState>,
     payload: PostPurchasePayload,
 ) -> Result<PostPurchaseResult, String> {
-    // --- Validate up front; cheaper than rolling back. ---
     if payload.lines.is_empty() {
         return Err("Purchase must have at least one line.".into());
     }
@@ -247,7 +273,6 @@ pub async fn post_purchase(
     let pool = pool(&app, &state).await?;
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
 
-    // --- 1. Allocate purchase number + insert header. ---
     let purchase_number = next_purchase_number(&mut tx, &payload.store_id).await?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -265,28 +290,31 @@ pub async fn post_purchase(
          status, created_by_user_id, device_id, posted_at, notes
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, NULL, ?)"#,
 )
-    .bind(&payload.purchase_id)
-    .bind(&payload.store_id)
-    .bind(&payload.supplier_id)
-    .bind(&payload.purchase_type)
-    .bind(&payload.supplier_reference)
-    .bind(purchase_number)
-    .bind(&payload.purchase_date)
-    .bind(subtotal)
-    .bind(vat_total)
-    .bind(total)
-    .bind(&payload.created_by_user_id)
-    .bind(&payload.device_id)
-    .bind(&payload.notes)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| format!("insert purchase: {e}"))?;
+.bind(&payload.purchase_id)
+.bind(&payload.store_id)
+.bind(&payload.supplier_id)
+.bind(&payload.purchase_type)
+.bind(&payload.supplier_reference)
+.bind(purchase_number)
+.bind(&payload.purchase_date)
+.bind(subtotal)
+.bind(vat_total)
+.bind(total)
+.bind(&payload.created_by_user_id)
+.bind(&payload.device_id)
+.bind(&payload.notes)
+.execute(&mut *tx)
+.await
+.map_err(|e| format!("insert purchase: {e}"))?;
 
-    // --- 2. For each line: insert purchase_item, insert movement, update product. ---
     let mut movement_ids: Vec<String> = Vec::with_capacity(payload.lines.len());
 
     for line in &payload.lines {
-        // Read current stock + avg cost for weighted-avg recompute.
+        let purchase_item_id = if line.purchase_item_id.trim().is_empty() {
+    uuid::Uuid::new_v4().to_string()
+} else {
+    line.purchase_item_id.clone()
+};
         let row = sqlx::query(
             "SELECT quantity_on_hand, avg_cost_excl_vat_cents, avg_cost_incl_vat_cents
              FROM products WHERE id = ? AND store_id = ?",
@@ -312,7 +340,8 @@ pub async fn post_purchase(
         let movement_id = uuid::Uuid::new_v4().to_string();
         movement_ids.push(movement_id.clone());
 
-        // 2a — purchase_item row, linking the movement.
+        // Order: movement first, then purchase_item (which references it).
+        let movement_type = if payload.purchase_type == "opening" { "opening" } else { "purchase" };
         sqlx::query(
             r#"INSERT INTO purchase_items (
                  id, purchase_id, store_id, product_id,
@@ -327,7 +356,7 @@ pub async fn post_purchase(
                  related_movement_id
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
-        .bind(&line.purchase_item_id)
+        .bind(&purchase_item_id)
         .bind(&payload.purchase_id)
         .bind(&payload.store_id)
         .bind(&line.product_id)
@@ -352,9 +381,6 @@ pub async fn post_purchase(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert purchase_item: {e}"))?;
-
-        // 2b — inventory_movement row.
-        let movement_type = if payload.purchase_type == "opening" { "opening" } else { "purchase" };
         sqlx::query(
             r#"INSERT INTO inventory_movements (
                  id, store_id, product_id, movement_type, quantity_delta,
@@ -370,11 +396,11 @@ pub async fn post_purchase(
         .bind(&payload.store_id)
         .bind(&line.product_id)
         .bind(movement_type)
-        .bind(line.quantity_base) // positive delta
+        .bind(line.quantity_base)
         .bind(line.unit_cost_excl_vat_base_cents)
         .bind(line.unit_cost_incl_vat_base_cents)
         .bind(&payload.purchase_id)
-        .bind(&line.purchase_item_id)
+        .bind(&purchase_item_id)
         .bind(&payload.supplier_reference)
         .bind(&payload.notes)
         .bind(&payload.created_by_user_id)
@@ -387,18 +413,18 @@ pub async fn post_purchase(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert inventory_movement: {e}"))?;
-        sqlx::query(
-                r#"UPDATE purchase_items
-                    SET related_movement_id = ?
-                    WHERE id = ?"#,
-            )
-        .bind(&movement_id)
-        .bind(&line.purchase_item_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| format!("link purchase_item to movement: {e}"))?;
 
-        // 2c — bump products.quantity_on_hand and avg cost.
+        sqlx::query(
+    r#"UPDATE purchase_items
+          SET related_movement_id = ?
+        WHERE id = ?"#,
+)
+.bind(&movement_id)
+.bind(&purchase_item_id)
+.execute(&mut *tx)
+.await
+.map_err(|e| format!("link purchase_item to movement: {e}"))?;
+
         sqlx::query(
             r#"UPDATE products
                   SET quantity_on_hand        = quantity_on_hand + ?,
@@ -415,6 +441,38 @@ pub async fn post_purchase(
         .await
         .map_err(|e| format!("update product stock/cost: {e}"))?;
     }
+
+    // --- Ledger entry: only for 'normal' purchases with a supplier. ---
+    let ledger_entry_id: Option<String> = if payload.purchase_type == "normal" {
+        if let Some(supplier_id) = &payload.supplier_id {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                r#"INSERT INTO supplier_ledger (
+                     id, store_id, supplier_id, entry_type, amount_cents,
+                     entry_date, related_purchase_id, notes,
+                     created_by_user_id, device_id, posted_at
+                   ) VALUES (?, ?, ?, 'purchase', ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&id)
+            .bind(&payload.store_id)
+            .bind(supplier_id)
+            .bind(total) // positive = we owe more
+            .bind(&payload.purchase_date)
+            .bind(&payload.purchase_id)
+            .bind(format!("Purchase #{}", purchase_number))
+            .bind(&payload.created_by_user_id)
+            .bind(&payload.device_id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("insert supplier_ledger: {e}"))?;
+            Some(id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     sqlx::query(
     r#"UPDATE purchases
           SET status = 'posted',
@@ -434,8 +492,13 @@ pub async fn post_purchase(
         purchase_number,
         posted_at: now,
         movement_ids,
+        ledger_entry_id,
     })
 }
+
+// ============================================================================
+// post_adjustment (unchanged from 2C)
+// ============================================================================
 
 #[tauri::command]
 pub async fn post_adjustment(
@@ -467,7 +530,6 @@ pub async fn post_adjustment(
     let mut movement_ids: Vec<String> = Vec::with_capacity(payload.lines.len());
 
     for line in &payload.lines {
-        // Sanity: if removing stock, the product must have enough.
         if line.quantity_base_signed < 0 {
             let row = sqlx::query(
                 "SELECT quantity_on_hand FROM products WHERE id = ? AND store_id = ?",
@@ -487,9 +549,6 @@ pub async fn post_adjustment(
             }
         }
 
-        // Adjustments do NOT recompute weighted-avg cost (treat as shrinkage
-        // at current avg cost). We snapshot the current avg cost into the
-        // movement so historical COGS-style queries still work.
         let cost_row = sqlx::query(
             "SELECT avg_cost_excl_vat_cents, avg_cost_incl_vat_cents
              FROM products WHERE id = ? AND store_id = ?",
@@ -512,6 +571,7 @@ pub async fn post_adjustment(
                  factor_num_snapshot, factor_den_snapshot
                ) VALUES (?, ?, ?, 'adjustment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
+        
         .bind(&line.movement_id)
         .bind(&payload.store_id)
         .bind(&line.product_id)
@@ -546,4 +606,67 @@ pub async fn post_adjustment(
 
     tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
     Ok(PostAdjustmentResult { movement_ids })
+}
+
+// ============================================================================
+// post_supplier_payment (Phase 2D.6)
+// ============================================================================
+
+#[tauri::command]
+pub async fn post_supplier_payment(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: PostSupplierPaymentPayload,
+) -> Result<PostSupplierPaymentResult, String> {
+    let allowed = ["payment", "credit_note", "opening_balance", "adjustment"];
+    if !allowed.contains(&payload.entry_type.as_str()) {
+        return Err(format!("Invalid entry_type for this command: {}", payload.entry_type));
+    }
+    if payload.amount_cents == 0 {
+        return Err("Amount must be non-zero.".into());
+    }
+    if payload.entry_type == "adjustment" && payload.notes.as_deref().unwrap_or("").trim().is_empty() {
+        return Err("Adjustment entries require a note explaining why.".into());
+    }
+    if payload.entry_date.trim().is_empty() {
+        return Err("Entry date is required.".into());
+    }
+
+    let pool = pool(&app, &state).await?;
+    let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+
+    sqlx::query(
+        r#"INSERT INTO supplier_ledger (
+             id, store_id, supplier_id, entry_type, amount_cents,
+             entry_date, payment_reference, notes,
+             created_by_user_id, device_id, posted_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(&payload.ledger_entry_id)
+    .bind(&payload.store_id)
+    .bind(&payload.supplier_id)
+    .bind(&payload.entry_type)
+    .bind(payload.amount_cents)
+    .bind(&payload.entry_date)
+    .bind(&payload.payment_reference)
+    .bind(&payload.notes)
+    .bind(&payload.created_by_user_id)
+    .bind(&payload.device_id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert supplier_ledger: {e}"))?;
+
+    let new_balance = current_supplier_balance(&mut tx, &payload.supplier_id).await?;
+
+    tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+
+    Ok(PostSupplierPaymentResult {
+        ledger_entry_id: payload.ledger_entry_id,
+        posted_at: now,
+        new_balance_cents: new_balance,
+    })
 }

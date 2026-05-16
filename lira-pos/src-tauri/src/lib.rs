@@ -6,9 +6,6 @@ use posting::DbState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Migrations are versioned. NEVER edit a migration that has shipped —
-    // always add a new one. The plugin tracks applied versions in
-    // a metadata table inside the SQLite file.
     let migrations = vec![
         Migration {
             version: 1,
@@ -40,6 +37,12 @@ pub fn run() {
             sql: include_str!("../../src/db/migrations/005_purchases.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 6,
+            description: "supplier_ledger",
+            sql: include_str!("../../src/db/migrations/006_supplier_ledger.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -52,6 +55,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             posting::post_purchase,
             posting::post_adjustment,
+            posting::post_supplier_payment,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

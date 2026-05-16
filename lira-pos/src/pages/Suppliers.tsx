@@ -1,35 +1,67 @@
 import { useCallback, useEffect, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
 import { suppliersRepo } from "../db/repos/suppliers";
-import type { Supplier } from "../db/types";
+import { supplierLedgerRepo } from "../db/repos/supplierLedger";
+import type { Supplier, SupplierWithBalance } from "../db/types";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
+import { formatUsd } from "../lib/money";
+import { useNavigate } from "react-router-dom";
 import clsx from "clsx";
 
 export default function Suppliers() {
   const { storeId } = useActiveContext();
+  const navigate = useNavigate();
   const [rows, setRows] = useState<Supplier[]>([]);
+  type SupplierBalanceSummary = {
+  balanceCents: number;
+  lastActivityAt: string | null;
+};
+
+const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
+  new Map(),
+);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [includeInactive, setIncludeInactive] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
 
-  const reload = useCallback(async () => {
-    if (!storeId) return;
-    setLoading(true);
+ const reload = useCallback(async () => {
+  if (!storeId) return;
+
+  setLoading(true);
+
+  try {
+    const list = await suppliersRepo.list({
+      storeId,
+      search: search.trim() || undefined,
+      includeInactive,
+    });
+
+    setRows(list);
+
     try {
-      const list = await suppliersRepo.list({
-        storeId,
-        search: search.trim() || undefined,
-        includeInactive,
-      });
-      setRows(list);
-    } finally {
-      setLoading(false);
+      const bals = await supplierLedgerRepo.listBalances(storeId);
+
+      if (bals instanceof Map) {
+        setBalances(bals);
+      } else {
+        setBalances(new Map(bals));
+      }
+    } catch (balanceError) {
+      console.error("Failed to load supplier balances:", balanceError);
+      setBalances(new Map());
     }
-  }, [storeId, search, includeInactive]);
+  } catch (e) {
+    console.error("Failed to load suppliers:", e);
+    setRows([]);
+    setBalances(new Map());
+  } finally {
+    setLoading(false);
+  }
+}, [storeId, search, includeInactive]);
 
   useEffect(() => {
     void reload();
@@ -43,17 +75,12 @@ export default function Suppliers() {
         <div>
           <h2 className="text-2xl font-semibold text-slate-900">Suppliers</h2>
           <p className="text-sm text-slate-600">
-            The vendors you buy from. Used when recording purchases.
+            The vendors you buy from, and how much you owe each one.
           </p>
         </div>
         <div className="flex items-center gap-3">
-          {justSaved && (
-            <span className="text-sm text-emerald-700">✓ Supplier added</span>
-          )}
-          <Button
-            variant={formOpen ? "ghost" : "primary"}
-            onClick={() => setFormOpen((o) => !o)}
-          >
+          {justSaved && (<span className="text-sm text-emerald-700">✓ Supplier added</span>)}
+          <Button variant={formOpen ? "ghost" : "primary"} onClick={() => setFormOpen((o) => !o)}>
             {formOpen ? "Close form" : "New supplier"}
           </Button>
         </div>
@@ -97,15 +124,11 @@ export default function Suppliers() {
       <Card>
         <CardHeader
           title="Suppliers"
-          subtitle={
-            loading ? "Loading…" : `${rows.length} ${rows.length === 1 ? "record" : "records"}`
-          }
+          subtitle={loading ? "Loading…" : `${rows.length} ${rows.length === 1 ? "record" : "records"}`}
         />
         {rows.length === 0 && !loading ? (
           <CardBody>
-            <div className="py-8 text-center text-sm text-slate-500">
-              No suppliers match.
-            </div>
+            <div className="py-8 text-center text-sm text-slate-500">No suppliers match.</div>
           </CardBody>
         ) : (
           <div className="overflow-x-auto">
@@ -115,43 +138,55 @@ export default function Suppliers() {
                   <th className="px-5 py-2 font-medium">Name</th>
                   <th className="px-5 py-2 font-medium">Contact</th>
                   <th className="px-5 py-2 font-medium">Phone</th>
-                  <th className="px-5 py-2 font-medium">Email</th>
+                  <th className="px-5 py-2 font-medium text-right">Balance owed</th>
                   <th className="px-5 py-2"></th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {rows.map((s) => (
-                  <tr
-                    key={s.id}
-                    className={clsx(
-                      "hover:bg-slate-50",
-                      !s.isActive && "bg-slate-50/60 text-slate-500",
-                    )}
-                  >
-                    <td className="px-5 py-2 font-medium text-slate-900">
-                      {s.name}
-                      {!s.isActive && (
-                        <span className="ml-2 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-600">
-                          Inactive
-                        </span>
+                {rows.map((s) => {
+                  const bal = balances.get(s.id)?.balanceCents ?? 0;
+                  return (
+                    <tr
+                      key={s.id}
+                      className={clsx(
+                        "cursor-pointer hover:bg-slate-50",
+                        !s.isActive && "bg-slate-50/60 text-slate-500",
                       )}
-                    </td>
-                    <td className="px-5 py-2 text-slate-600">{s.contactName ?? "—"}</td>
-                    <td className="px-5 py-2 text-slate-600">{s.phone ?? "—"}</td>
-                    <td className="px-5 py-2 text-slate-600">{s.email ?? "—"}</td>
-                    <td className="px-5 py-2 text-right">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => {
-                          void suppliersRepo.setActive(s.id, !s.isActive).then(reload);
-                        }}
+                      onClick={() => navigate(`/suppliers/${s.id}`)}
+                    >
+                      <td className="px-5 py-2 font-medium text-slate-900">
+                        {s.name}
+                        {!s.isActive && (
+                          <span className="ml-2 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-600">
+                            Inactive
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-5 py-2 text-slate-600">{s.contactName ?? "—"}</td>
+                      <td className="px-5 py-2 text-slate-600">{s.phone ?? "—"}</td>
+                      <td
+                        className={clsx(
+                          "px-5 py-2 text-right font-medium",
+                          bal > 0 ? "text-red-700" : bal < 0 ? "text-emerald-700" : "text-slate-500",
+                        )}
                       >
-                        {s.isActive ? "Deactivate" : "Reactivate"}
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
+                        {bal === 0 ? "—" : formatUsd(bal)}
+                      </td>
+                      <td className="px-5 py-2 text-right">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void suppliersRepo.setActive(s.id, !s.isActive).then(reload);
+                          }}
+                        >
+                          {s.isActive ? "Deactivate" : "Reactivate"}
+                        </Button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -207,9 +242,7 @@ function NewSupplierForm({
       <CardHeader
         title="New supplier"
         actions={
-          <Button variant="ghost" size="sm" onClick={onCancel} disabled={submitting}>
-            Cancel
-          </Button>
+          <Button variant="ghost" size="sm" onClick={onCancel} disabled={submitting}>Cancel</Button>
         }
       />
       <CardBody className="space-y-3">
@@ -221,17 +254,13 @@ function NewSupplierForm({
         </div>
         <Input label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
         {error && (
-          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-            {error}
-          </div>
+          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>
         )}
         <div className="flex items-center gap-3 border-t border-slate-100 pt-3">
           <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
             {submitting ? "Saving…" : "Save supplier"}
           </Button>
-          <Button variant="ghost" onClick={onCancel} disabled={submitting}>
-            Cancel
-          </Button>
+          <Button variant="ghost" onClick={onCancel} disabled={submitting}>Cancel</Button>
         </div>
       </CardBody>
     </Card>

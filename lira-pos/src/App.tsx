@@ -14,6 +14,7 @@ import SalesHistory from "./pages/SalesHistory";
 import LocalReports from "./pages/LocalReports";
 import ManagerDashboard from "./pages/ManagerDashboard";
 import DevProbe from "./pages/_Dev";
+import SupplierDetail from "./pages/SupplierDetail";
 
 type BootStage = "db" | "context" | "ready" | "error";
 
@@ -55,25 +56,31 @@ export default function App() {
   }
 
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route element={<AppShell />}>
-          <Route index element={<PosRegister />} />
-          <Route path="products" element={<Products />} />
-          <Route path="inventory" element={<Inventory />} />
-          <Route path="purchases" element={<Purchases />} />
-          <Route path="suppliers" element={<Suppliers />} />
-          <Route path="exchange-rate" element={<ExchangeRate />} />
-          <Route path="shift" element={<ShiftSummary />} />
-          <Route path="sales" element={<SalesHistory />} />
-          <Route path="reports" element={<LocalReports />} />
-          <Route path="manager" element={<ManagerDashboard />} />
-          {import.meta.env.DEV && (
-            <Route path="_dev" element={<DevProbe />} />
-          )}
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Route>
-      </Routes>
-    </BrowserRouter>
-  );
+  <BrowserRouter>
+    <Routes>
+      <Route element={<AppShell />}>
+        <Route index element={<PosRegister />} />
+
+        <Route path="products" element={<Products />} />
+        <Route path="inventory" element={<Inventory />} />
+        <Route path="purchases" element={<Purchases />} />
+
+        <Route path="suppliers" element={<Suppliers />} />
+        <Route path="suppliers/:id" element={<SupplierDetail />} />
+
+        <Route path="exchange-rate" element={<ExchangeRate />} />
+        <Route path="shift" element={<ShiftSummary />} />
+        <Route path="sales" element={<SalesHistory />} />
+        <Route path="reports" element={<LocalReports />} />
+        <Route path="manager" element={<ManagerDashboard />} />
+
+        {import.meta.env.DEV && (
+          <Route path="_dev" element={<DevProbe />} />
+        )}
+
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Route>
+    </Routes>
+  </BrowserRouter>
+);
 }

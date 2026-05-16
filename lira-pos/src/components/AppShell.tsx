@@ -2,9 +2,11 @@ import { Outlet } from "react-router-dom";
 import { NavLink } from "./NavLink";
 import { NetworkBadge } from "./NetworkBadge";
 import { useOnline } from "../lib/network";
+import { useLowStockCount } from "../state/lowStockBadge";
 
 export function AppShell() {
   const online = useOnline();
+  const lowCount = useLowStockCount();
 
   return (
     <div className="flex h-screen w-screen overflow-hidden">
@@ -15,7 +17,16 @@ export function AppShell() {
         <nav className="flex-1 space-y-1 p-3">
           <NavLink to="/">POS Register</NavLink>
           <NavLink to="/products">Products</NavLink>
-          <NavLink to="/inventory">Inventory</NavLink>
+          <NavLink to="/inventory">
+            <span className="flex items-center justify-between">
+              <span>Inventory</span>
+              {lowCount !== null && lowCount > 0 && (
+                <span className="ml-2 rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-semibold text-white">
+                  {lowCount}
+                </span>
+              )}
+            </span>
+          </NavLink>
           <NavLink to="/purchases">Purchases</NavLink>
           <NavLink to="/suppliers">Suppliers</NavLink>
           <NavLink to="/exchange-rate">Exchange Rate</NavLink>
@@ -29,7 +40,7 @@ export function AppShell() {
           {import.meta.env.DEV && <NavLink to="/_dev">🔧 Dev probe</NavLink>}
         </nav>
         <div className="border-t border-slate-200 p-3 text-xs text-slate-500">
-          v0.1.0 · Phase 2C
+          v0.1.0 · Phase 2D
         </div>
       </aside>
 

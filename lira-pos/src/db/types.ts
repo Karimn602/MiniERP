@@ -204,3 +204,73 @@ export interface PurchaseItem {
   lineTotalInclVatCents: UsdCents;
   relatedMovementId: string | null;
 }
+
+export interface PurchaseWithLines extends Purchase {
+  lines: PurchaseItem[];
+  supplier: Supplier | null;
+}
+// ---------- Phase 2C: Inventory movements ----------
+
+export type MovementType =
+  | "purchase"
+  | "sale"
+  | "return_in"
+  | "return_out"
+  | "adjustment"
+  | "transfer_in"
+  | "transfer_out"
+  | "opening";
+
+export interface InventoryMovement {
+  id: string;
+  storeId: string;
+  productId: string;
+  movementType: MovementType;
+  quantityDelta: number;
+  unitCostExclVatCents: UsdCents;
+  unitCostInclVatCents: UsdCents;
+  relatedSaleId: string | null;
+  relatedSaleItemId: string | null;
+  relatedPurchaseId: string | null;
+  relatedPurchaseItemId: string | null;
+  supplierReference: string | null;
+  notes: string | null;
+  createdByUserId: string | null;
+  deviceId: string | null;
+  postedAt: string;
+  quantityInUom: number | null;
+  uomCodeSnapshot: string | null;
+  factorNumSnapshot: number | null;
+  factorDenSnapshot: number | null;
+}
+// ---------- Phase 2D: Supplier ledger ----------
+
+export type SupplierLedgerEntryType =
+  | "purchase"
+  | "payment"
+  | "credit_memo"
+  | "opening_balance"
+  | "adjustment";
+
+export type LedgerEntryType = SupplierLedgerEntryType;
+
+export interface SupplierLedgerEntry {
+  id: string;
+  storeId: string;
+  supplierId: string;
+  entryDate: string;
+  entryType: SupplierLedgerEntryType;
+  amountSignedCents: UsdCents;
+  relatedPurchaseId: string | null;
+  relatedPaymentId: string | null;
+  notes: string | null;
+  createdByUserId: string | null;
+  deviceId: string | null;
+  createdAt: string;
+  postedAt: string;
+}
+
+export interface SupplierWithBalance extends Supplier {
+  balanceCents: UsdCents;   // positive = we owe them
+  lastActivityAt: string | null;
+}

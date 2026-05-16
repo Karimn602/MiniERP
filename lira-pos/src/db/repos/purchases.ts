@@ -152,6 +152,7 @@ export interface PostPurchaseResult {
   purchaseNumber: number;
   postedAt: string;
   movementIds: string[];
+  ledgerEntryId: string | null;
 }
 
 // ---------- Repo ----------

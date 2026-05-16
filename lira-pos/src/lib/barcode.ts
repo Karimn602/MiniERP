@@ -58,3 +58,23 @@ export function looksLikeBarcode(raw: string): boolean {
   const norm = normalizeBarcode(raw);
   return norm.length >= 4 && norm.length <= 48 && !/\s/.test(norm);
 }
+export function isValidEan13(raw: string): boolean {
+  const code = normalizeBarcode(raw);
+
+  if (!/^\d{13}$/.test(code)) {
+    return false;
+  }
+
+  const digits = code.split("").map(Number);
+  const checkDigit = digits[12];
+
+  let sum = 0;
+
+  for (let i = 0; i < 12; i++) {
+    sum += digits[i] * (i % 2 === 0 ? 1 : 3);
+  }
+
+  const calculatedCheckDigit = (10 - (sum % 10)) % 10;
+
+  return calculatedCheckDigit === checkDigit;
+}
