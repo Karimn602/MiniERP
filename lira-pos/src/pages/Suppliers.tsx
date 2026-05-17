@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
 import { suppliersRepo } from "../db/repos/suppliers";
 import { supplierLedgerRepo } from "../db/repos/supplierLedger";
-import type { Supplier, SupplierWithBalance } from "../db/types";
+import type { Supplier } from "../db/types";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
@@ -10,77 +10,83 @@ import { formatUsd } from "../lib/money";
 import { useNavigate } from "react-router-dom";
 import clsx from "clsx";
 
-export default function Suppliers() {
-  const { storeId } = useActiveContext();
-  const navigate = useNavigate();
-  const [rows, setRows] = useState<Supplier[]>([]);
-  type SupplierBalanceSummary = {
+type SupplierBalanceSummary = {
   balanceCents: number;
   lastActivityAt: string | null;
 };
 
-const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
-  new Map(),
-);
+export default function Suppliers() {
+  const { storeId } = useActiveContext();
+  const navigate = useNavigate();
+
+  const [rows, setRows] = useState<Supplier[]>([]);
+  const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
+    new Map(),
+  );
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [includeInactive, setIncludeInactive] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
 
- const reload = useCallback(async () => {
-  if (!storeId) return;
+  const reload = useCallback(async () => {
+    if (!storeId) return;
 
-  setLoading(true);
-
-  try {
-    const list = await suppliersRepo.list({
-      storeId,
-      search: search.trim() || undefined,
-      includeInactive,
-    });
-
-    setRows(list);
+    setLoading(true);
 
     try {
-      const bals = await supplierLedgerRepo.listBalances(storeId);
+      const list = await suppliersRepo.list({
+        storeId,
+        search: search.trim() || undefined,
+        includeInactive,
+      });
 
-      if (bals instanceof Map) {
+      setRows(list);
+
+      try {
+        const bals = await supplierLedgerRepo.listBalances(storeId);
         setBalances(bals);
-      } else {
-        setBalances(new Map(bals));
+      } catch (balanceError) {
+        console.error("Failed to load supplier balances:", balanceError);
+        setBalances(new Map());
       }
-    } catch (balanceError) {
-      console.error("Failed to load supplier balances:", balanceError);
+    } catch (e) {
+      console.error("Failed to load suppliers:", e);
+      setRows([]);
       setBalances(new Map());
+    } finally {
+      setLoading(false);
     }
-  } catch (e) {
-    console.error("Failed to load suppliers:", e);
-    setRows([]);
-    setBalances(new Map());
-  } finally {
-    setLoading(false);
-  }
-}, [storeId, search, includeInactive]);
+  }, [storeId, search, includeInactive]);
 
   useEffect(() => {
     void reload();
   }, [reload]);
 
-  if (!storeId) return <div className="text-sm text-slate-500">Loading…</div>;
+  if (!storeId) {
+    return <div className="text-sm text-slate-500">Loading…</div>;
+  }
 
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between">
         <div>
           <h2 className="text-2xl font-semibold text-slate-900">Suppliers</h2>
+
           <p className="text-sm text-slate-600">
             The vendors you buy from, and how much you owe each one.
           </p>
         </div>
+
         <div className="flex items-center gap-3">
-          {justSaved && (<span className="text-sm text-emerald-700">✓ Supplier added</span>)}
-          <Button variant={formOpen ? "ghost" : "primary"} onClick={() => setFormOpen((o) => !o)}>
+          {justSaved && (
+            <span className="text-sm text-emerald-700">✓ Supplier added</span>
+          )}
+
+          <Button
+            variant={formOpen ? "ghost" : "primary"}
+            onClick={() => setFormOpen((o) => !o)}
+          >
             {formOpen ? "Close form" : "New supplier"}
           </Button>
         </div>
@@ -101,6 +107,7 @@ const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
 
       <Card>
         <CardHeader title="Filter" />
+
         <CardBody className="flex flex-col gap-3 md:flex-row md:items-end">
           <div className="flex-1">
             <Input
@@ -109,6 +116,7 @@ const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
               onChange={(e) => setSearch(e.target.value)}
             />
           </div>
+
           <label className="inline-flex items-center gap-2 text-xs text-slate-700">
             <input
               type="checkbox"
@@ -124,11 +132,18 @@ const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
       <Card>
         <CardHeader
           title="Suppliers"
-          subtitle={loading ? "Loading…" : `${rows.length} ${rows.length === 1 ? "record" : "records"}`}
+          subtitle={
+            loading
+              ? "Loading…"
+              : `${rows.length} ${rows.length === 1 ? "record" : "records"}`
+          }
         />
+
         {rows.length === 0 && !loading ? (
           <CardBody>
-            <div className="py-8 text-center text-sm text-slate-500">No suppliers match.</div>
+            <div className="py-8 text-center text-sm text-slate-500">
+              No suppliers match.
+            </div>
           </CardBody>
         ) : (
           <div className="overflow-x-auto">
@@ -142,9 +157,11 @@ const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
                   <th className="px-5 py-2"></th>
                 </tr>
               </thead>
+
               <tbody className="divide-y divide-slate-100">
                 {rows.map((s) => {
                   const bal = balances.get(s.id)?.balanceCents ?? 0;
+
                   return (
                     <tr
                       key={s.id}
@@ -156,22 +173,35 @@ const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
                     >
                       <td className="px-5 py-2 font-medium text-slate-900">
                         {s.name}
+
                         {!s.isActive && (
                           <span className="ml-2 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-600">
                             Inactive
                           </span>
                         )}
                       </td>
-                      <td className="px-5 py-2 text-slate-600">{s.contactName ?? "—"}</td>
-                      <td className="px-5 py-2 text-slate-600">{s.phone ?? "—"}</td>
+
+                      <td className="px-5 py-2 text-slate-600">
+                        {s.contactName ?? "—"}
+                      </td>
+
+                      <td className="px-5 py-2 text-slate-600">
+                        {s.phone ?? "—"}
+                      </td>
+
                       <td
                         className={clsx(
                           "px-5 py-2 text-right font-medium",
-                          bal > 0 ? "text-red-700" : bal < 0 ? "text-emerald-700" : "text-slate-500",
+                          bal > 0
+                            ? "text-red-700"
+                            : bal < 0
+                              ? "text-emerald-700"
+                              : "text-slate-500",
                         )}
                       >
                         {bal === 0 ? "—" : formatUsd(bal)}
                       </td>
+
                       <td className="px-5 py-2 text-right">
                         <Button
                           variant="ghost"
@@ -218,8 +248,10 @@ function NewSupplierForm({
       setError("Name is required.");
       return;
     }
+
     setSubmitting(true);
     setError(null);
+
     try {
       await suppliersRepo.create({
         storeId,
@@ -229,6 +261,7 @@ function NewSupplierForm({
         email: email.trim() || null,
         notes: notes.trim() || null,
       });
+
       onCreated();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -242,25 +275,66 @@ function NewSupplierForm({
       <CardHeader
         title="New supplier"
         actions={
-          <Button variant="ghost" size="sm" onClick={onCancel} disabled={submitting}>Cancel</Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onCancel}
+            disabled={submitting}
+          >
+            Cancel
+          </Button>
         }
       />
+
       <CardBody className="space-y-3">
-        <Input label="Name *" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+        <Input
+          label="Name *"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          autoFocus
+        />
+
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-          <Input label="Contact name" value={contactName} onChange={(e) => setContactName(e.target.value)} />
-          <Input label="Phone" value={phone} onChange={(e) => setPhone(e.target.value)} />
-          <Input label="Email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <Input
+            label="Contact name"
+            value={contactName}
+            onChange={(e) => setContactName(e.target.value)}
+          />
+
+          <Input
+            label="Phone"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+          />
+
+          <Input
+            label="Email"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
         </div>
-        <Input label="Notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
+
+        <Input
+          label="Notes"
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+        />
+
         {error && (
-          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>
+          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+            {error}
+          </div>
         )}
+
         <div className="flex items-center gap-3 border-t border-slate-100 pt-3">
           <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
             {submitting ? "Saving…" : "Save supplier"}
           </Button>
-          <Button variant="ghost" onClick={onCancel} disabled={submitting}>Cancel</Button>
+
+          <Button variant="ghost" onClick={onCancel} disabled={submitting}>
+            Cancel
+          </Button>
         </div>
       </CardBody>
     </Card>

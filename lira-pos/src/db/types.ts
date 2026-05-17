@@ -18,9 +18,9 @@ import type { UsdCents } from "../lib/money";
 export interface VatRate {
   id: string;
   name: string;
-  rateBps: number;          // 1100 = 11%
+  rateBps: number;
   isExempt: boolean;
-  effectiveFrom: string;    // ISO date
+  effectiveFrom: string;
   effectiveTo: string | null;
 }
 
@@ -43,7 +43,6 @@ export interface ProductUom {
   isDefaultSale: boolean;
   isDefaultPurchase: boolean;
   isActive: boolean;
-  /** Override prices in USD cents. Null means derive from product base price × factor. */
   salePriceExclVatCents: UsdCents | null;
   salePriceInclVatCents: UsdCents | null;
 }
@@ -60,13 +59,10 @@ export interface Product {
   description: string | null;
   vatRateId: string;
   vatPricingMode: VatPricingMode;
-  /** Base-UoM price, USD cents. */
   priceExclVatCents: UsdCents;
   priceInclVatCents: UsdCents;
-  /** Base-UoM weighted-average cost, USD cents. */
   avgCostExclVatCents: UsdCents;
   avgCostInclVatCents: UsdCents;
-  /** Quantity in BASE UoM. */
   quantityOnHand: number;
   reorderPoint: number | null;
   isActive: boolean;
@@ -75,15 +71,9 @@ export interface Product {
   updatedAt: string;
 }
 
-/**
- * Product enriched with its UoMs and primary barcode — what the Products
- * list screen and POS scan resolution both consume.
- */
 export interface ProductWithUoms extends Product {
   uoms: ProductUom[];
-  /** Convenience: the row where isBase=1. Always present. */
   baseUom: ProductUom;
-  /** Convenience: the row where isDefaultSale=1. Always present. */
   defaultSaleUom: ProductUom;
   primaryBarcode: ProductBarcode | null;
   vatRate: VatRate;
@@ -104,23 +94,17 @@ export interface ProductBarcode {
   id: string;
   storeId: string;
   productId: string;
-  /** The barcode as scanned/entered (preserve exactly). */
   barcode: string;
-  /** Normalized form, used for lookup. */
   lookupValue: string;
   barcodeType: BarcodeType;
   isPrimary: boolean;
   isActive: boolean;
-  /** If set, scanning this barcode auto-picks that UoM. */
   productUomId: string | null;
 }
 
-/** What a successful POS scan resolves to. */
 export interface BarcodeScanResult {
   product: ProductWithUoms;
-  /** The UoM resolved from the barcode (or the product's default if barcode wasn't UoM-specific). */
   resolvedUom: ProductUom;
-  /** The barcode row that matched. */
   matchedBarcode: ProductBarcode;
 }
 
@@ -129,16 +113,14 @@ export interface BarcodeScanResult {
 export interface ExchangeRate {
   id: string;
   storeId: string;
-  /** 'YYYY-MM-DD' local date. */
   effectiveDate: string;
-  /** Integer LBP per 1 USD. */
   rateLbpPerUsd: number;
   source: "manual" | "api" | "imported";
   notes: string | null;
   createdAt: string;
 }
 
-// ---------- Phase 2C: Suppliers ----------
+// ---------- Suppliers ----------
 
 export interface Supplier {
   id: string;
@@ -153,7 +135,7 @@ export interface Supplier {
   updatedAt: string;
 }
 
-// ---------- Phase 2C: Purchases ----------
+// ---------- Purchases ----------
 
 export type PurchaseStatus = "draft" | "posted" | "voided";
 export type PurchaseType = "normal" | "opening";
@@ -165,7 +147,7 @@ export interface Purchase {
   purchaseType: PurchaseType;
   supplierReference: string | null;
   purchaseNumber: number;
-  purchaseDate: string; // YYYY-MM-DD
+  purchaseDate: string;
   subtotalExclVatCents: UsdCents;
   vatTotalCents: UsdCents;
   totalInclVatCents: UsdCents;
@@ -209,7 +191,8 @@ export interface PurchaseWithLines extends Purchase {
   lines: PurchaseItem[];
   supplier: Supplier | null;
 }
-// ---------- Phase 2C: Inventory movements ----------
+
+// ---------- Inventory movements ----------
 
 export type MovementType =
   | "purchase"
@@ -243,12 +226,13 @@ export interface InventoryMovement {
   factorNumSnapshot: number | null;
   factorDenSnapshot: number | null;
 }
-// ---------- Phase 2D: Supplier ledger ----------
+
+// ---------- Supplier ledger ----------
 
 export type SupplierLedgerEntryType =
   | "purchase"
   | "payment"
-  | "credit_memo"
+  | "credit_note"
   | "opening_balance"
   | "adjustment";
 
@@ -271,6 +255,94 @@ export interface SupplierLedgerEntry {
 }
 
 export interface SupplierWithBalance extends Supplier {
-  balanceCents: UsdCents;   // positive = we owe them
+  balanceCents: UsdCents;
   lastActivityAt: string | null;
+}
+
+// ---------- Sales ----------
+
+export type SaleStatus = "draft" | "posted" | "voided";
+export type SaleType = "normal" | "credit_memo";
+
+export type PaymentMethod =
+  | "cash_usd"
+  | "cash_lbp"
+  | "card_usd"
+  | "card_lbp"
+  | "bank_transfer"
+  | "wallet"
+  | "store_credit"
+  | "other";
+
+export type PaymentCurrency = "USD" | "LBP";
+
+export interface Sale {
+  id: string;
+  storeId: string;
+  shiftId: string | null;
+  deviceId: string | null;
+  cashierUserId: string | null;
+  receiptNumber: number;
+  exchangeRateLbpPerUsd: number;
+  exchangeRateId: string | null;
+  subtotalExclVatCents: UsdCents;
+  vatTotalCents: UsdCents;
+  totalInclVatCents: UsdCents;
+  discountCents: UsdCents;
+  cogsTotalCents: UsdCents;
+  saleType: SaleType;
+  originalSaleId: string | null;
+  status: SaleStatus;
+  createdAt: string;
+  postedAt: string | null;
+  voidedAt: string | null;
+  voidedByUserId: string | null;
+  voidReason: string | null;
+  notes: string | null;
+}
+
+export interface SaleItem {
+  id: string;
+  saleId: string;
+  storeId: string;
+  productId: string;
+  productNameSnapshot: string;
+  productSkuSnapshot: string | null;
+  vatRateIdSnapshot: string;
+  vatRateBpsSnapshot: number;
+  quantity: number;
+  unitPriceExclVatCents: UsdCents;
+  unitPriceInclVatCents: UsdCents;
+  lineSubtotalExclVatCents: UsdCents;
+  lineVatCents: UsdCents;
+  lineTotalInclVatCents: UsdCents;
+  lineDiscountCents: UsdCents;
+  unitCogsExclVatCents: UsdCents;
+  lineCogsExclVatCents: UsdCents;
+  barcodeUsedSnapshot: string | null;
+  barcodeTypeSnapshot: string | null;
+  quantityInUom: number | null;
+  uomCodeSnapshot: string | null;
+  factorNumSnapshot: number | null;
+  factorDenSnapshot: number | null;
+}
+
+export interface SalePayment {
+  id: string;
+  saleId: string;
+  storeId: string;
+  method: PaymentMethod;
+  currency: PaymentCurrency;
+  amountNativeUsdCents: UsdCents;
+  amountNativeLbp: number;
+  amountUsdCentsEquivalent: UsdCents;
+  changeGivenUsdCents: UsdCents;
+  changeGivenLbp: number;
+  reference: string | null;
+  createdAt: string;
+}
+
+export interface SaleWithDetails extends Sale {
+  lines: SaleItem[];
+  payments: SalePayment[];
 }

@@ -56,6 +56,7 @@ pub fn run() {
             posting::post_purchase,
             posting::post_adjustment,
             posting::post_supplier_payment,
+            posting::post_sale,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
