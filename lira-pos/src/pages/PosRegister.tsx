@@ -32,6 +32,7 @@ import { exchangeRatesRepo } from "../db/repos/exchangeRates";
 import { salesRepo, type PostSaleLineInput, type PostSalePaymentInput } from "../db/repos/sales";
 import type {
   BarcodeScanResult,
+  CogsMethod,
   ExchangeRate,
   ProductUom,
   ProductWithUoms,
@@ -103,6 +104,7 @@ export default function PosRegister() {
   const [cashUsdInput, setCashUsdInput] = useState("");
   const [cashLbpInput, setCashLbpInput] = useState("");
   const [cardUsdInput, setCardUsdInput] = useState("");
+  const [cogsMethod, setCogsMethod] = useState<CogsMethod>("weighted_average");
 
   // Scan box
   const [scanInput, setScanInput] = useState("");
@@ -422,6 +424,7 @@ export default function PosRegister() {
         exchangeRateId: rate.id,
         exchangeRateLbpPerUsd: rate.rateLbpPerUsd,
         notes: null,
+        cogsMethod,
         lines: linePayloads,
         payments: paymentPayloads,
       });
@@ -620,6 +623,41 @@ export default function PosRegister() {
                   />
                 )}
               </div>
+            </CardBody>
+          </Card>
+
+          <Card>
+            <CardHeader
+              title="Cost method"
+              subtitle="Choose how COGS/profit is calculated for this sale."
+            />
+            <CardBody className="space-y-2 text-sm">
+              <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2">
+                <input
+                  type="radio"
+                  name="cogs-method"
+                  checked={cogsMethod === "weighted_average"}
+                  onChange={() => setCogsMethod("weighted_average")}
+                  className="mt-1"
+                />
+                <span>
+                  <span className="block font-medium text-slate-800">Weighted average cost</span>
+                  <span className="text-xs text-slate-500">Uses the current average cost stored on each product.</span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2">
+                <input
+                  type="radio"
+                  name="cogs-method"
+                  checked={cogsMethod === "last_purchase"}
+                  onChange={() => setCogsMethod("last_purchase")}
+                  className="mt-1"
+                />
+                <span>
+                  <span className="block font-medium text-slate-800">Last purchase cost</span>
+                  <span className="text-xs text-slate-500">Uses the most recent purchase/opening cost, falling back to average cost if unavailable.</span>
+                </span>
+              </label>
             </CardBody>
           </Card>
 

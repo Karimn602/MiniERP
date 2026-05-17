@@ -43,6 +43,12 @@ pub fn run() {
             sql: include_str!("../../src/db/migrations/006_supplier_ledger.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 7,
+            description: "sales_cogs_method",
+            sql: include_str!("../../src/db/migrations/007_sales_cogs_method.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()

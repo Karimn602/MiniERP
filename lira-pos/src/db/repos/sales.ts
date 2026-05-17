@@ -10,6 +10,7 @@ import type {
   SaleStatus,
   SaleType,
   SaleWithDetails,
+  CogsMethod,
 } from "../types";
 
 // ---------- Row shapes ----------
@@ -28,6 +29,7 @@ interface SaleRow {
   total_incl_vat_cents: number;
   discount_cents: number;
   cogs_total_cents: number;
+  cogs_method: CogsMethod | null;
   sale_type: SaleType;
   original_sale_id: string | null;
   status: SaleStatus;
@@ -97,6 +99,7 @@ function toSale(r: SaleRow): Sale {
     totalInclVatCents: r.total_incl_vat_cents,
     discountCents: r.discount_cents,
     cogsTotalCents: r.cogs_total_cents,
+    cogsMethod: r.cogs_method ?? "weighted_average",
     saleType: r.sale_type,
     originalSaleId: r.original_sale_id,
     status: r.status,
@@ -204,6 +207,7 @@ export interface PostSaleInput {
   exchangeRateId: string;
   exchangeRateLbpPerUsd: number;
   notes: string | null;
+  cogsMethod: CogsMethod;
   lines: PostSaleLineInput[];
   payments: PostSalePaymentInput[];
 }

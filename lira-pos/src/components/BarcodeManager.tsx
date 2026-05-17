@@ -15,7 +15,13 @@ import clsx from "clsx";
  *
  * Self-contained — owns its own loading state and reloads after each mutation.
  */
-export function BarcodeManager({ productId }: { productId: string }) {
+export function BarcodeManager({
+  productId,
+  onChanged,
+}: {
+  productId: string;
+  onChanged?: () => void;
+}) {
   const [rows, setRows] = useState<ProductBarcode[]>([]);
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState("");
@@ -52,10 +58,10 @@ export function BarcodeManager({ productId }: { productId: string }) {
       await barcodesRepo.addBarcode({
         productId,
         barcode: code,
-        // First barcode is automatically primary; the repo handles this.
       });
       setAdding("");
       await reload();
+      onChanged?.();
     } catch (e) {
       setAddError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -66,12 +72,14 @@ export function BarcodeManager({ productId }: { productId: string }) {
   async function handleSetPrimary(barcodeId: string) {
     await barcodesRepo.setPrimary(productId, barcodeId);
     await reload();
+    onChanged?.();
   }
 
   async function handleRemove(barcodeId: string) {
-    if (rows.length <= 1) return; // safety; UI also blocks
+    if (rows.length <= 1) return;
     await barcodesRepo.remove(barcodeId);
     await reload();
+    onChanged?.();
   }
 
   return (

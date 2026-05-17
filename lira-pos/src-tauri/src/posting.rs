@@ -690,6 +690,7 @@ pub struct PostSalePayload {
     pub exchange_rate_lbp_per_usd: i64,
 
     pub notes: Option<String>,
+    pub cogs_method: String,
     pub lines: Vec<PostSaleLine>,
     pub payments: Vec<PostSalePayment>,
 }
@@ -799,6 +800,11 @@ pub async fn post_sale(
     if payload.exchange_rate_lbp_per_usd <= 0 {
         return Err("Exchange rate must be positive.".into());
     }
+
+    let cogs_method = match payload.cogs_method.as_str() {
+        "weighted_average" | "last_purchase" => payload.cogs_method.as_str(),
+        other => return Err(format!("Invalid COGS method: {}", other)),
+    };
 
     // ---- Validation: lines ----
     for (i, line) in payload.lines.iter().enumerate() {
@@ -952,8 +958,41 @@ pub async fn post_sale(
             ));
         }
 
-        let unit_excl = if is_service { 0 } else { avg_cost_excl };
-        let unit_incl = if is_service { 0 } else { avg_cost_incl };
+        let (unit_excl, unit_incl) = if is_service {
+            (0, 0)
+        } else if cogs_method == "last_purchase" {
+            let last_cost_row = sqlx::query(
+                "SELECT unit_cost_excl_vat_cents, unit_cost_incl_vat_cents
+                   FROM inventory_movements
+                  WHERE store_id = ?
+                    AND product_id = ?
+                    AND movement_type IN ('purchase', 'opening')
+                    AND unit_cost_excl_vat_cents >= 0
+                  ORDER BY posted_at DESC
+                  LIMIT 1",
+            )
+            .bind(&payload.store_id)
+            .bind(&line.product_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("read last purchase cost for {}: {e}", line.product_id))?;
+
+            if let Some(cost_row) = last_cost_row {
+                let last_excl: i64 = cost_row
+                    .try_get("unit_cost_excl_vat_cents")
+                    .map_err(|e| format!("decode last_cost_excl: {e}"))?;
+                let last_incl: i64 = cost_row
+                    .try_get("unit_cost_incl_vat_cents")
+                    .map_err(|e| format!("decode last_cost_incl: {e}"))?;
+                (last_excl, last_incl)
+            } else {
+                // Fallback: products without a purchase/opening movement still use WAC.
+                (avg_cost_excl, avg_cost_incl)
+            }
+        } else {
+            (avg_cost_excl, avg_cost_incl)
+        };
+
         line_cogs_unit_excl.push(unit_excl);
         line_cogs_unit_incl.push(unit_incl);
         cogs_total += unit_excl * line.quantity_base;
@@ -966,9 +1005,9 @@ pub async fn post_sale(
              receipt_number,
              exchange_rate_lbp_per_usd, exchange_rate_id,
              subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
-             discount_cents, cogs_total_cents,
+             discount_cents, cogs_total_cents, cogs_method,
              sale_type, status, posted_at, notes
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'normal', 'posted', ?, ?)"#,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'normal', 'posted', ?, ?)"#,
     )
     .bind(&payload.sale_id)
     .bind(&payload.store_id)
@@ -982,6 +1021,7 @@ pub async fn post_sale(
     .bind(vat_total)
     .bind(total)
     .bind(cogs_total)
+    .bind(cogs_method)
     .bind(&now)
     .bind(&payload.notes)
     .execute(&mut *tx)

@@ -68,7 +68,40 @@ export function assertValidFactor(f: Factor): void {
   assertPositiveInt(f.num, "factor.num");
   assertPositiveInt(f.den, "factor.den");
 }
+export interface Factor {
+  num: number;
+  den: number;
+}
 
+export function gcd(a: number, b: number): number {
+  let x = Math.abs(a);
+  let y = Math.abs(b);
+
+  while (y !== 0) {
+    const t = y;
+    y = x % y;
+    x = t;
+  }
+
+  return x;
+}
+
+export function makeFactor(num: number, den: number = 1): Factor {
+  if (!Number.isInteger(num) || !Number.isInteger(den)) {
+    throw new Error("UoM factor must use integer numerator and denominator.");
+  }
+
+  if (num <= 0 || den <= 0) {
+    throw new Error("UoM factor numerator and denominator must be positive.");
+  }
+
+  const divisor = gcd(num, den);
+
+  return {
+    num: num / divisor,
+    den: den / divisor,
+  };
+}
 // ---------- Core conversions ----------
 
 /**

@@ -263,6 +263,7 @@ export interface SupplierWithBalance extends Supplier {
 
 export type SaleStatus = "draft" | "posted" | "voided";
 export type SaleType = "normal" | "credit_memo";
+export type CogsMethod = "weighted_average" | "last_purchase";
 
 export type PaymentMethod =
   | "cash_usd"
@@ -290,6 +291,7 @@ export interface Sale {
   totalInclVatCents: UsdCents;
   discountCents: UsdCents;
   cogsTotalCents: UsdCents;
+  cogsMethod: CogsMethod;
   saleType: SaleType;
   originalSaleId: string | null;
   status: SaleStatus;

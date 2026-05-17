@@ -8,9 +8,16 @@ import type {
   ProductWithUoms,
   VatPricingMode,
   VatRate,
+  BarcodeType,
 } from "../types";
+import type { Factor } from "../../lib/uom";
 
-// ---------- Row shapes ----------
+export class DuplicateSkuError extends Error {
+  constructor() {
+    super("Duplicate SKU");
+    this.name = "DuplicateSkuError";
+  }
+}
 
 interface ProductRow {
   id: string;
@@ -55,7 +62,68 @@ interface VatRateRow {
   effective_to: string | null;
 }
 
-// ---------- Mappers ----------
+type ProductListArgs = {
+  storeId: string;
+  search?: string;
+  includeInactive?: boolean;
+  limit?: number;
+};
+
+type ProductCreateArgs = {
+  storeId: string;
+  sku: string | null;
+  name: string;
+  description: string | null;
+  vatRateId: string;
+  vatPricingMode: VatPricingMode;
+  priceExclVatCents: number;
+  priceInclVatCents: number;
+  avgCostExclVatCents: number;
+  avgCostInclVatCents: number;
+  quantityOnHand: number;
+  reorderPoint: number | null;
+  isService: boolean;
+  barcode?: string | null;
+  barcodeType?: BarcodeType | null;
+  baseUomCode: string;
+  saleUomCode: string;
+  saleFactor: Factor;
+  salePriceExclVatCents: number | null;
+  salePriceInclVatCents: number | null;
+};
+
+type ProductUpdateArgs = {
+  sku: string | null;
+  name: string;
+  description: string | null;
+  vatRateId: string;
+  vatPricingMode: VatPricingMode;
+  priceExclVatCents: number;
+  priceInclVatCents: number;
+  avgCostExclVatCents: number;
+  avgCostInclVatCents: number;
+  quantityOnHand: number;
+  reorderPoint: number | null;
+  isService: boolean;
+  isActive: boolean;
+};
+
+type ProductAddUomArgs = {
+  productId: string;
+  uomCode: string;
+  factor: Factor;
+  isDefaultSale: boolean;
+  isDefaultPurchase: boolean;
+  salePriceExclVatCents: number | null;
+  salePriceInclVatCents: number | null;
+};
+
+type ProductUpdateUomArgs = {
+  factor: Factor;
+  isDefaultSale: boolean;
+  salePriceExclVatCents: number | null;
+  salePriceInclVatCents: number | null;
+};
 
 function rowToProduct(r: ProductRow): Product {
   return {
@@ -105,7 +173,13 @@ function rowToVatRate(r: VatRateRow): VatRate {
   };
 }
 
-// ---------- Composition helper ----------
+function isDuplicateSkuError(e: unknown): boolean {
+  return (
+    e instanceof Error &&
+    e.message.includes("UNIQUE constraint failed") &&
+    e.message.includes("products")
+  );
+}
 
 async function enrich(p: Product): Promise<ProductWithUoms> {
   const [uomRows, vatRows, primaryBarcode] = await Promise.all([
@@ -131,13 +205,17 @@ async function enrich(p: Product): Promise<ProductWithUoms> {
   const defaultSaleUom = uoms.find((u) => u.isDefaultSale);
 
   if (!baseUom) {
-    throw new Error(`Product ${p.id} (${p.name}) has no base UoM — data corruption`);
+    throw new Error(`Product ${p.id} (${p.name}) has no base UoM.`);
   }
+
   if (!defaultSaleUom) {
-    throw new Error(`Product ${p.id} (${p.name}) has no default sale UoM — data corruption`);
+    throw new Error(`Product ${p.id} (${p.name}) has no default sale UoM.`);
   }
+
   if (!vatRows[0]) {
-    throw new Error(`Product ${p.id} (${p.name}) references missing VAT rate ${p.vatRateId}`);
+    throw new Error(
+      `Product ${p.id} (${p.name}) references missing VAT rate ${p.vatRateId}`,
+    );
   }
 
   return {
@@ -150,50 +228,13 @@ async function enrich(p: Product): Promise<ProductWithUoms> {
   };
 }
 
-// ---------- Create ----------
-
-export type CreateProductInput = {
-  storeId: string;
-  name: string;
-  sku: string | null;
-  description: string | null;
-  vatRateId: string;
-  vatPricingMode: VatPricingMode;
-  /** Pre-computed by the caller using `addVat`/`stripVat` so both sides agree exactly. */
-  priceExclVatCents: number;
-  priceInclVatCents: number;
-  /** UoM code (must exist in units_of_measure). Becomes the product's base UoM with factor (1,1). */
-  baseUomCode: string;
-  reorderPoint: number | null;
-  isService: boolean;
-};
-
-/**
- * Thrown when the SKU collides with an existing product in the same store.
- * The UI catches this specifically to highlight the SKU field.
- */
-export class DuplicateSkuError extends Error {
-  readonly sku: string;
-  constructor(sku: string) {
-    super(`A product with SKU "${sku}" already exists in this store.`);
-    this.name = "DuplicateSkuError";
-    this.sku = sku;
-  }
-}
-
-// ---------- Repo ----------
-type ProductListArgs = {
-  storeId: string;
-  search?: string;
-  includeInactive?: boolean;
-  limit?: number;
-};
 export const productsRepo = {
   async findById(id: string): Promise<Product | null> {
     const rows = await query<ProductRow>(
       `SELECT * FROM products WHERE id = ?`,
       [id],
     );
+
     return rows[0] ? rowToProduct(rows[0]) : null;
   },
 
@@ -202,10 +243,6 @@ export const productsRepo = {
     return p ? enrich(p) : null;
   },
 
-  /**
-   * List products with optional search. Search matches BOTH name (LIKE) AND
-   * barcode (exact, normalized). Barcode hits take priority via match_priority.
-   */
   async list(args: ProductListArgs): Promise<Product[]> {
     const includeInactive = args.includeInactive ?? false;
     const limit = args.limit ?? 200;
@@ -213,11 +250,13 @@ export const productsRepo = {
     if (!args.search || args.search.trim() === "") {
       const rows = await query<ProductRow>(
         `SELECT * FROM products
-         WHERE store_id = ? ${includeInactive ? "" : "AND is_active = 1"}
+         WHERE store_id = ?
+         ${includeInactive ? "" : "AND is_active = 1"}
          ORDER BY name
          LIMIT ?`,
         [args.storeId, limit],
       );
+
       return rows.map(rowToProduct);
     }
 
@@ -242,24 +281,28 @@ export const productsRepo = {
       [args.storeId, normalizedTerm, args.storeId, likePattern, likePattern, limit],
     );
 
-    // Dedupe by id (barcode hit wins due to ORDER BY match_priority).
     const seen = new Set<string>();
     const deduped: ProductRow[] = [];
+
     for (const r of rows) {
       if (!seen.has(r.id)) {
         seen.add(r.id);
         deduped.push(r);
       }
     }
+
     return deduped.map(rowToProduct);
   },
 
- async listEnriched(args: ProductListArgs): Promise<ProductWithUoms[]> {
-  const products = await this.list(args);
-  return Promise.all(products.map(enrich));
-},
-  /** POS scan path: barcode → barcode row → enriched product → resolved UoM. */
-  async findByScan(storeId: string, scannedInput: string): Promise<BarcodeScanResult | null> {
+  async listEnriched(args: ProductListArgs): Promise<ProductWithUoms[]> {
+    const products = await this.list(args);
+    return Promise.all(products.map(enrich));
+  },
+
+  async findByScan(
+    storeId: string,
+    scannedInput: string,
+  ): Promise<BarcodeScanResult | null> {
     const matchedBarcode = await barcodesRepo.findByScan(storeId, scannedInput);
     if (!matchedBarcode) return null;
 
@@ -267,188 +310,260 @@ export const productsRepo = {
     if (!product) return null;
 
     const resolvedUom = matchedBarcode.productUomId
-      ? product.uoms.find((u) => u.id === matchedBarcode.productUomId) ?? product.defaultSaleUom
+      ? product.uoms.find((u) => u.id === matchedBarcode.productUomId) ??
+        product.defaultSaleUom
       : product.defaultSaleUom;
 
     return { product, resolvedUom, matchedBarcode };
   },
 
-  async count(storeId: string, opts: { includeInactive?: boolean } = {}): Promise<number> {
+  async count(
+    storeId: string,
+    opts: { includeInactive?: boolean } = {},
+  ): Promise<number> {
     const rows = await query<{ n: number }>(
       `SELECT COUNT(*) AS n FROM products
        WHERE store_id = ?
-         ${opts.includeInactive ? "" : "AND is_active = 1"}`,
+       ${opts.includeInactive ? "" : "AND is_active = 1"}`,
       [storeId],
     );
+
     return rows[0]?.n ?? 0;
   },
 
- /**
-   * Create a new product plus its base UoM row.
-   *
-   * NOTE on atomicity: we do NOT use BEGIN/COMMIT because tauri-plugin-sql's
-   * connection pool dispatches each execute() to potentially-different
-   * connections, which makes SQL-level transactions unreliable across calls
-   * (COMMIT ends up on a connection that never saw BEGIN, raising
-   * "cannot commit - no transaction is active").
-   *
-   * Instead we use a saga pattern: do INSERT 1, then INSERT 2, and if INSERT 2
-   * fails we compensate with a DELETE of the product. The `product_uoms`
-   * table has `ON DELETE CASCADE` on `product_id`, so the delete cleans up
-   * any partial UoM rows automatically.
-   *
-   * The only window of inconsistency is between the two INSERTs — if the
-   * app process dies right there, we'd leave an orphan product. We accept
-   * that for now; a periodic integrity check (Phase 5) can scrub orphans.
-   */
-  async create(input: CreateProductInput): Promise<Product> {
+  async create(args: ProductCreateArgs): Promise<ProductWithUoms> {
     const productId = newId();
-    const baseUomRowId = newId();
 
-    // INSERT 1: the product itself.
     try {
       await execute(
         `INSERT INTO products (
            id, store_id, sku, name, description,
            vat_rate_id, vat_pricing_mode,
            price_excl_vat_cents, price_incl_vat_cents,
-           reorder_point, is_service
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
+           quantity_on_hand, reorder_point,
+           is_active, is_service
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
         [
           productId,
-          input.storeId,
-          input.sku,
-          input.name,
-          input.description,
-          input.vatRateId,
-          input.vatPricingMode,
-          input.priceExclVatCents,
-          input.priceInclVatCents,
-          input.reorderPoint,
-          input.isService ? 1 : 0,
+          args.storeId,
+          args.sku,
+          args.name,
+          args.description,
+          args.vatRateId,
+          args.vatPricingMode,
+          args.priceExclVatCents,
+          args.priceInclVatCents,
+          args.avgCostExclVatCents,
+          args.avgCostInclVatCents,
+          args.quantityOnHand,
+          args.reorderPoint,
+          args.isService ? 1 : 0,
         ],
       );
     } catch (e) {
-      // Nothing was written; no cleanup needed.
-      if (
-        e instanceof Error &&
-        /UNIQUE constraint failed/i.test(e.message) &&
-        /sku/i.test(e.message)
-      ) {
-        throw new DuplicateSkuError(input.sku ?? "(empty)");
-      }
+      if (isDuplicateSkuError(e)) throw new DuplicateSkuError();
       throw e;
     }
 
-    // INSERT 2: the base UoM. If this fails, compensate by deleting the product.
-    try {
+    const baseUomId = newId();
+
+    if (args.baseUomCode === args.saleUomCode) {
       await execute(
         `INSERT INTO product_uoms (
-           id, store_id, product_id, uom_code,
-           factor_num, factor_den,
-           is_base, is_default_sale_uom, is_default_purchase_uom, is_active
-         ) VALUES (?, ?, ?, ?, 1, 1, 1, 1, 1, 1)`,
-        [baseUomRowId, input.storeId, productId, input.baseUomCode],
+           id, store_id, product_id, uom_code, factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
+           sale_price_excl_vat_cents, sale_price_incl_vat_cents
+         ) VALUES (?, ?, ?, ?, 1, 1, 1, 1, 1, 1, ?, ?)`,
+        [
+          baseUomId,
+          args.storeId,
+          productId,
+          args.baseUomCode,
+          args.salePriceExclVatCents,
+          args.salePriceInclVatCents,
+        ],
       );
-    } catch (e) {
-      try {
-        await execute(`DELETE FROM products WHERE id = ?`, [productId]);
-      } catch {
-        // Best effort; surface the original error.
-      }
-      throw e;
+    } else {
+      await execute(
+        `INSERT INTO product_uoms (
+           id, store_id, product_id, uom_code, factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
+           sale_price_excl_vat_cents, sale_price_incl_vat_cents
+         ) VALUES (?, ?, ?, ?, 1, 1, 1, 0, 1, 1, NULL, NULL)`,
+        [baseUomId, args.storeId, productId, args.baseUomCode],
+      );
+
+      await execute(
+        `INSERT INTO product_uoms (
+           id, store_id, product_id, uom_code, factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
+           sale_price_excl_vat_cents, sale_price_incl_vat_cents
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0, 1, ?, ?)`,
+        [
+          newId(),
+          args.storeId,
+          productId,
+          args.saleUomCode,
+          args.saleFactor.num,
+          args.saleFactor.den,
+          args.salePriceExclVatCents,
+          args.salePriceInclVatCents,
+        ],
+      );
     }
 
-    const created = await this.findById(productId);
-    if (!created) {
-      throw new Error(
-        "Product was created but could not be re-fetched. The database may be in an inconsistent state.",
-      );
+    if (args.barcode) {
+      await barcodesRepo.addBarcode({
+        productId,
+        barcode: args.barcode,
+        barcodeType: args.barcodeType ?? undefined,
+        makePrimary: true,
+      });
     }
+
+    const created = await this.findByIdEnriched(productId);
+
+    if (!created) {
+      throw new Error("Product was created but could not be loaded.");
+    }
+
     return created;
   },
-  /**
-   * Patch-style update of an existing product. Pass only the fields you want
-   * to change. Throws DuplicateSkuError on UNIQUE collision (same as create).
-   *
-   * Does NOT modify product_uoms — UoM management is a separate concern
-   * (Phase 2E). Changing baseUomCode here would be incoherent with all the
-   * historical quantity_on_hand and avg_cost values that are denominated in
-   * the existing base. If you need to rebase a product's UoM, do it via a
-   * deliberate migration, not a UI patch.
-   */
-  async update(
-    id: string,
-    patch: {
-      name?: string;
-      sku?: string | null;
-      description?: string | null;
-      vatRateId?: string;
-      vatPricingMode?: VatPricingMode;
-      priceExclVatCents?: number;
-      priceInclVatCents?: number;
-      reorderPoint?: number | null;
-      isService?: boolean;
-    },
-  ): Promise<Product> {
-    const sets: string[] = [];
-    const params: unknown[] = [];
 
-    const map: Record<string, [string, unknown]> = {
-      name:               ["name = ?",                  patch.name],
-      sku:                ["sku = ?",                   patch.sku],
-      description:        ["description = ?",           patch.description],
-      vatRateId:          ["vat_rate_id = ?",           patch.vatRateId],
-      vatPricingMode:     ["vat_pricing_mode = ?",      patch.vatPricingMode],
-      priceExclVatCents:  ["price_excl_vat_cents = ?",  patch.priceExclVatCents],
-      priceInclVatCents:  ["price_incl_vat_cents = ?",  patch.priceInclVatCents],
-      reorderPoint:       ["reorder_point = ?",         patch.reorderPoint],
-      isService:          ["is_service = ?",            patch.isService === undefined ? undefined : (patch.isService ? 1 : 0)],
-    };
-
-    for (const key of Object.keys(map) as Array<keyof typeof map>) {
-      const [clause, value] = map[key];
-      if (value !== undefined) {
-        sets.push(clause);
-        params.push(value);
-      }
-    }
-
-    if (sets.length === 0) {
-      // No-op update is fine — just return the current row.
-      const cur = await this.findById(id);
-      if (!cur) throw new Error(`Product ${id} not found`);
-      return cur;
-    }
-
-    params.push(id);
-
+  async update(id: string, args: ProductUpdateArgs): Promise<void> {
     try {
       await execute(
-        `UPDATE products SET ${sets.join(", ")} WHERE id = ?`,
-        params,
+        `UPDATE products
+            SET sku = ?,
+                name = ?,
+                description = ?,
+                vat_rate_id = ?,
+                vat_pricing_mode = ?,
+                price_excl_vat_cents = ?,
+                price_incl_vat_cents = ?,
+                avg_cost_excl_vat_cents = ?,
+                avg_cost_incl_vat_cents = ?,
+                quantity_on_hand = ?,
+                reorder_point = ?,
+                is_service = ?,
+                is_active = ?
+          WHERE id = ?`,
+        [
+          args.sku,
+          args.name,
+          args.description,
+          args.vatRateId,
+          args.vatPricingMode,
+          args.priceExclVatCents,
+          args.priceInclVatCents,
+          args.avgCostExclVatCents,
+          args.avgCostInclVatCents,
+          args.quantityOnHand,
+          args.reorderPoint,
+          args.isService ? 1 : 0,
+          args.isActive ? 1 : 0,
+          id,
+        ],
       );
     } catch (e) {
-      if (
-        e instanceof Error &&
-        /UNIQUE constraint failed/i.test(e.message) &&
-        /sku/i.test(e.message)
-      ) {
-        throw new DuplicateSkuError(patch.sku ?? "(empty)");
-      }
+      if (isDuplicateSkuError(e)) throw new DuplicateSkuError();
       throw e;
     }
-
-    const updated = await this.findById(id);
-    if (!updated) throw new Error(`Product ${id} vanished after update`);
-    return updated;
   },
 
-  /** Block (is_active=0) or unblock (is_active=1) — affects sale/list visibility. */
-  async setActive(id: string, active: boolean): Promise<void> {
-    await execute(`UPDATE products SET is_active = ? WHERE id = ?`, [
-      active ? 1 : 0,
-      id,
-    ]);
+  async addUom(args: ProductAddUomArgs): Promise<{ id: string }> {
+    const id = newId();
+
+    const productRows = await query<{ store_id: string }>(
+      `SELECT store_id FROM products WHERE id = ?`,
+      [args.productId],
+    );
+
+    const storeId = productRows[0]?.store_id;
+
+    if (!storeId) {
+      throw new Error("Product not found while adding UoM.");
+    }
+
+    if (args.isDefaultSale) {
+      await execute(
+        `UPDATE product_uoms
+         SET is_default_sale_uom = 0
+         WHERE product_id = ?`,
+        [args.productId],
+      );
+    }
+
+    if (args.isDefaultPurchase) {
+      await execute(
+        `UPDATE product_uoms
+         SET is_default_purchase_uom = 0
+         WHERE product_id = ?`,
+        [args.productId],
+      );
+    }
+
+    await execute(
+      `INSERT INTO product_uoms (
+         id, store_id, product_id, uom_code, factor_num, factor_den,
+         is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
+         sale_price_excl_vat_cents, sale_price_incl_vat_cents
+       ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 1, ?, ?)`,
+      [
+        id,
+        storeId,
+        args.productId,
+        args.uomCode,
+        args.factor.num,
+        args.factor.den,
+        args.isDefaultSale ? 1 : 0,
+        args.isDefaultPurchase ? 1 : 0,
+        args.salePriceExclVatCents,
+        args.salePriceInclVatCents,
+      ],
+    );
+
+    return { id };
+  },
+
+  async updateUom(id: string, args: ProductUpdateUomArgs): Promise<void> {
+    const rows = await query<{ product_id: string }>(
+      `SELECT product_id FROM product_uoms WHERE id = ?`,
+      [id],
+    );
+
+    const productId = rows[0]?.product_id;
+
+    if (!productId) {
+      throw new Error("Product UoM not found.");
+    }
+
+    if (args.isDefaultSale) {
+      await execute(
+        `UPDATE product_uoms
+         SET is_default_sale_uom = 0
+         WHERE product_id = ?`,
+        [productId],
+      );
+    }
+
+    await execute(
+      `UPDATE product_uoms
+          SET factor_num = ?,
+              factor_den = ?,
+              is_default_sale_uom = ?,
+              sale_price_excl_vat_cents = ?,
+              sale_price_incl_vat_cents = ?
+        WHERE id = ?`,
+      [
+        args.factor.num,
+        args.factor.den,
+        args.isDefaultSale ? 1 : 0,
+        args.salePriceExclVatCents,
+        args.salePriceInclVatCents,
+        id,
+      ],
+    );
   },
 };
