@@ -331,6 +331,17 @@ export const productsRepo = {
     return rows[0]?.n ?? 0;
   },
 
+  async nextAutoSku(storeId: string): Promise<string> {
+    const rows = await query<{ n: number }>(
+      `SELECT MAX(CAST(SUBSTR(sku, 6) AS INTEGER)) AS n
+       FROM products
+       WHERE store_id = ? AND sku LIKE 'Item-%' AND LENGTH(sku) = 10`,
+      [storeId],
+    );
+    const next = (rows[0]?.n ?? 0) + 1;
+    return `Item-${String(next).padStart(5, "0")}`;
+  },
+
   async create(args: ProductCreateArgs): Promise<ProductWithUoms> {
     const productId = newId();
 

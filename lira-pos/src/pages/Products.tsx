@@ -35,8 +35,6 @@ interface ProductFormState {
   vatPricingMode: "inclusive" | "exclusive";
   priceInput: string;
 
-  avgCostInput: string;
-  quantityInput: string;
   reorderPointInput: string;
 
   baseUomCode: string;
@@ -63,8 +61,6 @@ const EMPTY_FORM: ProductFormState = {
   vatPricingMode: "inclusive",
   priceInput: "",
 
-  avgCostInput: "",
-  quantityInput: "0",
   reorderPointInput: "",
 
   baseUomCode: "pcs",
@@ -149,6 +145,7 @@ export default function Products() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveOk, setSaveOk] = useState<string | null>(null);
+  const [showForm, setShowForm] = useState(false);
 
   const reload = useCallback(async () => {
     if (!storeId) return;
@@ -229,7 +226,13 @@ export default function Products() {
     setSaveOk(null);
   }
 
+  function closePanel() {
+    resetForm();
+    setShowForm(false);
+  }
+
   function editProduct(product: ProductWithUoms) {
+    setShowForm(true);
     const saleUom = product.defaultSaleUom;
     const baseUom = product.baseUom;
 
@@ -251,8 +254,6 @@ export default function Products() {
           ? (product.priceInclVatCents / 100).toFixed(2)
           : (product.priceExclVatCents / 100).toFixed(2),
 
-      avgCostInput: (product.avgCostExclVatCents / 100).toFixed(2),
-      quantityInput: String(product.quantityOnHand),
       reorderPointInput:
         product.reorderPoint === null ? "" : String(product.reorderPoint),
 
@@ -284,7 +285,13 @@ export default function Products() {
       const name = form.name.trim();
       if (!name) throw new Error("Product name is required.");
 
-      const sku = form.sku.trim() || null;
+      let sku = form.sku.trim() || null;
+      if (!sku && form.mode === "new") {
+        sku = await productsRepo.nextAutoSku(storeId);
+      }
+      if (!sku) {
+        throw new Error("SKU is required.");
+      }
       const description = form.description.trim() || null;
 
       const barcode = form.barcode.trim();
@@ -307,17 +314,12 @@ export default function Products() {
           ? splitInclVat(typedPriceCents, currentVatBps)
           : splitExclVat(typedPriceCents, currentVatBps);
 
-      const avgCostExclVatCents = form.avgCostInput.trim()
-        ? parseUsdInput(form.avgCostInput)
-        : 0;
+      const avgCostExclVatCents =
+        form.mode === "edit" ? (selectedProduct?.avgCostExclVatCents ?? 0) : 0;
 
       const quantityOnHand = form.isService
         ? 0
-        : toIntInput(form.quantityInput, 0);
-
-      if (quantityOnHand < 0) {
-        throw new Error("Quantity on hand cannot be negative.");
-      }
+        : (form.mode === "edit" ? (selectedProduct?.quantityOnHand ?? 0) : 0);
 
       const reorderPoint =
         form.reorderPointInput.trim() === ""
@@ -553,6 +555,7 @@ export default function Products() {
       </div>
 
       <div>
+        {showForm ? (
         <Card>
           <CardHeader
             title={form.mode === "new" ? "New product" : "Edit product"}
@@ -562,11 +565,9 @@ export default function Products() {
                 : selectedProduct?.name
             }
             actions={
-              form.mode === "edit" ? (
-                <Button variant="ghost" size="sm" onClick={resetForm}>
-                  New
-                </Button>
-              ) : undefined
+              <Button variant="ghost" size="sm" onClick={closePanel}>
+                Cancel
+              </Button>
             }
           />
 
@@ -583,7 +584,7 @@ export default function Products() {
                 label="SKU"
                 value={form.sku}
                 onChange={(e) => setForm((f) => ({ ...f, sku: e.target.value }))}
-                placeholder="Optional"
+                placeholder={form.mode === "new" ? "Leave blank to auto-generate" : ""}
               />
 
               <Input
@@ -603,7 +604,6 @@ export default function Products() {
                     setForm((f) => ({
                       ...f,
                       isService: e.target.checked,
-                      quantityInput: e.target.checked ? "0" : f.quantityInput,
                     }))
                   }
                 />
@@ -739,16 +739,15 @@ export default function Products() {
                   </div>
                 )}
 
-                <Input
-                  label="Average cost excl. VAT"
-                  prefix="$"
-                  inputMode="decimal"
-                  value={form.avgCostInput}
-                  onChange={(e) =>
-                    setForm((f) => ({ ...f, avgCostInput: e.target.value }))
-                  }
-                  placeholder="0.00"
-                />
+                {form.mode === "edit" && selectedProduct && (
+                  <div className="text-xs text-slate-500">
+                    Avg cost (excl. VAT):{" "}
+                    <span className="font-medium text-slate-700">
+                      {formatUsd(selectedProduct.avgCostExclVatCents)}
+                    </span>
+                    <span className="ml-1 text-slate-400">— set by purchase receipts</span>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -759,18 +758,21 @@ export default function Products() {
                 </div>
 
                 <div className="grid grid-cols-2 gap-2">
-                  <Input
-                    label="Quantity on hand"
-                    inputMode="numeric"
-                    value={form.quantityInput}
-                    onChange={(e) =>
-                      setForm((f) => ({
-                        ...f,
-                        quantityInput: e.target.value,
-                      }))
-                    }
-                    placeholder="0"
-                  />
+                  <div>
+                    <div className="mb-1 text-xs font-medium text-slate-700">
+                      Quantity on hand
+                    </div>
+                    <div className="text-sm text-slate-700">
+                      {form.mode === "edit"
+                        ? (selectedProduct?.quantityOnHand ?? 0)
+                        : 0}
+                      {form.mode === "new" && (
+                        <span className="ml-1 text-xs text-slate-400">
+                          — adjust via Inventory
+                        </span>
+                      )}
+                    </div>
+                  </div>
 
                   <Input
                     label="Reorder point"
@@ -910,6 +912,19 @@ export default function Products() {
             </Button>
           </CardBody>
         </Card>
+        ) : (
+          <div className="flex justify-end">
+            <Button
+              variant="primary"
+              onClick={() => {
+                resetForm();
+                setShowForm(true);
+              }}
+            >
+              New product
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   );
