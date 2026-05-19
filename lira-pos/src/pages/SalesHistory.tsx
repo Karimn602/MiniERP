@@ -117,14 +117,14 @@ export default function SalesHistory() {
       </div>
 
       <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
-        <MiniStat label="Sales total" value={formatUsd(summary.total)} />
+        <MiniStat label="Sales (incl. VAT)" value={formatUsd(summary.total)} />
         <MiniStat label="Total cost" value={formatUsd(summary.cost)} />
         <MiniStat
           label="Gross profit"
           value={formatUsd(summary.profit)}
           tone={summary.profit >= 0 ? "good" : "bad"}
         />
-        <MiniStat label="Net sales" value={formatUsd(summary.net)} />
+        <MiniStat label="Net sales (excl. VAT)" value={formatUsd(summary.net)} />
       </div>
 
       <Card>
@@ -155,7 +155,7 @@ export default function SalesHistory() {
                   <th className="px-5 py-2">Receipt #</th>
                   <th className="px-5 py-2">Date</th>
                   <th className="px-5 py-2">Time</th>
-                  <th className="px-5 py-2 text-right">Subtotal</th>
+                  <th className="px-5 py-2 text-right">Subtotal (excl. VAT)</th>
                   <th className="px-5 py-2 text-right">VAT</th>
 
                   {/* requested order */}
@@ -338,7 +338,7 @@ function SaleDetailCard({
         ) : sale ? (
           <>
             <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
-              <MiniStat label="Total" value={formatUsd(sale.totalInclVatCents)} />
+              <MiniStat label="Total (incl. VAT)" value={formatUsd(sale.totalInclVatCents)} />
               <MiniStat label="Total cost" value={formatUsd(sale.cogsTotalCents)} />
               <MiniStat
                 label="Gross profit"
@@ -388,7 +388,7 @@ function SaleDetailCard({
                   value={formatUsd(sale.cogsTotalCents)}
                 />
                 <DetailRow
-                  label="Profit"
+                  label="Gross profit"
                   value={formatUsd(grossProfitCents(sale))}
                 />
               </div>
@@ -423,12 +423,12 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
             <th className="px-4 py-2">Product</th>
             <th className="px-4 py-2">Barcode</th>
             <th className="px-4 py-2 text-right">Qty</th>
-            <th className="px-4 py-2 text-right">Unit price</th>
+            <th className="px-4 py-2 text-right">Unit price (incl. VAT)</th>
 
             {/* replaces cost method with unit cost */}
             <th className="px-4 py-2 text-right">Unit cost</th>
 
-            <th className="px-4 py-2 text-right">Line total</th>
+            <th className="px-4 py-2 text-right">Line total (incl. VAT)</th>
             <th className="px-4 py-2 text-right">Total cost</th>
             <th className="px-4 py-2 text-right">Profit</th>
           </tr>
