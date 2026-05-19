@@ -1,0 +1,14 @@
+{
+  "defaultMode": "plan",
+  "permissions": {
+    "deny": [
+      "Read(./**/.env)",
+      "Read(./**/.env.*)",
+      "Read(./**/node_modules/**)",
+      "Read(./**/dist/**)",
+      "Read(./**/target/**)",
+      "Read(./**/*.log)",
+      "Bash(git push *)"
+    ]
+  }
+}
