@@ -127,142 +127,155 @@ export default function SalesHistory() {
         <MiniStat label="Net sales (excl. VAT)" value={formatUsd(summary.net)} />
       </div>
 
-      <Card>
-        <CardHeader
-          title="Sales"
-          subtitle={
-            loading
-              ? "Loading…"
-              : `${sales.length} record${sales.length === 1 ? "" : "s"}`
-          }
-        />
+      <div>
+          <Card>
+            <CardHeader
+              title="Sales"
+              subtitle={
+                loading
+                  ? "Loading…"
+                  : `${sales.length} record${sales.length === 1 ? "" : "s"}`
+              }
+            />
 
-        {loadError && (
-          <div className="border-b border-red-200 bg-red-50 px-5 py-3 text-xs text-red-700">
-            Failed to load sales: {loadError}
-          </div>
-        )}
+            {loadError && (
+              <div className="border-b border-red-200 bg-red-50 px-5 py-3 text-xs text-red-700">
+                Failed to load sales: {loadError}
+              </div>
+            )}
 
-        {sales.length === 0 && !loading && !loadError ? (
-          <div className="px-5 py-8 text-center text-sm text-slate-500">
-            No sales yet. Post your first sale from the POS Register.
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-                <tr>
-                  <th className="px-5 py-2">Receipt #</th>
-                  <th className="px-5 py-2">Date</th>
-                  <th className="px-5 py-2">Time</th>
-                  <th className="px-5 py-2 text-right">Subtotal (excl. VAT)</th>
-                  <th className="px-5 py-2 text-right">VAT</th>
+            {sales.length === 0 && !loading && !loadError ? (
+              <div className="px-5 py-8 text-center text-sm text-slate-500">
+                No sales yet. Post your first sale from the POS Register.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                    <tr>
+                      <th className="px-5 py-2">Receipt #</th>
+                      <th className="px-5 py-2">Date</th>
+                      <th className="px-5 py-2">Time</th>
+                      <th className="px-5 py-2 text-right">Subtotal (excl. VAT)</th>
+                      <th className="px-5 py-2 text-right">VAT</th>
 
-                  {/* requested order */}
-                  <th className="px-5 py-2 text-right">Total</th>
-                  <th className="px-5 py-2 text-right">Total cost</th>
-                  <th className="px-5 py-2 text-right">Profit</th>
+                      {/* requested order */}
+                      <th className="px-5 py-2 text-right">Total</th>
+                      <th className="px-5 py-2 text-right">Total cost</th>
+                      <th className="px-5 py-2 text-right">Profit</th>
 
-                  <th className="px-5 py-2 text-right">Margin</th>
-                  <th className="px-5 py-2">Status</th>
-                </tr>
-              </thead>
-
-              <tbody className="divide-y divide-slate-100">
-                {sales.map((s) => {
-                  const dateIso = s.postedAt ?? s.createdAt;
-                  const localDate = isoToLocalDate(dateIso);
-                  const cost = totalCostCents(s);
-                  const profit = grossProfitCents(s);
-
-                  return (
-                    <tr
-                      key={s.id}
-                      className={clsx(
-                        "cursor-pointer transition-colors hover:bg-slate-50",
-                        selectedId === s.id && "bg-brand/5",
-                      )}
-                      onClick={() => void openDetails(s.id)}
-                    >
-                      <td className="px-5 py-2 font-medium text-slate-900">
-                        #{s.receiptNumber}
-                      </td>
-
-                      <td className="px-5 py-2 text-slate-700">
-                        {formatPrettyDate(localDate)}
-                        <div className="text-xs text-slate-500">
-                          {relativeFromToday(localDate)}
-                        </div>
-                      </td>
-
-                      <td className="px-5 py-2 text-slate-600">
-                        {isoToTime(dateIso)}
-                      </td>
-
-                      <td className="px-5 py-2 text-right tabular-nums text-slate-700">
-                        {formatUsd(s.subtotalExclVatCents)}
-                      </td>
-
-                      <td className="px-5 py-2 text-right tabular-nums text-slate-700">
-                        {formatUsd(s.vatTotalCents)}
-                      </td>
-
-                      <td className="px-5 py-2 text-right tabular-nums font-medium text-slate-900">
-                        {formatUsd(s.totalInclVatCents)}
-                      </td>
-
-                      <td className="px-5 py-2 text-right tabular-nums text-slate-700">
-                        {formatUsd(cost)}
-                      </td>
-
-                      <td
-                        className={clsx(
-                          "px-5 py-2 text-right tabular-nums font-medium",
-                          profit >= 0 ? "text-emerald-700" : "text-red-700",
-                        )}
-                      >
-                        {formatUsd(profit)}
-                      </td>
-
-                      <td className="px-5 py-2 text-right tabular-nums text-slate-700">
-                        {profitMargin(s)}
-                      </td>
-
-                      <td className="px-5 py-2">
-                        <span
-                          className={clsx(
-                            "rounded px-2 py-0.5 text-xs font-medium",
-                            s.status === "posted" &&
-                              "bg-emerald-100 text-emerald-800",
-                            s.status === "draft" &&
-                              "bg-amber-100 text-amber-800",
-                            s.status === "voided" &&
-                              "bg-slate-200 text-slate-600 line-through",
-                          )}
-                        >
-                          {s.status}
-                        </span>
-                      </td>
+                      <th className="px-5 py-2 text-right">Margin</th>
+                      <th className="px-5 py-2">Status</th>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
+                  </thead>
 
-      {selectedId && (
-        <SaleDetailCard
-          sale={details}
-          loading={detailsLoading}
-          error={detailsError}
-          onClose={() => {
-            setSelectedId(null);
-            setDetails(null);
-          }}
-        />
-      )}
+                  <tbody className="divide-y divide-slate-100">
+                    {sales.map((s) => {
+                      const dateIso = s.postedAt ?? s.createdAt;
+                      const localDate = isoToLocalDate(dateIso);
+                      const cost = totalCostCents(s);
+                      const profit = grossProfitCents(s);
+
+                      return (
+                        <tr
+                          key={s.id}
+                          className={clsx(
+                            "cursor-pointer transition-colors hover:bg-slate-50",
+                            selectedId === s.id && "bg-brand/5",
+                          )}
+                          onClick={() => void openDetails(s.id)}
+                        >
+                          <td className="px-5 py-2 font-medium text-slate-900">
+                            #{s.receiptNumber}
+                          </td>
+
+                          <td className="px-5 py-2 text-slate-700">
+                            {formatPrettyDate(localDate)}
+                            <div className="text-xs text-slate-500">
+                              {relativeFromToday(localDate)}
+                            </div>
+                          </td>
+
+                          <td className="px-5 py-2 text-slate-600">
+                            {isoToTime(dateIso)}
+                          </td>
+
+                          <td className="px-5 py-2 text-right tabular-nums text-slate-700">
+                            {formatUsd(s.subtotalExclVatCents)}
+                          </td>
+
+                          <td className="px-5 py-2 text-right tabular-nums text-slate-700">
+                            {formatUsd(s.vatTotalCents)}
+                          </td>
+
+                          <td className="px-5 py-2 text-right tabular-nums font-medium text-slate-900">
+                            {formatUsd(s.totalInclVatCents)}
+                          </td>
+
+                          <td className="px-5 py-2 text-right tabular-nums text-slate-700">
+                            {formatUsd(cost)}
+                          </td>
+
+                          <td
+                            className={clsx(
+                              "px-5 py-2 text-right tabular-nums font-medium",
+                              profit >= 0 ? "text-emerald-700" : "text-red-700",
+                            )}
+                          >
+                            {formatUsd(profit)}
+                          </td>
+
+                          <td className="px-5 py-2 text-right tabular-nums text-slate-700">
+                            {profitMargin(s)}
+                          </td>
+
+                          <td className="px-5 py-2">
+                            <span
+                              className={clsx(
+                                "rounded px-2 py-0.5 text-xs font-medium",
+                                s.status === "posted" &&
+                                  "bg-emerald-100 text-emerald-800",
+                                s.status === "draft" &&
+                                  "bg-amber-100 text-amber-800",
+                                s.status === "voided" &&
+                                  "bg-slate-200 text-slate-600 line-through",
+                              )}
+                            >
+                              {s.status}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+
+        {selectedId && (
+          <>
+            <div
+              className="fixed inset-0 z-40 bg-black/10"
+              onClick={() => {
+                setSelectedId(null);
+                setDetails(null);
+              }}
+            />
+            <div className="fixed inset-y-0 right-0 z-50 w-[820px] max-w-[80vw] overflow-y-auto border-l border-slate-200 bg-white shadow-xl">
+              <SaleDetailCard
+                sale={details}
+                loading={detailsLoading}
+                error={detailsError}
+                onClose={() => {
+                  setSelectedId(null);
+                  setDetails(null);
+                }}
+              />
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -337,7 +350,7 @@ function SaleDetailCard({
           <p className="text-sm text-red-700">{error}</p>
         ) : sale ? (
           <>
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
+            <div className="grid grid-cols-2 gap-3">
               <MiniStat label="Total (incl. VAT)" value={formatUsd(sale.totalInclVatCents)} />
               <MiniStat label="Total cost" value={formatUsd(sale.cogsTotalCents)} />
               <MiniStat
@@ -348,7 +361,7 @@ function SaleDetailCard({
               <MiniStat label="Margin" value={profitMargin(sale)} />
             </div>
 
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div className="grid grid-cols-2 gap-3">
               <div className="rounded-md border border-slate-200 p-3 text-sm">
                 <div className="font-medium text-slate-900">Sale info</div>
                 <DetailRow label="Status" value={sale.status} />
