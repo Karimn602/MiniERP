@@ -3,6 +3,8 @@ import { useActiveContext } from "../state/activeContext";
 import { purchasesRepo, type PostPurchaseLineInput } from "../db/repos/purchases";
 import type {
   Purchase,
+  PurchaseWithLines,
+  PurchaseItem,
   ProductWithUoms,
   ProductUom,
   Supplier,
@@ -86,6 +88,11 @@ export default function Purchases() {
   const [formOpen, setFormOpen] = useState(false);
   const [justSaved, setJustSaved] = useState<{ number: number } | null>(null);
 
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [details, setDetails] = useState<PurchaseWithLines | null>(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsError, setDetailsError] = useState<string | null>(null);
+
   const reload = useCallback(async () => {
     if (!storeId) return;
 
@@ -105,6 +112,29 @@ export default function Purchases() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  async function openDetails(id: string) {
+    if (selectedId === id && details) {
+      setSelectedId(null);
+      setDetails(null);
+      return;
+    }
+
+    setSelectedId(id);
+    setDetails(null);
+    setDetailsError(null);
+    setDetailsLoading(true);
+
+    try {
+      const row = await purchasesRepo.findByIdWithLines(id);
+      if (!row) throw new Error("Purchase not found.");
+      setDetails(row);
+    } catch (e) {
+      setDetailsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDetailsLoading(false);
+    }
+  }
 
   function handlePosted(purchaseNumber: number) {
     setFormOpen(false);
@@ -191,7 +221,14 @@ export default function Purchases() {
 
               <tbody className="divide-y divide-slate-100">
                 {purchases.map((p) => (
-                  <tr key={p.id} className="hover:bg-slate-50">
+                  <tr
+                    key={p.id}
+                    className={clsx(
+                      "cursor-pointer transition-colors hover:bg-slate-50",
+                      selectedId === p.id && "bg-brand/5",
+                    )}
+                    onClick={() => void openDetails(p.id)}
+                  >
                     <td className="px-5 py-2 font-medium text-slate-900">
                       #{p.purchaseNumber}
                     </td>
@@ -244,6 +281,29 @@ export default function Purchases() {
           </div>
         )}
       </Card>
+
+      {selectedId && (
+        <>
+          <div
+            className="fixed inset-0 z-40 bg-black/10"
+            onClick={() => {
+              setSelectedId(null);
+              setDetails(null);
+            }}
+          />
+          <div className="fixed inset-y-0 right-0 z-50 w-[820px] max-w-[80vw] overflow-y-auto border-l border-slate-200 bg-white shadow-xl">
+            <PurchaseDetailCard
+              purchase={details}
+              loading={detailsLoading}
+              error={detailsError}
+              onClose={() => {
+                setSelectedId(null);
+                setDetails(null);
+              }}
+            />
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -544,6 +604,202 @@ function NewPurchaseForm({
             Posting is atomic — all lines succeed or none do.
           </p>
         </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="mt-2 flex items-center justify-between gap-3">
+      <span className="text-xs text-slate-500">{label}</span>
+      <span className="text-right text-xs font-medium text-slate-800">{value}</span>
+    </div>
+  );
+}
+
+function PurchaseLinesTable({ lines }: { lines: PurchaseItem[] }) {
+  return (
+    <div className="overflow-x-auto rounded-md border border-slate-200">
+      <table className="min-w-full text-sm">
+        <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+          <tr>
+            <th className="px-4 py-2">Product</th>
+            <th className="px-4 py-2">SKU</th>
+            <th className="px-4 py-2">Barcode</th>
+            <th className="px-4 py-2">UoM</th>
+            <th className="px-4 py-2 text-right">Qty</th>
+            <th className="px-4 py-2 text-right">Unit cost excl. VAT</th>
+            <th className="px-4 py-2 text-right">Unit cost incl. VAT</th>
+            <th className="px-4 py-2 text-right">Subtotal excl. VAT</th>
+            <th className="px-4 py-2 text-right">VAT</th>
+            <th className="px-4 py-2 text-right">Line total</th>
+          </tr>
+        </thead>
+
+        <tbody className="divide-y divide-slate-100">
+          {lines.map((line) => (
+            <tr key={line.id}>
+              <td className="px-4 py-2">
+                <div className="font-medium text-slate-900">
+                  {line.productNameSnapshot}
+                </div>
+                <div className="text-xs text-slate-500">
+                  VAT {(line.vatRateBpsSnapshot / 100).toFixed(0)}%
+                </div>
+              </td>
+
+              <td className="px-4 py-2 text-xs text-slate-600">
+                {line.productSkuSnapshot ?? "—"}
+              </td>
+
+              <td className="px-4 py-2 text-xs text-slate-400">—</td>
+
+              <td className="px-4 py-2 text-xs text-slate-600">
+                {line.uomCodeSnapshot}
+              </td>
+
+              <td className="px-4 py-2 text-right tabular-nums text-slate-700">
+                {line.quantityInUom}
+              </td>
+
+              <td className="px-4 py-2 text-right tabular-nums text-slate-700">
+                {formatUsd(line.unitCostExclVatInUomCents)}
+              </td>
+
+              <td className="px-4 py-2 text-right tabular-nums text-slate-700">
+                {formatUsd(line.unitCostInclVatInUomCents)}
+              </td>
+
+              <td className="px-4 py-2 text-right tabular-nums text-slate-700">
+                {formatUsd(line.lineSubtotalExclVatCents)}
+              </td>
+
+              <td className="px-4 py-2 text-right tabular-nums text-slate-700">
+                {formatUsd(line.lineVatCents)}
+              </td>
+
+              <td className="px-4 py-2 text-right tabular-nums font-medium text-slate-900">
+                {formatUsd(line.lineTotalInclVatCents)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function PurchaseDetailCard({
+  purchase,
+  loading,
+  error,
+  onClose,
+}: {
+  purchase: PurchaseWithLines | null;
+  loading: boolean;
+  error: string | null;
+  onClose: () => void;
+}) {
+  return (
+    <Card>
+      <CardHeader
+        title={
+          purchase ? `Purchase #${purchase.purchaseNumber}` : "Purchase details"
+        }
+        subtitle={
+          purchase?.postedAt
+            ? `Posted ${formatPrettyDate(purchase.postedAt.slice(0, 10))}`
+            : undefined
+        }
+        actions={
+          <Button variant="ghost" size="sm" onClick={onClose}>
+            Close
+          </Button>
+        }
+      />
+
+      <CardBody className="space-y-5">
+        {loading ? (
+          <p className="text-sm text-slate-500">Loading purchase details…</p>
+        ) : error ? (
+          <p className="text-sm text-red-700">{error}</p>
+        ) : purchase ? (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="rounded-md border border-slate-200 p-3 text-sm">
+                <div className="font-medium text-slate-900">Purchase info</div>
+
+                <div className="mt-2 flex items-center justify-between gap-3">
+                  <span className="text-xs text-slate-500">Type</span>
+                  <span
+                    className={clsx(
+                      "rounded px-2 py-0.5 text-xs font-medium",
+                      purchase.purchaseType === "opening"
+                        ? "bg-indigo-100 text-indigo-700"
+                        : "bg-slate-100 text-slate-700",
+                    )}
+                  >
+                    {purchase.purchaseType}
+                  </span>
+                </div>
+
+                <div className="mt-2 flex items-center justify-between gap-3">
+                  <span className="text-xs text-slate-500">Status</span>
+                  <span
+                    className={clsx(
+                      "rounded px-2 py-0.5 text-xs font-medium",
+                      purchase.status === "posted" &&
+                        "bg-emerald-100 text-emerald-800",
+                      purchase.status === "draft" &&
+                        "bg-amber-100 text-amber-800",
+                      purchase.status === "voided" &&
+                        "bg-slate-200 text-slate-600 line-through",
+                    )}
+                  >
+                    {purchase.status}
+                  </span>
+                </div>
+
+                <DetailRow
+                  label="Supplier"
+                  value={purchase.supplier?.name ?? "—"}
+                />
+                <DetailRow
+                  label="Reference"
+                  value={purchase.supplierReference ?? "—"}
+                />
+                <DetailRow
+                  label="Date"
+                  value={formatPrettyDate(purchase.purchaseDate)}
+                />
+                <DetailRow label="Notes" value={purchase.notes ?? "—"} />
+              </div>
+
+              <div className="rounded-md border border-slate-200 p-3 text-sm">
+                <div className="font-medium text-slate-900">Totals</div>
+                <DetailRow
+                  label="Subtotal excl. VAT"
+                  value={formatUsd(purchase.subtotalExclVatCents)}
+                />
+                <DetailRow
+                  label="VAT"
+                  value={formatUsd(purchase.vatTotalCents)}
+                />
+                <div className="mt-2 flex items-center justify-between gap-3 border-t border-slate-100 pt-2">
+                  <span className="text-xs font-semibold text-slate-700">
+                    Total incl. VAT
+                  </span>
+                  <span className="text-right text-sm font-semibold text-slate-900">
+                    {formatUsd(purchase.totalInclVatCents)}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <PurchaseLinesTable lines={purchase.lines} />
+          </>
+        ) : null}
       </CardBody>
     </Card>
   );
