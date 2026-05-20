@@ -1,7 +1,6 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { useActiveContext } from "../state/activeContext";
 import { productsRepo, DuplicateSkuError } from "../db/repos/products";
-import { barcodesRepo } from "../db/repos/barcodes";
 import { vatRatesRepo } from "../db/repos/vatRates";
 import { uomsRepo } from "../db/repos/uoms";
 import type {
@@ -414,15 +413,6 @@ export default function Products() {
           });
         }
 
-        if (barcode && selectedProduct?.primaryBarcode?.barcode !== barcode) {
-          await barcodesRepo.addBarcode({
-            productId: form.id,
-            barcode,
-            barcodeType: inferBarcodeType(barcode),
-            makePrimary: true,
-          });
-        }
-
         setSaveOk("Product updated.");
       }
 
@@ -646,17 +636,7 @@ export default function Products() {
                   }
                 />
               ) : form.id ? (
-                <div className="space-y-3">
-                  <Input
-                    label="Set / add primary barcode"
-                    value={form.barcode}
-                    onChange={(e) =>
-                      setForm((f) => ({ ...f, barcode: e.target.value }))
-                    }
-                    placeholder="Scan or type barcode"
-                  />
-                  <BarcodeManager productId={form.id} />
-                </div>
+                <BarcodeManager productId={form.id} />
               ) : null}
             </div>
 
@@ -797,7 +777,7 @@ export default function Products() {
 
               <div className="space-y-3">
                 <label className="block text-xs font-medium text-slate-700">
-                  Base UoM
+                  Stock unit
                   <select
                     value={form.baseUomCode}
                     disabled={form.mode === "edit"}
@@ -819,7 +799,7 @@ export default function Products() {
                 </label>
 
                 <label className="block text-xs font-medium text-slate-700">
-                  Default sale UoM
+                  Selling unit
                   <select
                     value={form.saleUomCode}
                     onChange={(e) =>
@@ -838,36 +818,58 @@ export default function Products() {
                   </select>
                 </label>
 
-                <div className="grid grid-cols-2 gap-2">
-                  <Input
-                    label="Factor numerator"
-                    inputMode="numeric"
-                    value={form.saleFactorNum}
-                    onChange={(e) =>
-                      setForm((f) => ({
-                        ...f,
-                        saleFactorNum: e.target.value,
-                      }))
-                    }
-                  />
+                {(() => {
+                  const baseUomName =
+                    uoms.find((u) => u.code === form.baseUomCode)?.name ??
+                    form.baseUomCode;
+                  const saleUomName =
+                    uoms.find((u) => u.code === form.saleUomCode)?.name ??
+                    form.saleUomCode;
+                  const isSameUom = form.saleUomCode === form.baseUomCode;
+                  const isSimple = form.saleFactorDen === "1";
+                  const qtyInt = parseInt(form.saleFactorNum);
 
-                  <Input
-                    label="Factor denominator"
-                    inputMode="numeric"
-                    value={form.saleFactorDen}
-                    onChange={(e) =>
-                      setForm((f) => ({
-                        ...f,
-                        saleFactorDen: e.target.value,
-                      }))
-                    }
-                  />
-                </div>
+                  if (isSameUom) {
+                    return (
+                      <p className="text-xs text-slate-500">
+                        Selling unit is the same as stock unit.
+                      </p>
+                    );
+                  }
 
-                <p className="text-xs text-slate-500">
-                  Example: if one box contains 12 pieces, sale UoM = box,
-                  factor numerator = 12, denominator = 1.
-                </p>
+                  return (
+                    <div className="space-y-1">
+                      <label className="block text-xs font-medium text-slate-700">
+                        How many {baseUomName} are inside 1 {saleUomName}?
+                        <input
+                          type="number"
+                          inputMode="numeric"
+                          min={1}
+                          step={1}
+                          value={form.saleFactorNum}
+                          onChange={(e) =>
+                            setForm((f) => ({
+                              ...f,
+                              saleFactorNum: e.target.value,
+                              saleFactorDen: "1",
+                            }))
+                          }
+                          className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+                        />
+                      </label>
+                      {isSimple && qtyInt >= 1 ? (
+                        <p className="text-xs text-slate-500">
+                          1 {saleUomName} = {form.saleFactorNum} {baseUomName}
+                        </p>
+                      ) : (
+                        <p className="text-xs text-amber-600">
+                          This product has an advanced unit conversion. Saving a
+                          new quantity will convert it to the simple format.
+                        </p>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 <Input
                   label="Sale UoM price incl. VAT override"
