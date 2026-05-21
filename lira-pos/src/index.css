@@ -11,3 +11,22 @@ body {
   @apply bg-slate-50 text-slate-900 antialiased;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
+
+@media print {
+  body * { visibility: hidden; }
+  #receipt-print-root,
+  #receipt-print-root *,
+  #receipt-print,
+  #receipt-print * { visibility: visible; }
+  #receipt-print {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 72mm;
+    background: white;
+    color: black;
+    font-size: 10px;
+    font-family: 'Courier New', Courier, monospace;
+  }
+  @page { size: 80mm auto; margin: 4mm; }
+}

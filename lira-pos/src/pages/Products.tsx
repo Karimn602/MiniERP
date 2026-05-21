@@ -3,6 +3,7 @@ import { useActiveContext } from "../state/activeContext";
 import { productsRepo, DuplicateSkuError } from "../db/repos/products";
 import { vatRatesRepo } from "../db/repos/vatRates";
 import { uomsRepo } from "../db/repos/uoms";
+import { ProductImportDialog } from "../components/ProductImportDialog";
 import type {
   ProductWithUoms,
   VatRate,
@@ -145,6 +146,7 @@ export default function Products() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveOk, setSaveOk] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
+  const [showImport, setShowImport] = useState(false);
 
   const reload = useCallback(async () => {
     if (!storeId) return;
@@ -915,7 +917,13 @@ export default function Products() {
           </CardBody>
         </Card>
         ) : (
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => setShowImport(true)}
+            >
+              Import products
+            </Button>
             <Button
               variant="primary"
               onClick={() => {
@@ -928,6 +936,16 @@ export default function Products() {
           </div>
         )}
       </div>
+
+      {showImport && storeId && (
+        <ProductImportDialog
+          storeId={storeId}
+          vatRates={vatRates}
+          uoms={uoms}
+          onClose={() => setShowImport(false)}
+          onImported={() => void reload()}
+        />
+      )}
     </div>
   );
 }

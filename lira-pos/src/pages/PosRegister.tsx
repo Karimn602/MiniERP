@@ -36,7 +36,10 @@ import type {
   ExchangeRate,
   ProductUom,
   ProductWithUoms,
+  SaleWithDetails,
 } from "../db/types";
+import { query } from "../db/client";
+import { ReceiptPrint } from "../components/ReceiptPrint";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
@@ -111,13 +114,20 @@ export default function PosRegister() {
   const [scanError, setScanError] = useState<string | null>(null);
   const scanRef = useRef<HTMLInputElement>(null);
 
+  // Store name (for receipt header)
+  const [storeName, setStoreName] = useState("Store");
+
   // Post lifecycle
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [justPosted, setJustPosted] = useState<{
-    receiptNumber: number;
-    changeUsdCents: number;
-  } | null>(null);
+  const [receiptSale, setReceiptSale] = useState<SaleWithDetails | null>(null);
+
+  useEffect(() => {
+    if (!storeId || !hydrated) return;
+    query<{ name: string }>("SELECT name FROM stores WHERE id = ? LIMIT 1", [storeId])
+      .then((rows) => { if (rows[0]) setStoreName(rows[0].name); })
+      .catch(() => {});
+  }, [storeId, hydrated]);
 
   // ----- Hydrate rate once (and on demand if user just set one) -----
   const reloadRate = useCallback(async () => {
@@ -429,15 +439,9 @@ export default function PosRegister() {
         payments: paymentPayloads,
       });
 
-      setJustPosted({
-        receiptNumber: result.receiptNumber,
-        changeUsdCents: result.changeTotalUsdCents,
-      });
+      const details = await salesRepo.findByIdWithDetails(result.saleId);
       clearCart();
-      // Dismiss the banner after a few seconds; the receipt # also lives
-      // in Sales History.
-      setTimeout(() => setJustPosted(null), 6000);
-      scanRef.current?.focus();
+      setReceiptSale(details);
     } catch (e) {
       setSubmitError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -474,12 +478,33 @@ export default function PosRegister() {
         )}
       </div>
 
-      {justPosted && (
-        <div className="rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
-          ✓ Posted Sale #{justPosted.receiptNumber}
-          {justPosted.changeUsdCents > 0 && (
-            <> · Change due: {formatUsd(justPosted.changeUsdCents)}</>
-          )}
+      {/* Print-only receipt root — outside modal so print:hidden on the modal doesn't suppress it */}
+      {receiptSale && (
+        <div id="receipt-print-root" className="hidden print:block">
+          <ReceiptPrint sale={receiptSale} storeName={storeName} />
+        </div>
+      )}
+
+      {receiptSale && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 print:hidden">
+          <div className="max-h-[90vh] w-full max-w-sm overflow-y-auto rounded-lg bg-white shadow-2xl">
+            <ReceiptPrint sale={receiptSale} storeName={storeName} />
+            <div className="flex gap-2 border-t border-slate-200 p-4 print:hidden">
+              <Button variant="primary" className="flex-1" onClick={() => window.print()}>
+                Print receipt
+              </Button>
+              <Button
+                variant="ghost"
+                className="flex-1"
+                onClick={() => {
+                  setReceiptSale(null);
+                  scanRef.current?.focus();
+                }}
+              >
+                New sale
+              </Button>
+            </div>
+          </div>
         </div>
       )}
 

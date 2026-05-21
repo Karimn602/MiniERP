@@ -4,10 +4,12 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
 import { salesRepo } from "../db/repos/sales";
 import type { Sale, SaleItem, SalePayment, SaleWithDetails } from "../db/types";
+import { query } from "../db/client";
 import { Card, CardBody, CardHeader } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { formatLbp, formatUsd, usdCentsToLbp } from "../lib/money";
 import { formatPrettyDate, relativeFromToday } from "../lib/dates";
+import { ReceiptPrint } from "../components/ReceiptPrint";
 import clsx from "clsx";
 
 function isoToLocalDate(iso: string): string {
@@ -36,6 +38,7 @@ function profitMargin(s: Sale): string {
 export default function SalesHistory() {
   const { storeId, hydrated } = useActiveContext();
 
+  const [storeName, setStoreName] = useState("Store");
   const [sales, setSales] = useState<Sale[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -44,6 +47,13 @@ export default function SalesHistory() {
   const [details, setDetails] = useState<SaleWithDetails | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!storeId || !hydrated) return;
+    query<{ name: string }>("SELECT name FROM stores WHERE id = ? LIMIT 1", [storeId])
+      .then((rows) => { if (rows[0]) setStoreName(rows[0].name); })
+      .catch(() => {});
+  }, [storeId, hydrated]);
 
   const reload = useCallback(async () => {
     if (!storeId) return;
@@ -267,6 +277,7 @@ export default function SalesHistory() {
                 sale={details}
                 loading={detailsLoading}
                 error={detailsError}
+                onPrint={() => window.print()}
                 onClose={() => {
                   setSelectedId(null);
                   setDetails(null);
@@ -276,6 +287,13 @@ export default function SalesHistory() {
           </>
         )}
       </div>
+
+      {/* Print-only receipt root — outside the drawer so fixed positioning escapes correctly */}
+      {details && (
+        <div id="receipt-print-root" className="hidden print:block">
+          <ReceiptPrint sale={details} storeName={storeName} />
+        </div>
+      )}
     </div>
   );
 }
@@ -314,11 +332,13 @@ function SaleDetailCard({
   sale,
   loading,
   error,
+  onPrint,
   onClose,
 }: {
   sale: SaleWithDetails | null;
   loading: boolean;
   error: string | null;
+  onPrint: () => void;
   onClose: () => void;
 }) {
   const profit = sale ? grossProfitCents(sale) : 0;
@@ -337,9 +357,16 @@ function SaleDetailCard({
             : undefined
         }
         actions={
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            Close
-          </Button>
+          <>
+            {sale && (
+              <Button variant="ghost" size="sm" className="print:hidden" onClick={onPrint}>
+                Print receipt
+              </Button>
+            )}
+            <Button variant="ghost" size="sm" className="print:hidden" onClick={onClose}>
+              Close
+            </Button>
+          </>
         }
       />
 
@@ -409,7 +436,7 @@ function SaleDetailCard({
 
             <LinesTable lines={sale.lines} />
             <PaymentsTable payments={sale.payments} />
-          </>
+</>
         ) : null}
       </CardBody>
     </Card>
