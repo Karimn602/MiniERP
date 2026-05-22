@@ -114,6 +114,10 @@ export default function PosRegister() {
   const [scanError, setScanError] = useState<string | null>(null);
   const scanRef = useRef<HTMLInputElement>(null);
 
+  const focusScanInput = useCallback(() => {
+    requestAnimationFrame(() => scanRef.current?.focus());
+  }, []);
+
   // Store name (for receipt header)
   const [storeName, setStoreName] = useState("Store");
 
@@ -163,7 +167,7 @@ export default function PosRegister() {
         barcodeType: hit.matchedBarcode.barcodeType,
       });
       setScanInput("");
-      scanRef.current?.focus();
+      focusScanInput();
     } catch (e) {
       setScanError(e instanceof Error ? e.message : String(e));
     }
@@ -172,7 +176,7 @@ export default function PosRegister() {
   // ----- Add a product via the search picker -----
   function handlePick(product: ProductWithUoms) {
     addProductToCart(product, product.defaultSaleUom, null);
-    scanRef.current?.focus();
+    focusScanInput();
   }
 
   /**
@@ -498,7 +502,7 @@ export default function PosRegister() {
                 className="flex-1"
                 onClick={() => {
                   setReceiptSale(null);
-                  scanRef.current?.focus();
+                  focusScanInput();
                 }}
               >
                 New sale
@@ -552,7 +556,7 @@ export default function PosRegister() {
               subtitle={lines.length === 0 ? "Empty" : `${lines.length} line(s)`}
               actions={
                 lines.length > 0 ? (
-                  <Button variant="ghost" onClick={clearCart}>
+                  <Button variant="ghost" onClick={() => { clearCart(); focusScanInput(); }}>
                     Clear cart
                   </Button>
                 ) : undefined
@@ -604,6 +608,7 @@ export default function PosRegister() {
                           <QuantityStepper
                             value={l.quantityInUom}
                             onChange={(n) => setLineQty(l.draftId, n)}
+                            onAfterStep={focusScanInput}
                           />
                         </td>
                         <td className="px-5 py-2 text-right font-medium text-slate-900">
@@ -613,7 +618,7 @@ export default function PosRegister() {
                           <Button
                             variant="ghost"
                             size="sm"
-                            onClick={() => removeLine(l.draftId)}
+                            onClick={() => { removeLine(l.draftId); focusScanInput(); }}
                           >
                             Remove
                           </Button>
@@ -839,15 +844,17 @@ function TotalsRow({
 function QuantityStepper({
   value,
   onChange,
+  onAfterStep,
 }: {
   value: number;
   onChange: (n: number) => void;
+  onAfterStep?: () => void;
 }) {
   return (
     <div className="inline-flex items-center gap-1">
       <button
         type="button"
-        onClick={() => onChange(value - 1)}
+        onClick={() => { onChange(value - 1); onAfterStep?.(); }}
         disabled={value <= 1}
         className="h-7 w-7 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
         aria-label="Decrease quantity"
@@ -866,7 +873,7 @@ function QuantityStepper({
       />
       <button
         type="button"
-        onClick={() => onChange(value + 1)}
+        onClick={() => { onChange(value + 1); onAfterStep?.(); }}
         className="h-7 w-7 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50"
         aria-label="Increase quantity"
       >
