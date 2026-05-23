@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { ensureDbReady } from "./db/migrate";
 import { hydrateActiveContext } from "./state/activeContext";
+import { I18nProvider } from "./lib/i18n";
 import PosRegister from "./pages/PosRegister";
 import Products from "./pages/Products";
 import Inventory from "./pages/Inventory";
@@ -36,51 +37,47 @@ export default function App() {
     })();
   }, []);
 
-  if (stage === "error") {
-    return (
-      <div className="flex h-screen items-center justify-center bg-red-50 p-8">
-        <div className="max-w-lg space-y-2 rounded-lg border border-red-200 bg-white p-6 shadow-sm">
-          <h2 className="text-lg font-semibold text-red-800">Startup failed</h2>
-          <pre className="whitespace-pre-wrap text-xs text-red-900">{error}</pre>
-        </div>
-      </div>
-    );
-  }
-
-  if (stage !== "ready") {
-    return (
-      <div className="flex h-screen items-center justify-center text-slate-500">
-        {stage === "db" ? "Initializing database…" : "Loading workspace…"}
-      </div>
-    );
-  }
-
   return (
-  <BrowserRouter>
-    <Routes>
-      <Route element={<AppShell />}>
-        <Route index element={<PosRegister />} />
+    <I18nProvider>
+      {stage === "error" ? (
+        <div className="flex h-screen items-center justify-center bg-red-50 p-8">
+          <div className="max-w-lg space-y-2 rounded-lg border border-red-200 bg-white p-6 shadow-sm">
+            <h2 className="text-lg font-semibold text-red-800">Startup failed</h2>
+            <pre className="whitespace-pre-wrap text-xs text-red-900">{error}</pre>
+          </div>
+        </div>
+      ) : stage !== "ready" ? (
+        <div className="flex h-screen items-center justify-center text-slate-500">
+          {stage === "db" ? "Initializing database…" : "Loading workspace…"}
+        </div>
+      ) : (
+        <BrowserRouter>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route index element={<PosRegister />} />
 
-        <Route path="products" element={<Products />} />
-        <Route path="inventory" element={<Inventory />} />
-        <Route path="purchases" element={<Purchases />} />
+              <Route path="products" element={<Products />} />
+              <Route path="inventory" element={<Inventory />} />
+              <Route path="purchases" element={<Purchases />} />
 
-        <Route path="suppliers" element={<Suppliers />} />
-        <Route path="suppliers/:id" element={<SupplierDetail />} />
+              <Route path="suppliers" element={<Suppliers />} />
+              <Route path="suppliers/:id" element={<SupplierDetail />} />
 
-        <Route path="exchange-rate" element={<ExchangeRate />} />
-        <Route path="shift" element={<ShiftSummary />} />
-        <Route path="sales" element={<SalesHistory />} />
-        <Route path="reports" element={<LocalReports />} />
-        <Route path="manager" element={<ManagerDashboard />} />
+              <Route path="exchange-rate" element={<ExchangeRate />} />
+              <Route path="shift" element={<ShiftSummary />} />
+              <Route path="sales" element={<SalesHistory />} />
+              <Route path="reports" element={<LocalReports />} />
+              <Route path="manager" element={<ManagerDashboard />} />
 
-        {import.meta.env.DEV && (
-          <Route path="_dev" element={<DevProbe />} />
-        )}
+              {import.meta.env.DEV && (
+                <Route path="_dev" element={<DevProbe />} />
+              )}
 
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Route>
-    </Routes>
-  </BrowserRouter>
-);
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Route>
+          </Routes>
+        </BrowserRouter>
+      )}
+    </I18nProvider>
+  );
 }

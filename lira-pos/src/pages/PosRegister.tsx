@@ -30,12 +30,14 @@ import { useActiveContext } from "../state/activeContext";
 import { productsRepo } from "../db/repos/products";
 import { exchangeRatesRepo } from "../db/repos/exchangeRates";
 import { salesRepo, type PostSaleLineInput, type PostSalePaymentInput } from "../db/repos/sales";
+import { shiftsRepo } from "../db/repos/shifts";
 import type {
   BarcodeScanResult,
   CogsMethod,
   ExchangeRate,
   ProductUom,
   ProductWithUoms,
+  Shift,
   SaleWithDetails,
 } from "../db/types";
 import { query } from "../db/client";
@@ -56,6 +58,7 @@ import {
 import { computeSaleLineMath, type SaleLineMath } from "../lib/saleMath";
 import { fromBaseQty } from "../lib/uom";
 import { newId } from "../lib/ids";
+import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 // ============================================================================
@@ -95,9 +98,13 @@ function lineMathFor(product: ProductWithUoms, uom: ProductUom, qty: number): Sa
 
 export default function PosRegister() {
   const { storeId, userId, hydrated } = useActiveContext();
+  const { t } = useTranslation();
 
   // Cart
   const [lines, setLines] = useState<CartLine[]>([]);
+
+  // Active shift — null = no open shift; undefined = still loading
+  const [activeShift, setActiveShift] = useState<Shift | null | undefined>(undefined);
 
   // Exchange rate (read once on mount; locked into the sale at post time).
   const [rate, setRate] = useState<ExchangeRate | null>(null);
@@ -133,7 +140,7 @@ export default function PosRegister() {
       .catch(() => {});
   }, [storeId, hydrated]);
 
-  // ----- Hydrate rate once (and on demand if user just set one) -----
+  // ----- Hydrate rate and active shift on mount -----
   const reloadRate = useCallback(async () => {
     if (!storeId) return;
     setRateError(null);
@@ -147,9 +154,22 @@ export default function PosRegister() {
     }
   }, [storeId]);
 
+  const reloadShift = useCallback(async () => {
+    if (!storeId) return;
+    try {
+      const shift = await shiftsRepo.getOpenShift(storeId);
+      setActiveShift(shift);
+    } catch {
+      setActiveShift(null);
+    }
+  }, [storeId]);
+
   useEffect(() => {
-    if (hydrated) void reloadRate();
-  }, [hydrated, reloadRate]);
+    if (hydrated) {
+      void reloadRate();
+      void reloadShift();
+    }
+  }, [hydrated, reloadRate, reloadShift]);
 
   // ----- Scan handler -----
   async function handleScan() {
@@ -159,7 +179,7 @@ export default function PosRegister() {
     try {
       const hit: BarcodeScanResult | null = await productsRepo.findByScan(storeId, raw);
       if (!hit) {
-        setScanError(`No product matches barcode "${raw}".`);
+        setScanError(t("pos.errNoProductForBarcode", { barcode: raw }));
         return;
       }
       addProductToCart(hit.product, hit.resolvedUom, {
@@ -197,13 +217,11 @@ export default function PosRegister() {
   ) {
     setSubmitError(null);
     if (!product.isActive) {
-      setScanError(`"${product.name}" is inactive and cannot be sold.`);
+      setScanError(t("pos.errInactiveProduct", { name: product.name }));
       return;
     }
     if (!product.isService && product.primaryBarcode === null) {
-      setScanError(
-        `"${product.name}" has no barcode. Add one in Products before selling.`,
-      );
+      setScanError(t("pos.errNoBarcode", { name: product.name }));
       return;
     }
 
@@ -217,7 +235,11 @@ export default function PosRegister() {
         const probedBase = (newQty * uom.factor.num) / uom.factor.den;
         if (!product.isService && probedBase > product.quantityOnHand) {
           setScanError(
-            `Only ${product.quantityOnHand} ${product.baseUom.uomCode} of "${product.name}" in stock.`,
+            t("pos.errStockExceeded", {
+              qty: String(product.quantityOnHand),
+              uom: product.baseUom.uomCode,
+              name: product.name,
+            }),
           );
           return prev;
         }
@@ -233,7 +255,11 @@ export default function PosRegister() {
       const math = lineMathFor(product, uom, 1);
       if (!product.isService && math.quantityBase > product.quantityOnHand) {
         setScanError(
-          `Only ${product.quantityOnHand} ${product.baseUom.uomCode} of "${product.name}" in stock.`,
+          t("pos.errStockExceeded", {
+            qty: String(product.quantityOnHand),
+            uom: product.baseUom.uomCode,
+            name: product.name,
+          }),
         );
         return prev;
       }
@@ -259,7 +285,11 @@ export default function PosRegister() {
         const probedBase = (newQty * l.uom.factor.num) / l.uom.factor.den;
         if (!l.product.isService && probedBase > l.product.quantityOnHand) {
           setScanError(
-            `Only ${l.product.quantityOnHand} ${l.product.baseUom.uomCode} of "${l.product.name}" in stock.`,
+            t("pos.errStockExceeded", {
+              qty: String(l.product.quantityOnHand),
+              uom: l.product.baseUom.uomCode,
+              name: l.product.name,
+            }),
           );
           return l;
         }
@@ -307,19 +337,19 @@ export default function PosRegister() {
       try {
         cashUsdCents = parseUsdInput(cashUsdInput);
       } catch {
-        errs.push("Cash USD: not a valid amount.");
+        errs.push(t("pos.errCashUsdInvalid"));
       }
     }
 
     let cashLbp = 0;
     if (cashLbpInput.trim() !== "") {
       if (!rate) {
-        errs.push("Cash LBP: exchange rate not set.");
+        errs.push(t("pos.errCashLbpNoRate"));
       } else {
         try {
           cashLbp = parseLbpInput(cashLbpInput);
         } catch {
-          errs.push("Cash LBP: not a valid whole-lira amount.");
+          errs.push(t("pos.errCashLbpInvalid"));
         }
       }
     }
@@ -329,7 +359,7 @@ export default function PosRegister() {
       try {
         cardUsdCents = parseUsdInput(cardUsdInput);
       } catch {
-        errs.push("Card USD: not a valid amount.");
+        errs.push(t("pos.errCardUsdInvalid"));
       }
     }
 
@@ -345,21 +375,26 @@ export default function PosRegister() {
       totalPaidUsdCents,
       errors: errs,
     };
-  }, [cashUsdInput, cashLbpInput, cardUsdInput, rate]);
+  }, [cashUsdInput, cashLbpInput, cardUsdInput, rate, t]);
 
   const remainingCents = totals.total - payments.totalPaidUsdCents;
   const changeCents = payments.totalPaidUsdCents - totals.total;
   const isFullyPaid =
     lines.length > 0 && remainingCents <= 0 && payments.errors.length === 0;
 
-  const canPost = !submitting && lines.length > 0 && isFullyPaid && rate !== null;
+  const canPost =
+    !submitting &&
+    lines.length > 0 &&
+    isFullyPaid &&
+    rate !== null &&
+    !!activeShift;
 
   // ----- Post -----
   async function handlePost() {
-    if (!storeId || !rate) return;
+    if (!storeId || !rate || !activeShift) return;
     setSubmitError(null);
     if (lines.length === 0) {
-      setSubmitError("Cart is empty.");
+      setSubmitError(t("pos.errCartEmpty"));
       return;
     }
     if (payments.errors.length > 0) {
@@ -368,9 +403,10 @@ export default function PosRegister() {
     }
     if (payments.totalPaidUsdCents < totals.total) {
       setSubmitError(
-        `Underpaid: tendered ${formatUsd(
-          payments.totalPaidUsdCents,
-        )}, total ${formatUsd(totals.total)}.`,
+        t("pos.errUnderpaid", {
+          tendered: formatUsd(payments.totalPaidUsdCents),
+          total: formatUsd(totals.total),
+        }),
       );
       return;
     }
@@ -434,7 +470,7 @@ export default function PosRegister() {
         storeId,
         cashierUserId: userId,
         deviceId: null,
-        shiftId: null, // Shifts wired in a later phase.
+        shiftId: activeShift.id,
         exchangeRateId: rate.id,
         exchangeRateLbpPerUsd: rate.rateLbpPerUsd,
         notes: null,
@@ -458,29 +494,35 @@ export default function PosRegister() {
   // ============================================================================
 
   if (!hydrated) {
-    return <div className="text-sm text-slate-500">Loading register…</div>;
+    return <div className="text-sm text-slate-500">{t("pos.loadingRegister")}</div>;
   }
 
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between">
         <div>
-          <h2 className="text-2xl font-semibold text-slate-900">POS Register</h2>
-          <p className="text-sm text-slate-600">
-            Scan or search to add items, then take payment.
-          </p>
+          <h2 className="text-2xl font-semibold text-slate-900">{t("pos.title")}</h2>
+          <p className="text-sm text-slate-600">{t("pos.subtitle")}</p>
         </div>
         {rate ? (
           <div className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-sm">
-            <span className="font-medium text-slate-800">Rate locked:</span>{" "}
+            <span className="font-medium text-slate-800">{t("pos.rateLocked")}</span>{" "}
             {formatRate(rate.rateLbpPerUsd)}
           </div>
         ) : (
           <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-800">
-            No exchange rate — LBP payments disabled
+            {t("pos.noExchangeRate")}
           </div>
         )}
       </div>
+
+      {/* Shift warning */}
+      {activeShift === null && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          <span className="font-semibold">{t("pos.noOpenShiftBold")}</span>{" "}
+          {t("pos.goTo")} <strong>{t("nav.shiftSummary")}</strong> {t("pos.toOpenShift")}
+        </div>
+      )}
 
       {/* Print-only receipt root — outside modal so print:hidden on the modal doesn't suppress it */}
       {receiptSale && (
@@ -495,7 +537,7 @@ export default function PosRegister() {
             <ReceiptPrint sale={receiptSale} storeName={storeName} />
             <div className="flex gap-2 border-t border-slate-200 p-4 print:hidden">
               <Button variant="primary" className="flex-1" onClick={() => window.print()}>
-                Print receipt
+                {t("pos.printReceipt")}
               </Button>
               <Button
                 variant="ghost"
@@ -505,7 +547,7 @@ export default function PosRegister() {
                   focusScanInput();
                 }}
               >
-                New sale
+                {t("pos.newSale")}
               </Button>
             </div>
           </div>
@@ -516,7 +558,7 @@ export default function PosRegister() {
         {/* ─── LEFT: Scan + cart ───────────────────────────────────────── */}
         <div className="space-y-6 lg:col-span-2">
           <Card>
-            <CardHeader title="Add item" subtitle="Scan a barcode or search the catalog." />
+            <CardHeader title={t("pos.addItemTitle")} subtitle={t("pos.addItemSubtitle")} />
             <CardBody className="space-y-3">
               <div className="flex gap-2">
                 <input
@@ -529,21 +571,21 @@ export default function PosRegister() {
                       void handleScan();
                     }
                   }}
-                  placeholder="Scan barcode…"
+                  placeholder={t("pos.scanBarcodePlaceholder")}
                   autoFocus
                   className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
                 />
                 <Button variant="primary" onClick={handleScan} disabled={!scanInput.trim()}>
-                  Add
+                  {t("common.add")}
                 </Button>
               </div>
               <div>
-                <p className="mb-1 text-xs text-slate-500">Or search by name / SKU:</p>
+                <p className="mb-1 text-xs text-slate-500">{t("pos.orSearchByName")}</p>
                 <ProductPicker
                   storeId={storeId!}
                   onPick={handlePick}
                   excludeIds={[]}
-                  placeholder="Type to search products…"
+                  placeholder={t("pos.searchProductsPlaceholder")}
                 />
               </div>
               {scanError && <p className="text-xs text-red-600">{scanError}</p>}
@@ -552,32 +594,34 @@ export default function PosRegister() {
 
           <Card>
             <CardHeader
-              title="Cart"
-              subtitle={lines.length === 0 ? "Empty" : `${lines.length} line(s)`}
+              title={t("pos.cartTitle")}
+              subtitle={
+                lines.length === 0
+                  ? t("pos.cartEmpty")
+                  : t("pos.cartLinesCount", { count: String(lines.length) })
+              }
               actions={
                 lines.length > 0 ? (
                   <Button variant="ghost" onClick={() => { clearCart(); focusScanInput(); }}>
-                    Clear cart
+                    {t("pos.clearCart")}
                   </Button>
                 ) : undefined
               }
             />
             {lines.length === 0 ? (
               <CardBody>
-                <p className="text-sm text-slate-500">
-                  Scan or search to add the first item.
-                </p>
+                <p className="text-sm text-slate-500">{t("pos.cartEmptyMessage")}</p>
               </CardBody>
             ) : (
               <div className="overflow-x-auto">
                 <table className="min-w-full text-sm">
                   <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
                     <tr>
-                      <th className="px-5 py-2">Product</th>
-                      <th className="px-5 py-2">UoM</th>
-                      <th className="px-5 py-2 text-right">Unit price (incl-VAT)</th>
-                      <th className="px-5 py-2 text-center">Qty</th>
-                      <th className="px-5 py-2 text-right">Line total</th>
+                      <th className="px-5 py-2">{t("pos.colProduct")}</th>
+                      <th className="px-5 py-2">{t("pos.colUom")}</th>
+                      <th className="px-5 py-2 text-end">{t("pos.colUnitPrice")}</th>
+                      <th className="px-5 py-2 text-center">{t("pos.colQty")}</th>
+                      <th className="px-5 py-2 text-end">{t("pos.colLineTotal")}</th>
                       <th className="px-5 py-2"></th>
                     </tr>
                   </thead>
@@ -590,18 +634,18 @@ export default function PosRegister() {
                             {l.product.sku && <>SKU: {l.product.sku} · </>}
                             {!l.product.isService && (
                               <>
-                                stock:{" "}
+                                {t("pos.stockLabel")}{" "}
                                 {fromBaseQty(l.product.quantityOnHand, l.uom.factor)}{" "}
                                 {l.uom.uomCode}
                               </>
                             )}
                             {l.product.isService && (
-                              <span className="italic">service</span>
+                              <span className="italic">{t("pos.serviceLabel")}</span>
                             )}
                           </div>
                         </td>
                         <td className="px-5 py-2 text-slate-600">{l.uom.uomCode}</td>
-                        <td className="px-5 py-2 text-right text-slate-700">
+                        <td className="px-5 py-2 text-end text-slate-700">
                           {formatUsd(l.math.unitPriceInclVatCents)}
                         </td>
                         <td className="px-5 py-2 text-center">
@@ -611,16 +655,16 @@ export default function PosRegister() {
                             onAfterStep={focusScanInput}
                           />
                         </td>
-                        <td className="px-5 py-2 text-right font-medium text-slate-900">
+                        <td className="px-5 py-2 text-end font-medium text-slate-900">
                           {formatUsd(l.math.lineTotalInclVatCents)}
                         </td>
-                        <td className="px-5 py-2 text-right">
+                        <td className="px-5 py-2 text-end">
                           <Button
                             variant="ghost"
                             size="sm"
                             onClick={() => { removeLine(l.draftId); focusScanInput(); }}
                           >
-                            Remove
+                            {t("common.remove")}
                           </Button>
                         </td>
                       </tr>
@@ -635,19 +679,19 @@ export default function PosRegister() {
         {/* ─── RIGHT: Totals + payment ─────────────────────────────────── */}
         <div className="space-y-6">
           <Card>
-            <CardHeader title="Totals" />
+            <CardHeader title={t("pos.totalsTitle")} />
             <CardBody className="space-y-2 text-sm">
-              <TotalsRow label="Subtotal (excl-VAT)" value={formatUsd(totals.subtotal)} />
-              <TotalsRow label="VAT" value={formatUsd(totals.vat)} />
+              <TotalsRow label={t("pos.subtotalExclVat")} value={formatUsd(totals.subtotal)} />
+              <TotalsRow label={t("pos.vat")} value={formatUsd(totals.vat)} />
               <div className="border-t border-slate-200 pt-2">
                 <TotalsRow
-                  label="Total (incl-VAT)"
+                  label={t("pos.totalInclVat")}
                   value={formatUsd(totals.total)}
                   strong
                 />
                 {rate && (
                   <TotalsRow
-                    label="= LBP equivalent"
+                    label={t("pos.lbpEquivalent")}
                     value={formatLbp(usdCentsToLbp(totals.total, rate.rateLbpPerUsd))}
                     muted
                   />
@@ -658,8 +702,8 @@ export default function PosRegister() {
 
           <Card>
             <CardHeader
-              title="Cost method"
-              subtitle="Choose how COGS/profit is calculated for this sale."
+              title={t("pos.costMethodTitle")}
+              subtitle={t("pos.costMethodSubtitle")}
             />
             <CardBody className="space-y-2 text-sm">
               <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2">
@@ -671,8 +715,8 @@ export default function PosRegister() {
                   className="mt-1"
                 />
                 <span>
-                  <span className="block font-medium text-slate-800">Weighted average cost</span>
-                  <span className="text-xs text-slate-500">Uses the current average cost stored on each product.</span>
+                  <span className="block font-medium text-slate-800">{t("pos.weightedAverage")}</span>
+                  <span className="text-xs text-slate-500">{t("pos.weightedAverageDesc")}</span>
                 </span>
               </label>
               <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2">
@@ -684,18 +728,18 @@ export default function PosRegister() {
                   className="mt-1"
                 />
                 <span>
-                  <span className="block font-medium text-slate-800">Last purchase cost</span>
-                  <span className="text-xs text-slate-500">Uses the most recent purchase/opening cost, falling back to average cost if unavailable.</span>
+                  <span className="block font-medium text-slate-800">{t("pos.lastPurchase")}</span>
+                  <span className="text-xs text-slate-500">{t("pos.lastPurchaseDesc")}</span>
                 </span>
               </label>
             </CardBody>
           </Card>
 
           <Card>
-            <CardHeader title="Payment" subtitle="Mix any combination of USD and LBP." />
+            <CardHeader title={t("pos.paymentTitle")} subtitle={t("pos.paymentSubtitle")} />
             <CardBody className="space-y-3">
               <Input
-                label="Cash USD received"
+                label={t("pos.cashUsdReceived")}
                 inputMode="decimal"
                 placeholder="0.00"
                 prefix="$"
@@ -703,7 +747,7 @@ export default function PosRegister() {
                 onChange={(e) => setCashUsdInput(e.target.value)}
               />
               <Input
-                label={`Cash LBP received${rate ? "" : " (no rate set)"}`}
+                label={rate ? t("pos.cashLbpReceived") : t("pos.cashLbpNoRate")}
                 inputMode="numeric"
                 placeholder={rate ? "0" : "—"}
                 suffix="L.L."
@@ -717,7 +761,7 @@ export default function PosRegister() {
                 }
               />
               <Input
-                label="Card USD received"
+                label={t("pos.cardUsdReceived")}
                 inputMode="decimal"
                 placeholder="0.00"
                 prefix="$"
@@ -727,19 +771,19 @@ export default function PosRegister() {
 
               <div className="space-y-1 rounded-md bg-slate-50 p-3 text-sm">
                 <TotalsRow
-                  label="Total paid (USD-equiv)"
+                  label={t("pos.totalPaidUsdEquiv")}
                   value={formatUsd(payments.totalPaidUsdCents)}
                 />
                 {remainingCents > 0 ? (
                   <>
                     <TotalsRow
-                      label="Remaining"
+                      label={t("pos.remaining")}
                       value={formatUsd(remainingCents)}
                       tone="warn"
                     />
                     {rate && (
                       <TotalsRow
-                        label="= LBP remaining"
+                        label={t("pos.lbpRemaining")}
                         value={formatLbp(usdCentsToLbp(remainingCents, rate.rateLbpPerUsd))}
                         tone="warn"
                         muted
@@ -749,14 +793,14 @@ export default function PosRegister() {
                 ) : changeCents > 0 ? (
                   <>
                     <TotalsRow
-                      label="Change due"
+                      label={t("pos.changeDue")}
                       value={formatUsd(changeCents)}
                       tone="good"
                       strong
                     />
                     {rate && (
                       <TotalsRow
-                        label="= LBP change"
+                        label={t("pos.lbpChange")}
                         value={formatLbp(usdCentsToLbp(changeCents, rate.rateLbpPerUsd))}
                         tone="good"
                         muted
@@ -764,7 +808,7 @@ export default function PosRegister() {
                     )}
                   </>
                 ) : lines.length > 0 ? (
-                  <TotalsRow label="Status" value="Exact payment" tone="good" />
+                  <TotalsRow label={t("pos.statusLabel")} value={t("pos.exactPayment")} tone="good" />
                 ) : null}
               </div>
 
@@ -772,10 +816,7 @@ export default function PosRegister() {
                 <p className="text-xs text-red-600">{payments.errors[0]}</p>
               )}
               {rateError === "NO_EXCHANGE_RATE_SET" && (
-                <p className="text-xs text-amber-700">
-                  No exchange rate is set for today. Set one in the Exchange Rate
-                  page to enable LBP payments.
-                </p>
+                <p className="text-xs text-amber-700">{t("pos.noRateHint")}</p>
               )}
               {submitError && <p className="text-xs text-red-600">{submitError}</p>}
 
@@ -785,7 +826,7 @@ export default function PosRegister() {
                 disabled={!canPost}
                 onClick={handlePost}
               >
-                {submitting ? "Posting…" : "Post Sale"}
+                {submitting ? t("pos.posting") : t("pos.postSale")}
               </Button>
             </CardBody>
           </Card>
@@ -850,6 +891,8 @@ function QuantityStepper({
   onChange: (n: number) => void;
   onAfterStep?: () => void;
 }) {
+  const { t } = useTranslation();
+
   return (
     <div className="inline-flex items-center gap-1">
       <button
@@ -857,7 +900,7 @@ function QuantityStepper({
         onClick={() => { onChange(value - 1); onAfterStep?.(); }}
         disabled={value <= 1}
         className="h-7 w-7 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
-        aria-label="Decrease quantity"
+        aria-label={t("pos.decreaseQty")}
       >
         −
       </button>
@@ -875,7 +918,7 @@ function QuantityStepper({
         type="button"
         onClick={() => { onChange(value + 1); onAfterStep?.(); }}
         className="h-7 w-7 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50"
-        aria-label="Increase quantity"
+        aria-label={t("pos.increaseQty")}
       >
         +
       </button>
