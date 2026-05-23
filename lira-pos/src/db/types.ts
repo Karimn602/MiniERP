@@ -348,3 +348,27 @@ export interface SaleWithDetails extends Sale {
   lines: SaleItem[];
   payments: SalePayment[];
 }
+
+// ---------- Shifts ----------
+
+export type ShiftStatus = "open" | "closed" | "voided";
+
+export interface Shift {
+  id: string;
+  storeId: string;
+  deviceId: string | null;
+  openedByUserId: string;
+  closedByUserId: string | null;
+  openedAt: string;
+  closedAt: string | null;
+  openingCashUsdCents: number;
+  openingCashLbp: number;
+  closingCashUsdCents: number | null;
+  closingCashLbp: number | null;
+  expectedCashUsdCents: number | null;
+  expectedCashLbp: number | null;
+  varianceUsdCents: number | null;
+  varianceLbp: number | null;
+  status: ShiftStatus;
+  notes: string | null;
+}
