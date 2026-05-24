@@ -11,6 +11,7 @@ import {
 import type { VatRate, UnitOfMeasure } from "../db/types";
 import { formatUsd } from "../lib/money";
 import { Button } from "./ui/Button";
+import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 // ─── Props ────────────────────────────────────────────────────────────────────
@@ -30,6 +31,7 @@ type Step = "pick" | "validating" | "preview" | "importing" | "done";
 // ─── Status badge ─────────────────────────────────────────────────────────────
 
 function StatusBadge({ status }: { status: RowStatus }) {
+  const { t } = useTranslation();
   return (
     <span
       className={clsx(
@@ -39,9 +41,9 @@ function StatusBadge({ status }: { status: RowStatus }) {
         status === "error" && "bg-red-100 text-red-800",
       )}
     >
-      {status === "valid" && "Ready"}
-      {status === "warning" && "Skip"}
-      {status === "error" && "Error"}
+      {status === "valid" && t("productImport.statusReady")}
+      {status === "warning" && t("productImport.statusSkip")}
+      {status === "error" && t("productImport.statusError")}
     </span>
   );
 }
@@ -55,6 +57,7 @@ export function ProductImportDialog({
   onClose,
   onImported,
 }: Props) {
+  const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState<Step>("pick");
   const [parseError, setParseError] = useState<string | null>(null);
@@ -167,10 +170,10 @@ export function ProductImportDialog({
         <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
           <div>
             <h2 className="text-base font-semibold text-slate-900">
-              Import products
+              {t("productImport.title")}
             </h2>
             <p className="text-xs text-slate-500">
-              CSV or XLSX — create new products and barcodes from a spreadsheet
+              {t("productImport.subtitle")}
             </p>
           </div>
           <button
@@ -189,48 +192,48 @@ export function ProductImportDialog({
               {/* Template download */}
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
                 <p className="text-sm font-medium text-slate-800">
-                  1. Download the template
+                  {t("productImport.step1Title")}
                 </p>
                 <p className="mt-1 text-xs text-slate-500">
-                  Fill in the spreadsheet with your product catalog, then upload it below.
+                  {t("productImport.step1Desc")}
                 </p>
                 <button
                   onClick={downloadTemplate}
                   className="mt-2 text-xs font-medium text-teal-700 underline hover:text-teal-900"
                 >
-                  Download product_import_template.xlsx
+                  {t("productImport.downloadTemplate")}
                 </button>
               </div>
 
               {/* Required columns reference */}
               <div className="rounded-lg border border-slate-200 p-4 text-xs text-slate-600">
-                <p className="mb-2 font-medium text-slate-800">Required columns</p>
+                <p className="mb-2 font-medium text-slate-800">{t("productImport.requiredCols")}</p>
                 <div className="grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-3">
-                  <span><code>name</code> — product name</span>
-                  <span><code>sku</code> — leave blank to auto-generate</span>
-                  <span><code>barcode</code> — required unless service</span>
-                  <span><code>sale_price_incl_vat</code> — USD e.g. 2.50</span>
-                  <span><code>vat_rate</code> — e.g. "11%" or "Standard"</span>
-                  <span><code>stock_unit</code> — e.g. pcs, kg</span>
-                  <span><code>selling_unit</code> — same as stock_unit or e.g. box</span>
-                  <span><code>qty_per_selling_unit</code> — e.g. 12</span>
-                  <span><code>is_service</code> — yes / no</span>
-                  <span><code>active</code> — yes / no</span>
+                  <span><code>name</code> — {t("productImport.colNameDesc")}</span>
+                  <span><code>sku</code> — {t("productImport.colSkuDesc")}</span>
+                  <span><code>barcode</code> — {t("productImport.colBarcodeDesc")}</span>
+                  <span><code>sale_price_incl_vat</code> — {t("productImport.colSalePriceDesc")}</span>
+                  <span><code>vat_rate</code> — {t("productImport.colVatRateDesc")}</span>
+                  <span><code>stock_unit</code> — {t("productImport.colStockUnitDesc")}</span>
+                  <span><code>selling_unit</code> — {t("productImport.colSellingUnitDesc")}</span>
+                  <span><code>qty_per_selling_unit</code> — {t("productImport.colQtyPerUnitDesc")}</span>
+                  <span><code>is_service</code> — {t("productImport.colIsServiceDesc")}</span>
+                  <span><code>active</code> — {t("productImport.colActiveDesc")}</span>
                 </div>
               </div>
 
               {/* Opening stock note */}
               <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
-                <span className="font-semibold">Note:</span> Opening stock
-                quantities are not imported here. After importing your product
-                catalog, use <span className="font-medium">Inventory → Adjustments</span> to
-                set opening quantities and costs.
+                <span className="font-semibold">{t("productImport.noteLabel")}</span>{" "}
+                {t("productImport.openingStockNote")}{" "}
+                <span className="font-medium">{t("productImport.inventoryAdjLink")}</span>{" "}
+                {t("productImport.openingStockSuffix")}
               </div>
 
               {/* File picker */}
               <div>
                 <p className="mb-2 text-sm font-medium text-slate-800">
-                  2. Upload your file
+                  {t("productImport.step2Title")}
                 </p>
                 <input
                   ref={fileInputRef}
@@ -244,7 +247,9 @@ export function ProductImportDialog({
                   onClick={() => fileInputRef.current?.click()}
                   disabled={step === "validating"}
                 >
-                  {step === "validating" ? "Validating…" : "Choose file (.xlsx or .csv)"}
+                  {step === "validating"
+                    ? t("productImport.validating")
+                    : t("productImport.chooseFile")}
                 </Button>
               </div>
 
@@ -262,43 +267,44 @@ export function ProductImportDialog({
               {/* Summary bar */}
               <div className="flex flex-wrap gap-3 text-sm">
                 <span className="rounded-full bg-emerald-100 px-3 py-1 text-emerald-800">
-                  {validRows.length} ready to import
+                  {t("productImport.readyToImport", { count: String(validRows.length) })}
                 </span>
                 {warnRows.length > 0 && (
                   <span className="rounded-full bg-amber-100 px-3 py-1 text-amber-800">
-                    {warnRows.length} will be skipped (SKU exists)
+                    {t("productImport.willBeSkipped", { count: String(warnRows.length) })}
                   </span>
                 )}
                 {errorRows.length > 0 && (
                   <span className="rounded-full bg-red-100 px-3 py-1 text-red-800">
-                    {errorRows.length} have errors
+                    {t("productImport.haveErrors", { count: String(errorRows.length) })}
                   </span>
                 )}
               </div>
 
               {/* Opening stock note */}
               <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">
-                <span className="font-semibold">Note:</span> Opening stock
-                quantities are not imported. Use Inventory → Adjustments after
-                import.
+                <span className="font-semibold">{t("productImport.noteLabel")}</span>{" "}
+                {t("productImport.openingStockNoteShort")}{" "}
+                <span className="font-medium">{t("productImport.inventoryAdjLink")}</span>{" "}
+                {t("productImport.openingStockSuffixShort")}
               </div>
 
               {/* Preview table */}
               <div className="overflow-x-auto rounded-lg border border-slate-200">
                 <table className="min-w-full text-xs">
-                  <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
                     <tr>
-                      <th className="px-3 py-2">#</th>
-                      <th className="px-3 py-2">Status</th>
-                      <th className="px-3 py-2">Name</th>
-                      <th className="px-3 py-2">SKU</th>
-                      <th className="px-3 py-2">Barcode</th>
-                      <th className="px-3 py-2 text-right">Price incl. VAT</th>
-                      <th className="px-3 py-2">VAT</th>
-                      <th className="px-3 py-2">Stock unit</th>
-                      <th className="px-3 py-2">Sell unit</th>
-                      <th className="px-3 py-2">Qty/unit</th>
-                      <th className="px-3 py-2">Issues</th>
+                      <th className="px-3 py-2">{t("productImport.colHash")}</th>
+                      <th className="px-3 py-2">{t("productImport.colStatus")}</th>
+                      <th className="px-3 py-2">{t("productImport.colNameHeader")}</th>
+                      <th className="px-3 py-2">{t("productImport.colSkuHeader")}</th>
+                      <th className="px-3 py-2">{t("productImport.colBarcodeHeader")}</th>
+                      <th className="px-3 py-2 text-right">{t("productImport.colPriceHeader")}</th>
+                      <th className="px-3 py-2">{t("productImport.colVatHeader")}</th>
+                      <th className="px-3 py-2">{t("productImport.colStockUnitHeader")}</th>
+                      <th className="px-3 py-2">{t("productImport.colSellUnitHeader")}</th>
+                      <th className="px-3 py-2">{t("productImport.colQtyUnit")}</th>
+                      <th className="px-3 py-2">{t("productImport.colIssues")}</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -315,10 +321,18 @@ export function ProductImportDialog({
                           <StatusBadge status={row.status} />
                         </td>
                         <td className="px-3 py-2 font-medium text-slate-800">
-                          {row.rawName || <span className="italic text-red-400">blank</span>}
+                          {row.rawName || (
+                            <span className="italic text-red-400">
+                              {t("productImport.blankName")}
+                            </span>
+                          )}
                         </td>
                         <td className="px-3 py-2 text-slate-600">
-                          {row.rawSku || <span className="text-slate-400">auto</span>}
+                          {row.rawSku || (
+                            <span className="text-slate-400">
+                              {t("productImport.autoSku")}
+                            </span>
+                          )}
                         </td>
                         <td className="px-3 py-2 font-mono text-slate-600">
                           {row.rawBarcode || <span className="font-sans text-slate-400">—</span>}
@@ -362,7 +376,7 @@ export function ProductImportDialog({
                 }}
                 className="text-xs text-slate-500 underline hover:text-slate-700"
               >
-                Choose a different file
+                {t("productImport.chooseDifferentFile")}
               </button>
             </div>
           )}
@@ -371,7 +385,9 @@ export function ProductImportDialog({
           {step === "importing" && (
             <div className="flex flex-col items-center gap-3 py-12 text-slate-600">
               <div className="h-6 w-6 animate-spin rounded-full border-2 border-teal-600 border-t-transparent" />
-              <p className="text-sm">Importing {validRows.length} products…</p>
+              <p className="text-sm">
+                {t("productImport.importing", { count: String(validRows.length) })}
+              </p>
             </div>
           )}
 
@@ -384,28 +400,29 @@ export function ProductImportDialog({
                 </div>
                 <div>
                   <p className="text-sm font-semibold text-slate-900">
-                    Import complete
+                    {t("productImport.doneTitle")}
                   </p>
                   <p className="text-xs text-slate-500">
-                    {importedCount} product{importedCount !== 1 ? "s" : ""} created
-                    {skippedCount > 0 && `, ${skippedCount} skipped`}
-                    {failedCount > 0 && `, ${failedCount} failed unexpectedly`}
+                    {t("productImport.doneCreated", { count: String(importedCount) })}
+                    {skippedCount > 0 &&
+                      t("productImport.doneSkipped", { count: String(skippedCount) })}
+                    {failedCount > 0 &&
+                      t("productImport.doneFailed", { count: String(failedCount) })}
                   </p>
                 </div>
               </div>
 
               {failedCount > 0 && (
                 <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700">
-                  {failedCount} row{failedCount !== 1 ? "s" : ""} failed during
-                  import (e.g. duplicate barcode detected at write time). These
-                  products were not created.
+                  {t("productImport.failedNote", { count: String(failedCount) })}
                 </div>
               )}
 
               <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
-                <span className="font-semibold">Next step:</span> Go to{" "}
-                <span className="font-medium">Inventory → Adjustments</span> to
-                set opening stock quantities and costs for the imported products.
+                <span className="font-semibold">{t("productImport.nextStepLabel")}</span>{" "}
+                {t("productImport.nextStepText")}{" "}
+                <span className="font-medium">{t("productImport.nextStepLink")}</span>{" "}
+                {t("productImport.nextStepSuffix")}
               </div>
             </div>
           )}
@@ -416,25 +433,25 @@ export function ProductImportDialog({
           {step === "preview" && (
             <>
               <Button variant="ghost" onClick={onClose}>
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button
                 variant="primary"
                 onClick={() => void handleImport()}
                 disabled={validRows.length === 0}
               >
-                Import {validRows.length} product{validRows.length !== 1 ? "s" : ""}
+                {t("productImport.importButton", { count: String(validRows.length) })}
               </Button>
             </>
           )}
           {(step === "pick" || step === "validating") && (
             <Button variant="ghost" onClick={onClose}>
-              Cancel
+              {t("common.cancel")}
             </Button>
           )}
           {step === "done" && (
             <Button variant="primary" onClick={onClose}>
-              Done
+              {t("productImport.done")}
             </Button>
           )}
         </div>

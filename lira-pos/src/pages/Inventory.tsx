@@ -20,18 +20,19 @@ import { Input } from "../components/ui/Input";
 import { ProductPicker } from "../components/ProductPicker";
 import { newId } from "../lib/ids";
 import { useSearchParams } from "react-router-dom";
+import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 type View = "stock" | "movements" | "adjust" | "opening";
+type TFunc = (key: string, vars?: Record<string, string>) => string;
 
 export default function Inventory() {
   const { storeId, userId } = useActiveContext();
+  const { t } = useTranslation();
   const [view, setView] = useState<View>("stock");
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Honor ?drill=<productId> from incoming links (e.g. Purchases page).
-  // We hand the ID to StockView via prop; clear the param so the drawer
-  // doesn't reopen on every interaction.
   const drillProductId = searchParams.get("drill");
   useEffect(() => {
     if (drillProductId) setView("stock");
@@ -45,17 +46,22 @@ export default function Inventory() {
   }
 
   if (!storeId) {
-    return <div className="text-sm text-slate-500">Loading…</div>;
+    return <div className="text-sm text-slate-500">{t("inventory.loadingPage")}</div>;
   }
+
+  const tabLabels: Record<View, string> = {
+    stock: t("inventory.tabStock"),
+    movements: t("inventory.tabMovements"),
+    adjust: t("inventory.tabAdjust"),
+    opening: t("inventory.tabOpening"),
+  };
 
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between">
         <div>
-          <h2 className="text-2xl font-semibold text-slate-900">Inventory</h2>
-          <p className="text-sm text-slate-600">
-            Current stock levels, the movement ledger, manual adjustments, and opening stock.
-          </p>
+          <h2 className="text-2xl font-semibold text-slate-900">{t("inventory.title")}</h2>
+          <p className="text-sm text-slate-600">{t("inventory.subtitle")}</p>
         </div>
         <div className="inline-flex rounded-md border border-slate-300 bg-white p-0.5 shadow-sm">
           {(["stock", "movements", "adjust", "opening"] as const).map((v) => (
@@ -73,13 +79,7 @@ export default function Inventory() {
                   : "text-slate-600 hover:bg-slate-50",
               )}
             >
-              {v === "stock"
-                ? "Stock"
-                : v === "movements"
-                  ? "Movements"
-                  : v === "adjust"
-                    ? "Adjust"
-                    : "Opening"}
+              {tabLabels[v]}
             </button>
           ))}
         </div>
@@ -112,6 +112,7 @@ function StockView({
   drillProductId: string | null;
   onCloseDrill: () => void;
 }) {
+  const { t } = useTranslation();
   const [rows, setRows] = useState<ProductWithUoms[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -157,11 +158,11 @@ function StockView({
   return (
     <div className="space-y-4">
       <Card>
-        <CardHeader title="Filter" />
+        <CardHeader title={t("inventory.filterTitle")} />
         <CardBody className="flex flex-col gap-3 md:flex-row md:items-end">
           <div className="flex-1">
             <Input
-              placeholder="Search by name, SKU, or barcode…"
+              placeholder={t("inventory.filterPlaceholder")}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
@@ -173,29 +174,31 @@ function StockView({
               onChange={(e) => setLowOnly(e.target.checked)}
               className="rounded border-slate-300"
             />
-            Low stock only (at or below reorder point)
+            {t("inventory.filterLowOnly")}
           </label>
         </CardBody>
       </Card>
 
       <Card>
         <CardHeader
-          title="Stock on hand"
+          title={t("inventory.stockTitle")}
           subtitle={
             loading
-              ? "Loading…"
-              : `${filtered.length} ${filtered.length === 1 ? "product" : "products"}`
+              ? t("common.loading")
+              : filtered.length === 1
+                ? t("inventory.countOne", { count: String(filtered.length) })
+                : t("inventory.countMany", { count: String(filtered.length) })
           }
         />
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
-            <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+            <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
               <tr>
-                <th className="px-5 py-2 font-medium">Product</th>
-                <th className="px-5 py-2 font-medium text-right">On hand</th>
-                <th className="px-5 py-2 font-medium text-right">Reorder pt.</th>
-                <th className="px-5 py-2 font-medium text-right">Avg cost (incl)</th>
-                <th className="px-5 py-2 font-medium text-right">Stock value</th>
+                <th className="px-5 py-2 font-medium">{t("inventory.colProduct")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colOnHand")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colReorderPt")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colAvgCost")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colStockValue")}</th>
                 <th className="px-5 py-2"></th>
               </tr>
             </thead>
@@ -203,7 +206,7 @@ function StockView({
               {filtered.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="px-5 py-6 text-center text-sm text-slate-500">
-                    {lowOnly ? "Nothing below reorder point." : "No products match."}
+                    {lowOnly ? t("inventory.emptyLow") : t("inventory.emptyAll")}
                   </td>
                 </tr>
               ) : (
@@ -226,11 +229,13 @@ function StockView({
                       <td className="px-5 py-2">
                         <div className="font-medium text-slate-900">{p.name}</div>
                         <div className="text-xs text-slate-500">
-                          {p.sku && <span>SKU: {p.sku} · </span>}
-                          base {p.baseUom.uomCode}
+                          {p.sku && (
+                            <span>{t("inventory.skuPrefix")} {p.sku} · </span>
+                          )}
+                          {t("inventory.basePrefix")} {p.baseUom.uomCode}
                           {p.isService && (
                             <span className="ml-2 rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-indigo-700">
-                              Service
+                              {t("products.serviceLabel")}
                             </span>
                           )}
                         </div>
@@ -261,13 +266,13 @@ function StockView({
                           formatUsd(stockValue)
                         )}
                       </td>
-                      <td className="px-5 py-2 text-right">
+                      <td className="px-5 py-2 text-end">
                         <Button
                           variant="ghost"
                           size="sm"
                           onClick={() => setDrillProduct(p)}
                         >
-                          History →
+                          {t("inventory.historyButton")}
                         </Button>
                       </td>
                     </tr>
@@ -303,6 +308,7 @@ function MovementsDrawer({
   product: ProductWithUoms;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   const [movements, setMovements] = useState<InventoryMovement[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -324,29 +330,32 @@ function MovementsDrawer({
         <div className="flex items-start justify-between border-b border-slate-200 px-5 py-3">
           <div>
             <h3 className="text-base font-semibold text-slate-900">
-              {product.name} — movement history
+              {product.name} {t("inventory.drawerMovHistory")}
             </h3>
             <p className="text-xs text-slate-500">
-              Current stock: {product.quantityOnHand} {product.baseUom.uomCode} ·
-              avg cost {formatUsd(product.avgCostInclVatCents)} incl. VAT
+              {t("inventory.drawerSubtitle", {
+                qty: String(product.quantityOnHand),
+                uom: product.baseUom.uomCode,
+                cost: formatUsd(product.avgCostInclVatCents),
+              })}
             </p>
           </div>
           <Button variant="ghost" size="sm" onClick={onClose}>✕</Button>
         </div>
         <div className="flex-1 overflow-auto">
           {loading ? (
-            <p className="p-5 text-sm text-slate-500">Loading…</p>
+            <p className="p-5 text-sm text-slate-500">{t("common.loading")}</p>
           ) : movements.length === 0 ? (
-            <p className="p-5 text-sm text-slate-500">No movements recorded yet for this product.</p>
+            <p className="p-5 text-sm text-slate-500">{t("inventory.drawerEmpty")}</p>
           ) : (
             <table className="min-w-full text-sm">
-              <thead className="sticky top-0 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+              <thead className="sticky top-0 bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
                 <tr>
-                  <th className="px-4 py-2 font-medium">When</th>
-                  <th className="px-4 py-2 font-medium">Type</th>
-                  <th className="px-4 py-2 font-medium text-right">Δ qty</th>
-                  <th className="px-4 py-2 font-medium text-right">Unit cost</th>
-                  <th className="px-4 py-2 font-medium">Notes</th>
+                  <th className="px-4 py-2 font-medium">{t("inventory.drawerColWhen")}</th>
+                  <th className="px-4 py-2 font-medium">{t("inventory.drawerColType")}</th>
+                  <th className="px-4 py-2 font-medium text-right">{t("inventory.drawerColDelta")}</th>
+                  <th className="px-4 py-2 font-medium text-right">{t("inventory.drawerColCost")}</th>
+                  <th className="px-4 py-2 font-medium">{t("inventory.drawerColNotes")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -387,8 +396,10 @@ function MovementsDrawer({
   );
 }
 
-// Sharper sign-aware badge (Phase 2D.3).
+// Sign-aware movement badge.
 function MovementBadge({ type, delta }: { type: MovementType; delta: number }) {
+  const { t } = useTranslation();
+
   const signed: Partial<Record<MovementType, true>> = {
     adjustment: true,
     return_in: true,
@@ -400,11 +411,11 @@ function MovementBadge({ type, delta }: { type: MovementType; delta: number }) {
     const positive = delta > 0;
     const label =
       type === "adjustment"
-        ? positive ? "adjust +" : "adjust −"
-        : type === "return_in" ? "return in"
-        : type === "return_out" ? "return out"
-        : type === "transfer_in" ? "xfer in"
-        : "xfer out";
+        ? positive ? t("inventory.movLabelAdjustPos") : t("inventory.movLabelAdjustNeg")
+        : type === "return_in" ? t("inventory.movLabelReturnIn")
+        : type === "return_out" ? t("inventory.movLabelReturnOut")
+        : type === "transfer_in" ? t("inventory.movLabelXferIn")
+        : t("inventory.movLabelXferOut");
     return (
       <span
         className={clsx(
@@ -417,18 +428,22 @@ function MovementBadge({ type, delta }: { type: MovementType; delta: number }) {
     );
   }
 
-  const meta: Record<MovementType, { label: string; className: string }> = {
-    purchase:     { label: "purchase",   className: "bg-emerald-100 text-emerald-800" },
-    opening:      { label: "opening",    className: "bg-indigo-100 text-indigo-800" },
-    sale:         { label: "sale",       className: "bg-blue-100 text-blue-800" },
-    return_in:    { label: "return in",  className: "bg-teal-100 text-teal-800" },
-    return_out:   { label: "return out", className: "bg-orange-100 text-orange-800" },
-    adjustment:   { label: "adjust",     className: "bg-amber-100 text-amber-800" },
-    transfer_in:  { label: "xfer in",    className: "bg-slate-200 text-slate-700" },
-    transfer_out: { label: "xfer out",   className: "bg-slate-200 text-slate-700" },
+  const meta: Record<MovementType, { labelKey: string; className: string }> = {
+    purchase:     { labelKey: "inventory.movLabelPurchase",  className: "bg-emerald-100 text-emerald-800" },
+    opening:      { labelKey: "inventory.movLabelOpening",   className: "bg-indigo-100 text-indigo-800" },
+    sale:         { labelKey: "inventory.movLabelSale",      className: "bg-blue-100 text-blue-800" },
+    return_in:    { labelKey: "inventory.movLabelReturnIn",  className: "bg-teal-100 text-teal-800" },
+    return_out:   { labelKey: "inventory.movLabelReturnOut", className: "bg-orange-100 text-orange-800" },
+    adjustment:   { labelKey: "inventory.movLabelAdjustPos", className: "bg-amber-100 text-amber-800" },
+    transfer_in:  { labelKey: "inventory.movLabelXferIn",    className: "bg-slate-200 text-slate-700" },
+    transfer_out: { labelKey: "inventory.movLabelXferOut",   className: "bg-slate-200 text-slate-700" },
   };
   const m = meta[type];
-  return <span className={clsx("rounded px-2 py-0.5 text-xs font-medium", m.className)}>{m.label}</span>;
+  return (
+    <span className={clsx("rounded px-2 py-0.5 text-xs font-medium", m.className)}>
+      {t(m.labelKey)}
+    </span>
+  );
 }
 
 // ============================================================================
@@ -436,6 +451,7 @@ function MovementBadge({ type, delta }: { type: MovementType; delta: number }) {
 // ============================================================================
 
 function MovementsView({ storeId }: { storeId: string }) {
+  const { t } = useTranslation();
   const [movements, setMovements] = useState<InventoryMovement[]>([]);
   const [products, setProducts] = useState<Map<string, ProductWithUoms>>(new Map());
   const [loading, setLoading] = useState(true);
@@ -466,41 +482,45 @@ function MovementsView({ storeId }: { storeId: string }) {
   return (
     <Card>
       <CardHeader
-        title="Recent movements"
-        subtitle={loading ? "Loading…" : `${movements.length} entries`}
+        title={t("inventory.movementsTitle")}
+        subtitle={
+          loading
+            ? t("common.loading")
+            : t("inventory.movementsCount", { count: String(movements.length) })
+        }
         actions={
           <select
             value={filter}
             onChange={(e) => setFilter(e.target.value as MovementType | "all")}
             className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
           >
-            <option value="all">All types</option>
-            <option value="purchase">Purchase</option>
-            <option value="opening">Opening</option>
-            <option value="adjustment">Adjustment</option>
-            <option value="sale">Sale</option>
-            <option value="return_in">Return in</option>
-            <option value="return_out">Return out</option>
+            <option value="all">{t("inventory.filterAll")}</option>
+            <option value="purchase">{t("inventory.filterPurchase")}</option>
+            <option value="opening">{t("inventory.filterOpening")}</option>
+            <option value="adjustment">{t("inventory.filterAdjustment")}</option>
+            <option value="sale">{t("inventory.filterSale")}</option>
+            <option value="return_in">{t("inventory.filterReturnIn")}</option>
+            <option value="return_out">{t("inventory.filterReturnOut")}</option>
           </select>
         }
       />
       <div className="overflow-x-auto">
         <table className="min-w-full text-sm">
-          <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+          <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
             <tr>
-              <th className="px-5 py-2 font-medium">When</th>
-              <th className="px-5 py-2 font-medium">Type</th>
-              <th className="px-5 py-2 font-medium">Product</th>
-              <th className="px-5 py-2 font-medium text-right">Δ qty</th>
-              <th className="px-5 py-2 font-medium text-right">Unit cost</th>
-              <th className="px-5 py-2 font-medium">Notes</th>
+              <th className="px-5 py-2 font-medium">{t("inventory.movColWhen")}</th>
+              <th className="px-5 py-2 font-medium">{t("inventory.movColType")}</th>
+              <th className="px-5 py-2 font-medium">{t("inventory.movColProduct")}</th>
+              <th className="px-5 py-2 font-medium text-right">{t("inventory.movColDelta")}</th>
+              <th className="px-5 py-2 font-medium text-right">{t("inventory.movColCost")}</th>
+              <th className="px-5 py-2 font-medium">{t("inventory.movColNotes")}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {movements.length === 0 ? (
               <tr>
                 <td colSpan={6} className="px-5 py-6 text-center text-sm text-slate-500">
-                  No movements recorded yet.
+                  {t("inventory.movementsEmpty")}
                 </td>
               </tr>
             ) : (
@@ -559,12 +579,13 @@ interface AdjLineDraft {
 
 function computeAdjLine(
   partial: Omit<AdjLineDraft, "quantityInUomSigned" | "quantityBaseSigned" | "error">,
+  t: TFunc,
 ): { quantityInUomSigned: number | null; quantityBaseSigned: number | null; error: string | null } {
   const uom = partial.product.uoms.find((u) => u.id === partial.selectedUomId);
-  if (!uom) return { quantityInUomSigned: null, quantityBaseSigned: null, error: "Pick a UoM." };
+  if (!uom) return { quantityInUomSigned: null, quantityBaseSigned: null, error: t("inventory.errPickUom") };
   const magnitude = Number(partial.quantityInput);
   if (!Number.isInteger(magnitude) || magnitude <= 0) {
-    return { quantityInUomSigned: null, quantityBaseSigned: null, error: "Whole positive number." };
+    return { quantityInUomSigned: null, quantityBaseSigned: null, error: t("inventory.errWholePositive") };
   }
   const sign = partial.direction === "+" ? 1 : -1;
   const baseMagnitude = toBaseQty(magnitude, uom.factor);
@@ -572,7 +593,10 @@ function computeAdjLine(
     return {
       quantityInUomSigned: null,
       quantityBaseSigned: null,
-      error: `Only ${partial.product.quantityOnHand} ${partial.product.baseUom.uomCode} on hand.`,
+      error: t("inventory.errInsufficientStock", {
+        qty: String(partial.product.quantityOnHand),
+        uom: partial.product.baseUom.uomCode,
+      }),
     };
   }
   return {
@@ -583,6 +607,7 @@ function computeAdjLine(
 }
 
 function AdjustView({ storeId, userId }: { storeId: string; userId: string | null }) {
+  const { t } = useTranslation();
   const [reason, setReason] = useState("");
   const [lines, setLines] = useState<AdjLineDraft[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -598,7 +623,7 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
       direction: "+",
       quantityInput: "1",
     };
-    const computed = computeAdjLine(partial);
+    const computed = computeAdjLine(partial, t);
     setLines((prev) => [...prev, { ...partial, ...computed }]);
   }
 
@@ -607,7 +632,7 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
       prev.map((l) => {
         if (l.draftId !== draftId) return l;
         const merged = { ...l, ...patch };
-        const computed = computeAdjLine(merged);
+        const computed = computeAdjLine(merged, t);
         return { ...merged, ...computed };
       }),
     );
@@ -618,12 +643,12 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
   }
 
   const validationError = useMemo<string | null>(() => {
-    if (!reason.trim()) return "Reason is required.";
-    if (lines.length === 0) return "Add at least one line.";
+    if (!reason.trim()) return t("inventory.errReasonRequired");
+    if (lines.length === 0) return t("inventory.errAtLeastOneLine");
     const bad = lines.find((l) => l.error || l.quantityBaseSigned === null);
-    if (bad) return bad.error ?? "Fix line errors before posting.";
+    if (bad) return bad.error ?? t("inventory.errFixLines");
     return null;
-  }, [reason, lines]);
+  }, [reason, lines, t]);
 
   async function handlePost() {
     setSubmitError(null);
@@ -664,19 +689,21 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
   return (
     <Card>
       <CardHeader
-        title="Manual adjustment"
-        subtitle="Record shrinkage, breakage, count corrections. Adjustments do not change weighted-average cost."
+        title={t("inventory.adjustTitle")}
+        subtitle={t("inventory.adjustSubtitle")}
       />
       <CardBody className="space-y-4">
         <Input
-          label="Reason *"
-          placeholder="e.g. Monthly count correction, breakage, theft, expired stock"
+          label={t("inventory.adjustReason")}
+          placeholder={t("inventory.adjustReasonPlaceholder")}
           value={reason}
           onChange={(e) => setReason(e.target.value)}
         />
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-slate-700">Add a product</label>
+          <label className="mb-1 block text-xs font-medium text-slate-700">
+            {t("inventory.adjustAddProduct")}
+          </label>
           <ProductPicker
             storeId={storeId}
             onPick={addLine}
@@ -687,14 +714,14 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
         {lines.length > 0 && (
           <div className="overflow-x-auto rounded-md border border-slate-200">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
                 <tr>
-                  <th className="px-3 py-2 font-medium">Product</th>
-                  <th className="px-3 py-2 font-medium">UoM</th>
-                  <th className="px-3 py-2 font-medium">+ / −</th>
-                  <th className="px-3 py-2 font-medium">Qty</th>
-                  <th className="px-3 py-2 font-medium text-right">Δ in base</th>
-                  <th className="px-3 py-2 font-medium text-right">After</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.adjColProduct")}</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.adjColUom")}</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.adjColSign")}</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.adjColQty")}</th>
+                  <th className="px-3 py-2 font-medium text-right">{t("inventory.adjColDelta")}</th>
+                  <th className="px-3 py-2 font-medium text-right">{t("inventory.adjColAfter")}</th>
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
@@ -708,7 +735,10 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
                       <td className="px-3 py-2 align-top">
                         <div className="font-medium text-slate-900">{l.product.name}</div>
                         <div className="text-xs text-slate-500">
-                          Current: {l.product.quantityOnHand} {l.product.baseUom.uomCode}
+                          {t("inventory.adjCurrentQty", {
+                            qty: String(l.product.quantityOnHand),
+                            uom: l.product.baseUom.uomCode,
+                          })}
                         </div>
                       </td>
                       <td className="px-3 py-2 align-top">
@@ -782,12 +812,18 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
         )}
 
         <div className="flex items-center gap-3 border-t border-slate-100 pt-3">
-          <Button variant="primary" onClick={handlePost} disabled={submitting || validationError !== null}>
-            {submitting ? "Posting…" : "Post adjustment"}
+          <Button
+            variant="primary"
+            onClick={handlePost}
+            disabled={submitting || validationError !== null}
+          >
+            {submitting ? t("inventory.adjPosting") : t("inventory.adjPost")}
           </Button>
-          {justSaved && <span className="text-sm text-emerald-700">✓ Adjustment posted</span>}
+          {justSaved && (
+            <span className="text-sm text-emerald-700">{t("inventory.adjSuccess")}</span>
+          )}
           <p className="ml-auto text-xs text-slate-500">
-            Adjustments are append-only. Mistakes are fixed by posting another adjustment.
+            {t("inventory.adjNote")}
           </p>
         </div>
       </CardBody>
@@ -796,7 +832,7 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
 }
 
 // ============================================================================
-// Opening stock (Phase 2D.4) — same posting code path as Purchases, no supplier
+// Opening stock
 // ============================================================================
 
 interface OpeningLineDraft {
@@ -810,25 +846,28 @@ interface OpeningLineDraft {
   error: string | null;
 }
 
-function buildOpeningLineMath(line: Omit<OpeningLineDraft, "math" | "error">): {
+function buildOpeningLineMath(
+  line: Omit<OpeningLineDraft, "math" | "error">,
+  t: TFunc,
+): {
   math: PurchaseLineMath | null;
   error: string | null;
 } {
   const qty = Number(line.quantityInput);
   if (!Number.isInteger(qty) || qty <= 0) {
-    return { math: null, error: "Quantity must be a positive whole number." };
+    return { math: null, error: t("inventory.errQtyPositive") };
   }
   let unitCostCents: number;
   try {
     unitCostCents = parseUsdInput(line.unitCostInput);
   } catch {
-    return { math: null, error: "Invalid unit cost." };
+    return { math: null, error: t("inventory.errUnitCostInvalid") };
   }
   if (unitCostCents < 0) {
-    return { math: null, error: "Unit cost cannot be negative." };
+    return { math: null, error: t("inventory.errUnitCostNegative") };
   }
   const uom = line.product.uoms.find((u) => u.id === line.selectedUomId);
-  if (!uom) return { math: null, error: "Pick a UoM." };
+  if (!uom) return { math: null, error: t("inventory.errPickUom") };
   try {
     const math = computeLineMath({
       quantityInUom: qty,
@@ -844,6 +883,7 @@ function buildOpeningLineMath(line: Omit<OpeningLineDraft, "math" | "error">): {
 }
 
 function OpeningStockView({ storeId, userId }: { storeId: string; userId: string | null }) {
+  const { t } = useTranslation();
   const [openingDate, setOpeningDate] = useState(todayLocalDate());
   const [notes, setNotes] = useState("");
   const [lines, setLines] = useState<OpeningLineDraft[]>([]);
@@ -864,7 +904,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
       unitCostInput: "",
       costMode: product.vatPricingMode,
     };
-    const { math, error } = buildOpeningLineMath(draft);
+    const { math, error } = buildOpeningLineMath(draft, t);
     setLines((prev) => [...prev, { ...draft, math, error }]);
   }
 
@@ -873,7 +913,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
       prev.map((l) => {
         if (l.draftId !== draftId) return l;
         const merged = { ...l, ...patch };
-        const { math, error } = buildOpeningLineMath(merged);
+        const { math, error } = buildOpeningLineMath(merged, t);
         return { ...merged, math, error };
       }),
     );
@@ -896,12 +936,12 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
   }, [lines]);
 
   const validationError = useMemo<string | null>(() => {
-    if (lines.length === 0) return "Add at least one line.";
-    if (!openingDate) return "Date is required.";
+    if (lines.length === 0) return t("inventory.errAtLeastOneLine");
+    if (!openingDate) return t("inventory.errDateRequired");
     const bad = lines.find((l) => !l.math);
     if (bad) return bad.error;
     return null;
-  }, [lines, openingDate]);
+  }, [lines, openingDate, t]);
 
   async function handlePost() {
     setSubmitError(null);
@@ -962,27 +1002,29 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
   return (
     <Card>
       <CardHeader
-        title="Opening stock"
-        subtitle="Record the stock you already had when you started using Lira POS. Creates a purchase document marked 'opening' — no supplier required."
+        title={t("inventory.openingTitle")}
+        subtitle={t("inventory.openingSubtitle")}
       />
       <CardBody className="space-y-4">
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <Input
             type="date"
-            label="Opening date *"
+            label={t("inventory.openingDate")}
             value={openingDate}
             onChange={(e) => setOpeningDate(e.target.value)}
           />
           <Input
-            label="Notes (optional)"
-            placeholder="e.g. Initial count Jan 2025"
+            label={t("inventory.openingNotes")}
+            placeholder={t("inventory.openingNotesPlaceholder")}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
           />
         </div>
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-slate-700">Add a product</label>
+          <label className="mb-1 block text-xs font-medium text-slate-700">
+            {t("inventory.openingAddProduct")}
+          </label>
           <ProductPicker
             storeId={storeId}
             onPick={addLine}
@@ -993,14 +1035,14 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
         {lines.length > 0 && (
           <div className="overflow-x-auto rounded-md border border-slate-200">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
                 <tr>
-                  <th className="px-3 py-2 font-medium">Product</th>
-                  <th className="px-3 py-2 font-medium">UoM</th>
-                  <th className="px-3 py-2 font-medium">Qty</th>
-                  <th className="px-3 py-2 font-medium">Unit cost</th>
-                  <th className="px-3 py-2 font-medium">Cost mode</th>
-                  <th className="px-3 py-2 font-medium text-right">Total</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.openColProduct")}</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.openColUom")}</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.openColQty")}</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.openColUnitCost")}</th>
+                  <th className="px-3 py-2 font-medium">{t("inventory.openColCostMode")}</th>
+                  <th className="px-3 py-2 font-medium text-right">{t("inventory.openColTotal")}</th>
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
@@ -1012,7 +1054,10 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
                       <td className="px-3 py-2 align-top">
                         <div className="font-medium text-slate-900">{l.product.name}</div>
                         <div className="text-xs text-slate-500">
-                          Currently: {l.product.quantityOnHand} {l.product.baseUom.uomCode}
+                          {t("inventory.openCurrentQty", {
+                            qty: String(l.product.quantityOnHand),
+                            uom: l.product.baseUom.uomCode,
+                          })}
                         </div>
                       </td>
                       <td className="px-3 py-2 align-top">
@@ -1062,7 +1107,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
                               "px-2 py-1",
                               l.costMode === "inclusive" ? "bg-brand text-brand-fg" : "text-slate-600 hover:bg-slate-50",
                             )}
-                          >incl.</button>
+                          >{t("inventory.openInclLabel")}</button>
                           <button
                             type="button"
                             onClick={() => updateLine(l.draftId, { costMode: "exclusive" })}
@@ -1070,7 +1115,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
                               "px-2 py-1",
                               l.costMode === "exclusive" ? "bg-brand text-brand-fg" : "text-slate-600 hover:bg-slate-50",
                             )}
-                          >excl.</button>
+                          >{t("inventory.openExclLabel")}</button>
                         </div>
                       </td>
                       <td className="px-3 py-2 text-right align-top font-medium text-slate-900">
@@ -1088,7 +1133,9 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
               </tbody>
               <tfoot className="bg-slate-50 text-sm">
                 <tr>
-                  <td className="px-3 py-2 text-right font-medium text-slate-700" colSpan={5}>Total stock value</td>
+                  <td className="px-3 py-2 text-right font-medium text-slate-700" colSpan={5}>
+                    {t("inventory.openTotalValue")}
+                  </td>
                   <td className="px-3 py-2 text-right font-semibold text-emerald-900">
                     {formatUsd(totals.total)}
                   </td>
@@ -1100,18 +1147,26 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
         )}
 
         {submitError && (
-          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{submitError}</div>
+          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+            {submitError}
+          </div>
         )}
 
         <div className="flex items-center gap-3 border-t border-slate-100 pt-3">
-          <Button variant="primary" onClick={handlePost} disabled={submitting || validationError !== null}>
-            {submitting ? "Posting…" : "Post opening stock"}
+          <Button
+            variant="primary"
+            onClick={handlePost}
+            disabled={submitting || validationError !== null}
+          >
+            {submitting ? t("inventory.openPosting") : t("inventory.openPost")}
           </Button>
           {justSaved && (
-            <span className="text-sm text-emerald-700">✓ Opening batch #{justSaved.number} posted</span>
+            <span className="text-sm text-emerald-700">
+              {t("inventory.openSuccess", { number: String(justSaved.number) })}
+            </span>
           )}
           <p className="ml-auto text-xs text-slate-500">
-            Creates a "purchase" document marked opening — appears in Purchases list with the opening badge.
+            {t("inventory.openNote")}
           </p>
         </div>
       </CardBody>

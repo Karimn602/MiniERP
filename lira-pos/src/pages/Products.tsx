@@ -17,6 +17,7 @@ import { formatUsd, parseUsdInput } from "../lib/money";
 import { addVat, stripVat } from "../lib/vat";
 import { classifyBarcode as inferBarcodeType, isValidEan13 } from "../lib/barcode";
 import { gcd, makeFactor, type Factor } from "../lib/uom";
+import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 type ProductMode = "new" | "edit";
@@ -120,17 +121,13 @@ function getProductPriceDisplay(p: ProductWithUoms): string {
   return formatUsd(p.priceInclVatCents);
 }
 
-function getProductStockDisplay(p: ProductWithUoms): string {
-  if (p.isService) return "Service";
-  return `${p.quantityOnHand} ${p.baseUom.uomCode}`;
-}
-
 function getPrimaryBarcodeDisplay(p: ProductWithUoms): string {
   return p.primaryBarcode?.barcode ?? "—";
 }
 
 export default function Products() {
   const { storeId, hydrated } = useActiveContext();
+  const { t } = useTranslation();
 
   const [products, setProducts] = useState<ProductWithUoms[]>([]);
   const [vatRates, setVatRates] = useState<VatRate[]>([]);
@@ -284,29 +281,29 @@ export default function Products() {
 
     try {
       const name = form.name.trim();
-      if (!name) throw new Error("Product name is required.");
+      if (!name) throw new Error(t("products.errNameRequired"));
 
       let sku = form.sku.trim() || null;
       if (!sku && form.mode === "new") {
         sku = await productsRepo.nextAutoSku(storeId);
       }
       if (!sku) {
-        throw new Error("SKU is required.");
+        throw new Error(t("products.errSkuRequired"));
       }
       const description = form.description.trim() || null;
 
       const barcode = form.barcode.trim();
 
       if (form.mode === "new" && !form.isService && !barcode) {
-        throw new Error("Barcode is required for stock products.");
+        throw new Error(t("products.errBarcodeRequired"));
       }
 
       if (barcode.length === 13 && /^\d+$/.test(barcode) && !isValidEan13(barcode)) {
-        throw new Error("EAN-13 checksum is invalid. Double-check the barcode.");
+        throw new Error(t("products.errEan13Invalid"));
       }
 
-      if (!form.vatRateId) throw new Error("VAT rate is required.");
-      if (!form.priceInput.trim()) throw new Error("Sale price is required.");
+      if (!form.vatRateId) throw new Error(t("products.errVatRequired"));
+      if (!form.priceInput.trim()) throw new Error(t("products.errPriceRequired"));
 
       const typedPriceCents = parseUsdInput(form.priceInput);
 
@@ -328,13 +325,18 @@ export default function Products() {
           : toIntInput(form.reorderPointInput);
 
       if (reorderPoint !== null && reorderPoint < 0) {
-        throw new Error("Reorder point cannot be negative.");
+        throw new Error(t("products.errReorderNegative"));
       }
 
-      const factor = validateFactor(
-        toIntInput(form.saleFactorNum, 1),
-        toIntInput(form.saleFactorDen, 1),
-      );
+      let factor: Factor;
+      try {
+        factor = validateFactor(
+          toIntInput(form.saleFactorNum, 1),
+          toIntInput(form.saleFactorDen, 1),
+        );
+      } catch {
+        throw new Error(t("products.errUomFactor"));
+      }
 
       const salePriceOverrideIncl = form.salePriceInput.trim()
         ? parseUsdInput(form.salePriceInput)
@@ -372,9 +374,9 @@ export default function Products() {
           salePriceInclVatCents: salePriceOverride.inclVatCents,
         });
 
-        setSaveOk("Product created.");
+        setSaveOk(t("products.createdOk"));
       } else {
-        if (!form.id) throw new Error("Missing product id.");
+        if (!form.id) throw new Error(t("products.errMissingId"));
 
         await productsRepo.update(form.id, {
           sku,
@@ -415,7 +417,7 @@ export default function Products() {
           });
         }
 
-        setSaveOk("Product updated.");
+        setSaveOk(t("products.updatedOk"));
       }
 
       await reload();
@@ -425,7 +427,7 @@ export default function Products() {
       }
     } catch (e) {
       if (e instanceof DuplicateSkuError) {
-        setSaveError("SKU already exists. Use a different SKU or leave it blank.");
+        setSaveError(t("products.errSkuDuplicate"));
       } else {
         setSaveError(e instanceof Error ? e.message : String(e));
       }
@@ -435,53 +437,51 @@ export default function Products() {
   }
 
   if (!hydrated) {
-    return <div className="text-sm text-slate-500">Loading products…</div>;
+    return <div className="text-sm text-slate-500">{t("products.loadingPage")}</div>;
   }
 
   return (
     <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
       <div className="space-y-6 xl:col-span-2">
         <div>
-          <h2 className="text-2xl font-semibold text-slate-900">Products</h2>
-          <p className="text-sm text-slate-600">
-            Create products, assign barcodes, set VAT pricing, and manage UoM.
-          </p>
+          <h2 className="text-2xl font-semibold text-slate-900">{t("products.title")}</h2>
+          <p className="text-sm text-slate-600">{t("products.subtitle")}</p>
         </div>
 
         <Card>
           <CardHeader
-            title="Product list"
+            title={t("products.listTitle")}
             subtitle={
               loading
-                ? "Loading…"
-                : `${filteredProducts.length} product${
-                    filteredProducts.length === 1 ? "" : "s"
-                  }`
+                ? t("common.loading")
+                : filteredProducts.length === 1
+                  ? t("products.countOne", { count: String(filteredProducts.length) })
+                  : t("products.countMany", { count: String(filteredProducts.length) })
             }
           />
 
           {loadError && (
             <div className="border-b border-red-200 bg-red-50 px-5 py-3 text-xs text-red-700">
-              Failed to load products: {loadError}
+              {t("products.loadFailed", { error: loadError })}
             </div>
           )}
 
           {filteredProducts.length === 0 && !loading && !loadError ? (
             <div className="px-5 py-8 text-center text-sm text-slate-500">
-              No products yet. Create your first product on the right.
+              {t("products.emptyState")}
             </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="min-w-full text-sm">
-                <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
                   <tr>
-                    <th className="px-5 py-2">Product</th>
-                    <th className="px-5 py-2">Barcode</th>
-                    <th className="px-5 py-2">VAT</th>
-                    <th className="px-5 py-2 text-right">Price</th>
-                    <th className="px-5 py-2 text-right">Cost</th>
-                    <th className="px-5 py-2 text-right">Stock</th>
-                    <th className="px-5 py-2">Status</th>
+                    <th className="px-5 py-2">{t("products.colProduct")}</th>
+                    <th className="px-5 py-2">{t("products.colBarcode")}</th>
+                    <th className="px-5 py-2">{t("products.colVat")}</th>
+                    <th className="px-5 py-2 text-right">{t("products.colPrice")}</th>
+                    <th className="px-5 py-2 text-right">{t("products.colCost")}</th>
+                    <th className="px-5 py-2 text-right">{t("products.colStock")}</th>
+                    <th className="px-5 py-2">{t("products.colStatus")}</th>
                     <th className="px-5 py-2"></th>
                   </tr>
                 </thead>
@@ -492,7 +492,7 @@ export default function Products() {
                       <td className="px-5 py-2">
                         <div className="font-medium text-slate-900">{p.name}</div>
                         <div className="text-xs text-slate-500">
-                          {p.sku ? `SKU ${p.sku}` : "No SKU"}
+                          {p.sku ? `SKU ${p.sku}` : t("products.noSku")}
                           {p.description ? ` · ${p.description}` : ""}
                         </div>
                       </td>
@@ -516,7 +516,9 @@ export default function Products() {
                       </td>
 
                       <td className="px-5 py-2 text-right tabular-nums text-slate-700">
-                        {getProductStockDisplay(p)}
+                        {p.isService
+                          ? t("products.serviceLabel")
+                          : `${p.quantityOnHand} ${p.baseUom.uomCode}`}
                       </td>
 
                       <td className="px-5 py-2">
@@ -528,13 +530,13 @@ export default function Products() {
                               : "bg-slate-200 text-slate-600",
                           )}
                         >
-                          {p.isActive ? "Active" : "Inactive"}
+                          {p.isActive ? t("products.active") : t("products.inactive")}
                         </span>
                       </td>
 
-                      <td className="px-5 py-2 text-right">
+                      <td className="px-5 py-2 text-end">
                         <Button variant="ghost" size="sm" onClick={() => editProduct(p)}>
-                          Edit
+                          {t("common.edit")}
                         </Button>
                       </td>
                     </tr>
@@ -550,15 +552,15 @@ export default function Products() {
         {showForm ? (
         <Card>
           <CardHeader
-            title={form.mode === "new" ? "New product" : "Edit product"}
+            title={form.mode === "new" ? t("products.formNewTitle") : t("products.formEditTitle")}
             subtitle={
               form.mode === "new"
-                ? "Add a stock product or service."
+                ? t("products.formNewSubtitle")
                 : selectedProduct?.name
             }
             actions={
               <Button variant="ghost" size="sm" onClick={closePanel}>
-                Cancel
+                {t("common.cancel")}
               </Button>
             }
           />
@@ -566,26 +568,26 @@ export default function Products() {
           <CardBody className="space-y-4">
             <div className="grid grid-cols-1 gap-3">
               <Input
-                label="Name"
+                label={t("products.fieldName")}
                 value={form.name}
                 onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-                placeholder="e.g. Coca-Cola 330ml"
+                placeholder={t("products.namePlaceholder")}
               />
 
               <Input
-                label="SKU"
+                label={t("products.fieldSku")}
                 value={form.sku}
                 onChange={(e) => setForm((f) => ({ ...f, sku: e.target.value }))}
-                placeholder={form.mode === "new" ? "Leave blank to auto-generate" : ""}
+                placeholder={form.mode === "new" ? t("products.skuPlaceholderNew") : ""}
               />
 
               <Input
-                label="Description"
+                label={t("products.fieldDescription")}
                 value={form.description}
                 onChange={(e) =>
                   setForm((f) => ({ ...f, description: e.target.value }))
                 }
-                placeholder="Optional"
+                placeholder={t("products.optionalPlaceholder")}
               />
 
               <label className="flex items-center gap-2 text-sm">
@@ -599,7 +601,7 @@ export default function Products() {
                     }))
                   }
                 />
-                <span>Service item — no inventory movement</span>
+                <span>{t("products.serviceItem")}</span>
               </label>
 
               {form.mode === "edit" && (
@@ -611,29 +613,29 @@ export default function Products() {
                       setForm((f) => ({ ...f, isActive: e.target.checked }))
                     }
                   />
-                  <span>Active</span>
+                  <span>{t("products.activeLabel")}</span>
                 </label>
               )}
             </div>
 
             <div className="rounded-md border border-slate-200 p-3">
               <div className="mb-2 text-sm font-medium text-slate-900">
-                Barcode
+                {t("products.barcodeSection")}
               </div>
 
               {form.mode === "new" ? (
                 <Input
-                  label={form.isService ? "Barcode (optional)" : "Barcode"}
+                  label={form.isService ? t("products.barcodeLabelOptional") : t("products.barcodeLabel")}
                   value={form.barcode}
                   onChange={(e) =>
                     setForm((f) => ({ ...f, barcode: e.target.value }))
                   }
-                  placeholder="Scan or type barcode"
+                  placeholder={t("products.barcodePlaceholder")}
                   hint={
                     form.barcode.length === 13 &&
                     /^\d+$/.test(form.barcode) &&
                     !isValidEan13(form.barcode)
-                      ? "EAN-13 checksum looks invalid."
+                      ? t("products.barcodeEanHint")
                       : undefined
                   }
                 />
@@ -644,12 +646,12 @@ export default function Products() {
 
             <div className="rounded-md border border-slate-200 p-3">
               <div className="mb-2 text-sm font-medium text-slate-900">
-                VAT and price
+                {t("products.vatSection")}
               </div>
 
               <div className="space-y-3">
                 <label className="block text-xs font-medium text-slate-700">
-                  VAT rate
+                  {t("products.vatRateLabel")}
                   <select
                     value={form.vatRateId}
                     onChange={(e) =>
@@ -674,7 +676,7 @@ export default function Products() {
                         setForm((f) => ({ ...f, vatPricingMode: "inclusive" }))
                       }
                     />
-                    VAT inclusive
+                    {t("products.vatInclusive")}
                   </label>
 
                   <label className="flex items-center gap-2 rounded-md border border-slate-200 p-2 text-sm">
@@ -685,15 +687,15 @@ export default function Products() {
                         setForm((f) => ({ ...f, vatPricingMode: "exclusive" }))
                       }
                     />
-                    VAT exclusive
+                    {t("products.vatExclusive")}
                   </label>
                 </div>
 
                 <Input
                   label={
                     form.vatPricingMode === "inclusive"
-                      ? "Sale price incl. VAT"
-                      : "Sale price excl. VAT"
+                      ? t("products.salePriceInclVat")
+                      : t("products.salePriceExclVat")
                   }
                   prefix="$"
                   inputMode="decimal"
@@ -706,15 +708,15 @@ export default function Products() {
 
                 {pricePreview && (
                   <div className="rounded bg-slate-50 p-2 text-xs text-slate-600">
-                    Excl VAT:{" "}
+                    {t("products.pricePreviewExcl")}{" "}
                     <span className="font-medium">
                       {formatUsd(pricePreview.excl)}
                     </span>{" "}
-                    · VAT:{" "}
+                    · {t("products.pricePreviewVat")}{" "}
                     <span className="font-medium">
                       {formatUsd(pricePreview.vat)}
                     </span>{" "}
-                    · Incl VAT:{" "}
+                    · {t("products.pricePreviewIncl")}{" "}
                     <span className="font-medium">
                       {formatUsd(pricePreview.incl)}
                     </span>
@@ -723,11 +725,11 @@ export default function Products() {
 
                 {form.mode === "edit" && selectedProduct && (
                   <div className="text-xs text-slate-500">
-                    Avg cost (excl. VAT):{" "}
+                    {t("products.avgCostLabel")}{" "}
                     <span className="font-medium text-slate-700">
                       {formatUsd(selectedProduct.avgCostExclVatCents)}
                     </span>
-                    <span className="ml-1 text-slate-400">— set by purchase receipts</span>
+                    <span className="ml-1 text-slate-400">{t("products.avgCostNote")}</span>
                   </div>
                 )}
               </div>
@@ -736,13 +738,13 @@ export default function Products() {
             {!form.isService && (
               <div className="rounded-md border border-slate-200 p-3">
                 <div className="mb-2 text-sm font-medium text-slate-900">
-                  Inventory
+                  {t("products.inventorySection")}
                 </div>
 
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <div className="mb-1 text-xs font-medium text-slate-700">
-                      Quantity on hand
+                      {t("products.qtyOnHand")}
                     </div>
                     <div className="text-sm text-slate-700">
                       {form.mode === "edit"
@@ -750,14 +752,14 @@ export default function Products() {
                         : 0}
                       {form.mode === "new" && (
                         <span className="ml-1 text-xs text-slate-400">
-                          — adjust via Inventory
+                          {t("products.adjustViaInventory")}
                         </span>
                       )}
                     </div>
                   </div>
 
                   <Input
-                    label="Reorder point"
+                    label={t("products.reorderPoint")}
                     inputMode="numeric"
                     value={form.reorderPointInput}
                     onChange={(e) =>
@@ -766,7 +768,7 @@ export default function Products() {
                         reorderPointInput: e.target.value,
                       }))
                     }
-                    placeholder="Optional"
+                    placeholder={t("products.optionalPlaceholder")}
                   />
                 </div>
               </div>
@@ -774,12 +776,12 @@ export default function Products() {
 
             <div className="rounded-md border border-slate-200 p-3">
               <div className="mb-2 text-sm font-medium text-slate-900">
-                Units of measure
+                {t("products.uomSection")}
               </div>
 
               <div className="space-y-3">
                 <label className="block text-xs font-medium text-slate-700">
-                  Stock unit
+                  {t("products.stockUnit")}
                   <select
                     value={form.baseUomCode}
                     disabled={form.mode === "edit"}
@@ -801,7 +803,7 @@ export default function Products() {
                 </label>
 
                 <label className="block text-xs font-medium text-slate-700">
-                  Selling unit
+                  {t("products.sellingUnit")}
                   <select
                     value={form.saleUomCode}
                     onChange={(e) =>
@@ -834,7 +836,7 @@ export default function Products() {
                   if (isSameUom) {
                     return (
                       <p className="text-xs text-slate-500">
-                        Selling unit is the same as stock unit.
+                        {t("products.sameUom")}
                       </p>
                     );
                   }
@@ -842,7 +844,7 @@ export default function Products() {
                   return (
                     <div className="space-y-1">
                       <label className="block text-xs font-medium text-slate-700">
-                        How many {baseUomName} are inside 1 {saleUomName}?
+                        {t("products.uomFactorLabel", { base: baseUomName, sale: saleUomName })}
                         <input
                           type="number"
                           inputMode="numeric"
@@ -861,12 +863,15 @@ export default function Products() {
                       </label>
                       {isSimple && qtyInt >= 1 ? (
                         <p className="text-xs text-slate-500">
-                          1 {saleUomName} = {form.saleFactorNum} {baseUomName}
+                          {t("products.uomFactorPreview", {
+                            sale: saleUomName,
+                            num: form.saleFactorNum,
+                            base: baseUomName,
+                          })}
                         </p>
                       ) : (
                         <p className="text-xs text-amber-600">
-                          This product has an advanced unit conversion. Saving a
-                          new quantity will convert it to the simple format.
+                          {t("products.uomAdvanced")}
                         </p>
                       )}
                     </div>
@@ -874,7 +879,7 @@ export default function Products() {
                 })()}
 
                 <Input
-                  label="Sale UoM price incl. VAT override"
+                  label={t("products.saleUomPriceLabel")}
                   prefix="$"
                   inputMode="decimal"
                   value={form.salePriceInput}
@@ -884,8 +889,8 @@ export default function Products() {
                       salePriceInput: e.target.value,
                     }))
                   }
-                  placeholder="Optional"
-                  hint="Leave empty to derive price from base price × factor."
+                  placeholder={t("products.optionalPlaceholder")}
+                  hint={t("products.saleUomPriceHint")}
                 />
               </div>
             </div>
@@ -909,10 +914,10 @@ export default function Products() {
               onClick={handleSave}
             >
               {saving
-                ? "Saving…"
+                ? t("products.saving")
                 : form.mode === "new"
-                  ? "Create product"
-                  : "Save changes"}
+                  ? t("products.createProduct")
+                  : t("products.saveChanges")}
             </Button>
           </CardBody>
         </Card>
@@ -922,7 +927,7 @@ export default function Products() {
               variant="secondary"
               onClick={() => setShowImport(true)}
             >
-              Import products
+              {t("products.importProducts")}
             </Button>
             <Button
               variant="primary"
@@ -931,7 +936,7 @@ export default function Products() {
                 setShowForm(true);
               }}
             >
-              New product
+              {t("products.newProduct")}
             </Button>
           </div>
         )}
