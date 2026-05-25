@@ -61,6 +61,11 @@ const ar: TranslationDict = {
 
     totalsTitle: "المجاميع",
     subtotalExclVat: "المجموع الفرعي (قبل الضريبة)",
+    discount: "خصم",
+    discountSectionTitle: "خصم",
+    discountPct: "نسبة الخصم %",
+    discountAmt: "مبلغ الخصم دولار",
+    subtotalBeforeDiscount: "المجموع (قبل الخصم)",
     vat: "ضريبة القيمة المضافة",
     totalInclVat: "المجموع (شامل الضريبة)",
     lbpEquivalent: "= ما يعادل بالليرة اللبنانية",

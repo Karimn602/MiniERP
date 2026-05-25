@@ -26,11 +26,12 @@ function totalCostCents(s: Sale): number {
 }
 
 function grossProfitCents(s: Sale): number {
-  return s.subtotalExclVatCents - s.discountCents - s.cogsTotalCents;
+  // subtotalExclVatCents is stored post-discount; discountCents is not subtracted again.
+  return s.subtotalExclVatCents - s.cogsTotalCents;
 }
 
 function profitMargin(s: Sale): string {
-  const netSales = s.subtotalExclVatCents - s.discountCents;
+  const netSales = s.subtotalExclVatCents; // already post-discount
   if (netSales <= 0) return "—";
   return `${Math.round((grossProfitCents(s) / netSales) * 1000) / 10}%`;
 }
@@ -102,7 +103,7 @@ export default function SalesHistory() {
     return sales.reduce(
       (acc, s) => {
         acc.total += s.totalInclVatCents;
-        acc.net += s.subtotalExclVatCents - s.discountCents;
+        acc.net += s.subtotalExclVatCents; // post-discount; do not subtract discountCents again
         acc.vat += s.vatTotalCents;
         acc.cost += totalCostCents(s);
         acc.profit += grossProfitCents(s);

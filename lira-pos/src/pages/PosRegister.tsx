@@ -92,6 +92,47 @@ function lineMathFor(product: ProductWithUoms, uom: ProductUom, qty: number): Sa
   });
 }
 
+// Allocate a sale-level discount proportionally across lines by incl-VAT weight.
+// Guarantees sum(result) === totalDiscountCents exactly via largest-remainder rounding.
+function allocateLineDiscounts(lines: CartLine[], totalDiscountCents: number): number[] {
+  if (lines.length === 0 || totalDiscountCents <= 0) return lines.map(() => 0);
+  const preTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
+  if (preTotal <= 0) return lines.map(() => 0);
+
+  const allocated = lines.map((l) =>
+    Math.floor((totalDiscountCents * l.math.lineTotalInclVatCents) / preTotal),
+  );
+
+  let remainder = totalDiscountCents - allocated.reduce((s, x) => s + x, 0);
+  if (remainder > 0) {
+    const sorted = lines
+      .map((l, i) => ({ i, total: l.math.lineTotalInclVatCents }))
+      .sort((a, b) => b.total - a.total);
+    let idx = 0;
+    while (remainder > 0) {
+      allocated[sorted[idx % sorted.length].i]++;
+      remainder--;
+      idx++;
+    }
+  }
+  return allocated;
+}
+
+// Back-calculate post-discount excl-VAT and VAT for a single line.
+// Returns values that always satisfy: subtotalExclVat + vat === totalInclVat.
+function postDiscountLineTotals(
+  lineTotalInclVat: number,
+  lineDiscountCents: number,
+  vatBps: number,
+): { subtotalExclVat: number; vat: number; totalInclVat: number } {
+  const discountedTotal = lineTotalInclVat - lineDiscountCents;
+  if (vatBps === 0) {
+    return { subtotalExclVat: discountedTotal, vat: 0, totalInclVat: discountedTotal };
+  }
+  const subtotalExclVat = Math.round((discountedTotal * 10000) / (10000 + vatBps));
+  return { subtotalExclVat, vat: discountedTotal - subtotalExclVat, totalInclVat: discountedTotal };
+}
+
 // ============================================================================
 // Page
 // ============================================================================
@@ -115,6 +156,11 @@ export default function PosRegister() {
   const [cashLbpInput, setCashLbpInput] = useState("");
   const [cardUsdInput, setCardUsdInput] = useState("");
   const [cogsMethod, setCogsMethod] = useState<CogsMethod>("weighted_average");
+
+  // Discount — two synced inputs (% and USD amount). Amount is authoritative.
+  // TODO: line-level discount UI is a future phase (sale_items.line_discount_cents exists).
+  const [discountPctInput, setDiscountPctInput] = useState("");
+  const [discountAmountInput, setDiscountAmountInput] = useState("");
 
   // Scan box
   const [scanInput, setScanInput] = useState("");
@@ -311,22 +357,87 @@ export default function PosRegister() {
     setCashUsdInput("");
     setCashLbpInput("");
     setCardUsdInput("");
+    setDiscountPctInput("");
+    setDiscountAmountInput("");
     setSubmitError(null);
     setScanError(null);
   }
 
-  // ----- Totals -----
-  const totals = useMemo(() => {
-    let subtotal = 0;
-    let vat = 0;
-    let total = 0;
-    for (const l of lines) {
-      subtotal += l.math.lineSubtotalExclVatCents;
-      vat += l.math.lineVatCents;
-      total += l.math.lineTotalInclVatCents;
+  // ----- Discount cents (derived from amount input; clamped so total stays ≥ 1 cent) -----
+  const discountCents = useMemo(() => {
+    const preTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
+    if (preTotal <= 0 || !discountAmountInput.trim()) return 0;
+    try {
+      const raw = parseUsdInput(discountAmountInput);
+      return Math.min(Math.max(raw, 0), Math.max(preTotal - 1, 0));
+    } catch {
+      return 0;
     }
-    return { subtotal, vat, total };
-  }, [lines]);
+  }, [discountAmountInput, lines]);
+
+  // ----- Discount input handlers (keep % and $ in sync) -----
+  function handleDiscountPctChange(value: string) {
+    setDiscountPctInput(value);
+    const preTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
+    const pct = parseFloat(value);
+    if (!isNaN(pct) && pct > 0 && preTotal > 0) {
+      const cents = Math.min(Math.floor((preTotal * pct) / 100), Math.max(preTotal - 1, 0));
+      setDiscountAmountInput(cents > 0 ? (cents / 100).toFixed(2) : "");
+    } else {
+      setDiscountAmountInput("");
+    }
+  }
+
+  function handleDiscountAmountChange(value: string) {
+    setDiscountAmountInput(value);
+    const preTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
+    if (!value.trim() || preTotal <= 0) {
+      setDiscountPctInput("");
+      return;
+    }
+    try {
+      const cents = parseUsdInput(value);
+      const clamped = Math.min(Math.max(cents, 0), Math.max(preTotal - 1, 0));
+      const pct = Math.round((clamped / preTotal) * 10000) / 100;
+      setDiscountPctInput(pct > 0 ? String(pct) : "");
+    } catch {
+      setDiscountPctInput("");
+    }
+  }
+
+  // ----- Totals (all post-discount) -----
+  const totals = useMemo(() => {
+    const preDiscountSubtotalExclVat = lines.reduce(
+      (s, l) => s + l.math.lineSubtotalExclVatCents, 0,
+    );
+    const preDiscountTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
+
+    const lineAllocations = allocateLineDiscounts(lines, discountCents);
+
+    let postDiscountSubtotalExclVat = 0;
+    let postDiscountVat = 0;
+    let postDiscountTotal = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+      const pd = postDiscountLineTotals(
+        lines[i].math.lineTotalInclVatCents,
+        lineAllocations[i],
+        lines[i].math.vatBps,
+      );
+      postDiscountSubtotalExclVat += pd.subtotalExclVat;
+      postDiscountVat += pd.vat;
+      postDiscountTotal += pd.totalInclVat;
+    }
+
+    return {
+      preDiscountSubtotalExclVat,
+      preDiscountTotal,
+      discount: discountCents,
+      postDiscountVat,
+      postDiscountTotal,
+      lineAllocations,
+    };
+  }, [lines, discountCents]);
 
   // Parse the three payment inputs into USD-cents equivalents.
   const payments = useMemo(() => {
@@ -377,10 +488,19 @@ export default function PosRegister() {
     };
   }, [cashUsdInput, cashLbpInput, cardUsdInput, rate, t]);
 
-  const remainingCents = totals.total - payments.totalPaidUsdCents;
-  const changeCents = payments.totalPaidUsdCents - totals.total;
+  const remainingCents = totals.postDiscountTotal - payments.totalPaidUsdCents;
+  const changeCents = payments.totalPaidUsdCents - totals.postDiscountTotal;
+
+  const allPaymentsEmpty =
+    cashUsdInput.trim() === "" &&
+    cashLbpInput.trim() === "" &&
+    cardUsdInput.trim() === "";
+  const isAutoPayMode = allPaymentsEmpty && lines.length > 0 && totals.postDiscountTotal > 0;
+
   const isFullyPaid =
-    lines.length > 0 && remainingCents <= 0 && payments.errors.length === 0;
+    lines.length > 0 &&
+    payments.errors.length === 0 &&
+    (isAutoPayMode || remainingCents <= 0);
 
   const canPost =
     !submitting &&
@@ -401,11 +521,11 @@ export default function PosRegister() {
       setSubmitError(payments.errors[0]);
       return;
     }
-    if (payments.totalPaidUsdCents < totals.total) {
+    if (!isAutoPayMode && payments.totalPaidUsdCents < totals.postDiscountTotal) {
       setSubmitError(
         t("pos.errUnderpaid", {
           tendered: formatUsd(payments.totalPaidUsdCents),
-          total: formatUsd(totals.total),
+          total: formatUsd(totals.postDiscountTotal),
         }),
       );
       return;
@@ -413,57 +533,79 @@ export default function PosRegister() {
 
     setSubmitting(true);
     try {
-      const linePayloads: Omit<PostSaleLineInput, "saleItemId">[] = lines.map((l) => ({
-        productId: l.product.id,
-        productNameSnapshot: l.product.name,
-        productSkuSnapshot: l.product.sku,
-        uomCodeSnapshot: l.uom.uomCode,
-        factorNumSnapshot: l.uom.factor.num,
-        factorDenSnapshot: l.uom.factor.den,
-        quantityInUom: l.math.quantityInUom,
-        quantityBase: l.math.quantityBase,
-        unitPriceExclVatCents: l.math.unitPriceExclVatCents,
-        unitPriceInclVatCents: l.math.unitPriceInclVatCents,
-        vatRateIdSnapshot: l.product.vatRateId,
-        vatRateBpsSnapshot: l.product.vatRate.rateBps,
-        lineSubtotalExclVatCents: l.math.lineSubtotalExclVatCents,
-        lineVatCents: l.math.lineVatCents,
-        lineTotalInclVatCents: l.math.lineTotalInclVatCents,
-        barcodeUsedSnapshot: l.barcodeUsed,
-        barcodeTypeSnapshot: l.barcodeType,
-        isService: l.product.isService,
-      }));
+      // Build post-discount line payloads. Line values sent to Rust are post-discount
+      // so that Rust sums produce the correct discounted header totals automatically.
+      const linePayloads: Omit<PostSaleLineInput, "saleItemId">[] = lines.map((l, i) => {
+        const lineDiscount = totals.lineAllocations[i];
+        const pd = postDiscountLineTotals(
+          l.math.lineTotalInclVatCents,
+          lineDiscount,
+          l.math.vatBps,
+        );
+        return {
+          productId: l.product.id,
+          productNameSnapshot: l.product.name,
+          productSkuSnapshot: l.product.sku,
+          uomCodeSnapshot: l.uom.uomCode,
+          factorNumSnapshot: l.uom.factor.num,
+          factorDenSnapshot: l.uom.factor.den,
+          quantityInUom: l.math.quantityInUom,
+          quantityBase: l.math.quantityBase,
+          unitPriceExclVatCents: l.math.unitPriceExclVatCents,
+          unitPriceInclVatCents: l.math.unitPriceInclVatCents,
+          vatRateIdSnapshot: l.product.vatRateId,
+          vatRateBpsSnapshot: l.product.vatRate.rateBps,
+          lineSubtotalExclVatCents: pd.subtotalExclVat,
+          lineVatCents: pd.vat,
+          lineTotalInclVatCents: pd.totalInclVat,
+          lineDiscountCents: lineDiscount,
+          barcodeUsedSnapshot: l.barcodeUsed,
+          barcodeTypeSnapshot: l.barcodeType,
+          isService: l.product.isService,
+        };
+      });
 
       const paymentPayloads: Omit<PostSalePaymentInput, "paymentId">[] = [];
-      if (payments.cashUsdCents > 0) {
+      if (isAutoPayMode) {
         paymentPayloads.push({
           method: "cash_usd",
           currency: "USD",
-          amountNativeUsdCents: payments.cashUsdCents,
+          amountNativeUsdCents: totals.postDiscountTotal,
           amountNativeLbp: 0,
-          amountUsdCentsEquivalent: payments.cashUsdCents,
+          amountUsdCentsEquivalent: totals.postDiscountTotal,
           reference: null,
         });
-      }
-      if (payments.cashLbp > 0) {
-        paymentPayloads.push({
-          method: "cash_lbp",
-          currency: "LBP",
-          amountNativeUsdCents: 0,
-          amountNativeLbp: payments.cashLbp,
-          amountUsdCentsEquivalent: payments.cashLbpAsUsdCents,
-          reference: null,
-        });
-      }
-      if (payments.cardUsdCents > 0) {
-        paymentPayloads.push({
-          method: "card_usd",
-          currency: "USD",
-          amountNativeUsdCents: payments.cardUsdCents,
-          amountNativeLbp: 0,
-          amountUsdCentsEquivalent: payments.cardUsdCents,
-          reference: null,
-        });
+      } else {
+        if (payments.cashUsdCents > 0) {
+          paymentPayloads.push({
+            method: "cash_usd",
+            currency: "USD",
+            amountNativeUsdCents: payments.cashUsdCents,
+            amountNativeLbp: 0,
+            amountUsdCentsEquivalent: payments.cashUsdCents,
+            reference: null,
+          });
+        }
+        if (payments.cashLbp > 0) {
+          paymentPayloads.push({
+            method: "cash_lbp",
+            currency: "LBP",
+            amountNativeUsdCents: 0,
+            amountNativeLbp: payments.cashLbp,
+            amountUsdCentsEquivalent: payments.cashLbpAsUsdCents,
+            reference: null,
+          });
+        }
+        if (payments.cardUsdCents > 0) {
+          paymentPayloads.push({
+            method: "card_usd",
+            currency: "USD",
+            amountNativeUsdCents: payments.cardUsdCents,
+            amountNativeLbp: 0,
+            amountUsdCentsEquivalent: payments.cardUsdCents,
+            reference: null,
+          });
+        }
       }
 
       const result = await salesRepo.post({
@@ -475,6 +617,7 @@ export default function PosRegister() {
         exchangeRateLbpPerUsd: rate.rateLbpPerUsd,
         notes: null,
         cogsMethod,
+        discountCents: totals.discount,
         lines: linePayloads,
         payments: paymentPayloads,
       });
@@ -488,6 +631,27 @@ export default function PosRegister() {
       setSubmitting(false);
     }
   }
+
+  // ----- F5 keyboard shortcut -----
+  const canPostRef = useRef(canPost);
+  canPostRef.current = canPost;
+  const receiptOpenRef = useRef(receiptSale !== null);
+  receiptOpenRef.current = receiptSale !== null;
+  const handlePostRef = useRef<() => Promise<void>>(() => Promise.resolve());
+  handlePostRef.current = handlePost;
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "F5") return;
+      if (e.repeat) return;
+      e.preventDefault();
+      if (receiptOpenRef.current) return;
+      if (!canPostRef.current) return;
+      void handlePostRef.current();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   // ============================================================================
   // Render
@@ -680,19 +844,61 @@ export default function PosRegister() {
         <div className="space-y-6">
           <Card>
             <CardHeader title={t("pos.totalsTitle")} />
-            <CardBody className="space-y-2 text-sm">
-              <TotalsRow label={t("pos.subtotalExclVat")} value={formatUsd(totals.subtotal)} />
-              <TotalsRow label={t("pos.vat")} value={formatUsd(totals.vat)} />
+            <CardBody className="space-y-3 text-sm">
+              {/* Discount inputs */}
+              <div>
+                <p className="mb-1.5 text-xs font-medium text-slate-600">
+                  {t("pos.discountSectionTitle")}
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="min-w-0">
+                    <Input
+                      label={t("pos.discountPct")}
+                      inputMode="decimal"
+                      placeholder="0"
+                      suffix="%"
+                      value={discountPctInput}
+                      onChange={(e) => handleDiscountPctChange(e.target.value)}
+                    />
+                  </div>
+                  <div className="min-w-0">
+                    <Input
+                      label={t("pos.discountAmt")}
+                      inputMode="decimal"
+                      placeholder="0.00"
+                      prefix="$"
+                      value={discountAmountInput}
+                      onChange={(e) => handleDiscountAmountChange(e.target.value)}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <TotalsRow
+                  label={t("pos.subtotalExclVat")}
+                  value={formatUsd(totals.preDiscountSubtotalExclVat)}
+                />
+                {totals.discount > 0 && (
+                  <TotalsRow
+                    label={t("pos.discount")}
+                    value={`-${formatUsd(totals.discount)}`}
+                    tone="warn"
+                  />
+                )}
+                <TotalsRow label={t("pos.vat")} value={formatUsd(totals.postDiscountVat)} />
+              </div>
+
               <div className="border-t border-slate-200 pt-2">
                 <TotalsRow
                   label={t("pos.totalInclVat")}
-                  value={formatUsd(totals.total)}
+                  value={formatUsd(totals.postDiscountTotal)}
                   strong
                 />
                 {rate && (
                   <TotalsRow
                     label={t("pos.lbpEquivalent")}
-                    value={formatLbp(usdCentsToLbp(totals.total, rate.rateLbpPerUsd))}
+                    value={formatLbp(usdCentsToLbp(totals.postDiscountTotal, rate.rateLbpPerUsd))}
                     muted
                   />
                 )}

@@ -181,6 +181,7 @@ export interface PostSaleLineInput {
   lineSubtotalExclVatCents: number;
   lineVatCents: number;
   lineTotalInclVatCents: number;
+  lineDiscountCents: number;
 
   barcodeUsedSnapshot: string | null;
   barcodeTypeSnapshot: string | null;
@@ -208,6 +209,7 @@ export interface PostSaleInput {
   exchangeRateLbpPerUsd: number;
   notes: string | null;
   cogsMethod: CogsMethod;
+  discountCents: number;
   lines: PostSaleLineInput[];
   payments: PostSalePaymentInput[];
 }

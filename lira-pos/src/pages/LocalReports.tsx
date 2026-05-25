@@ -17,8 +17,9 @@ function firstDayOfMonth(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
 }
 
-function calcGrossProfit(subtotal: number, discount: number, cogs: number): number {
-  return subtotal - discount - cogs;
+function calcGrossProfit(subtotal: number, cogs: number): number {
+  // subtotal is stored post-discount; discountCents is not subtracted again.
+  return subtotal - cogs;
 }
 
 function calcMargin(profit: number, netSales: number): string {
@@ -71,7 +72,7 @@ export default function LocalReports() {
 
   const summary = useMemo(() => {
     const revenue = dailySales.reduce((s, r) => s + r.totalInclVatCents, 0);
-    const net = dailySales.reduce((s, r) => s + r.subtotalExclVatCents - r.discountCents, 0);
+    const net = dailySales.reduce((s, r) => s + r.subtotalExclVatCents, 0); // post-discount
     const cogs = dailySales.reduce((s, r) => s + r.cogsTotalCents, 0);
     const purchases = dailyPurchases.reduce((s, r) => s + r.totalInclVatCents, 0);
     return { revenue, net, cogs, profit: net - cogs, purchases };
@@ -161,12 +162,8 @@ export default function LocalReports() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {dailySales.map((row) => {
-                  const net = row.subtotalExclVatCents - row.discountCents;
-                  const profit = calcGrossProfit(
-                    row.subtotalExclVatCents,
-                    row.discountCents,
-                    row.cogsTotalCents,
-                  );
+                  const net = row.subtotalExclVatCents; // post-discount
+                  const profit = calcGrossProfit(row.subtotalExclVatCents, row.cogsTotalCents);
                   return (
                     <tr key={row.localDate} className="hover:bg-slate-50">
                       <td className="px-5 py-2 text-slate-700">
@@ -229,12 +226,8 @@ export default function LocalReports() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {productSales.map((row) => {
-                  const net = row.lineSubtotalExclVatCents - row.lineDiscountCents;
-                  const profit = calcGrossProfit(
-                    row.lineSubtotalExclVatCents,
-                    row.lineDiscountCents,
-                    row.lineCogsCents,
-                  );
+                  const net = row.lineSubtotalExclVatCents; // post-discount
+                  const profit = calcGrossProfit(row.lineSubtotalExclVatCents, row.lineCogsCents);
                   return (
                     <tr key={row.productId} className="hover:bg-slate-50">
                       <td className="px-5 py-2">

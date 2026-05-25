@@ -70,11 +70,22 @@ export function ReceiptPrint({ sale, storeName }: ReceiptPrintProps) {
 
       {/* Totals */}
       <div className="space-y-0.5">
-        <ReceiptRow label="Subtotal (excl. VAT)" value={formatUsd(sale.subtotalExclVatCents)} />
-        {sale.discountCents > 0 && (
-          <ReceiptRow label="Discount" value={`-${formatUsd(sale.discountCents)}`} />
+        {sale.discountCents > 0 ? (
+          <>
+            {/* Pre-discount total shown as subtotal so customer sees: subtotal - discount = total */}
+            <ReceiptRow
+              label="Subtotal (before discount)"
+              value={formatUsd(sale.totalInclVatCents + sale.discountCents)}
+            />
+            <ReceiptRow label="Discount" value={`-${formatUsd(sale.discountCents)}`} />
+            <ReceiptRow label={vatLabel} value={formatUsd(sale.vatTotalCents)} />
+          </>
+        ) : (
+          <>
+            <ReceiptRow label="Subtotal (excl. VAT)" value={formatUsd(sale.subtotalExclVatCents)} />
+            <ReceiptRow label={vatLabel} value={formatUsd(sale.vatTotalCents)} />
+          </>
         )}
-        <ReceiptRow label={vatLabel} value={formatUsd(sale.vatTotalCents)} />
         <div className="flex justify-between font-bold">
           <span>TOTAL</span>
           <span>{formatUsd(sale.totalInclVatCents)}</span>

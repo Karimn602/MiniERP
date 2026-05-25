@@ -59,6 +59,11 @@ const en = {
 
     totalsTitle: "Totals",
     subtotalExclVat: "Subtotal (excl-VAT)",
+    discount: "Discount",
+    discountSectionTitle: "Discount",
+    discountPct: "Discount %",
+    discountAmt: "Discount USD",
+    subtotalBeforeDiscount: "Subtotal (before discount)",
     vat: "VAT",
     totalInclVat: "Total (incl-VAT)",
     lbpEquivalent: "= LBP equivalent",
