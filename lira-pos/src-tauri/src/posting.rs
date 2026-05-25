@@ -691,6 +691,9 @@ pub struct PostSalePayload {
 
     pub notes: Option<String>,
     pub cogs_method: String,
+    // Sale-level discount in USD cents (incl-VAT). JS allocates this
+    // proportionally across lines and sends post-discount line values.
+    pub discount_cents: i64,
     pub lines: Vec<PostSaleLine>,
     pub payments: Vec<PostSalePayment>,
 }
@@ -723,6 +726,8 @@ pub struct PostSaleLine {
     pub line_subtotal_excl_vat_cents: i64,
     pub line_vat_cents: i64,
     pub line_total_incl_vat_cents: i64,
+    // Proportional share of the header discount_cents allocated to this line.
+    pub line_discount_cents: i64,
 
     // Optional: which barcode was scanned to add the line (for the receipt).
     pub barcode_used_snapshot: Option<String>,
@@ -805,6 +810,10 @@ pub async fn post_sale(
         "weighted_average" | "last_purchase" => payload.cogs_method.as_str(),
         other => return Err(format!("Invalid COGS method: {}", other)),
     };
+
+    if payload.discount_cents < 0 {
+        return Err("discount_cents must be non-negative.".into());
+    }
 
     // ---- Validation: lines ----
     for (i, line) in payload.lines.iter().enumerate() {
@@ -1007,7 +1016,7 @@ pub async fn post_sale(
              subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
              discount_cents, cogs_total_cents, cogs_method,
              sale_type, status, posted_at, notes
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'normal', 'posted', ?, ?)"#,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal', 'posted', ?, ?)"#,
     )
     .bind(&payload.sale_id)
     .bind(&payload.store_id)
@@ -1020,6 +1029,7 @@ pub async fn post_sale(
     .bind(subtotal)
     .bind(vat_total)
     .bind(total)
+    .bind(payload.discount_cents)
     .bind(cogs_total)
     .bind(cogs_method)
     .bind(&now)
@@ -1049,7 +1059,7 @@ pub async fn post_sale(
                  barcode_used_snapshot, barcode_type_snapshot,
                  quantity_in_uom, uom_code_snapshot,
                  factor_num_snapshot, factor_den_snapshot
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&line.sale_item_id)
         .bind(&payload.sale_id)
@@ -1065,6 +1075,7 @@ pub async fn post_sale(
         .bind(line.line_subtotal_excl_vat_cents)
         .bind(line.line_vat_cents)
         .bind(line.line_total_incl_vat_cents)
+        .bind(line.line_discount_cents)
         .bind(unit_cogs_excl)
         .bind(line_cogs)
         .bind(&line.barcode_used_snapshot)
