@@ -12,10 +12,12 @@ import { parseRateInput, formatRate, formatUsd, usdCentsToLbp, formatLbp } from 
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
+import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 export default function ExchangeRate() {
   const { storeId, userId } = useActiveContext();
+  const { t } = useTranslation();
 
   const [current, setCurrent] = useState<ExchangeRate | null>(null);
   const [history, setHistory] = useState<ExchangeRate[]>([]);
@@ -70,16 +72,21 @@ export default function ExchangeRate() {
     }
   }, [rateInput]);
 
-  /** Soft warning if the new rate differs by >30% from the most recent rate. */
   const sanityWarning = useMemo(() => {
     if (!parsedRate || !current) return null;
     const diff = Math.abs(parsedRate - current.rateLbpPerUsd);
     const ratio = diff / current.rateLbpPerUsd;
     if (ratio < 0.3) return null;
-    const direction = parsedRate > current.rateLbpPerUsd ? "higher" : "lower";
-    const pct = Math.round(ratio * 100);
-    return `This rate is ${pct}% ${direction} than your last (${formatRate(current.rateLbpPerUsd)}). Double-check before saving.`;
-  }, [parsedRate, current]);
+    const direction = parsedRate > current.rateLbpPerUsd
+      ? t("exchangeRate.sanityHigher")
+      : t("exchangeRate.sanityLower");
+    const pct = String(Math.round(ratio * 100));
+    return t("exchangeRate.sanityWarning", {
+      pct,
+      direction,
+      last: formatRate(current.rateLbpPerUsd),
+    });
+  }, [parsedRate, current, t]);
 
   const preview = useMemo(() => {
     if (!parsedRate) return null;
@@ -119,15 +126,20 @@ export default function ExchangeRate() {
     }
   }
 
+  const historySubtitle = t(
+    history.length === 1 ? "exchangeRate.historyCountOne" : "exchangeRate.historyCountMany",
+    { count: String(history.length) },
+  );
+
   if (loading) {
-    return <div className="text-sm text-slate-500">Loading exchange rates…</div>;
+    return <div className="text-sm text-slate-500">{t("exchangeRate.loading")}</div>;
   }
 
   if (loadError) {
     return (
       <Card>
         <CardBody>
-          <p className="text-sm text-red-700">Failed to load: {loadError}</p>
+          <p className="text-sm text-red-700">{t("exchangeRate.loadFailed", { error: loadError })}</p>
         </CardBody>
       </Card>
     );
@@ -136,10 +148,8 @@ export default function ExchangeRate() {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-2xl font-semibold text-slate-900">Exchange Rate</h2>
-        <p className="text-sm text-slate-600">
-          Set the daily LBP / USD rate used by the POS for every sale today.
-        </p>
+        <h2 className="text-2xl font-semibold text-slate-900">{t("exchangeRate.title")}</h2>
+        <p className="text-sm text-slate-600">{t("exchangeRate.subtitle")}</p>
       </div>
 
       <StatusBanner status={status} current={current} />
@@ -148,15 +158,15 @@ export default function ExchangeRate() {
         <CardHeader
           title={
             status === "current"
-              ? "Update today's rate"
+              ? t("exchangeRate.formTitleUpdate")
               : status === "stale"
-                ? "Set today's rate"
-                : "Set the first rate"
+                ? t("exchangeRate.formTitleSet")
+                : t("exchangeRate.formTitleFirst")
           }
           subtitle={
             status === "current"
-              ? `You already have a rate for ${formatPrettyDate(today)}. Saving will overwrite it.`
-              : `New rate effective for ${formatPrettyDate(today)}.`
+              ? t("exchangeRate.formSubtitleOverwrite", { date: formatPrettyDate(today) })
+              : t("exchangeRate.formSubtitleNew", { date: formatPrettyDate(today) })
           }
           actions={
             status === "current" ? (
@@ -165,7 +175,7 @@ export default function ExchangeRate() {
                 size="sm"
                 onClick={() => setFormOpen((v) => !v)}
               >
-                {formOpen ? "Cancel" : "Update"}
+                {formOpen ? t("exchangeRate.cancel") : t("exchangeRate.update")}
               </Button>
             ) : null
           }
@@ -174,22 +184,22 @@ export default function ExchangeRate() {
           <CardBody className="space-y-4">
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               <Input
-                label="Rate (LBP per 1 USD)"
-                placeholder="e.g. 89500"
+                label={t("exchangeRate.rateLabel")}
+                placeholder={t("exchangeRate.ratePlaceholder")}
                 value={rateInput}
                 onChange={(e) => setRateInput(e.target.value)}
                 error={formError}
-                hint="Enter a whole number. No decimals."
-                suffix="L.L. / USD"
+                hint={t("exchangeRate.rateHint")}
+                suffix={t("exchangeRate.rateSuffix")}
                 inputMode="numeric"
                 autoFocus
               />
               <Input
-                label="Notes (optional)"
-                placeholder="e.g. Sayrafa morning fixing"
+                label={t("exchangeRate.notesLabel")}
+                placeholder={t("exchangeRate.notesPlaceholder")}
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
-                hint="Visible later in the history table."
+                hint={t("exchangeRate.notesHint")}
               />
             </div>
 
@@ -202,7 +212,7 @@ export default function ExchangeRate() {
             {preview && (
               <div className="rounded-md border border-slate-200 bg-slate-50 p-3">
                 <div className="mb-2 text-xs font-medium text-slate-600">
-                  Preview at {formatRate(parsedRate!)}
+                  {t("exchangeRate.previewAt", { rate: formatRate(parsedRate!) })}
                 </div>
                 <div className="grid grid-cols-3 gap-2 text-xs">
                   {preview.map((p) => (
@@ -224,13 +234,13 @@ export default function ExchangeRate() {
                 disabled={submitting || parsedRate === null}
               >
                 {submitting
-                  ? "Saving…"
+                  ? t("exchangeRate.saving")
                   : status === "current"
-                    ? "Update rate"
-                    : "Save rate"}
+                    ? t("exchangeRate.updateRate")
+                    : t("exchangeRate.saveRate")}
               </Button>
               {justSaved && (
-                <span className="text-sm text-emerald-700">✓ Saved</span>
+                <span className="text-sm text-emerald-700">{t("exchangeRate.justSaved")}</span>
               )}
             </div>
           </CardBody>
@@ -239,24 +249,24 @@ export default function ExchangeRate() {
 
       <Card>
         <CardHeader
-          title="Rate history"
-          subtitle={`${history.length} record${history.length === 1 ? "" : "s"}`}
+          title={t("exchangeRate.historyTitle")}
+          subtitle={historySubtitle}
         />
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
-            <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+            <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
               <tr>
-                <th className="px-5 py-2 font-medium">Effective date</th>
-                <th className="px-5 py-2 font-medium">Rate</th>
-                <th className="px-5 py-2 font-medium">Source</th>
-                <th className="px-5 py-2 font-medium">Notes</th>
+                <th className="px-5 py-2 font-medium">{t("exchangeRate.colEffectiveDate")}</th>
+                <th className="px-5 py-2 font-medium">{t("exchangeRate.colRate")}</th>
+                <th className="px-5 py-2 font-medium">{t("exchangeRate.colSource")}</th>
+                <th className="px-5 py-2 font-medium">{t("exchangeRate.colNotes")}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {history.length === 0 ? (
                 <tr>
                   <td colSpan={4} className="px-5 py-6 text-center text-sm text-slate-500">
-                    No rates yet. Set one above.
+                    {t("exchangeRate.historyEmpty")}
                   </td>
                 </tr>
               ) : (
@@ -294,14 +304,16 @@ function StatusBanner({
   status: "none" | "current" | "stale";
   current: ExchangeRate | null;
 }) {
+  const { t } = useTranslation();
+
   if (status === "none") {
     return (
       <div className="rounded-md border border-amber-200 bg-amber-50 p-4">
         <p className="text-sm font-medium text-amber-900">
-          No exchange rate is set yet.
+          {t("exchangeRate.statusNoneTitle")}
         </p>
         <p className="mt-1 text-xs text-amber-800">
-          You can't post sales until a rate exists. Set today's rate below to get started.
+          {t("exchangeRate.statusNoneBody")}
         </p>
       </div>
     );
@@ -313,13 +325,13 @@ function StatusBanner({
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm font-medium text-emerald-900">
-              Up to date — rate set for today
+              {t("exchangeRate.statusCurrentTitle")}
             </p>
             <p className="mt-1 text-xs text-emerald-800">
-              All sales today use this rate as the locked exchange rate.
+              {t("exchangeRate.statusCurrentBody")}
             </p>
           </div>
-          <div className="text-right">
+          <div className="text-end">
             <div className="text-xl font-semibold text-emerald-900">
               {formatRate(current.rateLbpPerUsd)}
             </div>
@@ -339,14 +351,14 @@ function StatusBanner({
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm font-medium text-orange-900">
-              Rate is stale — last set {relativeFromToday(current.effectiveDate)}
+              {t("exchangeRate.statusStaleTitle", { relative: relativeFromToday(current.effectiveDate) })}
             </p>
             <p className="mt-1 text-xs text-orange-800">
-              The POS is still using this rate. Update it below if it's changed.
-              {days >= 3 && " You haven't entered a new rate in a few days."}
+              {t("exchangeRate.statusStaleBody")}
+              {days >= 3 && ` ${t("exchangeRate.statusStaleDays")}`}
             </p>
           </div>
-          <div className="text-right">
+          <div className="text-end">
             <div className="text-xl font-semibold text-orange-900">
               {formatRate(current.rateLbpPerUsd)}
             </div>

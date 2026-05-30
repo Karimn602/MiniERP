@@ -8,6 +8,7 @@ import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { formatUsd } from "../lib/money";
 import { useNavigate } from "react-router-dom";
+import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 type SupplierBalanceSummary = {
@@ -18,6 +19,7 @@ type SupplierBalanceSummary = {
 export default function Suppliers() {
   const { storeId } = useActiveContext();
   const navigate = useNavigate();
+  const { t } = useTranslation();
 
   const [rows, setRows] = useState<Supplier[]>([]);
   const [balances, setBalances] = useState<Map<string, SupplierBalanceSummary>>(
@@ -64,30 +66,33 @@ export default function Suppliers() {
   }, [reload]);
 
   if (!storeId) {
-    return <div className="text-sm text-slate-500">Loading…</div>;
+    return <div className="text-sm text-slate-500">{t("common.loading")}</div>;
   }
+
+  const listSubtitle = loading
+    ? t("common.loading")
+    : t(rows.length === 1 ? "suppliers.countOne" : "suppliers.countMany", {
+        count: String(rows.length),
+      });
 
   return (
     <div className="space-y-6">
       <div className="flex items-start justify-between">
         <div>
-          <h2 className="text-2xl font-semibold text-slate-900">Suppliers</h2>
-
-          <p className="text-sm text-slate-600">
-            The vendors you buy from, and how much you owe each one.
-          </p>
+          <h2 className="text-2xl font-semibold text-slate-900">{t("suppliers.title")}</h2>
+          <p className="text-sm text-slate-600">{t("suppliers.subtitle")}</p>
         </div>
 
         <div className="flex items-center gap-3">
           {justSaved && (
-            <span className="text-sm text-emerald-700">✓ Supplier added</span>
+            <span className="text-sm text-emerald-700">{t("suppliers.supplierAdded")}</span>
           )}
 
           <Button
             variant={formOpen ? "ghost" : "primary"}
             onClick={() => setFormOpen((o) => !o)}
           >
-            {formOpen ? "Close form" : "New supplier"}
+            {formOpen ? t("suppliers.closeForm") : t("suppliers.newSupplier")}
           </Button>
         </div>
       </div>
@@ -106,12 +111,12 @@ export default function Suppliers() {
       )}
 
       <Card>
-        <CardHeader title="Filter" />
+        <CardHeader title={t("suppliers.filterTitle")} />
 
         <CardBody className="flex flex-col gap-3 md:flex-row md:items-end">
           <div className="flex-1">
             <Input
-              placeholder="Search by name, contact, phone, email…"
+              placeholder={t("suppliers.searchPlaceholder")}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
@@ -124,36 +129,32 @@ export default function Suppliers() {
               onChange={(e) => setIncludeInactive(e.target.checked)}
               className="rounded border-slate-300"
             />
-            Include inactive
+            {t("suppliers.includeInactive")}
           </label>
         </CardBody>
       </Card>
 
       <Card>
         <CardHeader
-          title="Suppliers"
-          subtitle={
-            loading
-              ? "Loading…"
-              : `${rows.length} ${rows.length === 1 ? "record" : "records"}`
-          }
+          title={t("suppliers.listTitle")}
+          subtitle={listSubtitle}
         />
 
         {rows.length === 0 && !loading ? (
           <CardBody>
             <div className="py-8 text-center text-sm text-slate-500">
-              No suppliers match.
+              {t("suppliers.noMatch")}
             </div>
           </CardBody>
         ) : (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
                 <tr>
-                  <th className="px-5 py-2 font-medium">Name</th>
-                  <th className="px-5 py-2 font-medium">Contact</th>
-                  <th className="px-5 py-2 font-medium">Phone</th>
-                  <th className="px-5 py-2 font-medium text-right">Balance owed</th>
+                  <th className="px-5 py-2 font-medium">{t("suppliers.colName")}</th>
+                  <th className="px-5 py-2 font-medium">{t("suppliers.colContact")}</th>
+                  <th className="px-5 py-2 font-medium">{t("suppliers.colPhone")}</th>
+                  <th className="px-5 py-2 font-medium text-end">{t("suppliers.colBalance")}</th>
                   <th className="px-5 py-2"></th>
                 </tr>
               </thead>
@@ -175,8 +176,8 @@ export default function Suppliers() {
                         {s.name}
 
                         {!s.isActive && (
-                          <span className="ml-2 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-600">
-                            Inactive
+                          <span className="ms-2 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-600">
+                            {t("suppliers.inactive")}
                           </span>
                         )}
                       </td>
@@ -191,7 +192,7 @@ export default function Suppliers() {
 
                       <td
                         className={clsx(
-                          "px-5 py-2 text-right font-medium",
+                          "px-5 py-2 text-end font-medium",
                           bal > 0
                             ? "text-red-700"
                             : bal < 0
@@ -202,7 +203,7 @@ export default function Suppliers() {
                         {bal === 0 ? "—" : formatUsd(bal)}
                       </td>
 
-                      <td className="px-5 py-2 text-right">
+                      <td className="px-5 py-2 text-end">
                         <Button
                           variant="ghost"
                           size="sm"
@@ -211,7 +212,7 @@ export default function Suppliers() {
                             void suppliersRepo.setActive(s.id, !s.isActive).then(reload);
                           }}
                         >
-                          {s.isActive ? "Deactivate" : "Reactivate"}
+                          {s.isActive ? t("suppliers.deactivate") : t("suppliers.reactivate")}
                         </Button>
                       </td>
                     </tr>
@@ -235,6 +236,7 @@ function NewSupplierForm({
   onCreated: () => void;
   onCancel: () => void;
 }) {
+  const { t } = useTranslation();
   const [name, setName] = useState("");
   const [contactName, setContactName] = useState("");
   const [phone, setPhone] = useState("");
@@ -245,7 +247,7 @@ function NewSupplierForm({
 
   async function handleSubmit() {
     if (!name.trim()) {
-      setError("Name is required.");
+      setError(t("suppliers.errNameRequired"));
       return;
     }
 
@@ -273,7 +275,7 @@ function NewSupplierForm({
   return (
     <Card>
       <CardHeader
-        title="New supplier"
+        title={t("suppliers.formNewTitle")}
         actions={
           <Button
             variant="ghost"
@@ -281,14 +283,14 @@ function NewSupplierForm({
             onClick={onCancel}
             disabled={submitting}
           >
-            Cancel
+            {t("common.cancel")}
           </Button>
         }
       />
 
       <CardBody className="space-y-3">
         <Input
-          label="Name *"
+          label={t("suppliers.fieldName")}
           value={name}
           onChange={(e) => setName(e.target.value)}
           autoFocus
@@ -296,19 +298,19 @@ function NewSupplierForm({
 
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           <Input
-            label="Contact name"
+            label={t("suppliers.fieldContactName")}
             value={contactName}
             onChange={(e) => setContactName(e.target.value)}
           />
 
           <Input
-            label="Phone"
+            label={t("suppliers.fieldPhone")}
             value={phone}
             onChange={(e) => setPhone(e.target.value)}
           />
 
           <Input
-            label="Email"
+            label={t("suppliers.fieldEmail")}
             type="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
@@ -316,7 +318,7 @@ function NewSupplierForm({
         </div>
 
         <Input
-          label="Notes"
+          label={t("suppliers.fieldNotes")}
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
         />
@@ -329,11 +331,11 @@ function NewSupplierForm({
 
         <div className="flex items-center gap-3 border-t border-slate-100 pt-3">
           <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
-            {submitting ? "Saving…" : "Save supplier"}
+            {submitting ? t("suppliers.saving") : t("suppliers.saveSupplier")}
           </Button>
 
           <Button variant="ghost" onClick={onCancel} disabled={submitting}>
-            Cancel
+            {t("common.cancel")}
           </Button>
         </div>
       </CardBody>

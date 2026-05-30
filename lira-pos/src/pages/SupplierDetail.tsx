@@ -9,11 +9,13 @@ import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { formatUsd, parseUsdInput } from "../lib/money";
 import { todayLocalDate } from "../lib/dates";
+import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 export default function SupplierDetail() {
   const { id } = useParams<{ id: string }>();
   const { storeId, userId } = useActiveContext();
+  const { t } = useTranslation();
 
   const [supplier, setSupplier] = useState<Supplier | null>(null);
   const [entries, setEntries] = useState<SupplierLedgerEntry[]>([]);
@@ -47,15 +49,15 @@ export default function SupplierDetail() {
   }, [reload]);
 
   if (loading) {
-    return <div className="text-sm text-slate-500">Loading…</div>;
+    return <div className="text-sm text-slate-500">{t("supplierDetail.loading")}</div>;
   }
 
   if (!supplier) {
     return (
       <div className="space-y-2">
-        <p className="text-sm text-slate-600">Supplier not found.</p>
+        <p className="text-sm text-slate-600">{t("supplierDetail.notFound")}</p>
         <Link to="/suppliers" className="text-sm text-brand underline">
-          ← Back to suppliers
+          {t("supplierDetail.backToSuppliers")}
         </Link>
       </div>
     );
@@ -66,7 +68,7 @@ export default function SupplierDetail() {
       <div className="flex items-start justify-between">
         <div>
           <Link to="/suppliers" className="text-xs text-brand hover:underline">
-            ← All suppliers
+            {t("supplierDetail.allSuppliers")}
           </Link>
 
           <h2 className="mt-1 text-2xl font-semibold text-slate-900">
@@ -80,9 +82,9 @@ export default function SupplierDetail() {
           </div>
         </div>
 
-        <div className="text-right">
+        <div className="text-end">
           <div className="text-xs uppercase tracking-wide text-slate-500">
-            Balance owed
+            {t("supplierDetail.balanceOwed")}
           </div>
 
           <div
@@ -99,7 +101,7 @@ export default function SupplierDetail() {
           </div>
 
           {balance < 0 && (
-            <div className="text-[10px] text-emerald-700">credit on file</div>
+            <div className="text-[10px] text-emerald-700">{t("supplierDetail.creditOnFile")}</div>
           )}
         </div>
       </div>
@@ -109,11 +111,11 @@ export default function SupplierDetail() {
           variant={formOpen ? "ghost" : "primary"}
           onClick={() => setFormOpen((o) => !o)}
         >
-          {formOpen ? "Close form" : "Record entry"}
+          {formOpen ? t("supplierDetail.closeForm") : t("supplierDetail.recordEntry")}
         </Button>
 
         {justSaved && (
-          <span className="text-sm text-emerald-700">✓ Entry posted</span>
+          <span className="text-sm text-emerald-700">{t("supplierDetail.entryPosted")}</span>
         )}
       </div>
 
@@ -134,26 +136,25 @@ export default function SupplierDetail() {
 
       <Card>
         <CardHeader
-          title="Ledger"
-          subtitle="Append-only. Mistakes are fixed by posting a correcting entry."
+          title={t("supplierDetail.ledgerTitle")}
+          subtitle={t("supplierDetail.ledgerSubtitle")}
         />
 
         {entries.length === 0 ? (
           <CardBody>
             <div className="py-8 text-center text-sm text-slate-500">
-              No activity yet. Posting a purchase from this supplier — or a
-              payment recorded here — will appear.
+              {t("supplierDetail.ledgerEmpty")}
             </div>
           </CardBody>
         ) : (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
                 <tr>
-                  <th className="px-5 py-2 font-medium">Date</th>
-                  <th className="px-5 py-2 font-medium">Type</th>
-                  <th className="px-5 py-2 font-medium">Notes</th>
-                  <th className="px-5 py-2 font-medium text-right">Amount</th>
+                  <th className="px-5 py-2 font-medium">{t("supplierDetail.colDate")}</th>
+                  <th className="px-5 py-2 font-medium">{t("supplierDetail.colType")}</th>
+                  <th className="px-5 py-2 font-medium">{t("supplierDetail.colNotes")}</th>
+                  <th className="px-5 py-2 font-medium text-end">{t("supplierDetail.colAmount")}</th>
                 </tr>
               </thead>
 
@@ -173,14 +174,14 @@ export default function SupplierDetail() {
 
                       {e.relatedPaymentId && (
                         <div className="text-[10px] text-slate-500">
-                          payment: {e.relatedPaymentId}
+                          {t("supplierDetail.paymentRefLabel")} {e.relatedPaymentId}
                         </div>
                       )}
                     </td>
 
                     <td
                       className={clsx(
-                        "px-5 py-2 text-right font-medium",
+                        "px-5 py-2 text-end font-medium",
                         e.amountSignedCents > 0
                           ? "text-red-700"
                           : "text-emerald-700",
@@ -201,34 +202,19 @@ export default function SupplierDetail() {
 }
 
 function EntryBadge({ type }: { type: LedgerEntryType }) {
-  const meta: Record<LedgerEntryType, { label: string; className: string }> = {
-    purchase: {
-      label: "purchase",
-      className: "bg-slate-200 text-slate-700",
-    },
-    payment: {
-      label: "payment",
-      className: "bg-emerald-100 text-emerald-800",
-    },
-    credit_note: {
-      label: "credit note",
-      className: "bg-teal-100 text-teal-800",
-    },
-    opening_balance: {
-      label: "opening balance",
-      className: "bg-indigo-100 text-indigo-800",
-    },
-    adjustment: {
-      label: "adjustment",
-      className: "bg-amber-100 text-amber-800",
-    },
+  const { t } = useTranslation();
+
+  const classNames: Record<LedgerEntryType, string> = {
+    purchase: "bg-slate-200 text-slate-700",
+    payment: "bg-emerald-100 text-emerald-800",
+    credit_note: "bg-teal-100 text-teal-800",
+    opening_balance: "bg-indigo-100 text-indigo-800",
+    adjustment: "bg-amber-100 text-amber-800",
   };
 
-  const m = meta[type];
-
   return (
-    <span className={clsx("rounded px-2 py-0.5 text-xs font-medium", m.className)}>
-      {m.label}
+    <span className={clsx("rounded px-2 py-0.5 text-xs font-medium", classNames[type])}>
+      {t(`supplierDetail.entryType.${type}` as Parameters<typeof t>[0])}
     </span>
   );
 }
@@ -246,6 +232,7 @@ function RecordEntryForm({
   onPosted: () => void;
   onCancel: () => void;
 }) {
+  const { t } = useTranslation();
   type Kind = "payment" | "credit_note" | "opening_balance" | "adjustment";
 
   const [kind, setKind] = useState<Kind>("payment");
@@ -265,12 +252,12 @@ function RecordEntryForm({
     try {
       amountCents = parseUsdInput(amountInput);
     } catch {
-      setError("Enter a valid amount.");
+      setError(t("supplierDetail.errInvalidAmount"));
       return;
     }
 
     if (amountCents <= 0) {
-      setError("Amount must be positive.");
+      setError(t("supplierDetail.errAmountPositive"));
       return;
     }
 
@@ -293,7 +280,7 @@ function RecordEntryForm({
         signed = adjustmentSign === "+" ? amountCents : -amountCents;
 
         if (!notes.trim()) {
-          setError("Adjustment requires a reason in Notes.");
+          setError(t("supplierDetail.errAdjustmentReason"));
           return;
         }
 
@@ -323,11 +310,18 @@ function RecordEntryForm({
     }
   }
 
+  const kindLabels: Record<Kind, string> = {
+    payment: t("supplierDetail.kindPayment"),
+    credit_note: t("supplierDetail.kindCreditNote"),
+    opening_balance: t("supplierDetail.kindOpeningBalance"),
+    adjustment: t("supplierDetail.kindAdjustment"),
+  };
+
   return (
     <Card>
       <CardHeader
-        title="Record entry"
-        subtitle="Payments, credit notes, opening balances, manual adjustments."
+        title={t("supplierDetail.formTitle")}
+        subtitle={t("supplierDetail.formSubtitle")}
         actions={
           <Button
             variant="ghost"
@@ -335,7 +329,7 @@ function RecordEntryForm({
             onClick={onCancel}
             disabled={submitting}
           >
-            Cancel
+            {t("common.cancel")}
           </Button>
         }
       />
@@ -343,7 +337,7 @@ function RecordEntryForm({
       <CardBody className="space-y-4">
         <div>
           <label className="mb-1 block text-xs font-medium text-slate-700">
-            Entry type
+            {t("supplierDetail.entryTypeLabel")}
           </label>
 
           <div className="inline-flex rounded-md border border-slate-300 bg-white p-0.5 shadow-sm">
@@ -360,13 +354,7 @@ function RecordEntryForm({
                       : "text-slate-600 hover:bg-slate-50",
                   )}
                 >
-                  {k === "payment"
-                    ? "Payment"
-                    : k === "credit_note"
-                      ? "Credit note"
-                      : k === "opening_balance"
-                        ? "Opening balance"
-                        : "Adjustment"}
+                  {kindLabels[k]}
                 </button>
               ),
             )}
@@ -376,7 +364,7 @@ function RecordEntryForm({
         <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-700">
-              Amount *
+              {t("supplierDetail.amountLabel")}
             </label>
 
             <div className="flex items-center gap-2">
@@ -391,7 +379,7 @@ function RecordEntryForm({
                         ? "bg-red-600 text-white"
                         : "text-slate-600 hover:bg-slate-50",
                     )}
-                    title="Increase what we owe"
+                    title={t("supplierDetail.increaseOwed")}
                   >
                     +
                   </button>
@@ -405,7 +393,7 @@ function RecordEntryForm({
                         ? "bg-emerald-600 text-white"
                         : "text-slate-600 hover:bg-slate-50",
                     )}
-                    title="Decrease what we owe"
+                    title={t("supplierDetail.decreaseOwed")}
                   >
                     −
                   </button>
@@ -421,7 +409,7 @@ function RecordEntryForm({
                   value={amountInput}
                   onChange={(e) => setAmountInput(e.target.value)}
                   placeholder="0.00"
-                  className="ml-1 flex-1 py-1.5 text-sm focus:outline-none"
+                  className="ms-1 flex-1 py-1.5 text-sm focus:outline-none"
                 />
               </div>
             </div>
@@ -429,15 +417,15 @@ function RecordEntryForm({
 
           <Input
             type="date"
-            label="Date *"
+            label={t("supplierDetail.dateLabel")}
             value={entryDate}
             onChange={(e) => setEntryDate(e.target.value)}
           />
 
           {(kind === "payment" || kind === "credit_note") && (
             <Input
-              label={kind === "payment" ? "Payment reference" : "Credit note ref"}
-              placeholder={kind === "payment" ? "Wire / check / cash" : "CM-001"}
+              label={kind === "payment" ? t("supplierDetail.paymentRef") : t("supplierDetail.creditNoteRef")}
+              placeholder={kind === "payment" ? t("supplierDetail.paymentRefPlaceholder") : t("supplierDetail.creditNoteRefPlaceholder")}
               value={paymentReference}
               onChange={(e) => setPaymentReference(e.target.value)}
             />
@@ -445,8 +433,8 @@ function RecordEntryForm({
         </div>
 
         <Input
-          label={kind === "adjustment" ? "Reason *" : "Notes"}
-          placeholder={kind === "adjustment" ? "Why is this adjustment needed?" : "Optional"}
+          label={kind === "adjustment" ? t("supplierDetail.reasonLabel") : t("supplierDetail.notesLabel")}
+          placeholder={kind === "adjustment" ? t("supplierDetail.reasonPlaceholder") : t("supplierDetail.optionalPlaceholder")}
           value={notes}
           onChange={(e) => setNotes(e.target.value)}
         />
@@ -459,11 +447,11 @@ function RecordEntryForm({
 
         <div className="flex items-center gap-3 border-t border-slate-100 pt-3">
           <Button variant="primary" onClick={handleSubmit} disabled={submitting}>
-            {submitting ? "Posting…" : "Post entry"}
+            {submitting ? t("supplierDetail.posting") : t("supplierDetail.postEntry")}
           </Button>
 
           <Button variant="ghost" onClick={onCancel} disabled={submitting}>
-            Cancel
+            {t("common.cancel")}
           </Button>
         </div>
       </CardBody>
