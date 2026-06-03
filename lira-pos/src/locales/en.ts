@@ -47,6 +47,11 @@ const en = {
     cartLinesCount: "{{count}} line(s)",
     clearCart: "Clear cart",
 
+    cartLabel: "Cart {{n}}",
+    newCart: "New cart",
+    closeCart: "Close cart",
+    confirmCloseCart: "This cart has items. Close it and discard them?",
+
     colProduct: "Product",
     colUom: "UoM",
     colUnitPrice: "Unit price (incl-VAT)",
@@ -69,12 +74,20 @@ const en = {
     lbpEquivalent: "= LBP equivalent",
 
     costMethodTitle: "Cost method",
-    costMethodSubtitle: "Choose how COGS/profit is calculated for this sale.",
+    costMethodSubtitle: "Choose how COGS/profit is calculated for sales.",
     weightedAverage: "Weighted average cost",
     weightedAverageDesc: "Uses the current average cost stored on each product.",
     lastPurchase: "Last purchase cost",
     lastPurchaseDesc:
       "Uses the most recent purchase/opening cost, falling back to average cost if unavailable.",
+
+    posSettings: "POS Settings",
+    setupTitle: "POS Register Setup",
+    setupSubtitle: "These settings are saved on this device.",
+    costingLabel: "Costing",
+    allowNegativeInventory: "Allow negative inventory",
+    allowNegativeInventoryHelp:
+      "Allow sales even when stock is not enough. Inventory may go below zero.",
 
     paymentTitle: "Payment",
     paymentSubtitle: "Mix any combination of USD and LBP.",

@@ -210,6 +210,7 @@ export interface PostSaleInput {
   notes: string | null;
   cogsMethod: CogsMethod;
   discountCents: number;
+  allowNegativeInventory: boolean;
   lines: PostSaleLineInput[];
   payments: PostSalePaymentInput[];
 }

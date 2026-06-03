@@ -694,6 +694,11 @@ pub struct PostSalePayload {
     // Sale-level discount in USD cents (incl-VAT). JS allocates this
     // proportionally across lines and sends post-discount line values.
     pub discount_cents: i64,
+    // When true, the per-line stock-availability guard is skipped so stock
+    // can be driven below zero. Stock is still decremented normally.
+    // Defaults to false for older payloads that omit the field.
+    #[serde(default)]
+    pub allow_negative_inventory: bool,
     pub lines: Vec<PostSaleLine>,
     pub payments: Vec<PostSalePayment>,
 }
@@ -955,7 +960,7 @@ pub async fn post_sale(
         }
         // Defense-in-depth: trust the DB's is_service, not the payload's.
         let is_service = is_service_db == 1;
-        if !is_service && line.quantity_base > qoh {
+        if !is_service && !payload.allow_negative_inventory && line.quantity_base > qoh {
             return Err(format!(
                 "Line {}: insufficient stock for \"{}\" (have {} {}, need {} {}).",
                 i + 1,

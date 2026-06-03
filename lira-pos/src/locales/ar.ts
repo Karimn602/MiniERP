@@ -49,6 +49,11 @@ const ar: TranslationDict = {
     cartLinesCount: "{{count}} سطر",
     clearCart: "تفريغ السلة",
 
+    cartLabel: "السلة {{n}}",
+    newCart: "سلة جديدة",
+    closeCart: "إغلاق السلة",
+    confirmCloseCart: "هذه السلة تحتوي على منتجات. هل تريد إغلاقها وتجاهلها؟",
+
     colProduct: "المنتج",
     colUom: "الوحدة",
     colUnitPrice: "سعر الوحدة (شامل الضريبة)",
@@ -72,13 +77,21 @@ const ar: TranslationDict = {
 
     costMethodTitle: "طريقة التكلفة",
     costMethodSubtitle:
-      "اختر كيفية حساب تكلفة البضاعة المباعة والربح لهذه المعاملة.",
+      "اختر كيفية حساب تكلفة البضاعة المباعة والربح للمبيعات.",
     weightedAverage: "متوسط التكلفة المرجح",
     weightedAverageDesc:
       "يستخدم متوسط التكلفة الحالي المخزن على كل منتج.",
     lastPurchase: "تكلفة آخر شراء",
     lastPurchaseDesc:
       "يستخدم تكلفة آخر شراء أو فتح الرصيد، مع الرجوع إلى متوسط التكلفة عند عدم التوفر.",
+
+    posSettings: "إعدادات نقطة البيع",
+    setupTitle: "إعدادات نقطة البيع",
+    setupSubtitle: "تُحفظ هذه الإعدادات على هذا الجهاز.",
+    costingLabel: "التكلفة",
+    allowNegativeInventory: "السماح بالمخزون السلبي",
+    allowNegativeInventoryHelp:
+      "السماح بالبيع حتى عند عدم توفر كمية كافية. قد يصبح المخزون أقل من صفر.",
 
     paymentTitle: "الدفع",
     paymentSubtitle: "يمكن الدمج بين الدولار والليرة اللبنانية.",

@@ -4,8 +4,8 @@
 //
 // Workflow:
 //   1. Cashier scans a barcode (Enter submits) or picks via the search box.
-//   2. The line is added to the cart, defaulting to qty=1 in the barcode's
-//      UoM (or the product's default sale UoM if no barcode was used).
+//   2. The line is added to the ACTIVE cart, defaulting to qty=1 in the
+//      barcode's UoM (or the product's default sale UoM if no barcode was used).
 //   3. Cashier may bump qty up/down or remove a line.
 //   4. Totals panel shows: subtotal excl-VAT, VAT, total incl-VAT, and the
 //      LBP equivalent at the LOCKED rate read on form open.
@@ -13,14 +13,22 @@
 //      Live: total paid (USD-equiv), remaining (USD + LBP), change (USD + LBP).
 //   6. Post Sale → one Rust call → success banner with receipt number.
 //
+// Multiple carts:
+//   The cashier can park a cart and serve another customer. Each cart keeps its
+//   own lines, discounts, and payment inputs. Scanning, F5-post, and posting
+//   always act on the ACTIVE cart only. Carts are persisted to localStorage so
+//   they survive page navigation within a session.
+//
+// POS setup (saved on this device via localStorage):
+//   - Costing method (weighted_average | last_purchase). Default: last_purchase.
+//   - Allow negative inventory (bool). Default: false.
+//
 // Business rules enforced here (defense-in-depth; backend also re-checks):
 //   - Only active products are sellable.
-//   - Stock products must have at least one barcode (the ProductPicker and
-//     findByScan path both rely on barcodes; products without any barcode
-//     simply will not surface in search the way scans do, and we double-
-//     check the primary barcode at add-time below).
+//   - Stock products must have at least one barcode.
 //   - quantity_in_uom must be a positive integer.
-//   - For stock products, quantity_base must not exceed quantity_on_hand.
+//   - For stock products, quantity_base must not exceed quantity_on_hand —
+//     UNLESS "Allow negative inventory" is enabled in POS setup.
 //   - Cannot post an empty cart.
 //   - LBP payments are blocked if there's no exchange rate set today.
 //   - Total paid (USD-equiv) must be >= total invoice.
@@ -78,6 +86,77 @@ interface CartLine {
   barcodeType: string | null;
   /** Live math; never null because qty defaults to 1 on add. */
   math: SaleLineMath;
+}
+
+// ============================================================================
+// Cart state — one per open/parked cart
+// ============================================================================
+
+interface CartState {
+  /** Stable id for React keys + active-cart selection. */
+  id: string;
+  /** Stable sequence number used for the "Cart N" label. */
+  seq: number;
+  lines: CartLine[];
+  cashUsdInput: string;
+  cashLbpInput: string;
+  cardUsdInput: string;
+  discountPctInput: string;
+  discountAmountInput: string;
+}
+
+function createEmptyCart(seq: number): CartState {
+  return {
+    id: newId(),
+    seq,
+    lines: [],
+    cashUsdInput: "",
+    cashLbpInput: "",
+    cardUsdInput: "",
+    discountPctInput: "",
+    discountAmountInput: "",
+  };
+}
+
+// ============================================================================
+// POS setup persistence (localStorage)
+// ============================================================================
+
+const COST_METHOD_KEY = "lira_pos_cost_method";
+const ALLOW_NEG_KEY = "lira_pos_allow_negative_inventory";
+const OPEN_CARTS_KEY = "lira_pos_open_carts";
+
+function loadCostMethod(): CogsMethod {
+  try {
+    return localStorage.getItem(COST_METHOD_KEY) === "weighted_average"
+      ? "weighted_average"
+      : "last_purchase"; // default for a fresh install / no saved value
+  } catch {
+    return "last_purchase";
+  }
+}
+
+function loadAllowNegative(): boolean {
+  try {
+    return localStorage.getItem(ALLOW_NEG_KEY) === "true"; // default false
+  } catch {
+    return false;
+  }
+}
+
+function loadOpenCarts(): CartState[] {
+  try {
+    const raw = localStorage.getItem(OPEN_CARTS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as CartState[];
+      if (Array.isArray(parsed) && parsed.length > 0 && parsed.every((c) => c && c.id)) {
+        return parsed;
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return [createEmptyCart(1)];
 }
 
 function lineMathFor(product: ProductWithUoms, uom: ProductUom, qty: number): SaleLineMath {
@@ -141,8 +220,51 @@ export default function PosRegister() {
   const { storeId, userId, hydrated } = useActiveContext();
   const { t } = useTranslation();
 
-  // Cart
-  const [lines, setLines] = useState<CartLine[]>([]);
+  // ----- Multi-cart state (loaded once from localStorage) -----
+  const initialCartsRef = useRef<CartState[] | null>(null);
+  if (initialCartsRef.current === null) initialCartsRef.current = loadOpenCarts();
+  const [carts, setCarts] = useState<CartState[]>(initialCartsRef.current);
+  const [activeCartId, setActiveCartId] = useState<string>(initialCartsRef.current[0].id);
+
+  const activeCart = useMemo(
+    () => carts.find((c) => c.id === activeCartId) ?? carts[0],
+    [carts, activeCartId],
+  );
+
+  // Convenience views into the active cart.
+  const lines = activeCart.lines;
+  const { cashUsdInput, cashLbpInput, cardUsdInput, discountPctInput, discountAmountInput } =
+    activeCart;
+
+  // Persist carts (survives page navigation within a session).
+  useEffect(() => {
+    try {
+      localStorage.setItem(OPEN_CARTS_KEY, JSON.stringify(carts));
+    } catch {
+      /* ignore */
+    }
+  }, [carts]);
+
+  // ----- POS setup -----
+  const [costMethod, setCostMethod] = useState<CogsMethod>(loadCostMethod);
+  const [allowNegativeInventory, setAllowNegativeInventory] = useState<boolean>(loadAllowNegative);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(COST_METHOD_KEY, costMethod);
+    } catch {
+      /* ignore */
+    }
+  }, [costMethod]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ALLOW_NEG_KEY, String(allowNegativeInventory));
+    } catch {
+      /* ignore */
+    }
+  }, [allowNegativeInventory]);
 
   // Active shift — null = no open shift; undefined = still loading
   const [activeShift, setActiveShift] = useState<Shift | null | undefined>(undefined);
@@ -150,17 +272,6 @@ export default function PosRegister() {
   // Exchange rate (read once on mount; locked into the sale at post time).
   const [rate, setRate] = useState<ExchangeRate | null>(null);
   const [rateError, setRateError] = useState<string | null>(null);
-
-  // Payments — three independent inputs. Empty string = "not entered".
-  const [cashUsdInput, setCashUsdInput] = useState("");
-  const [cashLbpInput, setCashLbpInput] = useState("");
-  const [cardUsdInput, setCardUsdInput] = useState("");
-  const [cogsMethod, setCogsMethod] = useState<CogsMethod>("weighted_average");
-
-  // Discount — two synced inputs (% and USD amount). Amount is authoritative.
-  // TODO: line-level discount UI is a future phase (sale_items.line_discount_cents exists).
-  const [discountPctInput, setDiscountPctInput] = useState("");
-  const [discountAmountInput, setDiscountAmountInput] = useState("");
 
   // Scan box
   const [scanInput, setScanInput] = useState("");
@@ -178,6 +289,44 @@ export default function PosRegister() {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [receiptSale, setReceiptSale] = useState<SaleWithDetails | null>(null);
+
+  // ----- Active-cart mutation helpers -----
+  const updateActiveCart = useCallback(
+    (updater: (c: CartState) => CartState) => {
+      setCarts((prev) => prev.map((c) => (c.id === activeCartId ? updater(c) : c)));
+    },
+    [activeCartId],
+  );
+
+  const setLines = useCallback(
+    (updater: (prev: CartLine[]) => CartLine[]) => {
+      setCarts((prev) =>
+        prev.map((c) => (c.id === activeCartId ? { ...c, lines: updater(c.lines) } : c)),
+      );
+    },
+    [activeCartId],
+  );
+
+  const setCashUsdInput = useCallback(
+    (v: string) => updateActiveCart((c) => ({ ...c, cashUsdInput: v })),
+    [updateActiveCart],
+  );
+  const setCashLbpInput = useCallback(
+    (v: string) => updateActiveCart((c) => ({ ...c, cashLbpInput: v })),
+    [updateActiveCart],
+  );
+  const setCardUsdInput = useCallback(
+    (v: string) => updateActiveCart((c) => ({ ...c, cardUsdInput: v })),
+    [updateActiveCart],
+  );
+  const setDiscountPctInput = useCallback(
+    (v: string) => updateActiveCart((c) => ({ ...c, discountPctInput: v })),
+    [updateActiveCart],
+  );
+  const setDiscountAmountInput = useCallback(
+    (v: string) => updateActiveCart((c) => ({ ...c, discountAmountInput: v })),
+    [updateActiveCart],
+  );
 
   useEffect(() => {
     if (!storeId || !hydrated) return;
@@ -246,7 +395,8 @@ export default function PosRegister() {
   }
 
   /**
-   * Core cart-add logic. Reusable from scan and search paths.
+   * Core cart-add logic. Reusable from scan and search paths. Operates on the
+   * ACTIVE cart only.
    *
    * Rules:
    *   - Active products only.
@@ -254,7 +404,8 @@ export default function PosRegister() {
    *     (catalog policy: "barcode-first" for stock items).
    *   - If the same (product, uom) is already in the cart, bump its qty
    *     by 1 rather than adding a duplicate row.
-   *   - Stock cap: refuse to push qty_base beyond product.quantity_on_hand.
+   *   - Stock cap: refuse to push qty_base beyond product.quantity_on_hand,
+   *     UNLESS "Allow negative inventory" is enabled in POS setup.
    */
   function addProductToCart(
     product: ProductWithUoms,
@@ -279,7 +430,7 @@ export default function PosRegister() {
         const next = prev.slice();
         const newQty = next[existingIdx].quantityInUom + 1;
         const probedBase = (newQty * uom.factor.num) / uom.factor.den;
-        if (!product.isService && probedBase > product.quantityOnHand) {
+        if (!allowNegativeInventory && !product.isService && probedBase > product.quantityOnHand) {
           setScanError(
             t("pos.errStockExceeded", {
               qty: String(product.quantityOnHand),
@@ -299,7 +450,7 @@ export default function PosRegister() {
 
       // New line. Default qty = 1.
       const math = lineMathFor(product, uom, 1);
-      if (!product.isService && math.quantityBase > product.quantityOnHand) {
+      if (!allowNegativeInventory && !product.isService && math.quantityBase > product.quantityOnHand) {
         setScanError(
           t("pos.errStockExceeded", {
             qty: String(product.quantityOnHand),
@@ -329,7 +480,7 @@ export default function PosRegister() {
         if (l.draftId !== draftId) return l;
         if (!Number.isInteger(newQty) || newQty <= 0) return l;
         const probedBase = (newQty * l.uom.factor.num) / l.uom.factor.den;
-        if (!l.product.isService && probedBase > l.product.quantityOnHand) {
+        if (!allowNegativeInventory && !l.product.isService && probedBase > l.product.quantityOnHand) {
           setScanError(
             t("pos.errStockExceeded", {
               qty: String(l.product.quantityOnHand),
@@ -352,15 +503,54 @@ export default function PosRegister() {
     setLines((prev) => prev.filter((l) => l.draftId !== draftId));
   }
 
-  function clearCart() {
-    setLines([]);
-    setCashUsdInput("");
-    setCashLbpInput("");
-    setCardUsdInput("");
-    setDiscountPctInput("");
-    setDiscountAmountInput("");
+  // Clear the ACTIVE cart's contents (lines, discounts, payments).
+  function clearActiveCart() {
+    updateActiveCart((c) => ({
+      ...c,
+      lines: [],
+      cashUsdInput: "",
+      cashLbpInput: "",
+      cardUsdInput: "",
+      discountPctInput: "",
+      discountAmountInput: "",
+    }));
     setSubmitError(null);
     setScanError(null);
+  }
+
+  // ----- Multi-cart controls -----
+  function switchCart(id: string) {
+    if (id === activeCartId) return;
+    setActiveCartId(id);
+    setSubmitError(null);
+    setScanError(null);
+    focusScanInput();
+  }
+
+  function addCart() {
+    const nextSeq = carts.reduce((m, c) => Math.max(m, c.seq), 0) + 1;
+    const cart = createEmptyCart(nextSeq);
+    setCarts((prev) => [...prev, cart]);
+    setActiveCartId(cart.id);
+    setSubmitError(null);
+    setScanError(null);
+    focusScanInput();
+  }
+
+  function closeCart(id: string) {
+    if (carts.length <= 1) return; // never delete the only remaining cart
+    const cart = carts.find((c) => c.id === id);
+    if (!cart) return;
+    if (cart.lines.length > 0 && !window.confirm(t("pos.confirmCloseCart"))) return;
+
+    const remaining = carts.filter((c) => c.id !== id);
+    setCarts(remaining);
+    if (id === activeCartId) {
+      setActiveCartId(remaining[0].id);
+      setSubmitError(null);
+      setScanError(null);
+      focusScanInput();
+    }
   }
 
   // ----- Discount cents (derived from amount input; clamped so total stays ≥ 1 cent) -----
@@ -509,7 +699,7 @@ export default function PosRegister() {
     rate !== null &&
     !!activeShift;
 
-  // ----- Post -----
+  // ----- Post (active cart only) -----
   async function handlePost() {
     if (!storeId || !rate || !activeShift) return;
     setSubmitError(null);
@@ -616,20 +806,32 @@ export default function PosRegister() {
         exchangeRateId: rate.id,
         exchangeRateLbpPerUsd: rate.rateLbpPerUsd,
         notes: null,
-        cogsMethod,
+        cogsMethod: costMethod,
         discountCents: totals.discount,
+        allowNegativeInventory,
         lines: linePayloads,
         payments: paymentPayloads,
       });
 
       const details = await salesRepo.findByIdWithDetails(result.saleId);
-      clearCart();
+      clearActiveCart();
       setReceiptSale(details);
     } catch (e) {
       setSubmitError(e instanceof Error ? e.message : String(e));
     } finally {
       setSubmitting(false);
     }
+  }
+
+  // ----- New sale (after receipt): hop to a parked cart if the current one is empty -----
+  function handleNewSale() {
+    setReceiptSale(null);
+    const act = carts.find((c) => c.id === activeCartId);
+    if (act && act.lines.length === 0) {
+      const parked = carts.find((c) => c.id !== activeCartId && c.lines.length > 0);
+      if (parked) setActiveCartId(parked.id);
+    }
+    focusScanInput();
   }
 
   // ----- F5 keyboard shortcut -----
@@ -661,23 +863,35 @@ export default function PosRegister() {
     return <div className="text-sm text-slate-500">{t("pos.loadingRegister")}</div>;
   }
 
+  const costingMethodLabel =
+    costMethod === "weighted_average" ? t("pos.weightedAverage") : t("pos.lastPurchase");
+
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 className="text-2xl font-semibold text-slate-900">{t("pos.title")}</h2>
           <p className="text-sm text-slate-600">{t("pos.subtitle")}</p>
         </div>
-        {rate ? (
+        <div className="flex flex-wrap items-center gap-2">
+          {rate ? (
+            <div className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-sm">
+              <span className="font-medium text-slate-800">{t("pos.rateLocked")}</span>{" "}
+              {formatRate(rate.rateLbpPerUsd)}
+            </div>
+          ) : (
+            <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-800">
+              {t("pos.noExchangeRate")}
+            </div>
+          )}
           <div className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-sm">
-            <span className="font-medium text-slate-800">{t("pos.rateLocked")}</span>{" "}
-            {formatRate(rate.rateLbpPerUsd)}
+            <span className="font-medium text-slate-800">{t("pos.costingLabel")}:</span>{" "}
+            {costingMethodLabel}
           </div>
-        ) : (
-          <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-800">
-            {t("pos.noExchangeRate")}
-          </div>
-        )}
+          <Button variant="secondary" size="sm" onClick={() => setSettingsOpen(true)}>
+            {t("pos.posSettings")}
+          </Button>
+        </div>
       </div>
 
       {/* Shift warning */}
@@ -703,16 +917,88 @@ export default function PosRegister() {
               <Button variant="primary" className="flex-1" onClick={() => window.print()}>
                 {t("pos.printReceipt")}
               </Button>
-              <Button
-                variant="ghost"
-                className="flex-1"
-                onClick={() => {
-                  setReceiptSale(null);
-                  focusScanInput();
-                }}
-              >
+              <Button variant="ghost" className="flex-1" onClick={handleNewSale}>
                 {t("pos.newSale")}
               </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* POS Register setup drawer */}
+      {settingsOpen && (
+        <div
+          className="fixed inset-0 z-40 flex justify-end bg-black/30 print:hidden"
+          onClick={() => setSettingsOpen(false)}
+        >
+          <div
+            className="h-full w-full max-w-sm overflow-y-auto border-slate-200 bg-white shadow-2xl ltr:border-l rtl:border-r"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-200 p-4">
+              <div>
+                <h3 className="text-lg font-semibold text-slate-900">{t("pos.setupTitle")}</h3>
+                <p className="text-xs text-slate-500">{t("pos.setupSubtitle")}</p>
+              </div>
+              <Button variant="ghost" size="sm" onClick={() => setSettingsOpen(false)}>
+                {t("common.close")}
+              </Button>
+            </div>
+
+            <div className="space-y-6 p-4">
+              {/* Costing method */}
+              <div className="space-y-2">
+                <div>
+                  <p className="text-sm font-medium text-slate-800">{t("pos.costMethodTitle")}</p>
+                  <p className="text-xs text-slate-500">{t("pos.costMethodSubtitle")}</p>
+                </div>
+                <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2 text-sm">
+                  <input
+                    type="radio"
+                    name="cogs-method"
+                    checked={costMethod === "weighted_average"}
+                    onChange={() => setCostMethod("weighted_average")}
+                    className="mt-1"
+                  />
+                  <span>
+                    <span className="block font-medium text-slate-800">{t("pos.weightedAverage")}</span>
+                    <span className="text-xs text-slate-500">{t("pos.weightedAverageDesc")}</span>
+                  </span>
+                </label>
+                <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2 text-sm">
+                  <input
+                    type="radio"
+                    name="cogs-method"
+                    checked={costMethod === "last_purchase"}
+                    onChange={() => setCostMethod("last_purchase")}
+                    className="mt-1"
+                  />
+                  <span>
+                    <span className="block font-medium text-slate-800">{t("pos.lastPurchase")}</span>
+                    <span className="text-xs text-slate-500">{t("pos.lastPurchaseDesc")}</span>
+                  </span>
+                </label>
+              </div>
+
+              {/* Allow negative inventory */}
+              <div className="border-t border-slate-200 pt-4">
+                <label className="flex items-start gap-3 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={allowNegativeInventory}
+                    onChange={(e) => setAllowNegativeInventory(e.target.checked)}
+                    className="mt-1 h-4 w-4"
+                  />
+                  <span>
+                    <span className="block font-medium text-slate-800">
+                      {t("pos.allowNegativeInventory")}
+                    </span>
+                    <span className="text-xs text-slate-500">
+                      {t("pos.allowNegativeInventoryHelp")}
+                    </span>
+                  </span>
+                </label>
+              </div>
             </div>
           </div>
         </div>
@@ -756,6 +1042,54 @@ export default function PosRegister() {
             </CardBody>
           </Card>
 
+          {/* Cart tabs */}
+          <div className="flex flex-wrap items-center gap-2">
+            {carts.map((c) => {
+              const isActive = c.id === activeCartId;
+              return (
+                <div
+                  key={c.id}
+                  className={clsx(
+                    "inline-flex items-center rounded-md border shadow-sm",
+                    isActive
+                      ? "border-brand bg-brand/5"
+                      : "border-slate-200 bg-white hover:bg-slate-50",
+                  )}
+                >
+                  <button
+                    type="button"
+                    onClick={() => switchCart(c.id)}
+                    className={clsx(
+                      "px-3 py-1.5 text-sm",
+                      isActive ? "font-semibold text-brand" : "text-slate-700",
+                    )}
+                  >
+                    {t("pos.cartLabel", { n: String(c.seq) })}
+                    {c.lines.length > 0 ? (
+                      <span className="tabular-nums"> ({c.lines.length})</span>
+                    ) : (
+                      <span className="text-slate-400"> · {t("pos.cartEmpty")}</span>
+                    )}
+                  </button>
+                  {carts.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => closeCart(c.id)}
+                      aria-label={t("pos.closeCart")}
+                      title={t("pos.closeCart")}
+                      className="px-2 py-1.5 text-slate-400 hover:text-red-600"
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+            <Button variant="secondary" size="sm" onClick={addCart}>
+              + {t("pos.newCart")}
+            </Button>
+          </div>
+
           <Card>
             <CardHeader
               title={t("pos.cartTitle")}
@@ -766,7 +1100,7 @@ export default function PosRegister() {
               }
               actions={
                 lines.length > 0 ? (
-                  <Button variant="ghost" onClick={() => { clearCart(); focusScanInput(); }}>
+                  <Button variant="ghost" onClick={() => { clearActiveCart(); focusScanInput(); }}>
                     {t("pos.clearCart")}
                   </Button>
                 ) : undefined
@@ -903,41 +1237,6 @@ export default function PosRegister() {
                   />
                 )}
               </div>
-            </CardBody>
-          </Card>
-
-          <Card>
-            <CardHeader
-              title={t("pos.costMethodTitle")}
-              subtitle={t("pos.costMethodSubtitle")}
-            />
-            <CardBody className="space-y-2 text-sm">
-              <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2">
-                <input
-                  type="radio"
-                  name="cogs-method"
-                  checked={cogsMethod === "weighted_average"}
-                  onChange={() => setCogsMethod("weighted_average")}
-                  className="mt-1"
-                />
-                <span>
-                  <span className="block font-medium text-slate-800">{t("pos.weightedAverage")}</span>
-                  <span className="text-xs text-slate-500">{t("pos.weightedAverageDesc")}</span>
-                </span>
-              </label>
-              <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2">
-                <input
-                  type="radio"
-                  name="cogs-method"
-                  checked={cogsMethod === "last_purchase"}
-                  onChange={() => setCogsMethod("last_purchase")}
-                  className="mt-1"
-                />
-                <span>
-                  <span className="block font-medium text-slate-800">{t("pos.lastPurchase")}</span>
-                  <span className="text-xs text-slate-500">{t("pos.lastPurchaseDesc")}</span>
-                </span>
-              </label>
             </CardBody>
           </Card>
 
