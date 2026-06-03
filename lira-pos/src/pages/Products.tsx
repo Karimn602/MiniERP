@@ -1,4 +1,5 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
+import clsx from "clsx";
 import { useActiveContext } from "../state/activeContext";
 import { productsRepo, DuplicateSkuError } from "../db/repos/products";
 import { vatRatesRepo } from "../db/repos/vatRates";
@@ -12,13 +13,15 @@ import type {
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
+import { PageHeader } from "../components/ui/PageHeader";
+import { EmptyState } from "../components/ui/EmptyState";
+import { Badge } from "../components/ui/Badge";
 import { BarcodeManager } from "../components/BarcodeManager";
 import { formatUsd, parseUsdInput } from "../lib/money";
 import { addVat, stripVat } from "../lib/vat";
 import { classifyBarcode as inferBarcodeType, isValidEan13 } from "../lib/barcode";
 import { gcd, makeFactor, type Factor } from "../lib/uom";
 import { useTranslation } from "../lib/i18n";
-import clsx from "clsx";
 
 type ProductMode = "new" | "edit";
 
@@ -441,14 +444,36 @@ export default function Products() {
   }
 
   return (
-    <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-      <div className="space-y-6 xl:col-span-2">
-        <div>
-          <h2 className="text-2xl font-semibold text-slate-900">{t("products.title")}</h2>
-          <p className="text-sm text-slate-600">{t("products.subtitle")}</p>
-        </div>
+    <div className="space-y-6">
+      <PageHeader
+        title={t("products.title")}
+        subtitle={t("products.subtitle")}
+        actions={
+          <>
+            <Button variant="secondary" onClick={() => setShowImport(true)}>
+              {t("products.importProducts")}
+            </Button>
+            <Button
+              variant="primary"
+              onClick={() => {
+                resetForm();
+                setShowForm(true);
+              }}
+            >
+              {t("products.newProduct")}
+            </Button>
+          </>
+        }
+      />
 
-        <Card>
+      <div
+        className={clsx(
+          "grid grid-cols-1 gap-6",
+          showForm && "xl:grid-cols-3",
+        )}
+      >
+        <div className={clsx("space-y-6", showForm && "xl:col-span-2")}>
+          <Card>
           <CardHeader
             title={t("products.listTitle")}
             subtitle={
@@ -467,74 +492,77 @@ export default function Products() {
           )}
 
           {filteredProducts.length === 0 && !loading && !loadError ? (
-            <div className="px-5 py-8 text-center text-sm text-slate-500">
-              {t("products.emptyState")}
-            </div>
+            <EmptyState title={t("products.emptyState")} />
           ) : (
             <div className="overflow-x-auto">
-              <table className="min-w-full text-sm">
-                <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <table className="w-full text-sm" style={{ minWidth: "52rem" }}>
+                <thead className="border-b border-slate-200 bg-slate-50/70 text-start text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                   <tr>
-                    <th className="px-5 py-2">{t("products.colProduct")}</th>
-                    <th className="px-5 py-2">{t("products.colBarcode")}</th>
-                    <th className="px-5 py-2">{t("products.colVat")}</th>
-                    <th className="px-5 py-2 text-right">{t("products.colPrice")}</th>
-                    <th className="px-5 py-2 text-right">{t("products.colCost")}</th>
-                    <th className="px-5 py-2 text-right">{t("products.colStock")}</th>
-                    <th className="px-5 py-2">{t("products.colStatus")}</th>
-                    <th className="px-5 py-2"></th>
+                    <th className="px-5 py-2.5 font-semibold">{t("products.colProduct")}</th>
+                    <th className="whitespace-nowrap px-5 py-2.5 font-semibold">{t("products.colBarcode")}</th>
+                    <th className="whitespace-nowrap px-5 py-2.5 font-semibold">{t("products.colVat")}</th>
+                    <th className="whitespace-nowrap px-5 py-2.5 text-right font-semibold">{t("products.colPrice")}</th>
+                    <th className="whitespace-nowrap px-5 py-2.5 text-right font-semibold">{t("products.colCost")}</th>
+                    <th className="whitespace-nowrap px-5 py-2.5 text-right font-semibold">{t("products.colStock")}</th>
+                    <th className="whitespace-nowrap px-5 py-2.5 font-semibold">{t("products.colStatus")}</th>
+                    <th className="px-5 py-2.5"></th>
                   </tr>
                 </thead>
 
                 <tbody className="divide-y divide-slate-100">
                   {filteredProducts.map((p) => (
-                    <tr key={p.id} className="hover:bg-slate-50">
-                      <td className="px-5 py-2">
+                    <tr key={p.id} className="transition-colors hover:bg-brand-50/40">
+                      <td className="px-5 py-3">
                         <div className="font-medium text-slate-900">{p.name}</div>
-                        <div className="text-xs text-slate-500">
-                          {p.sku ? `SKU ${p.sku}` : t("products.noSku")}
+                        <div className="mt-0.5 text-xs text-slate-400">
+                          <span className="font-medium text-slate-500">
+                            {p.sku ? `SKU ${p.sku}` : t("products.noSku")}
+                          </span>
                           {p.description ? ` · ${p.description}` : ""}
                         </div>
                       </td>
 
-                      <td className="px-5 py-2">
-                        <code className="text-xs text-slate-700">
+                      <td className="whitespace-nowrap px-5 py-3">
+                        <code className="text-xs text-slate-600">
                           {getPrimaryBarcodeDisplay(p)}
                         </code>
                       </td>
 
-                      <td className="px-5 py-2 text-slate-600">
+                      <td className="whitespace-nowrap px-5 py-3 text-slate-600">
                         {p.vatRate.name}
                       </td>
 
-                      <td className="px-5 py-2 text-right tabular-nums text-slate-900">
+                      <td className="whitespace-nowrap px-5 py-3 text-right font-medium tabular-nums text-slate-900">
                         {getProductPriceDisplay(p)}
                       </td>
 
-                      <td className="px-5 py-2 text-right tabular-nums text-slate-600">
+                      <td className="whitespace-nowrap px-5 py-3 text-right tabular-nums text-slate-500">
                         {formatUsd(p.avgCostExclVatCents)}
                       </td>
 
-                      <td className="px-5 py-2 text-right tabular-nums text-slate-700">
-                        {p.isService
-                          ? t("products.serviceLabel")
-                          : `${p.quantityOnHand} ${p.baseUom.uomCode}`}
+                      <td className="whitespace-nowrap px-5 py-3 text-right tabular-nums">
+                        {p.isService ? (
+                          <span className="text-slate-500">{t("products.serviceLabel")}</span>
+                        ) : (
+                          <span
+                            className={clsx(
+                              "font-medium",
+                              p.quantityOnHand < 0 ? "text-red-600" : "text-slate-700",
+                            )}
+                          >
+                            {p.quantityOnHand}{" "}
+                            <span className="font-normal text-slate-400">{p.baseUom.uomCode}</span>
+                          </span>
+                        )}
                       </td>
 
-                      <td className="px-5 py-2">
-                        <span
-                          className={clsx(
-                            "rounded px-2 py-0.5 text-xs font-medium",
-                            p.isActive
-                              ? "bg-emerald-100 text-emerald-800"
-                              : "bg-slate-200 text-slate-600",
-                          )}
-                        >
+                      <td className="whitespace-nowrap px-5 py-3">
+                        <Badge tone={p.isActive ? "good" : "neutral"}>
                           {p.isActive ? t("products.active") : t("products.inactive")}
-                        </span>
+                        </Badge>
                       </td>
 
-                      <td className="px-5 py-2 text-end">
+                      <td className="whitespace-nowrap px-5 py-3 text-end">
                         <Button variant="ghost" size="sm" onClick={() => editProduct(p)}>
                           {t("common.edit")}
                         </Button>
@@ -545,11 +573,11 @@ export default function Products() {
               </table>
             </div>
           )}
-        </Card>
-      </div>
+          </Card>
+        </div>
 
-      <div>
-        {showForm ? (
+      {showForm && (
+        <div>
         <Card>
           <CardHeader
             title={form.mode === "new" ? t("products.formNewTitle") : t("products.formEditTitle")}
@@ -921,25 +949,8 @@ export default function Products() {
             </Button>
           </CardBody>
         </Card>
-        ) : (
-          <div className="flex justify-end gap-2">
-            <Button
-              variant="secondary"
-              onClick={() => setShowImport(true)}
-            >
-              {t("products.importProducts")}
-            </Button>
-            <Button
-              variant="primary"
-              onClick={() => {
-                resetForm();
-                setShowForm(true);
-              }}
-            >
-              {t("products.newProduct")}
-            </Button>
-          </div>
-        )}
+        </div>
+      )}
       </div>
 
       {showImport && storeId && (

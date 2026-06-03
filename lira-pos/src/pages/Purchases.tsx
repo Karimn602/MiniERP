@@ -17,6 +17,8 @@ import { computeLineMath, type PurchaseLineMath } from "../lib/purchaseMath";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
+import { PageHeader } from "../components/ui/PageHeader";
+import { EmptyState } from "../components/ui/EmptyState";
 import { ProductPicker } from "../components/ProductPicker";
 import { SupplierPicker } from "../components/SupplierPicker";
 import { newId } from "../lib/ids";
@@ -156,27 +158,26 @@ export default function Purchases() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between">
-        <div>
-          <h2 className="text-2xl font-semibold text-slate-900">{t("purchases.title")}</h2>
-          <p className="text-sm text-slate-600">{t("purchases.subtitle")}</p>
-        </div>
+      <PageHeader
+        title={t("purchases.title")}
+        subtitle={t("purchases.subtitle")}
+        actions={
+          <div className="flex items-center gap-3">
+            {justSaved && (
+              <span className="text-sm font-medium text-emerald-600">
+                {t("purchases.postedSuccess", { number: String(justSaved.number) })}
+              </span>
+            )}
 
-        <div className="flex items-center gap-3">
-          {justSaved && (
-            <span className="text-sm text-emerald-700">
-              {t("purchases.postedSuccess", { number: String(justSaved.number) })}
-            </span>
-          )}
-
-          <Button
-            variant={formOpen ? "ghost" : "primary"}
-            onClick={() => setFormOpen((o) => !o)}
-          >
-            {formOpen ? t("purchases.closeForm") : t("purchases.newPurchase")}
-          </Button>
-        </div>
-      </div>
+            <Button
+              variant={formOpen ? "ghost" : "primary"}
+              onClick={() => setFormOpen((o) => !o)}
+            >
+              {formOpen ? t("purchases.closeForm") : t("purchases.newPurchase")}
+            </Button>
+          </div>
+        }
+      />
 
       {formOpen && storeId && (
         <NewPurchaseForm
@@ -206,15 +207,11 @@ export default function Purchases() {
             </p>
           </CardBody>
         ) : purchases.length === 0 ? (
-          <CardBody>
-            <div className="py-8 text-center text-sm text-slate-500">
-              {t("purchases.emptyState")}
-            </div>
-          </CardBody>
+          <EmptyState title={t("purchases.emptyState")} />
         ) : (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-5 py-2 font-medium">{t("purchases.colNum")}</th>
                   <th className="px-5 py-2 font-medium">{t("purchases.colDate")}</th>
@@ -299,13 +296,13 @@ export default function Purchases() {
       {selectedId && (
         <>
           <div
-            className="fixed inset-0 z-40 bg-black/10"
+            className="fixed inset-0 z-40 bg-slate-900/20 backdrop-blur-sm"
             onClick={() => {
               setSelectedId(null);
               setDetails(null);
             }}
           />
-          <div className="fixed inset-y-0 right-0 z-50 w-[820px] max-w-[80vw] overflow-y-auto border-l border-slate-200 bg-white shadow-xl">
+          <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-white shadow-2xl">
             <PurchaseDetailCard
               purchase={details}
               loading={detailsLoading}
@@ -530,7 +527,7 @@ function NewPurchaseForm({
           {lines.length > 0 && (
             <div className="overflow-x-auto rounded-md border border-slate-200">
               <table className="min-w-full text-sm">
-                <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+                <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                   <tr>
                     <th className="px-3 py-2 font-medium">{t("purchases.lineColProduct")}</th>
                     <th className="px-3 py-2 font-medium">{t("purchases.lineColUom")}</th>
@@ -640,7 +637,7 @@ function PurchaseLinesTable({ lines }: { lines: PurchaseItem[] }) {
   return (
     <div className="overflow-x-auto rounded-md border border-slate-200">
       <table className="min-w-full text-sm">
-        <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+        <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
           <tr>
             <th className="px-4 py-2">{t("purchases.linesColProduct")}</th>
             <th className="px-4 py-2">{t("purchases.linesColSku")}</th>

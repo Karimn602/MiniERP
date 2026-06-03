@@ -8,6 +8,9 @@ import {
 } from "../db/repos/reports";
 import { Card, CardHeader } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
+import { PageHeader } from "../components/ui/PageHeader";
+import { StatCard } from "../components/ui/StatCard";
+import { EmptyState } from "../components/ui/EmptyState";
 import { formatUsd } from "../lib/money";
 import { todayLocalDate, formatPrettyDate } from "../lib/dates";
 import { useTranslation } from "../lib/i18n";
@@ -102,53 +105,52 @@ export default function LocalReports() {
   return (
     <div className="space-y-6">
       {/* Header + date filter */}
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h2 className="text-2xl font-semibold text-slate-900">{t("localReports.title")}</h2>
-          <p className="text-sm text-slate-600">{t("localReports.subtitle")}</p>
-        </div>
-
-        <div className="flex flex-wrap items-end gap-2">
-          <div className="flex flex-col gap-0.5">
-            <label className="text-xs font-medium text-slate-500">{t("localReports.labelFrom")}</label>
-            <input
-              type="date"
-              value={dateFrom}
-              onChange={(e) => setDateFrom(e.target.value)}
-              className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-brand/30"
-            />
-          </div>
-          <div className="flex flex-col gap-0.5">
-            <label className="text-xs font-medium text-slate-500">{t("localReports.labelTo")}</label>
-            <input
-              type="date"
-              value={dateTo}
-              onChange={(e) => setDateTo(e.target.value)}
-              className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-brand/30"
-            />
-          </div>
-          <Button variant="primary" onClick={handleApply} disabled={loading}>
-            {loading ? t("common.loading") : t("localReports.apply")}
-          </Button>
-        </div>
-      </div>
+      <PageHeader
+        title={t("localReports.title")}
+        subtitle={t("localReports.subtitle")}
+        actions={
+          <>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-slate-500">{t("localReports.labelFrom")}</label>
+              <input
+                type="date"
+                value={dateFrom}
+                onChange={(e) => setDateFrom(e.target.value)}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 shadow-soft transition-colors hover:border-slate-400 focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs font-medium text-slate-500">{t("localReports.labelTo")}</label>
+              <input
+                type="date"
+                value={dateTo}
+                onChange={(e) => setDateTo(e.target.value)}
+                className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 shadow-soft transition-colors hover:border-slate-400 focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15"
+              />
+            </div>
+            <Button variant="primary" onClick={handleApply} disabled={loading}>
+              {loading ? t("common.loading") : t("localReports.apply")}
+            </Button>
+          </>
+        }
+      />
 
       {loadError && (
-        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {t("localReports.loadFailed", { error: loadError })}
         </div>
       )}
 
       {/* KPI cards */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <MiniStat label={t("localReports.statRevenue")} value={formatUsd(summary.revenue)} />
-        <MiniStat label={t("localReports.statNetSales")} value={formatUsd(summary.net)} />
-        <MiniStat
+        <StatCard label={t("localReports.statRevenue")} value={formatUsd(summary.revenue)} />
+        <StatCard label={t("localReports.statNetSales")} value={formatUsd(summary.net)} />
+        <StatCard
           label={t("localReports.statGrossProfit")}
           value={formatUsd(summary.profit)}
           tone={summary.profit > 0 ? "good" : summary.profit < 0 ? "bad" : undefined}
         />
-        <MiniStat label={t("localReports.statPurchases")} value={formatUsd(summary.purchases)} />
+        <StatCard label={t("localReports.statPurchases")} value={formatUsd(summary.purchases)} />
       </div>
 
       {/* Daily Sales */}
@@ -158,13 +160,11 @@ export default function LocalReports() {
           subtitle={dailySalesSubtitle}
         />
         {dailySales.length === 0 && !loading ? (
-          <div className="px-5 py-8 text-center text-sm text-slate-500">
-            {t("localReports.noSalesInPeriod")}
-          </div>
+          <EmptyState title={t("localReports.noSalesInPeriod")} />
         ) : (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-5 py-2">{t("localReports.colDate")}</th>
                   <th className="px-5 py-2 text-end">{t("localReports.colSales")}</th>
@@ -223,13 +223,11 @@ export default function LocalReports() {
           subtitle={productSalesSubtitle}
         />
         {productSales.length === 0 && !loading ? (
-          <div className="px-5 py-8 text-center text-sm text-slate-500">
-            {t("localReports.noProductSales")}
-          </div>
+          <EmptyState title={t("localReports.noProductSales")} />
         ) : (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-5 py-2">{t("localReports.colProduct")}</th>
                   <th className="px-5 py-2 text-end">{t("localReports.colQtySold")}</th>
@@ -291,13 +289,11 @@ export default function LocalReports() {
           subtitle={purchasesSubtitle}
         />
         {dailyPurchases.length === 0 && !loading ? (
-          <div className="px-5 py-8 text-center text-sm text-slate-500">
-            {t("localReports.noPurchasesInPeriod")}
-          </div>
+          <EmptyState title={t("localReports.noPurchasesInPeriod")} />
         ) : (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-5 py-2">{t("localReports.colDate")}</th>
                   <th className="px-5 py-2 text-end">{t("localReports.colCount")}</th>
@@ -331,36 +327,6 @@ export default function LocalReports() {
           </div>
         )}
       </Card>
-    </div>
-  );
-}
-
-function MiniStat({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone?: "good" | "bad";
-}) {
-  return (
-    <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
-        {label}
-      </div>
-      <div
-        className={clsx(
-          "mt-1 text-lg font-semibold tabular-nums",
-          tone === "good"
-            ? "text-emerald-700"
-            : tone === "bad"
-              ? "text-red-700"
-              : "text-slate-900",
-        )}
-      >
-        {value}
-      </div>
     </div>
   );
 }

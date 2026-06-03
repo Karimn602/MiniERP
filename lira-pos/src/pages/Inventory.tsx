@@ -58,12 +58,12 @@ export default function Inventory() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between">
+      <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-semibold text-slate-900">{t("inventory.title")}</h2>
-          <p className="text-sm text-slate-600">{t("inventory.subtitle")}</p>
+          <h2 className="text-2xl font-bold tracking-tight text-slate-900">{t("inventory.title")}</h2>
+          <p className="mt-1 text-sm text-slate-500">{t("inventory.subtitle")}</p>
         </div>
-        <div className="inline-flex rounded-md border border-slate-300 bg-white p-0.5 shadow-sm">
+        <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1 shadow-soft">
           {(["stock", "movements", "adjust", "opening"] as const).map((v) => (
             <button
               key={v}
@@ -73,10 +73,10 @@ export default function Inventory() {
                 clearDrill();
               }}
               className={clsx(
-                "rounded px-3 py-1.5 text-xs font-medium transition-colors",
+                "rounded-md px-3 py-1.5 text-xs font-medium transition-all",
                 view === v
-                  ? "bg-brand text-brand-fg"
-                  : "text-slate-600 hover:bg-slate-50",
+                  ? "bg-brand text-brand-fg shadow-soft"
+                  : "text-slate-600 hover:text-slate-900",
               )}
             >
               {tabLabels[v]}
@@ -218,7 +218,7 @@ function StockView({
               type="checkbox"
               checked={lowOnly}
               onChange={(e) => setLowOnly(e.target.checked)}
-              className="rounded border-slate-300"
+              className="rounded border-slate-300 accent-brand"
             />
             {t("inventory.filterLowOnly")}
           </label>
@@ -230,21 +230,21 @@ function StockView({
           <Card>
             <CardBody className="space-y-1">
               <p className="text-xs font-medium text-slate-500">{t("inventory.valCardAvgTitle")}</p>
-              <p className="text-xl font-semibold text-slate-900">{formatUsd(summary.totalAvgCostValue)}</p>
+              <p className="text-2xl font-bold tabular-nums tracking-tight text-slate-900">{formatUsd(summary.totalAvgCostValue)}</p>
               <p className="text-xs text-slate-400">{t("inventory.valCardExclVat")}</p>
             </CardBody>
           </Card>
           <Card>
             <CardBody className="space-y-1">
               <p className="text-xs font-medium text-slate-500">{t("inventory.valCardLastTitle")}</p>
-              <p className="text-xl font-semibold text-slate-900">{formatUsd(summary.totalLastPurchValue)}</p>
+              <p className="text-2xl font-bold tabular-nums tracking-tight text-slate-900">{formatUsd(summary.totalLastPurchValue)}</p>
               <p className="text-xs text-slate-400">{t("inventory.valCardExclVat")}</p>
             </CardBody>
           </Card>
           <Card>
             <CardBody className="space-y-1">
               <p className="text-xs font-medium text-slate-500">{t("inventory.valCardDiffTitle")}</p>
-              <p className={clsx("text-xl font-semibold", summary.totalDifference >= 0 ? "text-emerald-700" : "text-red-700")}>
+              <p className={clsx("text-2xl font-bold tabular-nums tracking-tight", summary.totalDifference >= 0 ? "text-emerald-600" : "text-red-600")}>
                 {summary.totalDifference >= 0 ? "+" : ""}{formatUsd(summary.totalDifference)}
               </p>
               <p className="text-xs text-slate-400">
@@ -258,7 +258,7 @@ function StockView({
               {summary.missingCount === 0 ? (
                 <p className="text-sm text-emerald-700">{t("inventory.valCardMissingNone")}</p>
               ) : (
-                <p className="text-xl font-semibold text-amber-700">
+                <p className="text-2xl font-bold tabular-nums tracking-tight text-amber-600">
                   {t("inventory.valCardMissingCount", { count: String(summary.missingCount) })}
                 </p>
               )}
@@ -280,7 +280,7 @@ function StockView({
         />
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
-            <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+            <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
               <tr>
                 <th className="px-5 py-2 font-medium">{t("inventory.colProduct")}</th>
                 <th className="px-5 py-2 font-medium text-right">{t("inventory.colOnHand")}</th>
@@ -636,7 +636,7 @@ function MovementsView({ storeId }: { storeId: string }) {
       />
       <div className="overflow-x-auto">
         <table className="min-w-full text-sm">
-          <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+          <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
             <tr>
               <th className="px-5 py-2 font-medium">{t("inventory.movColWhen")}</th>
               <th className="px-5 py-2 font-medium">{t("inventory.movColType")}</th>
@@ -844,7 +844,7 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
         {lines.length > 0 && (
           <div className="overflow-x-auto rounded-md border border-slate-200">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-3 py-2 font-medium">{t("inventory.adjColProduct")}</th>
                   <th className="px-3 py-2 font-medium">{t("inventory.adjColUom")}</th>
@@ -1165,7 +1165,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
         {lines.length > 0 && (
           <div className="overflow-x-auto rounded-md border border-slate-200">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-3 py-2 font-medium">{t("inventory.openColProduct")}</th>
                   <th className="px-3 py-2 font-medium">{t("inventory.openColUom")}</th>

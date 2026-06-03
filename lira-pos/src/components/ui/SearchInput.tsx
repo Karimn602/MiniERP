@@ -52,9 +52,23 @@ export function SearchInput({
       value={local}
       onChange={(e) => setLocal(e.target.value)}
       autoFocus={autoFocus}
-      // Search-icon prefix — using a simple unicode glyph for now;
-      // Phase 3+ can swap in a proper icon library if we want.
-      prefix={<span aria-hidden>🔍</span>}
+      // Clean inline search glyph (no icon-library dependency).
+      prefix={
+        <svg
+          aria-hidden
+          viewBox="0 0 20 20"
+          fill="none"
+          className="h-4 w-4 text-slate-400"
+        >
+          <circle cx="9" cy="9" r="6" stroke="currentColor" strokeWidth="1.8" />
+          <path
+            d="m17 17-3.2-3.2"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+          />
+        </svg>
+      }
     />
   );
 }

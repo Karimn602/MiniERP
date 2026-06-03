@@ -6,6 +6,9 @@ import type { Supplier } from "../db/types";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
+import { PageHeader } from "../components/ui/PageHeader";
+import { EmptyState } from "../components/ui/EmptyState";
+import { Badge } from "../components/ui/Badge";
 import { formatUsd } from "../lib/money";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "../lib/i18n";
@@ -77,25 +80,24 @@ export default function Suppliers() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-start justify-between">
-        <div>
-          <h2 className="text-2xl font-semibold text-slate-900">{t("suppliers.title")}</h2>
-          <p className="text-sm text-slate-600">{t("suppliers.subtitle")}</p>
-        </div>
+      <PageHeader
+        title={t("suppliers.title")}
+        subtitle={t("suppliers.subtitle")}
+        actions={
+          <div className="flex items-center gap-3">
+            {justSaved && (
+              <span className="text-sm font-medium text-emerald-600">{t("suppliers.supplierAdded")}</span>
+            )}
 
-        <div className="flex items-center gap-3">
-          {justSaved && (
-            <span className="text-sm text-emerald-700">{t("suppliers.supplierAdded")}</span>
-          )}
-
-          <Button
-            variant={formOpen ? "ghost" : "primary"}
-            onClick={() => setFormOpen((o) => !o)}
-          >
-            {formOpen ? t("suppliers.closeForm") : t("suppliers.newSupplier")}
-          </Button>
-        </div>
-      </div>
+            <Button
+              variant={formOpen ? "ghost" : "primary"}
+              onClick={() => setFormOpen((o) => !o)}
+            >
+              {formOpen ? t("suppliers.closeForm") : t("suppliers.newSupplier")}
+            </Button>
+          </div>
+        }
+      />
 
       {formOpen && (
         <NewSupplierForm
@@ -122,12 +124,12 @@ export default function Suppliers() {
             />
           </div>
 
-          <label className="inline-flex items-center gap-2 text-xs text-slate-700">
+          <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-slate-700">
             <input
               type="checkbox"
               checked={includeInactive}
               onChange={(e) => setIncludeInactive(e.target.checked)}
-              className="rounded border-slate-300"
+              className="rounded border-slate-300 accent-brand"
             />
             {t("suppliers.includeInactive")}
           </label>
@@ -141,15 +143,11 @@ export default function Suppliers() {
         />
 
         {rows.length === 0 && !loading ? (
-          <CardBody>
-            <div className="py-8 text-center text-sm text-slate-500">
-              {t("suppliers.noMatch")}
-            </div>
-          </CardBody>
+          <EmptyState title={t("suppliers.noMatch")} />
         ) : (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-5 py-2 font-medium">{t("suppliers.colName")}</th>
                   <th className="px-5 py-2 font-medium">{t("suppliers.colContact")}</th>
@@ -176,9 +174,9 @@ export default function Suppliers() {
                         {s.name}
 
                         {!s.isActive && (
-                          <span className="ms-2 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-600">
+                          <Badge tone="neutral" className="ms-2 uppercase">
                             {t("suppliers.inactive")}
-                          </span>
+                          </Badge>
                         )}
                       </td>
 

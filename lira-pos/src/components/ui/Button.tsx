@@ -15,16 +15,16 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       ref={ref}
       {...rest}
       className={clsx(
-        "inline-flex items-center justify-center rounded-md font-medium shadow-sm transition-colors focus:outline-none focus:ring-2 focus:ring-offset-1 disabled:opacity-50 disabled:pointer-events-none",
-        size === "sm" ? "px-2.5 py-1.5 text-xs" : "px-3.5 py-2 text-sm",
+        "inline-flex select-none items-center justify-center gap-1.5 rounded-lg font-semibold tracking-tight transition-all duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-white active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none disabled:active:scale-100",
+        size === "sm" ? "px-3 py-1.5 text-xs" : "px-4 py-2 text-sm",
         variant === "primary" &&
-          "bg-brand text-brand-fg hover:bg-teal-800 focus:ring-brand",
+          "bg-brand text-brand-fg shadow-soft hover:bg-brand-hover hover:shadow-card-hover focus-visible:ring-brand",
         variant === "secondary" &&
-          "border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 focus:ring-slate-300",
+          "border border-slate-300 bg-white text-slate-700 shadow-soft hover:border-slate-400 hover:bg-slate-50 focus-visible:ring-slate-400",
         variant === "ghost" &&
-          "bg-transparent text-slate-700 shadow-none hover:bg-slate-100 focus:ring-slate-300",
+          "bg-transparent text-slate-600 hover:bg-slate-100 hover:text-slate-900 focus-visible:ring-slate-300",
         variant === "danger" &&
-          "bg-red-600 text-white hover:bg-red-700 focus:ring-red-500",
+          "bg-red-600 text-white shadow-soft hover:bg-red-700 focus-visible:ring-red-500",
         className,
       )}
     >

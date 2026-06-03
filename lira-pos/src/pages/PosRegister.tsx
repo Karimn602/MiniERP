@@ -53,6 +53,8 @@ import { ReceiptPrint } from "../components/ReceiptPrint";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
+import { PageHeader } from "../components/ui/PageHeader";
+import { EmptyState } from "../components/ui/EmptyState";
 import { ProductPicker } from "../components/ProductPicker";
 import {
   formatLbp,
@@ -64,10 +66,32 @@ import {
   usdCentsToLbp,
 } from "../lib/money";
 import { computeSaleLineMath, type SaleLineMath } from "../lib/saleMath";
-import { fromBaseQty } from "../lib/uom";
+import { fromBaseQty, type Factor } from "../lib/uom";
 import { newId } from "../lib/ids";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
+
+// ============================================================================
+// Safe stock display
+// ============================================================================
+
+/**
+ * Format a (possibly negative or invalid) base stock quantity for UI display.
+ *
+ * `fromBaseQty` correctly rejects negative base quantities, but negative
+ * inventory is an intended, supported condition (a product can be oversold
+ * when negative inventory is allowed). This helper keeps the sign separate so
+ * we only ever pass a non-negative value into `fromBaseQty`, and returns a
+ * safe fallback for null/undefined/non-finite quantities — so one bad product
+ * can never white-screen the POS page.
+ *
+ * Display-only: never use this in calculation or posting paths.
+ */
+function formatSignedStockQty(baseQty: number | null | undefined, factor: Factor): string {
+  if (baseQty == null || !Number.isFinite(baseQty)) return "—";
+  const sign = baseQty < 0 ? "-" : "";
+  return `${sign}${fromBaseQty(Math.abs(baseQty), factor)}`;
+}
 
 // ============================================================================
 // Cart line shape
@@ -868,37 +892,42 @@ export default function PosRegister() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 className="text-2xl font-semibold text-slate-900">{t("pos.title")}</h2>
-          <p className="text-sm text-slate-600">{t("pos.subtitle")}</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {rate ? (
-            <div className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-sm">
-              <span className="font-medium text-slate-800">{t("pos.rateLocked")}</span>{" "}
-              {formatRate(rate.rateLbpPerUsd)}
+      <PageHeader
+        title={t("pos.title")}
+        subtitle={t("pos.subtitle")}
+        actions={
+          <>
+            {rate ? (
+              <div className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-soft">
+                <span className="font-semibold text-slate-800">{t("pos.rateLocked")}</span>{" "}
+                <span className="tabular-nums">{formatRate(rate.rateLbpPerUsd)}</span>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800">
+                {t("pos.noExchangeRate")}
+              </div>
+            )}
+            <div className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-soft">
+              <span className="font-semibold text-slate-800">{t("pos.costingLabel")}:</span>{" "}
+              {costingMethodLabel}
             </div>
-          ) : (
-            <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-800">
-              {t("pos.noExchangeRate")}
-            </div>
-          )}
-          <div className="rounded-md border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-sm">
-            <span className="font-medium text-slate-800">{t("pos.costingLabel")}:</span>{" "}
-            {costingMethodLabel}
-          </div>
-          <Button variant="secondary" size="sm" onClick={() => setSettingsOpen(true)}>
-            {t("pos.posSettings")}
-          </Button>
-        </div>
-      </div>
+            <Button variant="secondary" size="sm" onClick={() => setSettingsOpen(true)}>
+              {t("pos.posSettings")}
+            </Button>
+          </>
+        }
+      />
 
       {/* Shift warning */}
       {activeShift === null && (
-        <div className="rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          <span className="font-semibold">{t("pos.noOpenShiftBold")}</span>{" "}
-          {t("pos.goTo")} <strong>{t("nav.shiftSummary")}</strong> {t("pos.toOpenShift")}
+        <div className="flex items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 h-5 w-5 shrink-0 text-amber-500">
+            <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <span>
+            <span className="font-semibold">{t("pos.noOpenShiftBold")}</span>{" "}
+            {t("pos.goTo")} <strong>{t("nav.shiftSummary")}</strong> {t("pos.toOpenShift")}
+          </span>
         </div>
       )}
 
@@ -910,8 +939,8 @@ export default function PosRegister() {
       )}
 
       {receiptSale && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 print:hidden">
-          <div className="max-h-[90vh] w-full max-w-sm overflow-y-auto rounded-lg bg-white shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm print:hidden">
+          <div className="max-h-[90vh] w-full max-w-sm animate-scale-in overflow-y-auto rounded-2xl bg-white shadow-2xl">
             <ReceiptPrint sale={receiptSale} storeName={storeName} />
             <div className="flex gap-2 border-t border-slate-200 p-4 print:hidden">
               <Button variant="primary" className="flex-1" onClick={() => window.print()}>
@@ -928,11 +957,11 @@ export default function PosRegister() {
       {/* POS Register setup drawer */}
       {settingsOpen && (
         <div
-          className="fixed inset-0 z-40 flex justify-end bg-black/30 print:hidden"
+          className="fixed inset-0 z-40 flex justify-end bg-slate-900/40 backdrop-blur-sm print:hidden"
           onClick={() => setSettingsOpen(false)}
         >
           <div
-            className="h-full w-full max-w-sm overflow-y-auto border-slate-200 bg-white shadow-2xl ltr:border-l rtl:border-r"
+            className="h-full w-full max-w-sm animate-fade-in overflow-y-auto border-slate-200 bg-white shadow-2xl ltr:border-l rtl:border-r"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between border-b border-slate-200 p-4">
@@ -952,26 +981,26 @@ export default function PosRegister() {
                   <p className="text-sm font-medium text-slate-800">{t("pos.costMethodTitle")}</p>
                   <p className="text-xs text-slate-500">{t("pos.costMethodSubtitle")}</p>
                 </div>
-                <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2 text-sm">
+                <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 p-3 text-sm transition-colors hover:bg-slate-50">
                   <input
                     type="radio"
                     name="cogs-method"
                     checked={costMethod === "weighted_average"}
                     onChange={() => setCostMethod("weighted_average")}
-                    className="mt-1"
+                    className="mt-1 accent-brand"
                   />
                   <span>
                     <span className="block font-medium text-slate-800">{t("pos.weightedAverage")}</span>
                     <span className="text-xs text-slate-500">{t("pos.weightedAverageDesc")}</span>
                   </span>
                 </label>
-                <label className="flex items-start gap-2 rounded-md border border-slate-200 p-2 text-sm">
+                <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 p-3 text-sm transition-colors hover:bg-slate-50">
                   <input
                     type="radio"
                     name="cogs-method"
                     checked={costMethod === "last_purchase"}
                     onChange={() => setCostMethod("last_purchase")}
-                    className="mt-1"
+                    className="mt-1 accent-brand"
                   />
                   <span>
                     <span className="block font-medium text-slate-800">{t("pos.lastPurchase")}</span>
@@ -982,12 +1011,12 @@ export default function PosRegister() {
 
               {/* Allow negative inventory */}
               <div className="border-t border-slate-200 pt-4">
-                <label className="flex items-start gap-3 text-sm">
+                <label className="flex cursor-pointer items-start gap-3 text-sm">
                   <input
                     type="checkbox"
                     checked={allowNegativeInventory}
                     onChange={(e) => setAllowNegativeInventory(e.target.checked)}
-                    className="mt-1 h-4 w-4"
+                    className="mt-1 h-4 w-4 accent-brand"
                   />
                   <span>
                     <span className="block font-medium text-slate-800">
@@ -1011,20 +1040,27 @@ export default function PosRegister() {
             <CardHeader title={t("pos.addItemTitle")} subtitle={t("pos.addItemSubtitle")} />
             <CardBody className="space-y-3">
               <div className="flex gap-2">
-                <input
-                  ref={scanRef}
-                  value={scanInput}
-                  onChange={(e) => setScanInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      void handleScan();
-                    }
-                  }}
-                  placeholder={t("pos.scanBarcodePlaceholder")}
-                  autoFocus
-                  className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
-                />
+                <div className="relative flex-1">
+                  <span className="pointer-events-none absolute inset-y-0 flex items-center text-slate-400 ltr:left-3.5 rtl:right-3.5">
+                    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5">
+                      <path d="M3 5v14M7 5v14M11 5v14M15 5v14M19 5v14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                    </svg>
+                  </span>
+                  <input
+                    ref={scanRef}
+                    value={scanInput}
+                    onChange={(e) => setScanInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void handleScan();
+                      }
+                    }}
+                    placeholder={t("pos.scanBarcodePlaceholder")}
+                    autoFocus
+                    className="w-full rounded-lg border border-slate-300 bg-white py-2.5 text-base shadow-soft transition-colors hover:border-slate-400 focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15 ltr:pl-11 ltr:pr-3 rtl:pr-11 rtl:pl-3"
+                  />
+                </div>
                 <Button variant="primary" onClick={handleScan} disabled={!scanInput.trim()}>
                   {t("common.add")}
                 </Button>
@@ -1050,9 +1086,9 @@ export default function PosRegister() {
                 <div
                   key={c.id}
                   className={clsx(
-                    "inline-flex items-center rounded-md border shadow-sm",
+                    "inline-flex items-center rounded-lg border shadow-soft transition-colors",
                     isActive
-                      ? "border-brand bg-brand/5"
+                      ? "border-brand bg-brand/10 ring-1 ring-brand/20"
                       : "border-slate-200 bg-white hover:bg-slate-50",
                   )}
                 >
@@ -1107,33 +1143,38 @@ export default function PosRegister() {
               }
             />
             {lines.length === 0 ? (
-              <CardBody>
-                <p className="text-sm text-slate-500">{t("pos.cartEmptyMessage")}</p>
-              </CardBody>
+              <EmptyState
+                title={t("pos.cartEmptyMessage")}
+                icon={
+                  <svg viewBox="0 0 24 24" fill="none" className="h-6 w-6">
+                    <path d="M3 6h18l-1.5 9h-12L6 6Zm0 0L5 3H2m6 18a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm10 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                }
+              />
             ) : (
               <div className="overflow-x-auto">
                 <table className="min-w-full text-sm">
-                  <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  <thead className="border-b border-slate-200 bg-slate-50/80 text-left text-xs uppercase tracking-wide text-slate-500">
                     <tr>
-                      <th className="px-5 py-2">{t("pos.colProduct")}</th>
-                      <th className="px-5 py-2">{t("pos.colUom")}</th>
-                      <th className="px-5 py-2 text-end">{t("pos.colUnitPrice")}</th>
-                      <th className="px-5 py-2 text-center">{t("pos.colQty")}</th>
-                      <th className="px-5 py-2 text-end">{t("pos.colLineTotal")}</th>
-                      <th className="px-5 py-2"></th>
+                      <th className="px-5 py-2.5 font-semibold">{t("pos.colProduct")}</th>
+                      <th className="px-5 py-2.5 font-semibold">{t("pos.colUom")}</th>
+                      <th className="px-5 py-2.5 text-end font-semibold">{t("pos.colUnitPrice")}</th>
+                      <th className="px-5 py-2.5 text-center font-semibold">{t("pos.colQty")}</th>
+                      <th className="px-5 py-2.5 text-end font-semibold">{t("pos.colLineTotal")}</th>
+                      <th className="px-5 py-2.5"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {lines.map((l) => (
-                      <tr key={l.draftId}>
-                        <td className="px-5 py-2">
+                      <tr key={l.draftId} className="transition-colors hover:bg-slate-50/70">
+                        <td className="px-5 py-3">
                           <div className="font-medium text-slate-900">{l.product.name}</div>
                           <div className="text-xs text-slate-500">
                             {l.product.sku && <>SKU: {l.product.sku} · </>}
                             {!l.product.isService && (
                               <>
                                 {t("pos.stockLabel")}{" "}
-                                {fromBaseQty(l.product.quantityOnHand, l.uom.factor)}{" "}
+                                {formatSignedStockQty(l.product.quantityOnHand, l.uom.factor)}{" "}
                                 {l.uom.uomCode}
                               </>
                             )}
@@ -1142,21 +1183,21 @@ export default function PosRegister() {
                             )}
                           </div>
                         </td>
-                        <td className="px-5 py-2 text-slate-600">{l.uom.uomCode}</td>
-                        <td className="px-5 py-2 text-end text-slate-700">
+                        <td className="px-5 py-3 text-slate-600">{l.uom.uomCode}</td>
+                        <td className="px-5 py-3 text-end tabular-nums text-slate-700">
                           {formatUsd(l.math.unitPriceInclVatCents)}
                         </td>
-                        <td className="px-5 py-2 text-center">
+                        <td className="px-5 py-3 text-center">
                           <QuantityStepper
                             value={l.quantityInUom}
                             onChange={(n) => setLineQty(l.draftId, n)}
                             onAfterStep={focusScanInput}
                           />
                         </td>
-                        <td className="px-5 py-2 text-end font-medium text-slate-900">
+                        <td className="px-5 py-3 text-end font-semibold tabular-nums text-slate-900">
                           {formatUsd(l.math.lineTotalInclVatCents)}
                         </td>
-                        <td className="px-5 py-2 text-end">
+                        <td className="px-5 py-3 text-end">
                           <Button
                             variant="ghost"
                             size="sm"
@@ -1223,18 +1264,22 @@ export default function PosRegister() {
                 <TotalsRow label={t("pos.vat")} value={formatUsd(totals.postDiscountVat)} />
               </div>
 
-              <div className="border-t border-slate-200 pt-2">
-                <TotalsRow
-                  label={t("pos.totalInclVat")}
-                  value={formatUsd(totals.postDiscountTotal)}
-                  strong
-                />
+              <div className="-mx-5 -mb-5 mt-1 rounded-b-xl border-t border-slate-200 bg-slate-50/70 px-5 py-4">
+                <div className="flex items-end justify-between gap-3">
+                  <span className="text-sm font-medium text-slate-600">
+                    {t("pos.totalInclVat")}
+                  </span>
+                  <span className="text-3xl font-bold tabular-nums tracking-tight text-slate-900">
+                    {formatUsd(totals.postDiscountTotal)}
+                  </span>
+                </div>
                 {rate && (
-                  <TotalsRow
-                    label={t("pos.lbpEquivalent")}
-                    value={formatLbp(usdCentsToLbp(totals.postDiscountTotal, rate.rateLbpPerUsd))}
-                    muted
-                  />
+                  <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
+                    <span>{t("pos.lbpEquivalent")}</span>
+                    <span className="tabular-nums">
+                      {formatLbp(usdCentsToLbp(totals.postDiscountTotal, rate.rateLbpPerUsd))}
+                    </span>
+                  </div>
                 )}
               </div>
             </CardBody>
@@ -1274,7 +1319,7 @@ export default function PosRegister() {
                 onChange={(e) => setCardUsdInput(e.target.value)}
               />
 
-              <div className="space-y-1 rounded-md bg-slate-50 p-3 text-sm">
+              <div className="space-y-1 rounded-lg border border-slate-200/70 bg-slate-50 p-3 text-sm">
                 <TotalsRow
                   label={t("pos.totalPaidUsdEquiv")}
                   value={formatUsd(payments.totalPaidUsdCents)}
@@ -1327,11 +1372,16 @@ export default function PosRegister() {
 
               <Button
                 variant="primary"
-                className="w-full"
+                className="w-full py-3 text-base"
                 disabled={!canPost}
                 onClick={handlePost}
               >
                 {submitting ? t("pos.posting") : t("pos.postSale")}
+                {!submitting && (
+                  <kbd className="ms-2 rounded border border-white/30 bg-white/15 px-1.5 py-0.5 text-[10px] font-semibold leading-none">
+                    F5
+                  </kbd>
+                )}
               </Button>
             </CardBody>
           </Card>
@@ -1399,12 +1449,12 @@ function QuantityStepper({
   const { t } = useTranslation();
 
   return (
-    <div className="inline-flex items-center gap-1">
+    <div className="inline-flex items-center rounded-lg border border-slate-300 bg-white shadow-soft">
       <button
         type="button"
         onClick={() => { onChange(value - 1); onAfterStep?.(); }}
         disabled={value <= 1}
-        className="h-7 w-7 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
+        className="flex h-8 w-8 items-center justify-center text-lg text-slate-600 transition-colors hover:bg-slate-100 disabled:opacity-40 ltr:rounded-l-lg rtl:rounded-r-lg"
         aria-label={t("pos.decreaseQty")}
       >
         −
@@ -1417,12 +1467,12 @@ function QuantityStepper({
           const n = Number(e.target.value);
           if (Number.isInteger(n) && n > 0) onChange(n);
         }}
-        className="h-7 w-12 rounded-md border border-slate-300 bg-white text-center text-sm tabular-nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+        className="h-8 w-11 border-x border-slate-200 bg-white text-center text-sm font-medium tabular-nums focus:outline-none focus:ring-2 focus:ring-inset focus:ring-brand/30"
       />
       <button
         type="button"
         onClick={() => { onChange(value + 1); onAfterStep?.(); }}
-        className="h-7 w-7 rounded-md border border-slate-300 text-slate-600 hover:bg-slate-50"
+        className="flex h-8 w-8 items-center justify-center text-lg text-slate-600 transition-colors hover:bg-slate-100 ltr:rounded-r-lg rtl:rounded-l-lg"
         aria-label={t("pos.increaseQty")}
       >
         +

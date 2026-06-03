@@ -10,17 +10,17 @@ export function LanguageSwitcher() {
   const { lang, setLang } = useTranslation();
 
   return (
-    <div className="flex gap-1">
+    <div className="inline-flex gap-0.5 rounded-lg border border-slate-200 bg-slate-100 p-0.5">
       {OPTIONS.map((opt) => (
         <button
           key={opt.lang}
           type="button"
           onClick={() => setLang(opt.lang)}
           className={clsx(
-            "rounded px-2 py-0.5 text-xs font-medium transition-colors",
+            "rounded-md px-2 py-0.5 text-xs font-semibold transition-all",
             lang === opt.lang
-              ? "bg-brand text-brand-fg"
-              : "text-slate-500 hover:bg-slate-100",
+              ? "bg-brand text-brand-fg shadow-soft"
+              : "text-slate-500 hover:text-slate-800",
           )}
         >
           {opt.label}

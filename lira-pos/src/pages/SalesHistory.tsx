@@ -7,6 +7,10 @@ import type { Sale, SaleItem, SalePayment, SaleWithDetails } from "../db/types";
 import { query } from "../db/client";
 import { Card, CardBody, CardHeader } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
+import { PageHeader } from "../components/ui/PageHeader";
+import { StatCard } from "../components/ui/StatCard";
+import { EmptyState } from "../components/ui/EmptyState";
+import { Badge } from "../components/ui/Badge";
 import { formatLbp, formatUsd, usdCentsToLbp } from "../lib/money";
 import { formatPrettyDate, relativeFromToday } from "../lib/dates";
 import { ReceiptPrint } from "../components/ReceiptPrint";
@@ -127,20 +131,17 @@ export default function SalesHistory() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-semibold text-slate-900">{t("salesHistory.title")}</h2>
-        <p className="text-sm text-slate-600">{t("salesHistory.subtitle")}</p>
-      </div>
+      <PageHeader title={t("salesHistory.title")} subtitle={t("salesHistory.subtitle")} />
 
       <div className="grid grid-cols-1 gap-3 md:grid-cols-4">
-        <MiniStat label={t("salesHistory.statInclVat")} value={formatUsd(summary.total)} />
-        <MiniStat label={t("salesHistory.statTotalCost")} value={formatUsd(summary.cost)} />
-        <MiniStat
+        <StatCard label={t("salesHistory.statInclVat")} value={formatUsd(summary.total)} />
+        <StatCard label={t("salesHistory.statTotalCost")} value={formatUsd(summary.cost)} />
+        <StatCard
           label={t("salesHistory.statGrossProfit")}
           value={formatUsd(summary.profit)}
           tone={summary.profit >= 0 ? "good" : "bad"}
         />
-        <MiniStat label={t("salesHistory.statNetSales")} value={formatUsd(summary.net)} />
+        <StatCard label={t("salesHistory.statNetSales")} value={formatUsd(summary.net)} />
       </div>
 
       <div>
@@ -157,13 +158,11 @@ export default function SalesHistory() {
             )}
 
             {sales.length === 0 && !loading && !loadError ? (
-              <div className="px-5 py-8 text-center text-sm text-slate-500">
-                {t("salesHistory.emptyState")}
-              </div>
+              <EmptyState title={t("salesHistory.emptyState")} />
             ) : (
               <div className="overflow-x-auto">
                 <table className="min-w-full text-sm">
-                  <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+                  <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                     <tr>
                       <th className="px-5 py-2">{t("salesHistory.colReceipt")}</th>
                       <th className="px-5 py-2">{t("salesHistory.colDate")}</th>
@@ -239,19 +238,18 @@ export default function SalesHistory() {
                           </td>
 
                           <td className="px-5 py-2">
-                            <span
-                              className={clsx(
-                                "rounded px-2 py-0.5 text-xs font-medium",
-                                s.status === "posted" &&
-                                  "bg-emerald-100 text-emerald-800",
-                                s.status === "draft" &&
-                                  "bg-amber-100 text-amber-800",
-                                s.status === "voided" &&
-                                  "bg-slate-200 text-slate-600 line-through",
-                              )}
+                            <Badge
+                              tone={
+                                s.status === "posted"
+                                  ? "good"
+                                  : s.status === "draft"
+                                    ? "warn"
+                                    : "neutral"
+                              }
+                              className={clsx(s.status === "voided" && "line-through")}
                             >
                               {t(`salesHistory.status${s.status.charAt(0).toUpperCase() + s.status.slice(1)}` as Parameters<typeof t>[0])}
-                            </span>
+                            </Badge>
                           </td>
                         </tr>
                       );
@@ -265,13 +263,13 @@ export default function SalesHistory() {
         {selectedId && (
           <>
             <div
-              className="fixed inset-0 z-40 bg-black/10"
+              className="fixed inset-0 z-40 bg-slate-900/20 backdrop-blur-sm"
               onClick={() => {
                 setSelectedId(null);
                 setDetails(null);
               }}
             />
-            <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] overflow-y-auto border-s border-slate-200 bg-white shadow-xl">
+            <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-white shadow-2xl">
               <SaleDetailCard
                 sale={details}
                 loading={detailsLoading}
@@ -293,36 +291,6 @@ export default function SalesHistory() {
           <ReceiptPrint sale={details} storeName={storeName} />
         </div>
       )}
-    </div>
-  );
-}
-
-function MiniStat({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: string;
-  tone?: "good" | "bad";
-}) {
-  return (
-    <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
-        {label}
-      </div>
-      <div
-        className={clsx(
-          "mt-1 text-lg font-semibold tabular-nums",
-          tone === "good"
-            ? "text-emerald-700"
-            : tone === "bad"
-              ? "text-red-700"
-              : "text-slate-900",
-        )}
-      >
-        {value}
-      </div>
     </div>
   );
 }
@@ -380,14 +348,14 @@ function SaleDetailCard({
         ) : sale ? (
           <>
             <div className="grid grid-cols-2 gap-3">
-              <MiniStat label={t("salesHistory.detailStatInclVat")} value={formatUsd(sale.totalInclVatCents)} />
-              <MiniStat label={t("salesHistory.detailStatCost")} value={formatUsd(sale.cogsTotalCents)} />
-              <MiniStat
+              <StatCard label={t("salesHistory.detailStatInclVat")} value={formatUsd(sale.totalInclVatCents)} />
+              <StatCard label={t("salesHistory.detailStatCost")} value={formatUsd(sale.cogsTotalCents)} />
+              <StatCard
                 label={t("salesHistory.detailStatProfit")}
                 value={formatUsd(profit)}
                 tone={profit >= 0 ? "good" : "bad"}
               />
-              <MiniStat label={t("salesHistory.detailStatMargin")} value={profitMargin(sale)} />
+              <StatCard label={t("salesHistory.detailStatMargin")} value={profitMargin(sale)} />
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -461,7 +429,7 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
   return (
     <div className="overflow-x-auto rounded-md border border-slate-200">
       <table className="min-w-full text-sm">
-        <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+        <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
           <tr>
             <th className="px-4 py-2">{t("salesHistory.linesColProduct")}</th>
             <th className="px-4 py-2">{t("salesHistory.linesColBarcode")}</th>
@@ -546,7 +514,7 @@ function PaymentsTable({ payments }: { payments: SalePayment[] }) {
   return (
     <div className="overflow-x-auto rounded-md border border-slate-200">
       <table className="min-w-full text-sm">
-        <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+        <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
           <tr>
             <th className="px-4 py-2">{t("salesHistory.paymentsColMethod")}</th>
             <th className="px-4 py-2">{t("salesHistory.paymentsColCurrency")}</th>

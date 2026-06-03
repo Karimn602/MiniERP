@@ -7,6 +7,7 @@ import type { Supplier, SupplierLedgerEntry, LedgerEntryType } from "../db/types
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
+import { EmptyState } from "../components/ui/EmptyState";
 import { formatUsd, parseUsdInput } from "../lib/money";
 import { todayLocalDate } from "../lib/dates";
 import { useTranslation } from "../lib/i18n";
@@ -71,7 +72,7 @@ export default function SupplierDetail() {
             {t("supplierDetail.allSuppliers")}
           </Link>
 
-          <h2 className="mt-1 text-2xl font-semibold text-slate-900">
+          <h2 className="mt-1 text-2xl font-bold tracking-tight text-slate-900">
             {supplier.name}
           </h2>
 
@@ -141,15 +142,11 @@ export default function SupplierDetail() {
         />
 
         {entries.length === 0 ? (
-          <CardBody>
-            <div className="py-8 text-center text-sm text-slate-500">
-              {t("supplierDetail.ledgerEmpty")}
-            </div>
-          </CardBody>
+          <EmptyState title={t("supplierDetail.ledgerEmpty")} />
         ) : (
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
-              <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+              <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
                 <tr>
                   <th className="px-5 py-2 font-medium">{t("supplierDetail.colDate")}</th>
                   <th className="px-5 py-2 font-medium">{t("supplierDetail.colType")}</th>
@@ -340,7 +337,7 @@ function RecordEntryForm({
             {t("supplierDetail.entryTypeLabel")}
           </label>
 
-          <div className="inline-flex rounded-md border border-slate-300 bg-white p-0.5 shadow-sm">
+          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1 shadow-soft">
             {(["payment", "credit_note", "opening_balance", "adjustment"] as const).map(
               (k) => (
                 <button
@@ -348,10 +345,10 @@ function RecordEntryForm({
                   type="button"
                   onClick={() => setKind(k)}
                   className={clsx(
-                    "rounded px-3 py-1.5 text-xs font-medium transition-colors",
+                    "rounded-md px-3 py-1.5 text-xs font-medium transition-all",
                     kind === k
-                      ? "bg-brand text-brand-fg"
-                      : "text-slate-600 hover:bg-slate-50",
+                      ? "bg-brand text-brand-fg shadow-soft"
+                      : "text-slate-600 hover:text-slate-900",
                   )}
                 >
                   {kindLabels[k]}

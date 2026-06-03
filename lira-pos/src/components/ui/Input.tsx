@@ -23,22 +23,22 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
       {label && (
         <label
           htmlFor={reactId}
-          className="block text-xs font-medium text-slate-700"
+          className="block text-xs font-medium text-slate-600"
         >
           {label}
         </label>
       )}
       <div
         className={clsx(
-          "flex items-stretch overflow-hidden rounded-md border bg-white shadow-sm transition-colors",
-          "focus-within:ring-2",
+          "flex items-stretch overflow-hidden rounded-lg border bg-white shadow-soft transition-colors",
+          "focus-within:ring-4",
           error
             ? "border-red-400 focus-within:border-red-500 focus-within:ring-red-100"
-            : "border-slate-300 focus-within:border-brand focus-within:ring-brand/20",
+            : "border-slate-300 hover:border-slate-400 focus-within:border-brand focus-within:ring-brand/15",
         )}
       >
         {prefix && (
-          <span className="flex items-center bg-slate-50 px-3 text-sm text-slate-500">
+          <span className="flex items-center border-e border-slate-200 bg-slate-50 px-3 text-sm font-medium text-slate-500">
             {prefix}
           </span>
         )}
@@ -54,7 +54,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
           )}
         />
         {suffix && (
-          <span className="flex items-center bg-slate-50 px-3 text-sm text-slate-500">
+          <span className="flex items-center border-s border-slate-200 bg-slate-50 px-3 text-sm font-medium text-slate-500">
             {suffix}
           </span>
         )}

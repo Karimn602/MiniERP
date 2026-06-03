@@ -12,6 +12,7 @@ import { parseRateInput, formatRate, formatUsd, usdCentsToLbp, formatLbp } from 
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
+import { PageHeader } from "../components/ui/PageHeader";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
@@ -147,10 +148,7 @@ export default function ExchangeRate() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-semibold text-slate-900">{t("exchangeRate.title")}</h2>
-        <p className="text-sm text-slate-600">{t("exchangeRate.subtitle")}</p>
-      </div>
+      <PageHeader title={t("exchangeRate.title")} subtitle={t("exchangeRate.subtitle")} />
 
       <StatusBanner status={status} current={current} />
 
@@ -204,13 +202,13 @@ export default function ExchangeRate() {
             </div>
 
             {sanityWarning && (
-              <div className="rounded-md border border-orange-200 bg-orange-50 p-3 text-xs text-orange-900">
+              <div className="rounded-lg border border-orange-200 bg-orange-50 p-3 text-xs text-orange-900">
                 ⚠ {sanityWarning}
               </div>
             )}
 
             {preview && (
-              <div className="rounded-md border border-slate-200 bg-slate-50 p-3">
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                 <div className="mb-2 text-xs font-medium text-slate-600">
                   {t("exchangeRate.previewAt", { rate: formatRate(parsedRate!) })}
                 </div>
@@ -254,7 +252,7 @@ export default function ExchangeRate() {
         />
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
-            <thead className="bg-slate-50 text-start text-xs uppercase tracking-wide text-slate-500">
+            <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
               <tr>
                 <th className="px-5 py-2 font-medium">{t("exchangeRate.colEffectiveDate")}</th>
                 <th className="px-5 py-2 font-medium">{t("exchangeRate.colRate")}</th>
