@@ -228,6 +228,15 @@ async function enrich(p: Product): Promise<ProductWithUoms> {
   };
 }
 
+export interface InventoryValuationRow {
+  productId: string;
+  name: string;
+  sku: string | null;
+  quantityOnHand: number;
+  avgCostExclVatCents: number;
+  lastPurchaseCostExclVatCents: number | null;
+}
+
 export const productsRepo = {
   async findById(id: string): Promise<Product | null> {
     const rows = await query<ProductRow>(
@@ -576,5 +585,49 @@ export const productsRepo = {
         id,
       ],
     );
+  },
+
+  async listForValuation(storeId: string): Promise<InventoryValuationRow[]> {
+    interface ValRow {
+      product_id: string;
+      name: string;
+      sku: string | null;
+      quantity_on_hand: number;
+      avg_cost_excl_vat_cents: number;
+      last_purchase_cost_excl_vat_cents: number | null;
+    }
+    const rows = await query<ValRow>(
+      `SELECT
+         p.id              AS product_id,
+         p.name,
+         p.sku,
+         p.quantity_on_hand,
+         p.avg_cost_excl_vat_cents,
+         (
+           SELECT pi.unit_cost_excl_vat_base_cents
+           FROM purchase_items pi
+           JOIN purchases pur ON pur.id = pi.purchase_id
+           WHERE pi.product_id = p.id
+             AND pur.store_id  = p.store_id
+             AND pur.status    = 'posted'
+           ORDER BY pur.posted_at DESC, pur.id DESC
+           LIMIT 1
+         ) AS last_purchase_cost_excl_vat_cents
+       FROM products p
+       WHERE p.store_id  = ?
+         AND p.is_active  = 1
+         AND p.is_service = 0
+       ORDER BY p.name
+       LIMIT 500`,
+      [storeId],
+    );
+    return rows.map((r) => ({
+      productId: r.product_id,
+      name: r.name,
+      sku: r.sku,
+      quantityOnHand: r.quantity_on_hand,
+      avgCostExclVatCents: r.avg_cost_excl_vat_cents,
+      lastPurchaseCostExclVatCents: r.last_purchase_cost_excl_vat_cents,
+    }));
   },
 };

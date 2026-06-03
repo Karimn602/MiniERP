@@ -470,6 +470,23 @@ const ar: TranslationDict = {
     errQtyPositive: "الكمية يجب أن تكون عدداً صحيحاً موجباً.",
     errUnitCostInvalid: "تكلفة الوحدة غير صحيحة.",
     errUnitCostNegative: "تكلفة الوحدة لا يمكن أن تكون سالبة.",
+
+    valCardAvgTitle: "قيمة المخزون — متوسط التكلفة",
+    valCardLastTitle: "قيمة المخزون — آخر سعر شراء",
+    valCardDiffTitle: "الفرق",
+    valCardDiffSub: "{{n}} من أصل {{total}} صنف متاح",
+    valCardMissingTitle: "بدون آخر سعر شراء",
+    valCardMissingNone: "جميع الأصناف المتاحة لديها سعر شراء",
+    valCardMissingCount: "{{count}} صنف بدون سعر شراء",
+    valCardExclVat: "قبل الضريبة",
+
+    colAvgCostExcl: "متوسط التكلفة (قبل الضريبة)",
+    colValueAtAvg: "القيمة @ المتوسط",
+    colLastPurchCost: "آخر سعر شراء",
+    colValueAtLastPurch: "القيمة @ آخر شراء",
+    colDiff: "الفرق",
+
+    noPurchaseCost: "لا يوجد سعر شراء",
   },
   purchases: {
     loadingPage: "جارٍ تحميل المشتريات…",

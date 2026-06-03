@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
-import { productsRepo } from "../db/repos/products";
+import { productsRepo, type InventoryValuationRow } from "../db/repos/products";
 import { movementsRepo } from "../db/repos/movements";
 import { purchasesRepo, type PostPurchaseLineInput } from "../db/repos/purchases";
 import type {
@@ -118,19 +118,27 @@ function StockView({
   const [search, setSearch] = useState("");
   const [lowOnly, setLowOnly] = useState(false);
   const [drillProduct, setDrillProduct] = useState<ProductWithUoms | null>(null);
+  const [valuationRows, setValuationRows] = useState<InventoryValuationRow[]>([]);
+  const [valuationLoading, setValuationLoading] = useState(true);
 
   const reload = useCallback(async () => {
     setLoading(true);
+    setValuationLoading(true);
     try {
-      const list = await productsRepo.listEnriched({
-        storeId,
-        search: search.trim() || undefined,
-        limit: 500,
-      });
+      const [list, vRows] = await Promise.all([
+        productsRepo.listEnriched({
+          storeId,
+          search: search.trim() || undefined,
+          limit: 500,
+        }),
+        productsRepo.listForValuation(storeId),
+      ]);
       setRows(list);
+      setValuationRows(vRows);
       return list;
     } finally {
       setLoading(false);
+      setValuationLoading(false);
     }
   }, [storeId, search]);
 
@@ -154,6 +162,44 @@ function StockView({
         p.quantityOnHand <= p.reorderPoint,
     );
   }, [rows, lowOnly]);
+
+  const { valuationMap, summary } = useMemo(() => {
+    const map = new Map<string, InventoryValuationRow>();
+    let totalAvgCostValue = 0;
+    let totalLastPurchValue = 0;
+    let totalDifference = 0;
+    let missingCount = 0;
+    let coveredCount = 0;
+
+    for (const vr of valuationRows) {
+      map.set(vr.productId, vr);
+      if (vr.quantityOnHand <= 0) continue;
+      const avgVal = Math.round(vr.quantityOnHand * vr.avgCostExclVatCents);
+      totalAvgCostValue += avgVal;
+      if (vr.lastPurchaseCostExclVatCents !== null) {
+        const lastVal = Math.round(vr.quantityOnHand * vr.lastPurchaseCostExclVatCents);
+        totalLastPurchValue += lastVal;
+        totalDifference += lastVal - avgVal;
+        coveredCount++;
+      } else {
+        missingCount++;
+      }
+    }
+
+    return {
+      valuationMap: map,
+      summary: {
+        totalAvgCostValue,
+        totalLastPurchValue,
+        totalDifference,
+        missingCount,
+        coveredCount,
+        totalWithQty: coveredCount + missingCount,
+      },
+    };
+  }, [valuationRows]);
+
+  const showCards = !loading && !valuationLoading;
 
   return (
     <div className="space-y-4">
@@ -179,6 +225,48 @@ function StockView({
         </CardBody>
       </Card>
 
+      {showCards && (
+        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <Card>
+            <CardBody className="space-y-1">
+              <p className="text-xs font-medium text-slate-500">{t("inventory.valCardAvgTitle")}</p>
+              <p className="text-xl font-semibold text-slate-900">{formatUsd(summary.totalAvgCostValue)}</p>
+              <p className="text-xs text-slate-400">{t("inventory.valCardExclVat")}</p>
+            </CardBody>
+          </Card>
+          <Card>
+            <CardBody className="space-y-1">
+              <p className="text-xs font-medium text-slate-500">{t("inventory.valCardLastTitle")}</p>
+              <p className="text-xl font-semibold text-slate-900">{formatUsd(summary.totalLastPurchValue)}</p>
+              <p className="text-xs text-slate-400">{t("inventory.valCardExclVat")}</p>
+            </CardBody>
+          </Card>
+          <Card>
+            <CardBody className="space-y-1">
+              <p className="text-xs font-medium text-slate-500">{t("inventory.valCardDiffTitle")}</p>
+              <p className={clsx("text-xl font-semibold", summary.totalDifference >= 0 ? "text-emerald-700" : "text-red-700")}>
+                {summary.totalDifference >= 0 ? "+" : ""}{formatUsd(summary.totalDifference)}
+              </p>
+              <p className="text-xs text-slate-400">
+                {t("inventory.valCardDiffSub", { n: String(summary.coveredCount), total: String(summary.totalWithQty) })}
+              </p>
+            </CardBody>
+          </Card>
+          <Card>
+            <CardBody className="space-y-1">
+              <p className="text-xs font-medium text-slate-500">{t("inventory.valCardMissingTitle")}</p>
+              {summary.missingCount === 0 ? (
+                <p className="text-sm text-emerald-700">{t("inventory.valCardMissingNone")}</p>
+              ) : (
+                <p className="text-xl font-semibold text-amber-700">
+                  {t("inventory.valCardMissingCount", { count: String(summary.missingCount) })}
+                </p>
+              )}
+            </CardBody>
+          </Card>
+        </div>
+      )}
+
       <Card>
         <CardHeader
           title={t("inventory.stockTitle")}
@@ -197,27 +285,39 @@ function StockView({
                 <th className="px-5 py-2 font-medium">{t("inventory.colProduct")}</th>
                 <th className="px-5 py-2 font-medium text-right">{t("inventory.colOnHand")}</th>
                 <th className="px-5 py-2 font-medium text-right">{t("inventory.colReorderPt")}</th>
-                <th className="px-5 py-2 font-medium text-right">{t("inventory.colAvgCost")}</th>
-                <th className="px-5 py-2 font-medium text-right">{t("inventory.colStockValue")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colAvgCostExcl")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colValueAtAvg")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colLastPurchCost")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colValueAtLastPurch")}</th>
+                <th className="px-5 py-2 font-medium text-right">{t("inventory.colDiff")}</th>
                 <th className="px-5 py-2"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-5 py-6 text-center text-sm text-slate-500">
+                  <td colSpan={9} className="px-5 py-6 text-center text-sm text-slate-500">
                     {lowOnly ? t("inventory.emptyLow") : t("inventory.emptyAll")}
                   </td>
                 </tr>
               ) : (
                 filtered.map((p) => {
+                  const vRow = valuationMap.get(p.id);
                   const low =
                     !p.isService &&
                     p.reorderPoint !== null &&
                     p.quantityOnHand <= p.reorderPoint;
-                  const stockValue = p.isService
-                    ? 0
-                    : p.quantityOnHand * p.avgCostInclVatCents;
+                  const avgCostValue = p.isService
+                    ? null
+                    : Math.round(p.quantityOnHand * p.avgCostExclVatCents);
+                  const lastPurchValue =
+                    !p.isService && vRow?.lastPurchaseCostExclVatCents != null
+                      ? Math.round(p.quantityOnHand * vRow.lastPurchaseCostExclVatCents)
+                      : null;
+                  const rowDiff =
+                    avgCostValue !== null && lastPurchValue !== null
+                      ? lastPurchValue - avgCostValue
+                      : null;
                   return (
                     <tr
                       key={p.id}
@@ -256,14 +356,44 @@ function StockView({
                         {p.isService ? (
                           <span className="text-xs text-slate-400">—</span>
                         ) : (
-                          formatUsd(p.avgCostInclVatCents)
+                          formatUsd(p.avgCostExclVatCents)
                         )}
                       </td>
                       <td className="px-5 py-2 text-right font-medium text-slate-900">
+                        {avgCostValue !== null ? (
+                          formatUsd(avgCostValue)
+                        ) : (
+                          <span className="text-xs text-slate-400">—</span>
+                        )}
+                      </td>
+                      <td className="px-5 py-2 text-right text-slate-700">
                         {p.isService ? (
                           <span className="text-xs text-slate-400">—</span>
+                        ) : vRow?.lastPurchaseCostExclVatCents != null ? (
+                          formatUsd(vRow.lastPurchaseCostExclVatCents)
                         ) : (
-                          formatUsd(stockValue)
+                          <span className="text-xs text-amber-600">{t("inventory.noPurchaseCost")}</span>
+                        )}
+                      </td>
+                      <td className="px-5 py-2 text-right font-medium text-slate-900">
+                        {lastPurchValue !== null ? (
+                          formatUsd(lastPurchValue)
+                        ) : (
+                          <span className="text-xs text-slate-400">—</span>
+                        )}
+                      </td>
+                      <td className="px-5 py-2 text-right">
+                        {rowDiff !== null ? (
+                          <span
+                            className={clsx(
+                              "font-medium",
+                              rowDiff > 0 ? "text-emerald-700" : rowDiff < 0 ? "text-red-700" : "text-slate-600",
+                            )}
+                          >
+                            {rowDiff > 0 ? "+" : ""}{formatUsd(rowDiff)}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-slate-400">—</span>
                         )}
                       </td>
                       <td className="px-5 py-2 text-end">

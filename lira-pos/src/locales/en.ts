@@ -467,6 +467,23 @@ const en = {
     errQtyPositive: "Quantity must be a positive whole number.",
     errUnitCostInvalid: "Invalid unit cost.",
     errUnitCostNegative: "Unit cost cannot be negative.",
+
+    valCardAvgTitle: "Inventory Value — Avg Cost",
+    valCardLastTitle: "Inventory Value — Last Purchase Cost",
+    valCardDiffTitle: "Difference",
+    valCardDiffSub: "{{n}} of {{total}} stocked items",
+    valCardMissingTitle: "Missing Last Purchase Cost",
+    valCardMissingNone: "All stocked items have a purchase cost",
+    valCardMissingCount: "{{count}} item(s) without purchase cost",
+    valCardExclVat: "excl. VAT",
+
+    colAvgCostExcl: "Avg cost (excl. VAT)",
+    colValueAtAvg: "Value @ avg",
+    colLastPurchCost: "Last purch. cost",
+    colValueAtLastPurch: "Value @ last purch.",
+    colDiff: "Difference",
+
+    noPurchaseCost: "No purchase cost",
   },
   purchases: {
     loadingPage: "Loading purchases…",
