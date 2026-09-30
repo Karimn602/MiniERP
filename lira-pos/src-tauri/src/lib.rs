@@ -55,7 +55,7 @@ pub fn run() {
         .manage(DbState::new())
         .plugin(
             tauri_plugin_sql::Builder::default()
-                .add_migrations("sqlite:lira-pos.db", migrations)
+                .add_migrations("sqlite:greaz-pos.db", migrations)
                 .build(),
         )
         .invoke_handler(tauri::generate_handler![

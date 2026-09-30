@@ -38,7 +38,7 @@ fn resolve_db_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String>
         .path()
         .app_data_dir()
         .map_err(|e| format!("cannot resolve app_data_dir: {e}"))?;
-    Ok(dir.join("lira-pos.db"))
+    Ok(dir.join("greaz-pos.db"))
 }
 
 async fn pool(
