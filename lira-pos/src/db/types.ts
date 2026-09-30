@@ -349,6 +349,90 @@ export interface SaleWithDetails extends Sale {
   payments: SalePayment[];
 }
 
+// ---------- Sales Credit Memos (Returns / Refunds) ----------
+
+export type CreditMemoStatus = "posted" | "voided";
+
+export interface CreditMemo {
+  id: string;
+  storeId: string;
+  originalSaleId: string;
+  creditMemoNumber: number;
+  shiftId: string | null;
+  deviceId: string | null;
+  cashierUserId: string | null;
+  exchangeRateLbpPerUsd: number;
+  exchangeRateId: string | null;
+  reason: string | null;
+  subtotalExclVatCents: UsdCents;
+  vatTotalCents: UsdCents;
+  discountCents: UsdCents;
+  totalInclVatCents: UsdCents;
+  cogsReversedCents: UsdCents;
+  refundTotalUsdCents: UsdCents;
+  status: CreditMemoStatus;
+  createdAt: string;
+  postedAt: string | null;
+  notes: string | null;
+}
+
+export interface CreditMemoLine {
+  id: string;
+  creditMemoId: string;
+  storeId: string;
+  originalSaleItemId: string;
+  productId: string;
+  productNameSnapshot: string;
+  productSkuSnapshot: string | null;
+  vatRateIdSnapshot: string;
+  vatRateBpsSnapshot: number;
+  quantityBase: number;
+  quantityInUom: number | null;
+  uomCodeSnapshot: string | null;
+  factorNumSnapshot: number | null;
+  factorDenSnapshot: number | null;
+  unitPriceExclVatCents: UsdCents;
+  unitPriceInclVatCents: UsdCents;
+  lineSubtotalExclVatCents: UsdCents;
+  lineVatCents: UsdCents;
+  lineTotalInclVatCents: UsdCents;
+  lineDiscountCents: UsdCents;
+  unitCogsExclVatCents: UsdCents;
+  lineCogsExclVatCents: UsdCents;
+  isService: boolean;
+  returnToStock: boolean;
+  relatedMovementId: string | null;
+}
+
+export interface CreditMemoRefund {
+  id: string;
+  creditMemoId: string;
+  storeId: string;
+  method: PaymentMethod;
+  currency: PaymentCurrency;
+  amountNativeUsdCents: UsdCents;
+  amountNativeLbp: number;
+  amountUsdCentsEquivalent: UsdCents;
+  reference: string | null;
+  createdAt: string;
+}
+
+export interface CreditMemoWithDetails extends CreditMemo {
+  lines: CreditMemoLine[];
+  refunds: CreditMemoRefund[];
+}
+
+// Per-original-line returnable summary, used by the Create Return screen.
+export interface ReturnableLine {
+  saleItem: SaleItem;
+  soldQtyBase: number;
+  returnedQtyBase: number;
+  returnableQtyBase: number;
+  isService: boolean;
+}
+
+export type SaleReturnStatus = "none" | "partial" | "full";
+
 // ---------- Shifts ----------
 
 export type ShiftStatus = "open" | "closed" | "voided";

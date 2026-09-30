@@ -48,8 +48,13 @@ body {
   #receipt-print-root,
   #receipt-print-root *,
   #receipt-print,
-  #receipt-print * { visibility: visible; }
-  #receipt-print {
+  #receipt-print *,
+  #credit-memo-print-root,
+  #credit-memo-print-root *,
+  #credit-memo-print,
+  #credit-memo-print * { visibility: visible; }
+  #receipt-print,
+  #credit-memo-print {
     position: fixed;
     top: 0;
     left: 0;

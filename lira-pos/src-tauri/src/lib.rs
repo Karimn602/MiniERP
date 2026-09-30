@@ -49,6 +49,12 @@ pub fn run() {
             sql: include_str!("../../src/db/migrations/007_sales_cogs_method.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 8,
+            description: "sales_credit_memos",
+            sql: include_str!("../../src/db/migrations/008_sales_credit_memos.sql"),
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -63,6 +69,7 @@ pub fn run() {
             posting::post_adjustment,
             posting::post_supplier_payment,
             posting::post_sale,
+            posting::post_credit_memo,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

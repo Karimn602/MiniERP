@@ -29,6 +29,24 @@ export interface DailyPurchasesRow {
   totalInclVatCents: number;
 }
 
+export interface DailyReturnsRow {
+  localDate: string;
+  returnCount: number;
+  subtotalExclVatCents: number;
+  vatTotalCents: number;
+  totalInclVatCents: number;
+  cogsReversedCents: number;
+  refundTotalUsdCents: number;
+}
+
+export interface ProductReturnsRow {
+  productId: string;
+  totalQtyBase: number;
+  subtotalExclVatCents: number;
+  totalInclVatCents: number;
+  cogsReversedCents: number;
+}
+
 // sales.posted_at is UTC ISO — convert local date boundaries to UTC ISO strings.
 function utcFrom(localDate: string): string {
   return new Date(`${localDate}T00:00:00`).toISOString();
@@ -170,6 +188,93 @@ export const reportsRepo = {
       subtotalExclVatCents: r.subtotal_excl_vat_cents,
       vatTotalCents: r.vat_total_cents,
       totalInclVatCents: r.total_incl_vat_cents,
+    }));
+  },
+
+  // Posted credit memos grouped by local day. Subtracted from sales in reports.
+  async dailyReturns(args: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+  }): Promise<DailyReturnsRow[]> {
+    interface Row {
+      local_date: string;
+      return_count: number;
+      subtotal_excl_vat_cents: number;
+      vat_total_cents: number;
+      total_incl_vat_cents: number;
+      cogs_reversed_cents: number;
+      refund_total_usd_cents: number;
+    }
+
+    const rows = await query<Row>(
+      `SELECT
+         date(posted_at, 'localtime') AS local_date,
+         COUNT(*) AS return_count,
+         SUM(subtotal_excl_vat_cents) AS subtotal_excl_vat_cents,
+         SUM(vat_total_cents) AS vat_total_cents,
+         SUM(total_incl_vat_cents) AS total_incl_vat_cents,
+         SUM(cogs_reversed_cents) AS cogs_reversed_cents,
+         SUM(refund_total_usd_cents) AS refund_total_usd_cents
+       FROM sales_credit_memos
+       WHERE store_id = ?
+         AND status = 'posted'
+         AND posted_at >= ?
+         AND posted_at <= ?
+       GROUP BY local_date
+       ORDER BY local_date ASC`,
+      [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+    );
+
+    return rows.map((r) => ({
+      localDate: r.local_date,
+      returnCount: r.return_count,
+      subtotalExclVatCents: r.subtotal_excl_vat_cents,
+      vatTotalCents: r.vat_total_cents,
+      totalInclVatCents: r.total_incl_vat_cents,
+      cogsReversedCents: r.cogs_reversed_cents,
+      refundTotalUsdCents: r.refund_total_usd_cents,
+    }));
+  },
+
+  // Posted credit memo lines aggregated by product. Subtracted from the
+  // per-product sales table so it reflects net sales.
+  async productReturns(args: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+  }): Promise<ProductReturnsRow[]> {
+    interface Row {
+      product_id: string;
+      total_qty_base: number;
+      subtotal_excl_vat_cents: number;
+      total_incl_vat_cents: number;
+      cogs_reversed_cents: number;
+    }
+
+    const rows = await query<Row>(
+      `SELECT
+         l.product_id,
+         SUM(l.quantity_base) AS total_qty_base,
+         SUM(l.line_subtotal_excl_vat_cents) AS subtotal_excl_vat_cents,
+         SUM(l.line_total_incl_vat_cents) AS total_incl_vat_cents,
+         SUM(CASE WHEN l.return_to_stock = 1 THEN l.line_cogs_excl_vat_cents ELSE 0 END) AS cogs_reversed_cents
+       FROM sales_credit_memo_lines l
+       JOIN sales_credit_memos m ON m.id = l.credit_memo_id
+       WHERE m.store_id = ?
+         AND m.status = 'posted'
+         AND m.posted_at >= ?
+         AND m.posted_at <= ?
+       GROUP BY l.product_id`,
+      [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+    );
+
+    return rows.map((r) => ({
+      productId: r.product_id,
+      totalQtyBase: r.total_qty_base,
+      subtotalExclVatCents: r.subtotal_excl_vat_cents,
+      totalInclVatCents: r.total_incl_vat_cents,
+      cogsReversedCents: r.cogs_reversed_cents,
     }));
   },
 };

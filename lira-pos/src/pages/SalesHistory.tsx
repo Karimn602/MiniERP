@@ -3,7 +3,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
 import { salesRepo } from "../db/repos/sales";
-import type { Sale, SaleItem, SalePayment, SaleWithDetails } from "../db/types";
+import { creditMemosRepo } from "../db/repos/creditMemos";
+import type {
+  CreditMemo,
+  Sale,
+  SaleItem,
+  SalePayment,
+  SaleReturnStatus,
+  SaleWithDetails,
+} from "../db/types";
 import { query } from "../db/client";
 import { Card, CardBody, CardHeader } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -14,6 +22,7 @@ import { Badge } from "../components/ui/Badge";
 import { formatLbp, formatUsd, usdCentsToLbp } from "../lib/money";
 import { formatPrettyDate, relativeFromToday } from "../lib/dates";
 import { ReceiptPrint } from "../components/ReceiptPrint";
+import { CreateReturnModal } from "../components/CreateReturnModal";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
@@ -55,6 +64,10 @@ export default function SalesHistory() {
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState<string | null>(null);
 
+  const [returnStatusMap, setReturnStatusMap] = useState<Record<string, SaleReturnStatus>>({});
+  const [saleMemos, setSaleMemos] = useState<CreditMemo[]>([]);
+  const [returnModalOpen, setReturnModalOpen] = useState(false);
+
   useEffect(() => {
     if (!storeId || !hydrated) return;
     query<{ name: string }>("SELECT name FROM stores WHERE id = ? LIMIT 1", [storeId])
@@ -71,6 +84,14 @@ export default function SalesHistory() {
     try {
       const rows = await salesRepo.list({ storeId, limit: 200 });
       setSales(rows);
+      try {
+        const statusMap = await creditMemosRepo.getReturnStatusForSales(
+          rows.map((s) => s.id),
+        );
+        setReturnStatusMap(statusMap);
+      } catch {
+        setReturnStatusMap({});
+      }
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -86,11 +107,13 @@ export default function SalesHistory() {
     if (selectedId === id && details) {
       setSelectedId(null);
       setDetails(null);
+      setSaleMemos([]);
       return;
     }
 
     setSelectedId(id);
     setDetails(null);
+    setSaleMemos([]);
     setDetailsError(null);
     setDetailsLoading(true);
 
@@ -98,12 +121,33 @@ export default function SalesHistory() {
       const row = await salesRepo.findByIdWithDetails(id);
       if (!row) throw new Error("Sale not found.");
       setDetails(row);
+      try {
+        setSaleMemos(await creditMemosRepo.listForSale(id));
+      } catch {
+        setSaleMemos([]);
+      }
     } catch (e) {
       setDetailsError(e instanceof Error ? e.message : String(e));
     } finally {
       setDetailsLoading(false);
     }
   }
+
+  const refreshAfterReturn = useCallback(async () => {
+    await reload();
+    if (selectedId) {
+      try {
+        const [row, memos] = await Promise.all([
+          salesRepo.findByIdWithDetails(selectedId),
+          creditMemosRepo.listForSale(selectedId),
+        ]);
+        setDetails(row);
+        setSaleMemos(memos);
+      } catch {
+        /* ignore refresh errors */
+      }
+    }
+  }, [reload, selectedId]);
 
   const summary = useMemo(() => {
     return sales.reduce(
@@ -250,6 +294,17 @@ export default function SalesHistory() {
                             >
                               {t(`salesHistory.status${s.status.charAt(0).toUpperCase() + s.status.slice(1)}` as Parameters<typeof t>[0])}
                             </Badge>
+                            {(returnStatusMap[s.id] === "partial" ||
+                              returnStatusMap[s.id] === "full") && (
+                              <Badge
+                                tone={returnStatusMap[s.id] === "full" ? "neutral" : "warn"}
+                                className="ms-1"
+                              >
+                                {returnStatusMap[s.id] === "full"
+                                  ? t("salesHistory.returnStatusFull")
+                                  : t("salesHistory.returnStatusPartial")}
+                              </Badge>
+                            )}
                           </td>
                         </tr>
                       );
@@ -274,10 +329,14 @@ export default function SalesHistory() {
                 sale={details}
                 loading={detailsLoading}
                 error={detailsError}
+                returnStatus={details ? returnStatusMap[details.id] ?? "none" : "none"}
+                memos={saleMemos}
+                onCreateReturn={() => setReturnModalOpen(true)}
                 onPrint={() => window.print()}
                 onClose={() => {
                   setSelectedId(null);
                   setDetails(null);
+                  setSaleMemos([]);
                 }}
               />
             </div>
@@ -286,30 +345,60 @@ export default function SalesHistory() {
       </div>
 
       {/* Print-only receipt root — outside the drawer so fixed positioning escapes correctly */}
-      {details && (
+      {details && !returnModalOpen && (
         <div id="receipt-print-root" className="hidden print:block">
           <ReceiptPrint sale={details} storeName={storeName} />
         </div>
       )}
+
+      {returnModalOpen && details && (
+        <CreateReturnModal
+          saleId={details.id}
+          originalReceiptNumber={details.receiptNumber}
+          saleDateIso={details.postedAt ?? details.createdAt}
+          storeName={storeName}
+          onClose={() => setReturnModalOpen(false)}
+          onPosted={() => void refreshAfterReturn()}
+        />
+      )}
     </div>
   );
+}
+
+function returnStatusTone(status: SaleReturnStatus): "good" | "warn" | "neutral" {
+  if (status === "full") return "neutral";
+  if (status === "partial") return "warn";
+  return "good";
 }
 
 function SaleDetailCard({
   sale,
   loading,
   error,
+  returnStatus,
+  memos,
+  onCreateReturn,
   onPrint,
   onClose,
 }: {
   sale: SaleWithDetails | null;
   loading: boolean;
   error: string | null;
+  returnStatus: SaleReturnStatus;
+  memos: CreditMemo[];
+  onCreateReturn: () => void;
   onPrint: () => void;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
   const profit = sale ? grossProfitCents(sale) : 0;
+  const canReturn = !!sale && sale.status === "posted" && returnStatus !== "full";
+  const returnStatusLabel =
+    returnStatus === "full"
+      ? t("salesHistory.returnStatusFull")
+      : returnStatus === "partial"
+        ? t("salesHistory.returnStatusPartial")
+        : t("salesHistory.returnStatusNone");
 
   const title = sale
     ? t("salesHistory.detailReceiptTitle", { number: String(sale.receiptNumber) })
@@ -328,6 +417,11 @@ function SaleDetailCard({
         subtitle={subtitle}
         actions={
           <>
+            {canReturn && (
+              <Button variant="primary" size="sm" className="print:hidden" onClick={onCreateReturn}>
+                {t("salesHistory.createReturn")}
+              </Button>
+            )}
             {sale && (
               <Button variant="ghost" size="sm" className="print:hidden" onClick={onPrint}>
                 {t("salesHistory.printReceipt")}
@@ -362,6 +456,10 @@ function SaleDetailCard({
               <div className="rounded-md border border-slate-200 p-3 text-sm">
                 <div className="font-medium text-slate-900">{t("salesHistory.detailSaleInfoTitle")}</div>
                 <DetailRow label={t("salesHistory.detailStatus")} value={sale.status} />
+                <div className="mt-2 flex items-center justify-between gap-3">
+                  <span className="text-xs text-slate-500">{t("salesHistory.detailReturnStatus")}</span>
+                  <Badge tone={returnStatusTone(returnStatus)}>{returnStatusLabel}</Badge>
+                </div>
                 <DetailRow
                   label={t("salesHistory.detailExchangeRate")}
                   value={`${sale.exchangeRateLbpPerUsd.toLocaleString()} L.L. / USD`}
@@ -406,6 +504,29 @@ function SaleDetailCard({
 
             <LinesTable lines={sale.lines} />
             <PaymentsTable payments={sale.payments} />
+
+            {memos.length > 0 && (
+              <div className="rounded-md border border-slate-200 p-3 text-sm">
+                <div className="mb-2 font-medium text-slate-900">
+                  {t("salesHistory.detailReturnsTitle")}
+                </div>
+                <div className="space-y-1.5">
+                  {memos.map((m) => (
+                    <div key={m.id} className="flex items-center justify-between gap-3">
+                      <span className="text-xs text-slate-600">
+                        {t("salesHistory.detailReturnMemo", { number: String(m.creditMemoNumber) })}
+                        {m.postedAt ? ` · ${formatPrettyDate(isoToLocalDate(m.postedAt))}` : ""}
+                      </span>
+                      <span className="text-xs font-medium text-slate-800">
+                        {t("salesHistory.detailReturnRefunded", {
+                          amount: formatUsd(m.refundTotalUsdCents),
+                        })}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 </>
         ) : null}
       </CardBody>

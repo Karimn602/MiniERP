@@ -1196,3 +1196,543 @@ pub async fn post_sale(
         change_total_usd_cents: change_total_usd,
     })
 }
+
+// ============================================================================
+// Payload types — credit memo / return (Phase 4 — Sales Returns)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCreditMemoPayload {
+    pub credit_memo_id: String,
+    pub store_id: String,
+    pub original_sale_id: String,
+    pub cashier_user_id: Option<String>,
+    pub device_id: Option<String>,
+    pub shift_id: Option<String>,
+
+    // Exchange rate LOCKED at refund time — used to value any LBP refund leg.
+    pub exchange_rate_id: String,
+    pub exchange_rate_lbp_per_usd: i64,
+
+    pub reason: Option<String>,
+    pub lines: Vec<PostCreditMemoLine>,
+    pub refunds: Vec<PostCreditMemoRefund>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCreditMemoLine {
+    pub credit_memo_line_id: String,
+    pub original_sale_item_id: String,
+    // Returned quantity in the canonical BASE UoM (authoritative for caps/proration).
+    pub quantity_base: i64,
+    // Display quantity in the sold UoM (snapshot only; may be null).
+    pub quantity_in_uom: Option<i64>,
+    // Whether to put stock back. Ignored (forced false) for service lines.
+    pub return_to_stock: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCreditMemoRefund {
+    pub refund_id: String,
+    pub method: String,
+    pub currency: String,
+    pub amount_native_usd_cents: i64,
+    pub amount_native_lbp: i64,
+    pub amount_usd_cents_equivalent: i64,
+    pub reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCreditMemoResult {
+    pub credit_memo_id: String,
+    pub credit_memo_number: i64,
+    pub posted_at: String,
+    pub total_incl_vat_cents: i64,
+    pub refund_total_usd_cents: i64,
+    pub movement_ids: Vec<String>,
+}
+
+// ============================================================================
+// Helpers — credit memo
+// ============================================================================
+
+async fn next_credit_memo_number(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+) -> Result<i64, String> {
+    let row = sqlx::query("SELECT value FROM app_settings WHERE key = 'next_credit_memo_number'")
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("read next_credit_memo_number: {e}"))?;
+    let current: i64 = row
+        .ok_or_else(|| "next_credit_memo_number missing from app_settings".to_string())?
+        .try_get::<String, _>("value")
+        .map_err(|e| format!("decode next_credit_memo_number: {e}"))?
+        .parse()
+        .map_err(|e| format!("parse next_credit_memo_number: {e}"))?;
+    sqlx::query("UPDATE app_settings SET value = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'next_credit_memo_number'")
+        .bind((current + 1).to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("write next_credit_memo_number: {e}"))?;
+    Ok(current)
+}
+
+// Proportional share of `amount` for `q` out of `total_q`, round-half-up.
+// Mirrors the JS Math.round(amount * q / total_q) used in creditMemoMath.ts.
+fn prorate(amount: i64, q: i64, total_q: i64) -> i64 {
+    if total_q <= 0 {
+        return 0;
+    }
+    let num = amount as i128 * q as i128;
+    let half = (total_q as i128) / 2;
+    ((num + half) / total_q as i128) as i64
+}
+
+// Split a VAT-inclusive total into (subtotal_excl, vat) so the two always sum
+// back to the input. Mirrors postDiscountLineTotals in the JS side.
+fn split_incl_vat(total_incl: i64, vat_bps: i64) -> (i64, i64) {
+    if vat_bps <= 0 {
+        return (total_incl, 0);
+    }
+    let denom = 10000 + vat_bps;
+    let subtotal =
+        ((total_incl as i128 * 10000 + (denom as i128) / 2) / denom as i128) as i64;
+    (subtotal, total_incl - subtotal)
+}
+
+// ============================================================================
+// post_credit_memo
+// ============================================================================
+
+#[tauri::command]
+pub async fn post_credit_memo(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: PostCreditMemoPayload,
+) -> Result<PostCreditMemoResult, String> {
+    // ---- Validation: header ----
+    if payload.lines.is_empty() {
+        return Err("A return must have at least one line.".into());
+    }
+    if payload.refunds.is_empty() {
+        return Err("A return must have at least one refund.".into());
+    }
+    if payload.exchange_rate_lbp_per_usd <= 0 {
+        return Err("Exchange rate must be positive.".into());
+    }
+
+    // ---- Validation: lines (shape only; amounts come from the DB) ----
+    for (i, line) in payload.lines.iter().enumerate() {
+        if line.quantity_base <= 0 {
+            return Err(format!("Return line {} has non-positive quantity.", i + 1));
+        }
+    }
+
+    // ---- Validation: refunds ----
+    let allowed_methods = [
+        "cash_usd", "cash_lbp", "card_usd", "card_lbp",
+        "bank_transfer", "wallet", "store_credit", "other",
+    ];
+    for (i, r) in payload.refunds.iter().enumerate() {
+        if !allowed_methods.contains(&r.method.as_str()) {
+            return Err(format!("Refund {} has invalid method: {}", i + 1, r.method));
+        }
+        if r.currency != "USD" && r.currency != "LBP" {
+            return Err(format!("Refund {} has invalid currency: {}", i + 1, r.currency));
+        }
+        if r.amount_usd_cents_equivalent <= 0 {
+            return Err(format!("Refund {} has non-positive amount.", i + 1));
+        }
+        let usd_ok = r.amount_native_usd_cents > 0
+            && r.currency == "USD"
+            && r.amount_native_lbp == 0;
+        let lbp_ok = r.amount_native_lbp > 0
+            && r.currency == "LBP"
+            && r.amount_native_usd_cents == 0;
+        if !(usd_ok || lbp_ok) {
+            return Err(format!(
+                "Refund {}: native amounts inconsistent with currency.",
+                i + 1
+            ));
+        }
+    }
+
+    let pool = pool(&app, &state).await?;
+    let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- The original sale must exist, be posted and be a normal sale. ----
+    let sale_row = sqlx::query(
+        "SELECT sale_type, status FROM sales WHERE id = ? AND store_id = ?",
+    )
+    .bind(&payload.original_sale_id)
+    .bind(&payload.store_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("read original sale: {e}"))?
+    .ok_or_else(|| "Original sale not found.".to_string())?;
+
+    let sale_type: String = sale_row.try_get("sale_type").map_err(|e| format!("decode sale_type: {e}"))?;
+    let sale_status: String = sale_row.try_get("status").map_err(|e| format!("decode status: {e}"))?;
+    if sale_status != "posted" {
+        return Err("Only posted sales can be returned.".into());
+    }
+    if sale_type != "normal" {
+        return Err("Only normal sales can be returned.".into());
+    }
+
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+
+    // ---- Resolve each line from the ORIGINAL sale_item snapshot. ----
+    struct ResolvedLine {
+        line: PostCreditMemoLine,
+        product_id: String,
+        product_name: String,
+        product_sku: Option<String>,
+        vat_rate_id: String,
+        vat_bps: i64,
+        uom_code: Option<String>,
+        factor_num: Option<i64>,
+        factor_den: Option<i64>,
+        unit_price_excl: i64,
+        unit_price_incl: i64,
+        line_subtotal: i64,
+        line_vat: i64,
+        line_total: i64,
+        line_discount: i64,
+        unit_cogs_excl: i64,
+        unit_cogs_incl: i64,
+        line_cogs: i64,
+        is_service: bool,
+    }
+
+    let mut resolved: Vec<ResolvedLine> = Vec::with_capacity(payload.lines.len());
+    let mut header_subtotal: i64 = 0;
+    let mut header_vat: i64 = 0;
+    let mut header_total: i64 = 0;
+    let mut header_discount: i64 = 0;
+    let mut header_cogs_reversed: i64 = 0;
+
+    for (i, line) in payload.lines.iter().enumerate() {
+        let item = sqlx::query(
+            "SELECT product_id, product_name_snapshot, product_sku_snapshot,
+                    vat_rate_id_snapshot, vat_rate_bps_snapshot,
+                    quantity, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot,
+                    unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+                    line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+                    line_discount_cents, unit_cogs_excl_vat_cents
+               FROM sale_items
+              WHERE id = ? AND sale_id = ? AND store_id = ?",
+        )
+        .bind(&line.original_sale_item_id)
+        .bind(&payload.original_sale_id)
+        .bind(&payload.store_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read sale_item: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "Return line {}: original sale item not found on this sale.",
+                i + 1
+            )
+        })?;
+
+        let orig_qty: i64 = item.try_get("quantity").map_err(|e| format!("decode quantity: {e}"))?;
+
+        // Already-returned base qty for this original sale item (posted memos only).
+        let prev_row = sqlx::query(
+            "SELECT COALESCE(SUM(l.quantity_base), 0) AS returned
+               FROM sales_credit_memo_lines l
+               JOIN sales_credit_memos m ON m.id = l.credit_memo_id
+              WHERE l.original_sale_item_id = ? AND m.status = 'posted'",
+        )
+        .bind(&line.original_sale_item_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("read already-returned qty: {e}"))?;
+        let already_returned: i64 =
+            prev_row.try_get("returned").map_err(|e| format!("decode returned: {e}"))?;
+
+        let remaining = orig_qty - already_returned;
+        if line.quantity_base > remaining {
+            return Err(format!(
+                "Return line {}: cannot return {} (only {} remaining of {} sold).",
+                i + 1,
+                line.quantity_base,
+                remaining,
+                orig_qty
+            ));
+        }
+
+        let product_id: String = item.try_get("product_id").map_err(|e| format!("decode product_id: {e}"))?;
+        let product_name: String = item.try_get("product_name_snapshot").map_err(|e| format!("decode name: {e}"))?;
+        let product_sku: Option<String> = item.try_get("product_sku_snapshot").map_err(|e| format!("decode sku: {e}"))?;
+        let vat_rate_id: String = item.try_get("vat_rate_id_snapshot").map_err(|e| format!("decode vat_rate_id: {e}"))?;
+        let vat_bps: i64 = item.try_get("vat_rate_bps_snapshot").map_err(|e| format!("decode vat_bps: {e}"))?;
+        let uom_code: Option<String> = item.try_get("uom_code_snapshot").map_err(|e| format!("decode uom: {e}"))?;
+        let factor_num: Option<i64> = item.try_get("factor_num_snapshot").map_err(|e| format!("decode factor_num: {e}"))?;
+        let factor_den: Option<i64> = item.try_get("factor_den_snapshot").map_err(|e| format!("decode factor_den: {e}"))?;
+        let unit_price_excl: i64 = item.try_get("unit_price_excl_vat_cents").map_err(|e| format!("decode unit_price_excl: {e}"))?;
+        let unit_price_incl: i64 = item.try_get("unit_price_incl_vat_cents").map_err(|e| format!("decode unit_price_incl: {e}"))?;
+        let orig_subtotal: i64 = item.try_get("line_subtotal_excl_vat_cents").map_err(|e| format!("decode subtotal: {e}"))?;
+        let orig_total: i64 = item.try_get("line_total_incl_vat_cents").map_err(|e| format!("decode total: {e}"))?;
+        let orig_discount: i64 = item.try_get("line_discount_cents").map_err(|e| format!("decode discount: {e}"))?;
+        let unit_cogs_excl: i64 = item.try_get("unit_cogs_excl_vat_cents").map_err(|e| format!("decode unit_cogs: {e}"))?;
+        let _ = orig_subtotal;
+
+        // Determine whether stock actually moved when this line was sold. If a
+        // 'sale' movement exists, it's a stock line; if not, it was a service.
+        let sale_mov = sqlx::query(
+            "SELECT unit_cost_excl_vat_cents, unit_cost_incl_vat_cents
+               FROM inventory_movements
+              WHERE related_sale_item_id = ? AND movement_type = 'sale'
+              LIMIT 1",
+        )
+        .bind(&line.original_sale_item_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read sale movement: {e}"))?;
+
+        let is_service = sale_mov.is_none();
+        let unit_cogs_incl: i64 = match &sale_mov {
+            Some(m) => m.try_get("unit_cost_incl_vat_cents").map_err(|e| format!("decode cost_incl: {e}"))?,
+            None => 0,
+        };
+
+        // Prorate the VAT-inclusive total by returned quantity, then back out VAT
+        // so subtotal + vat == total exactly. Discount/COGS prorate likewise.
+        let line_total = prorate(orig_total, line.quantity_base, orig_qty);
+        let (line_subtotal, line_vat) = split_incl_vat(line_total, vat_bps);
+        let line_discount = prorate(orig_discount, line.quantity_base, orig_qty);
+        let line_cogs = unit_cogs_excl * line.quantity_base;
+
+        let restock = !is_service && line.return_to_stock;
+        if restock {
+            header_cogs_reversed += line_cogs;
+        }
+
+        header_total += line_total;
+        header_subtotal += line_subtotal;
+        header_vat += line_vat;
+        header_discount += line_discount;
+
+        resolved.push(ResolvedLine {
+            line: PostCreditMemoLine {
+                credit_memo_line_id: line.credit_memo_line_id.clone(),
+                original_sale_item_id: line.original_sale_item_id.clone(),
+                quantity_base: line.quantity_base,
+                quantity_in_uom: line.quantity_in_uom,
+                return_to_stock: restock,
+            },
+            product_id,
+            product_name,
+            product_sku,
+            vat_rate_id,
+            vat_bps,
+            uom_code,
+            factor_num,
+            factor_den,
+            unit_price_excl,
+            unit_price_incl,
+            line_subtotal,
+            line_vat,
+            line_total,
+            line_discount,
+            unit_cogs_excl,
+            unit_cogs_incl,
+            line_cogs,
+            is_service,
+        });
+    }
+
+    if header_total <= 0 {
+        return Err("Return total must be positive.".into());
+    }
+
+    // ---- Refund total must reconcile to the credit memo total exactly. ----
+    let refund_total: i64 = payload
+        .refunds
+        .iter()
+        .map(|r| r.amount_usd_cents_equivalent)
+        .sum();
+    if refund_total != header_total {
+        return Err(format!(
+            "Refund total ({} USD-cents) must equal the return total ({} USD-cents).",
+            refund_total, header_total
+        ));
+    }
+
+    let credit_memo_number = next_credit_memo_number(&mut tx).await?;
+
+    // ---- Insert credit memo header. ----
+    sqlx::query(
+        r#"INSERT INTO sales_credit_memos (
+             id, store_id, original_sale_id, credit_memo_number,
+             shift_id, device_id, cashier_user_id,
+             exchange_rate_lbp_per_usd, exchange_rate_id, reason,
+             subtotal_excl_vat_cents, vat_total_cents, discount_cents, total_incl_vat_cents,
+             cogs_reversed_cents, refund_total_usd_cents,
+             status, posted_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted', ?)"#,
+    )
+    .bind(&payload.credit_memo_id)
+    .bind(&payload.store_id)
+    .bind(&payload.original_sale_id)
+    .bind(credit_memo_number)
+    .bind(&payload.shift_id)
+    .bind(&payload.device_id)
+    .bind(&payload.cashier_user_id)
+    .bind(payload.exchange_rate_lbp_per_usd)
+    .bind(&payload.exchange_rate_id)
+    .bind(&payload.reason)
+    .bind(header_subtotal)
+    .bind(header_vat)
+    .bind(header_discount)
+    .bind(header_total)
+    .bind(header_cogs_reversed)
+    .bind(refund_total)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert credit memo: {e}"))?;
+
+    // ---- Insert each line + (for restock lines) a return_in movement. ----
+    let mut movement_ids: Vec<String> = Vec::new();
+
+    for r in &resolved {
+        let mut related_movement_id: Option<String> = None;
+
+        if r.line.return_to_stock {
+            let movement_id = uuid::Uuid::new_v4().to_string();
+            movement_ids.push(movement_id.clone());
+            related_movement_id = Some(movement_id.clone());
+
+            sqlx::query(
+                r#"INSERT INTO inventory_movements (
+                     id, store_id, product_id, movement_type, quantity_delta,
+                     unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+                     related_sale_id, related_sale_item_id,
+                     related_credit_memo_id, related_credit_memo_line_id,
+                     notes, created_by_user_id, device_id, posted_at,
+                     quantity_in_uom, uom_code_snapshot,
+                     factor_num_snapshot, factor_den_snapshot
+                   ) VALUES (?, ?, ?, 'return_in', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&movement_id)
+            .bind(&payload.store_id)
+            .bind(&r.product_id)
+            .bind(r.line.quantity_base) // return = stock IN (positive)
+            .bind(r.unit_cogs_excl)
+            .bind(r.unit_cogs_incl)
+            .bind(&payload.original_sale_id)
+            .bind(&r.line.original_sale_item_id)
+            .bind(&payload.credit_memo_id)
+            .bind(&r.line.credit_memo_line_id)
+            .bind(format!("Return #{}", credit_memo_number))
+            .bind(&payload.cashier_user_id)
+            .bind(&payload.device_id)
+            .bind(&now)
+            .bind(&r.line.quantity_in_uom)
+            .bind(&r.uom_code)
+            .bind(&r.factor_num)
+            .bind(&r.factor_den)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("insert return_in movement: {e}"))?;
+
+            sqlx::query(
+                "UPDATE products
+                    SET quantity_on_hand = quantity_on_hand + ?
+                  WHERE id = ? AND store_id = ?",
+            )
+            .bind(r.line.quantity_base)
+            .bind(&r.product_id)
+            .bind(&payload.store_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("restock product: {e}"))?;
+        }
+
+        sqlx::query(
+            r#"INSERT INTO sales_credit_memo_lines (
+                 id, credit_memo_id, store_id, original_sale_item_id, product_id,
+                 product_name_snapshot, product_sku_snapshot,
+                 vat_rate_id_snapshot, vat_rate_bps_snapshot,
+                 quantity_base, quantity_in_uom, uom_code_snapshot,
+                 factor_num_snapshot, factor_den_snapshot,
+                 unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+                 line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+                 line_discount_cents,
+                 unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
+                 is_service, return_to_stock, related_movement_id
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&r.line.credit_memo_line_id)
+        .bind(&payload.credit_memo_id)
+        .bind(&payload.store_id)
+        .bind(&r.line.original_sale_item_id)
+        .bind(&r.product_id)
+        .bind(&r.product_name)
+        .bind(&r.product_sku)
+        .bind(&r.vat_rate_id)
+        .bind(r.vat_bps)
+        .bind(r.line.quantity_base)
+        .bind(&r.line.quantity_in_uom)
+        .bind(&r.uom_code)
+        .bind(&r.factor_num)
+        .bind(&r.factor_den)
+        .bind(r.unit_price_excl)
+        .bind(r.unit_price_incl)
+        .bind(r.line_subtotal)
+        .bind(r.line_vat)
+        .bind(r.line_total)
+        .bind(r.line_discount)
+        .bind(r.unit_cogs_excl)
+        .bind(r.line_cogs)
+        .bind(r.is_service as i64)
+        .bind(r.line.return_to_stock as i64)
+        .bind(&related_movement_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert credit memo line: {e}"))?;
+    }
+
+    // ---- Insert refund rows. ----
+    for r in &payload.refunds {
+        sqlx::query(
+            r#"INSERT INTO sales_credit_memo_refunds (
+                 id, credit_memo_id, store_id, method, currency,
+                 amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent,
+                 reference
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&r.refund_id)
+        .bind(&payload.credit_memo_id)
+        .bind(&payload.store_id)
+        .bind(&r.method)
+        .bind(&r.currency)
+        .bind(r.amount_native_usd_cents)
+        .bind(r.amount_native_lbp)
+        .bind(r.amount_usd_cents_equivalent)
+        .bind(&r.reference)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert credit memo refund: {e}"))?;
+    }
+
+    tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+
+    Ok(PostCreditMemoResult {
+        credit_memo_id: payload.credit_memo_id,
+        credit_memo_number,
+        posted_at: now,
+        total_incl_vat_cents: header_total,
+        refund_total_usd_cents: refund_total,
+        movement_ids,
+    })
+}

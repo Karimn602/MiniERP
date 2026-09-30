@@ -4,6 +4,7 @@ import {
   shiftsRepo,
   type ShiftSalesSummary,
   type ShiftPaymentRow,
+  type ShiftRefundsSummary,
 } from "../db/repos/shifts";
 import type { Shift } from "../db/types";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
@@ -115,6 +116,7 @@ export default function ShiftSummary() {
   const [activeShift, setActiveShift] = useState<Shift | null | undefined>(undefined);
   const [salesSummary, setSalesSummary] = useState<ShiftSalesSummary | null>(null);
   const [payments, setPayments] = useState<ShiftPaymentRow[]>([]);
+  const [refunds, setRefunds] = useState<ShiftRefundsSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -132,12 +134,14 @@ export default function ShiftSummary() {
 
   const loadShiftData = useCallback(async (shift: Shift) => {
     if (!storeId) return;
-    const [summary, breakdown] = await Promise.all([
+    const [summary, breakdown, refundsSummary] = await Promise.all([
       shiftsRepo.getSalesSummary(shift.id, storeId),
       shiftsRepo.getPaymentBreakdown(shift.id, storeId),
+      shiftsRepo.getRefundsSummary(shift.id, storeId),
     ]);
     setSalesSummary(summary);
     setPayments(breakdown);
+    setRefunds(refundsSummary);
   }, [storeId]);
 
   const loadShift = useCallback(async () => {
@@ -152,6 +156,7 @@ export default function ShiftSummary() {
       } else {
         setSalesSummary(null);
         setPayments([]);
+        setRefunds(null);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -190,8 +195,11 @@ export default function ShiftSummary() {
     const openingUsd = activeShift?.openingCashUsdCents ?? 0;
     const openingLbp = activeShift?.openingCashLbp ?? 0;
 
-    const expectedUsd = openingUsd + cashUsdReceived - changeUsd;
-    const expectedLbp = openingLbp + cashLbpReceived - changeLbp;
+    const cashRefundUsd = refunds?.cashUsdCents ?? 0;
+    const cashRefundLbp = refunds?.cashLbp ?? 0;
+
+    const expectedUsd = openingUsd + cashUsdReceived - changeUsd - cashRefundUsd;
+    const expectedLbp = openingLbp + cashLbpReceived - changeLbp - cashRefundLbp;
 
     // Live variance from closing inputs
     let closingUsd = 0;
@@ -218,6 +226,8 @@ export default function ShiftSummary() {
       cashLbpReceived,
       changeUsd,
       changeLbp,
+      cashRefundUsd,
+      cashRefundLbp,
       expectedUsd,
       expectedLbp,
       closingUsd,
@@ -227,7 +237,7 @@ export default function ShiftSummary() {
       varianceUsd: closingUsdValid ? closingUsd - expectedUsd : null,
       varianceLbp: closingLbpValid ? closingLbp - expectedLbp : null,
     };
-  }, [payments, activeShift, closingUsdInput, closingLbpInput]);
+  }, [payments, activeShift, closingUsdInput, closingLbpInput, refunds]);
 
   // ---------- Actions ----------
 
@@ -253,6 +263,7 @@ export default function ShiftSummary() {
       setActiveShift(shift);
       setSalesSummary({ receiptCount: 0, totalInclVatCents: 0, subtotalExclVatCents: 0, discountCents: 0, vatTotalCents: 0, netSalesExclVatCents: 0 });
       setPayments([]);
+      setRefunds({ refundCount: 0, totalUsdCents: 0, cashUsdCents: 0, cashLbp: 0, cardUsdCents: 0 });
       setOpeningUsdInput("");
       setOpeningLbpInput("");
       setClosingUsdInput("");
@@ -288,6 +299,7 @@ export default function ShiftSummary() {
       setActiveShift(null);
       setSalesSummary(null);
       setPayments([]);
+      setRefunds(null);
       setClosingUsdInput("");
       setClosingLbpInput("");
     } catch (e) {
@@ -426,6 +438,33 @@ export default function ShiftSummary() {
             </div>
           </div>
 
+          {/* Section 1b — Refunds (Returns) */}
+          <div>
+            <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-700">
+              {t("shift.refundsTitle")}
+            </h3>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <StatCard
+                label={t("shift.refundCount")}
+                value={refunds ? String(refunds.refundCount) : "—"}
+              />
+              <StatCard
+                label={t("shift.refundsPaid")}
+                value={refunds ? formatUsd(refunds.totalUsdCents) : "—"}
+                tone={refunds && refunds.totalUsdCents > 0 ? "warn" : undefined}
+              />
+              <StatCard
+                label={t("shift.netCollected")}
+                value={
+                  salesSummary
+                    ? formatUsd(salesSummary.totalInclVatCents - (refunds?.totalUsdCents ?? 0))
+                    : "—"
+                }
+                sub={t("shift.afterRefunds")}
+              />
+            </div>
+          </div>
+
           {/* Section 2 — Payment Method Breakdown */}
           <Card>
             <CardHeader
@@ -546,6 +585,11 @@ export default function ShiftSummary() {
                       tone={drawer.changeUsd > 0 ? "warn" : undefined}
                     />
                     <DrawerRow
+                      label={t("shift.cashRefunded")}
+                      value={drawer.cashRefundUsd > 0 ? `− ${formatUsd(drawer.cashRefundUsd)}` : "—"}
+                      tone={drawer.cashRefundUsd > 0 ? "warn" : undefined}
+                    />
+                    <DrawerRow
                       label={t("shift.expectedInDrawer")}
                       value={formatUsd(drawer.expectedUsd)}
                       isBold
@@ -603,6 +647,11 @@ export default function ShiftSummary() {
                       label={t("shift.changeGiven")}
                       value={drawer.changeLbp > 0 ? `− ${formatLbp(drawer.changeLbp)}` : "—"}
                       tone={drawer.changeLbp > 0 ? "warn" : undefined}
+                    />
+                    <DrawerRow
+                      label={t("shift.cashRefunded")}
+                      value={drawer.cashRefundLbp > 0 ? `− ${formatLbp(drawer.cashRefundLbp)}` : "—"}
+                      tone={drawer.cashRefundLbp > 0 ? "warn" : undefined}
                     />
                     <DrawerRow
                       label={t("shift.expectedInDrawer")}

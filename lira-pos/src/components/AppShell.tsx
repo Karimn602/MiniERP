@@ -35,6 +35,7 @@ const icons = {
   rate: <Icon d="M4 7h11m0 0-3-3m3 3-3 3M20 17H9m0 0 3-3m-3 3 3 3" />,
   shift: <Icon d="M12 7v5l3 2m6-2a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />,
   sales: <Icon d="M4 19V5m0 14h16M8 16l3-4 3 2 4-6" />,
+  returns: <Icon d="M9 14 4 9l5-5M4 9h11a5 5 0 0 1 5 5v1a5 5 0 0 1-5 5H7" />,
   reports: <Icon d="M5 21V8m0 13h14M5 21H3m16 0V4m0 17h2M12 21v-9" />,
   manager: <Icon d="M3 13l9-9 9 9M5 11v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8M9 21v-6h6v6" />,
 };
@@ -95,6 +96,7 @@ export function AppShell() {
           <div className="mx-2 my-2.5 border-t border-slate-200/70" />
           <NavLink to="/shift" icon={icons.shift}>{t("nav.shiftSummary")}</NavLink>
           <NavLink to="/sales" icon={icons.sales}>{t("nav.salesHistory")}</NavLink>
+          <NavLink to="/returns" icon={icons.returns}>{t("nav.returns")}</NavLink>
           <NavLink to="/reports" icon={icons.reports}>{t("nav.localReports")}</NavLink>
 
           <div className="mx-2 my-2.5 border-t border-slate-200/70" />

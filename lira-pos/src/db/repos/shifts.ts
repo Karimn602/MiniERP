@@ -67,6 +67,14 @@ export interface ShiftPaymentRow {
   changeGivenLbp: number;
 }
 
+export interface ShiftRefundsSummary {
+  refundCount: number;
+  totalUsdCents: number;
+  cashUsdCents: number;
+  cashLbp: number;
+  cardUsdCents: number;
+}
+
 // ---------- Repo ----------
 
 export const shiftsRepo = {
@@ -188,6 +196,49 @@ export const shiftsRepo = {
     }));
   },
 
+  // Posted credit memos refunded during this shift. Cash legs reduce the
+  // expected cash in the drawer; the total reduces net collection.
+  async getRefundsSummary(
+    shiftId: string,
+    storeId: string,
+  ): Promise<ShiftRefundsSummary> {
+    interface Row {
+      refund_count: number;
+      total_usd_cents: number;
+      cash_usd_cents: number;
+      cash_lbp: number;
+      card_usd_cents: number;
+    }
+    const rows = await query<Row>(
+      `SELECT
+         COUNT(DISTINCT m.id) AS refund_count,
+         COALESCE(SUM(r.amount_usd_cents_equivalent), 0) AS total_usd_cents,
+         COALESCE(SUM(CASE WHEN r.method = 'cash_usd' THEN r.amount_native_usd_cents ELSE 0 END), 0) AS cash_usd_cents,
+         COALESCE(SUM(CASE WHEN r.method = 'cash_lbp' THEN r.amount_native_lbp        ELSE 0 END), 0) AS cash_lbp,
+         COALESCE(SUM(CASE WHEN r.method = 'card_usd' THEN r.amount_native_usd_cents ELSE 0 END), 0) AS card_usd_cents
+       FROM sales_credit_memo_refunds r
+       JOIN sales_credit_memos m ON m.id = r.credit_memo_id
+       WHERE m.store_id = ?
+         AND m.shift_id = ?
+         AND m.status = 'posted'`,
+      [storeId, shiftId],
+    );
+    const r = rows[0] ?? {
+      refund_count: 0,
+      total_usd_cents: 0,
+      cash_usd_cents: 0,
+      cash_lbp: 0,
+      card_usd_cents: 0,
+    };
+    return {
+      refundCount: r.refund_count,
+      totalUsdCents: r.total_usd_cents,
+      cashUsdCents: r.cash_usd_cents,
+      cashLbp: r.cash_lbp,
+      cardUsdCents: r.card_usd_cents,
+    };
+  },
+
   async closeShift(args: {
     shiftId: string;
     storeId: string;
@@ -230,11 +281,14 @@ export const shiftsRepo = {
       change_lbp: 0,
     };
 
-    // expected = opening + received − change given back
+    // Cash refunds paid out during this shift reduce the drawer.
+    const refunds = await this.getRefundsSummary(args.shiftId, args.storeId);
+
+    // expected = opening + received − change given back − cash refunds paid
     const expectedUsd =
-      shift.opening_cash_usd_cents + d.cash_usd_received - d.change_usd;
+      shift.opening_cash_usd_cents + d.cash_usd_received - d.change_usd - refunds.cashUsdCents;
     const expectedLbp =
-      shift.opening_cash_lbp + d.cash_lbp_received - d.change_lbp;
+      shift.opening_cash_lbp + d.cash_lbp_received - d.change_lbp - refunds.cashLbp;
     const varianceUsd = args.closingCashUsdCents - expectedUsd;
     const varianceLbp = args.closingCashLbp - expectedLbp;
 

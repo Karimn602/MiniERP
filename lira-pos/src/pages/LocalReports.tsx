@@ -5,6 +5,8 @@ import {
   type DailySalesRow,
   type ProductSalesRow,
   type DailyPurchasesRow,
+  type DailyReturnsRow,
+  type ProductReturnsRow,
 } from "../db/repos/reports";
 import { Card, CardHeader } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -19,11 +21,6 @@ import clsx from "clsx";
 function firstDayOfMonth(): string {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
-}
-
-function calcGrossProfit(subtotal: number, cogs: number): number {
-  // subtotal is stored post-discount; discountCents is not subtracted again.
-  return subtotal - cogs;
 }
 
 function calcMargin(profit: number, netSales: number): string {
@@ -43,6 +40,8 @@ export default function LocalReports() {
   const [dailySales, setDailySales] = useState<DailySalesRow[]>([]);
   const [productSales, setProductSales] = useState<ProductSalesRow[]>([]);
   const [dailyPurchases, setDailyPurchases] = useState<DailyPurchasesRow[]>([]);
+  const [dailyReturns, setDailyReturns] = useState<DailyReturnsRow[]>([]);
+  const [productReturns, setProductReturns] = useState<ProductReturnsRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -51,14 +50,18 @@ export default function LocalReports() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [ds, ps, dp] = await Promise.all([
+      const [ds, ps, dp, dr, pr] = await Promise.all([
         reportsRepo.dailySales({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.productSales({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.dailyPurchases({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
+        reportsRepo.dailyReturns({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
+        reportsRepo.productReturns({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
       ]);
       setDailySales(ds);
       setProductSales(ps);
       setDailyPurchases(dp);
+      setDailyReturns(dr);
+      setProductReturns(pr);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -75,13 +78,34 @@ export default function LocalReports() {
     setAppliedTo(dateTo);
   }
 
+  // Returns indexed for netting against sales.
+  const returnsByDate = useMemo(() => {
+    const map = new Map<string, DailyReturnsRow>();
+    for (const r of dailyReturns) map.set(r.localDate, r);
+    return map;
+  }, [dailyReturns]);
+
+  const returnsByProduct = useMemo(() => {
+    const map = new Map<string, ProductReturnsRow>();
+    for (const r of productReturns) map.set(r.productId, r);
+    return map;
+  }, [productReturns]);
+
   const summary = useMemo(() => {
-    const revenue = dailySales.reduce((s, r) => s + r.totalInclVatCents, 0);
-    const net = dailySales.reduce((s, r) => s + r.subtotalExclVatCents, 0); // post-discount
-    const cogs = dailySales.reduce((s, r) => s + r.cogsTotalCents, 0);
+    const grossRevenue = dailySales.reduce((s, r) => s + r.totalInclVatCents, 0);
+    const grossNet = dailySales.reduce((s, r) => s + r.subtotalExclVatCents, 0); // post-discount
+    const grossCogs = dailySales.reduce((s, r) => s + r.cogsTotalCents, 0);
+
+    const returnsTotal = dailyReturns.reduce((s, r) => s + r.totalInclVatCents, 0);
+    const returnsNet = dailyReturns.reduce((s, r) => s + r.subtotalExclVatCents, 0);
+    const returnsCogs = dailyReturns.reduce((s, r) => s + r.cogsReversedCents, 0);
+
+    const revenue = grossRevenue - returnsTotal;
+    const net = grossNet - returnsNet;
+    const cogs = grossCogs - returnsCogs;
     const purchases = dailyPurchases.reduce((s, r) => s + r.totalInclVatCents, 0);
-    return { revenue, net, cogs, profit: net - cogs, purchases };
-  }, [dailySales, dailyPurchases]);
+    return { revenue, net, cogs, profit: net - cogs, purchases, returnsTotal };
+  }, [dailySales, dailyPurchases, dailyReturns]);
 
   if (!hydrated) {
     return <div className="text-sm text-slate-500">{t("common.loading")}</div>;
@@ -142,7 +166,7 @@ export default function LocalReports() {
       )}
 
       {/* KPI cards */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard label={t("localReports.statRevenue")} value={formatUsd(summary.revenue)} />
         <StatCard label={t("localReports.statNetSales")} value={formatUsd(summary.net)} />
         <StatCard
@@ -150,8 +174,16 @@ export default function LocalReports() {
           value={formatUsd(summary.profit)}
           tone={summary.profit > 0 ? "good" : summary.profit < 0 ? "bad" : undefined}
         />
+        <StatCard
+          label={t("localReports.statReturns")}
+          value={formatUsd(summary.returnsTotal)}
+          tone={summary.returnsTotal > 0 ? "warn" : undefined}
+        />
         <StatCard label={t("localReports.statPurchases")} value={formatUsd(summary.purchases)} />
       </div>
+      {summary.returnsTotal > 0 && (
+        <p className="-mt-3 text-xs text-slate-500">{t("localReports.returnsNote")}</p>
+      )}
 
       {/* Daily Sales */}
       <Card>
@@ -177,8 +209,12 @@ export default function LocalReports() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {dailySales.map((row) => {
-                  const net = row.subtotalExclVatCents; // post-discount
-                  const profit = calcGrossProfit(row.subtotalExclVatCents, row.cogsTotalCents);
+                  const ret = returnsByDate.get(row.localDate);
+                  const revenue = row.totalInclVatCents - (ret?.totalInclVatCents ?? 0);
+                  const vat = row.vatTotalCents - (ret?.vatTotalCents ?? 0);
+                  const cogs = row.cogsTotalCents - (ret?.cogsReversedCents ?? 0);
+                  const net = row.subtotalExclVatCents - (ret?.subtotalExclVatCents ?? 0);
+                  const profit = net - cogs;
                   return (
                     <tr key={row.localDate} className="hover:bg-slate-50">
                       <td className="px-5 py-2 text-slate-700">
@@ -188,13 +224,13 @@ export default function LocalReports() {
                         {row.saleCount}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums font-medium text-slate-900">
-                        {formatUsd(row.totalInclVatCents)}
+                        {formatUsd(revenue)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.vatTotalCents)}
+                        {formatUsd(vat)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.cogsTotalCents)}
+                        {formatUsd(cogs)}
                       </td>
                       <td
                         className={clsx(
@@ -239,8 +275,12 @@ export default function LocalReports() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {productSales.map((row) => {
-                  const net = row.lineSubtotalExclVatCents; // post-discount
-                  const profit = calcGrossProfit(row.lineSubtotalExclVatCents, row.lineCogsCents);
+                  const ret = returnsByProduct.get(row.productId);
+                  const qty = row.totalQty - (ret?.totalQtyBase ?? 0);
+                  const revenue = row.lineTotalInclVatCents - (ret?.totalInclVatCents ?? 0);
+                  const cogs = row.lineCogsCents - (ret?.cogsReversedCents ?? 0);
+                  const net = row.lineSubtotalExclVatCents - (ret?.subtotalExclVatCents ?? 0);
+                  const profit = net - cogs;
                   return (
                     <tr key={row.productId} className="hover:bg-slate-50">
                       <td className="px-5 py-2">
@@ -254,13 +294,13 @@ export default function LocalReports() {
                         )}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-700">
-                        {row.totalQty}
+                        {qty}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums font-medium text-slate-900">
-                        {formatUsd(row.lineTotalInclVatCents)}
+                        {formatUsd(revenue)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.lineCogsCents)}
+                        {formatUsd(cogs)}
                       </td>
                       <td
                         className={clsx(
