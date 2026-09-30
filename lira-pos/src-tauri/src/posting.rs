@@ -205,7 +205,7 @@ async fn next_purchase_number(
     Ok(current)
 }
 
-fn new_weighted_avg(
+pub(crate) fn new_weighted_avg(
     old_qty: i64,
     old_avg_cents: i64,
     new_qty: i64,
@@ -246,12 +246,9 @@ async fn current_supplier_balance(
 // post_purchase
 // ============================================================================
 
-#[tauri::command]
-pub async fn post_purchase(
-    app: tauri::AppHandle,
-    state: State<'_, DbState>,
-    payload: PostPurchasePayload,
-) -> Result<PostPurchaseResult, String> {
+/// Pure pre-DB validation for `post_purchase`. Extracted verbatim (WP-01) so it
+/// can be unit-tested; the command still runs it before acquiring the pool.
+pub(crate) fn validate_purchase_payload(payload: &PostPurchasePayload) -> Result<(), String> {
     if payload.lines.is_empty() {
         return Err("Purchase must have at least one line.".into());
     }
@@ -269,8 +266,37 @@ pub async fn post_purchase(
             return Err(format!("Line {} has invalid UoM factor.", i + 1));
         }
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn post_purchase(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: PostPurchasePayload,
+) -> Result<PostPurchaseResult, String> {
+    validate_purchase_payload(&payload)?;
 
     let pool = pool(&app, &state).await?;
+    post_purchase_tx(&pool, payload).await
+}
+
+/// Validate-then-post against an already-resolved pool. Preserves the command's
+/// ordering (validation first) and is the entry point the test harness uses.
+#[cfg(test)]
+pub(crate) async fn post_purchase_with_pool(
+    pool: &SqlitePool,
+    payload: PostPurchasePayload,
+) -> Result<PostPurchaseResult, String> {
+    validate_purchase_payload(&payload)?;
+    post_purchase_tx(pool, payload).await
+}
+
+/// The transactional body of `post_purchase`, unchanged.
+pub(crate) async fn post_purchase_tx(
+    pool: &SqlitePool,
+    payload: PostPurchasePayload,
+) -> Result<PostPurchaseResult, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
 
     let purchase_number = next_purchase_number(&mut tx, &payload.store_id).await?;
@@ -500,12 +526,8 @@ pub async fn post_purchase(
 // post_adjustment (unchanged from 2C)
 // ============================================================================
 
-#[tauri::command]
-pub async fn post_adjustment(
-    app: tauri::AppHandle,
-    state: State<'_, DbState>,
-    payload: PostAdjustmentPayload,
-) -> Result<PostAdjustmentResult, String> {
+/// Pure pre-DB validation for `post_adjustment`. Extracted verbatim (WP-01).
+pub(crate) fn validate_adjustment_payload(payload: &PostAdjustmentPayload) -> Result<(), String> {
     if payload.lines.is_empty() {
         return Err("Adjustment must have at least one line.".into());
     }
@@ -520,8 +542,36 @@ pub async fn post_adjustment(
             return Err(format!("Line {} has invalid UoM factor.", i + 1));
         }
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn post_adjustment(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: PostAdjustmentPayload,
+) -> Result<PostAdjustmentResult, String> {
+    validate_adjustment_payload(&payload)?;
 
     let pool = pool(&app, &state).await?;
+    post_adjustment_tx(&pool, payload).await
+}
+
+/// Validate-then-post against an already-resolved pool (test seam).
+#[cfg(test)]
+pub(crate) async fn post_adjustment_with_pool(
+    pool: &SqlitePool,
+    payload: PostAdjustmentPayload,
+) -> Result<PostAdjustmentResult, String> {
+    validate_adjustment_payload(&payload)?;
+    post_adjustment_tx(pool, payload).await
+}
+
+/// The transactional body of `post_adjustment`, unchanged.
+pub(crate) async fn post_adjustment_tx(
+    pool: &SqlitePool,
+    payload: PostAdjustmentPayload,
+) -> Result<PostAdjustmentResult, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -612,12 +662,10 @@ pub async fn post_adjustment(
 // post_supplier_payment (Phase 2D.6)
 // ============================================================================
 
-#[tauri::command]
-pub async fn post_supplier_payment(
-    app: tauri::AppHandle,
-    state: State<'_, DbState>,
-    payload: PostSupplierPaymentPayload,
-) -> Result<PostSupplierPaymentResult, String> {
+/// Pure pre-DB validation for `post_supplier_payment`. Extracted verbatim (WP-01).
+pub(crate) fn validate_supplier_payment_payload(
+    payload: &PostSupplierPaymentPayload,
+) -> Result<(), String> {
     let allowed = ["payment", "credit_note", "opening_balance", "adjustment"];
     if !allowed.contains(&payload.entry_type.as_str()) {
         return Err(format!("Invalid entry_type for this command: {}", payload.entry_type));
@@ -631,8 +679,36 @@ pub async fn post_supplier_payment(
     if payload.entry_date.trim().is_empty() {
         return Err("Entry date is required.".into());
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn post_supplier_payment(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: PostSupplierPaymentPayload,
+) -> Result<PostSupplierPaymentResult, String> {
+    validate_supplier_payment_payload(&payload)?;
 
     let pool = pool(&app, &state).await?;
+    post_supplier_payment_tx(&pool, payload).await
+}
+
+/// Validate-then-post against an already-resolved pool (test seam).
+#[cfg(test)]
+pub(crate) async fn post_supplier_payment_with_pool(
+    pool: &SqlitePool,
+    payload: PostSupplierPaymentPayload,
+) -> Result<PostSupplierPaymentResult, String> {
+    validate_supplier_payment_payload(&payload)?;
+    post_supplier_payment_tx(pool, payload).await
+}
+
+/// The transactional body of `post_supplier_payment`, unchanged.
+pub(crate) async fn post_supplier_payment_tx(
+    pool: &SqlitePool,
+    payload: PostSupplierPaymentPayload,
+) -> Result<PostSupplierPaymentResult, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -794,12 +870,22 @@ async fn next_receipt_number(
 // post_sale
 // ============================================================================
 
-#[tauri::command]
-pub async fn post_sale(
-    app: tauri::AppHandle,
-    state: State<'_, DbState>,
-    payload: PostSalePayload,
-) -> Result<PostSaleResult, String> {
+/// Everything `post_sale` computes before it touches the database: validation,
+/// the line/payment totals, and the change-allocation decision.
+///
+/// Extracted verbatim (WP-01) so it is unit-testable and so the Tauri command
+/// still performs all of it *before* acquiring the pool, exactly as before.
+#[derive(Debug)]
+pub(crate) struct PreparedSale {
+    pub cogs_method: String,
+    pub subtotal: i64,
+    pub vat_total: i64,
+    pub total: i64,
+    pub change_total_usd: i64,
+    pub change_row_index: Option<usize>,
+}
+
+pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, String> {
     // ---- Validation: header ----
     if payload.lines.is_empty() {
         return Err("Sale must have at least one line.".into());
@@ -812,7 +898,7 @@ pub async fn post_sale(
     }
 
     let cogs_method = match payload.cogs_method.as_str() {
-        "weighted_average" | "last_purchase" => payload.cogs_method.as_str(),
+        "weighted_average" | "last_purchase" => payload.cogs_method.clone(),
         other => return Err(format!("Invalid COGS method: {}", other)),
     };
 
@@ -899,8 +985,55 @@ pub async fn post_sale(
         None
     };
 
+    Ok(PreparedSale {
+        cogs_method,
+        subtotal,
+        vat_total,
+        total,
+        change_total_usd,
+        change_row_index,
+    })
+}
+
+#[tauri::command]
+pub async fn post_sale(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: PostSalePayload,
+) -> Result<PostSaleResult, String> {
+    let prepared = prepare_sale(&payload)?;
+
     // ---- Open transaction ----
     let pool = pool(&app, &state).await?;
+    post_sale_tx(&pool, payload, prepared).await
+}
+
+/// Validate-then-post against an already-resolved pool (test seam).
+#[cfg(test)]
+pub(crate) async fn post_sale_with_pool(
+    pool: &SqlitePool,
+    payload: PostSalePayload,
+) -> Result<PostSaleResult, String> {
+    let prepared = prepare_sale(&payload)?;
+    post_sale_tx(pool, payload, prepared).await
+}
+
+/// The transactional body of `post_sale`, unchanged.
+pub(crate) async fn post_sale_tx(
+    pool: &SqlitePool,
+    payload: PostSalePayload,
+    prepared: PreparedSale,
+) -> Result<PostSaleResult, String> {
+    let PreparedSale {
+        cogs_method,
+        subtotal,
+        vat_total,
+        total,
+        change_total_usd,
+        change_row_index,
+    } = prepared;
+    let cogs_method = cogs_method.as_str();
+
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
 
     let receipt_number = next_receipt_number(&mut tx, &payload.store_id).await?;

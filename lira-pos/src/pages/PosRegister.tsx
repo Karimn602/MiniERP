@@ -66,6 +66,7 @@ import {
   usdCentsToLbp,
 } from "../lib/money";
 import { computeSaleLineMath, type SaleLineMath } from "../lib/saleMath";
+import { allocateLineDiscounts, postDiscountLineTotals } from "../lib/discount";
 import { fromBaseQty, type Factor } from "../lib/uom";
 import { newId } from "../lib/ids";
 import { useTranslation } from "../lib/i18n";
@@ -193,47 +194,6 @@ function lineMathFor(product: ProductWithUoms, uom: ProductUom, qty: number): Sa
     uomOverrideExclVatCents: uom.salePriceExclVatCents,
     uomOverrideInclVatCents: uom.salePriceInclVatCents,
   });
-}
-
-// Allocate a sale-level discount proportionally across lines by incl-VAT weight.
-// Guarantees sum(result) === totalDiscountCents exactly via largest-remainder rounding.
-function allocateLineDiscounts(lines: CartLine[], totalDiscountCents: number): number[] {
-  if (lines.length === 0 || totalDiscountCents <= 0) return lines.map(() => 0);
-  const preTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
-  if (preTotal <= 0) return lines.map(() => 0);
-
-  const allocated = lines.map((l) =>
-    Math.floor((totalDiscountCents * l.math.lineTotalInclVatCents) / preTotal),
-  );
-
-  let remainder = totalDiscountCents - allocated.reduce((s, x) => s + x, 0);
-  if (remainder > 0) {
-    const sorted = lines
-      .map((l, i) => ({ i, total: l.math.lineTotalInclVatCents }))
-      .sort((a, b) => b.total - a.total);
-    let idx = 0;
-    while (remainder > 0) {
-      allocated[sorted[idx % sorted.length].i]++;
-      remainder--;
-      idx++;
-    }
-  }
-  return allocated;
-}
-
-// Back-calculate post-discount excl-VAT and VAT for a single line.
-// Returns values that always satisfy: subtotalExclVat + vat === totalInclVat.
-function postDiscountLineTotals(
-  lineTotalInclVat: number,
-  lineDiscountCents: number,
-  vatBps: number,
-): { subtotalExclVat: number; vat: number; totalInclVat: number } {
-  const discountedTotal = lineTotalInclVat - lineDiscountCents;
-  if (vatBps === 0) {
-    return { subtotalExclVat: discountedTotal, vat: 0, totalInclVat: discountedTotal };
-  }
-  const subtotalExclVat = Math.round((discountedTotal * 10000) / (10000 + vatBps));
-  return { subtotalExclVat, vat: discountedTotal - subtotalExclVat, totalInclVat: discountedTotal };
 }
 
 // ============================================================================

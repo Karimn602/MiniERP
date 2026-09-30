@@ -32,3 +32,7 @@ tokio = { version = "1", features = ["sync"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# WP-01 test harness only — `#[tokio::test]` and the temp-DB cleanup runtime.
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+

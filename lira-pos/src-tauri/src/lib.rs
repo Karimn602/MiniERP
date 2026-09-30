@@ -4,9 +4,18 @@ use tauri_plugin_sql::{Migration, MigrationKind};
 mod posting;
 use posting::DbState;
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    let migrations = vec![
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
+
+/// The application's migration list — the single source of truth.
+///
+/// `run()` registers exactly this list with tauri-plugin-sql, and the test
+/// harness applies exactly this list to its temporary databases, so the two
+/// cannot drift apart.
+pub(crate) fn migrations() -> Vec<Migration> {
+    vec![
         Migration {
             version: 1,
             description: "initial_schema",
@@ -49,7 +58,12 @@ pub fn run() {
             sql: include_str!("../../src/db/migrations/007_sales_cogs_method.sql"),
             kind: MigrationKind::Up,
         },
-    ];
+    ]
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let migrations = migrations();
 
     tauri::Builder::default()
         .manage(DbState::new())
