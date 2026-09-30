@@ -10,7 +10,7 @@ import Database from "@tauri-apps/plugin-sql";
  * The "sqlite:" prefix tells the plugin to use the bundled SQLite driver
  * and resolve the file path to the app's data directory automatically.
  */
-const DB_URL = "sqlite:lira-pos.db";
+const DB_URL = "sqlite:greaz-pos.db";
 
 let dbPromise: Promise<Database> | null = null;
 
