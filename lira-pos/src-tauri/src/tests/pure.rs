@@ -1,8 +1,8 @@
 // Layer B — pure Rust unit tests. No database.
 
 use crate::posting::{
-    new_weighted_avg, prepare_sale, validate_adjustment_payload, validate_purchase_payload,
-    validate_supplier_payment_payload,
+    derive_base_quantity, new_weighted_avg, prepare_sale, validate_adjustment_payload,
+    validate_purchase_payload, validate_supplier_payment_payload,
 };
 use crate::test_support::{VAT_EXEMPT_ID, VAT_STD_BPS, VAT_STD_ID};
 use crate::tests::builders::*;
@@ -299,4 +299,108 @@ fn strip_vat_matches_the_frontend_decomposition() {
     // Boundary: one cent.
     assert_eq!(strip_vat(1, VAT_STD_BPS), 1);
     assert_eq!(VAT_STD_ID.len(), 36);
+}
+
+// ============================================================================
+// WP-02 — line reconciliation, discount reconciliation, base-quantity derivation
+// ============================================================================
+
+#[test]
+fn prepare_sale_rejects_a_line_whose_parts_do_not_sum() {
+    let total = lines_total(&one_line_sale());
+    let mut p = sale_payload(one_line_sale(), vec![cash_usd(total)]);
+    // 900 + 150 ≠ 1000.
+    p.lines[0].line_subtotal_excl_vat_cents = 900;
+    p.lines[0].line_vat_cents = 150;
+    p.lines[0].line_total_incl_vat_cents = 1000;
+
+    let err = prepare_sale(&p).unwrap_err();
+    assert!(err.contains("does not reconcile"), "got: {err}");
+}
+
+#[test]
+fn prepare_sale_rejects_vat_charged_at_an_exempt_rate() {
+    let mut p = sale_payload(one_line_sale(), vec![cash_usd(1000)]);
+    p.lines[0].vat_rate_bps_snapshot = 0; // the line still carries 100¢ of VAT
+    let err = prepare_sale(&p).unwrap_err();
+    assert!(err.contains("exempt"), "got: {err}");
+}
+
+#[test]
+fn prepare_sale_rejects_negative_line_money() {
+    for mutate in [
+        (|l: &mut crate::posting::PostSaleLine| l.line_vat_cents = -1) as fn(&mut _),
+        |l: &mut crate::posting::PostSaleLine| l.line_subtotal_excl_vat_cents = -1,
+        |l: &mut crate::posting::PostSaleLine| l.line_discount_cents = -1,
+        |l: &mut crate::posting::PostSaleLine| l.vat_rate_bps_snapshot = -1,
+    ] {
+        let mut p = sale_payload(one_line_sale(), vec![cash_usd(1000)]);
+        mutate(&mut p.lines[0]);
+        assert!(prepare_sale(&p).is_err(), "a negative line amount must be refused");
+    }
+}
+
+#[test]
+fn prepare_sale_accepts_the_registers_own_line_decomposition() {
+    // What `lib/discount.ts::postDiscountLineTotals` sends: the excl-VAT part is
+    // stripped from the line total, so the parts always sum exactly.
+    let total = 1500;
+    let subtotal = strip_vat(total, VAT_STD_BPS);
+    let line = SaleLineBuilder::new("p1", "Coffee")
+        .qty(3)
+        .unit_incl(500)
+        .raw_line_totals(subtotal, total - subtotal, total)
+        .build();
+    let prep = prepare_sale(&sale_payload(vec![line], vec![cash_usd(total)])).expect("valid line");
+    assert_eq!(prep.total, total);
+    assert_eq!(prep.subtotal + prep.vat_total, prep.total);
+}
+
+#[test]
+fn prepare_sale_requires_line_discounts_to_sum_to_the_header_discount() {
+    // Header claims a discount the lines do not carry.
+    let mut p = sale_payload(one_line_sale(), vec![cash_usd(1000)]);
+    p.discount_cents = 100;
+    let err = prepare_sale(&p).unwrap_err();
+    assert!(err.contains("Discount does not reconcile"), "got: {err}");
+
+    // Lines carry a discount the header does not declare.
+    let line = SaleLineBuilder::new("p1", "Coffee").qty(2).unit_incl(500).discount(40).build();
+    let err = prepare_sale(&sale_payload(vec![line], vec![cash_usd(1000)])).unwrap_err();
+    assert!(err.contains("Discount does not reconcile"), "got: {err}");
+
+    // An exact allocation across several lines is accepted.
+    let lines = vec![
+        SaleLineBuilder::new("p1", "Coffee").qty(2).unit_incl(500).discount(60).build(),
+        SaleLineBuilder::new("p2", "Water").qty(1).unit_incl(700).discount(41).build(),
+    ];
+    let total = lines_total(&lines);
+    let mut p = sale_payload(lines, vec![cash_usd(total)]);
+    p.discount_cents = 101;
+    assert!(prepare_sale(&p).is_ok(), "an exactly-allocated discount must be accepted");
+}
+
+#[test]
+fn base_quantity_is_derived_from_the_uom_factor() {
+    // 2 boxes of 12 is 24 base units — the GP-A02 case.
+    assert_eq!(derive_base_quantity(2, 12, 1).unwrap(), 24);
+    // The base UoM itself is the identity.
+    assert_eq!(derive_base_quantity(7, 1, 1).unwrap(), 7);
+    // 3 kg of a gram-based product.
+    assert_eq!(derive_base_quantity(3, 1000, 1).unwrap(), 3_000);
+    // Rounds half away from zero, exactly like lib/uom.ts::toBaseQty.
+    assert_eq!(derive_base_quantity(3, 1, 2).unwrap(), 2, "1.5 → 2");
+    assert_eq!(derive_base_quantity(5, 1, 2).unwrap(), 3, "2.5 → 3");
+    assert_eq!(derive_base_quantity(5, 1, 4).unwrap(), 1, "1.25 → 1");
+}
+
+#[test]
+fn base_quantity_derivation_rejects_nonsense() {
+    assert!(derive_base_quantity(0, 12, 1).is_err(), "zero quantity");
+    assert!(derive_base_quantity(-1, 12, 1).is_err(), "negative quantity");
+    assert!(derive_base_quantity(2, 0, 1).is_err(), "zero numerator");
+    assert!(derive_base_quantity(2, 12, 0).is_err(), "zero denominator");
+    assert!(derive_base_quantity(i64::MAX, 12, 1).is_err(), "overflow");
+    // A conversion that would round away to nothing is not a sale.
+    assert!(derive_base_quantity(1, 1, 1000).is_err(), "0.001 → 0");
 }

@@ -284,17 +284,28 @@ export const salesRepo = {
     return rows.map(toSale);
   },
 
+/**
+ * Post a sale.
+ *
+ * `saleId` is the CHECKOUT IDENTITY and the caller owns it: issue one per
+ * checkout attempt and pass the same value for every retry of that attempt.
+ * `post_sale` is idempotent on it — replaying a posted identity returns that
+ * sale instead of creating a second one, so a double-click, a repeated F5, or
+ * a resend after an answer the client never saw cannot double-charge. A new
+ * checkout needs a new id; reusing a posted one for different content is
+ * refused by the backend.
+ *
+ * Line and payment identifiers are minted here because a replay never reaches
+ * the insert path — the sale identity alone decides what is the same checkout.
+ */
 async post(
-  input: Omit<PostSaleInput, "saleId" | "lines" | "payments"> & {
+  input: Omit<PostSaleInput, "lines" | "payments"> & {
     lines: Omit<PostSaleLineInput, "saleItemId">[];
     payments: Omit<PostSalePaymentInput, "paymentId">[];
   },
 ): Promise<PostSaleResult> {
-    const saleId = newId();
-
     const payload: PostSaleInput = {
       ...input,
-      saleId,
       lines: input.lines.map((l) => ({ ...l, saleItemId: newId() })),
       payments: input.payments.map((p) => ({ ...p, paymentId: newId() })),
     };

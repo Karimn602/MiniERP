@@ -814,7 +814,11 @@ pub struct PostSaleLine {
     pub barcode_used_snapshot: Option<String>,
     pub barcode_type_snapshot: Option<String>,
 
-    // Whether this product is a service. Services don't move stock or COGS.
+    // Whether the CLIENT believes this product is a service. Accepted for wire
+    // compatibility and never acted on: `post_sale` reads `products.is_service`
+    // instead, so a parked cart holding a stale flag cannot suppress a stocked
+    // product's inventory movement (GP-A05).
+    #[allow(dead_code)]
     pub is_service: bool,
 }
 
@@ -867,6 +871,412 @@ async fn next_receipt_number(
 }
 
 // ============================================================================
+// Checkout idempotency (GP-A01)
+// ============================================================================
+//
+// `sales.id` IS the checkout identity. The client issues one `saleId` per
+// checkout attempt and reuses it for every retry of that attempt (see
+// `pages/PosRegister.tsx`), so the backend can tell "the cashier pressed F5
+// twice" from "the next customer bought the same basket" — the latter arrives
+// under a different identity and must still post.
+//
+// Idempotency is keyed on that identity ALONE. Nothing here looks at basket
+// content, totals, or timing to decide whether two requests are the same
+// checkout: content-based deduplication would silently swallow a second
+// customer's money. Content is compared only to detect the opposite mistake —
+// one identity reused for a materially different transaction.
+
+/// The canonical business content of a sale: everything that decides WHAT
+/// transaction was rung up, in a form that compares equal for a true retry and
+/// unequal for anything materially different.
+///
+/// Deliberately EXCLUDED, because comparing them would reject honest retries:
+///   - `sale_item_id` / `payment_id` — regenerated per request by
+///     `db/repos/sales.ts::post`; they are request noise, not business content.
+///   - the client's `quantity_base` and `is_service` — the backend derives both
+///     from `product_uoms` and `products` (WP-02 GP-A02/GP-A05), so the payload
+///     copies are non-authoritative. `quantity_in_uom` + `uom_code` are
+///     compared instead, and the authoritative base follows from them.
+///   - `cogs_total_cents` and per-line COGS — read from product cost at post
+///     time, so a retry after a purchase would legitimately recompute them.
+///   - `change_given_*` — derived from tender minus amount due.
+///   - `receipt_number` / `posted_at` — assigned by the first post.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalSale {
+    store_id: String,
+    shift_id: Option<String>,
+    cashier_user_id: Option<String>,
+    device_id: Option<String>,
+    exchange_rate_id: String,
+    exchange_rate_lbp_per_usd: i64,
+    cogs_method: String,
+    notes: Option<String>,
+    subtotal_excl_vat_cents: i64,
+    vat_total_cents: i64,
+    total_incl_vat_cents: i64,
+    discount_cents: i64,
+    /// Sorted, so a retry is not rejected merely because rows came back in a
+    /// different order. Sorting a `Vec` of comparable values and comparing
+    /// gives multiset equality, which is what "the same basket" means here.
+    lines: Vec<CanonicalLine>,
+    payments: Vec<CanonicalPayment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalLine {
+    product_id: String,
+    uom_code: String,
+    quantity_in_uom: i64,
+    unit_price_excl_vat_cents: i64,
+    unit_price_incl_vat_cents: i64,
+    vat_rate_id: String,
+    vat_rate_bps: i64,
+    line_subtotal_excl_vat_cents: i64,
+    line_vat_cents: i64,
+    line_total_incl_vat_cents: i64,
+    line_discount_cents: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalPayment {
+    method: String,
+    currency: String,
+    amount_native_usd_cents: i64,
+    amount_native_lbp: i64,
+    amount_usd_cents_equivalent: i64,
+    reference: Option<String>,
+}
+
+impl CanonicalSale {
+    /// The canonical form of an incoming request. `subtotal`/`vat_total`/
+    /// `total` come from `prepare_sale`, which sums them from the lines.
+    fn from_payload(payload: &PostSalePayload, subtotal: i64, vat_total: i64, total: i64) -> Self {
+        let mut lines: Vec<CanonicalLine> = payload
+            .lines
+            .iter()
+            .map(|l| CanonicalLine {
+                product_id: l.product_id.clone(),
+                uom_code: l.uom_code_snapshot.clone(),
+                quantity_in_uom: l.quantity_in_uom,
+                unit_price_excl_vat_cents: l.unit_price_excl_vat_cents,
+                unit_price_incl_vat_cents: l.unit_price_incl_vat_cents,
+                vat_rate_id: l.vat_rate_id_snapshot.clone(),
+                vat_rate_bps: l.vat_rate_bps_snapshot,
+                line_subtotal_excl_vat_cents: l.line_subtotal_excl_vat_cents,
+                line_vat_cents: l.line_vat_cents,
+                line_total_incl_vat_cents: l.line_total_incl_vat_cents,
+                line_discount_cents: l.line_discount_cents,
+            })
+            .collect();
+        lines.sort();
+
+        let mut payments: Vec<CanonicalPayment> = payload
+            .payments
+            .iter()
+            .map(|p| CanonicalPayment {
+                method: p.method.clone(),
+                currency: p.currency.clone(),
+                amount_native_usd_cents: p.amount_native_usd_cents,
+                amount_native_lbp: p.amount_native_lbp,
+                amount_usd_cents_equivalent: p.amount_usd_cents_equivalent,
+                reference: p.reference.clone(),
+            })
+            .collect();
+        payments.sort();
+
+        Self {
+            store_id: payload.store_id.clone(),
+            shift_id: payload.shift_id.clone(),
+            cashier_user_id: payload.cashier_user_id.clone(),
+            device_id: payload.device_id.clone(),
+            exchange_rate_id: payload.exchange_rate_id.clone(),
+            exchange_rate_lbp_per_usd: payload.exchange_rate_lbp_per_usd,
+            cogs_method: payload.cogs_method.clone(),
+            notes: payload.notes.clone(),
+            subtotal_excl_vat_cents: subtotal,
+            vat_total_cents: vat_total,
+            total_incl_vat_cents: total,
+            discount_cents: payload.discount_cents,
+            lines,
+            payments,
+        }
+    }
+
+    fn tendered_usd_cents(&self) -> i64 {
+        self.payments.iter().map(|p| p.amount_usd_cents_equivalent).sum()
+    }
+}
+
+/// What a posted sale looks like to a replayed request.
+struct PostedSale {
+    receipt_number: i64,
+    posted_at: String,
+    status: String,
+    canonical: CanonicalSale,
+}
+
+/// Load the sale already stored under this checkout identity, if any, in the
+/// same canonical form an incoming payload is reduced to.
+async fn load_sale_by_identity(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    sale_id: &str,
+) -> Result<Option<PostedSale>, String> {
+    let header = sqlx::query(
+        "SELECT store_id, shift_id, cashier_user_id, device_id,
+                receipt_number, posted_at, status, notes,
+                exchange_rate_id, exchange_rate_lbp_per_usd, cogs_method,
+                subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents, discount_cents
+           FROM sales WHERE id = ?",
+    )
+    .bind(sale_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("read sale {sale_id}: {e}"))?;
+
+    let Some(row) = header else { return Ok(None) };
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+
+    let mut lines: Vec<CanonicalLine> = sqlx::query(
+        "SELECT product_id,
+                COALESCE(uom_code_snapshot, '') AS uom_code_snapshot,
+                COALESCE(quantity_in_uom, quantity) AS quantity_in_uom,
+                unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+                vat_rate_id_snapshot, vat_rate_bps_snapshot,
+                line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+                line_discount_cents
+           FROM sale_items WHERE sale_id = ?",
+    )
+    .bind(sale_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| format!("read sale_items for {sale_id}: {e}"))?
+    .into_iter()
+    .map(|r| {
+        Ok(CanonicalLine {
+            product_id: r.try_get("product_id").map_err(d("product_id"))?,
+            uom_code: r.try_get("uom_code_snapshot").map_err(d("uom_code"))?,
+            quantity_in_uom: r.try_get("quantity_in_uom").map_err(d("quantity_in_uom"))?,
+            unit_price_excl_vat_cents: r
+                .try_get("unit_price_excl_vat_cents")
+                .map_err(d("unit_price_excl"))?,
+            unit_price_incl_vat_cents: r
+                .try_get("unit_price_incl_vat_cents")
+                .map_err(d("unit_price_incl"))?,
+            vat_rate_id: r.try_get("vat_rate_id_snapshot").map_err(d("vat_rate_id"))?,
+            vat_rate_bps: r.try_get("vat_rate_bps_snapshot").map_err(d("vat_rate_bps"))?,
+            line_subtotal_excl_vat_cents: r
+                .try_get("line_subtotal_excl_vat_cents")
+                .map_err(d("line_subtotal"))?,
+            line_vat_cents: r.try_get("line_vat_cents").map_err(d("line_vat"))?,
+            line_total_incl_vat_cents: r
+                .try_get("line_total_incl_vat_cents")
+                .map_err(d("line_total"))?,
+            line_discount_cents: r.try_get("line_discount_cents").map_err(d("line_discount"))?,
+        })
+    })
+    .collect::<Result<Vec<_>, String>>()?;
+    lines.sort();
+
+    let mut payments: Vec<CanonicalPayment> = sqlx::query(
+        "SELECT method, currency,
+                amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent,
+                reference
+           FROM sale_payments WHERE sale_id = ?",
+    )
+    .bind(sale_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| format!("read sale_payments for {sale_id}: {e}"))?
+    .into_iter()
+    .map(|r| {
+        Ok(CanonicalPayment {
+            method: r.try_get("method").map_err(d("method"))?,
+            currency: r.try_get("currency").map_err(d("currency"))?,
+            amount_native_usd_cents: r
+                .try_get("amount_native_usd_cents")
+                .map_err(d("amount_native_usd"))?,
+            amount_native_lbp: r.try_get("amount_native_lbp").map_err(d("amount_native_lbp"))?,
+            amount_usd_cents_equivalent: r
+                .try_get("amount_usd_cents_equivalent")
+                .map_err(d("amount_usd_equivalent"))?,
+            reference: r.try_get("reference").map_err(d("reference"))?,
+        })
+    })
+    .collect::<Result<Vec<_>, String>>()?;
+    payments.sort();
+
+    Ok(Some(PostedSale {
+        receipt_number: row.try_get("receipt_number").map_err(d("receipt_number"))?,
+        posted_at: row
+            .try_get::<Option<String>, _>("posted_at")
+            .map_err(d("posted_at"))?
+            .unwrap_or_default(),
+        status: row.try_get("status").map_err(d("status"))?,
+        canonical: CanonicalSale {
+            store_id: row.try_get("store_id").map_err(d("store_id"))?,
+            shift_id: row.try_get("shift_id").map_err(d("shift_id"))?,
+            cashier_user_id: row.try_get("cashier_user_id").map_err(d("cashier_user_id"))?,
+            device_id: row.try_get("device_id").map_err(d("device_id"))?,
+            exchange_rate_id: row
+                .try_get::<Option<String>, _>("exchange_rate_id")
+                .map_err(d("exchange_rate_id"))?
+                .unwrap_or_default(),
+            exchange_rate_lbp_per_usd: row
+                .try_get("exchange_rate_lbp_per_usd")
+                .map_err(d("exchange_rate"))?,
+            cogs_method: row.try_get("cogs_method").map_err(d("cogs_method"))?,
+            notes: row.try_get("notes").map_err(d("notes"))?,
+            subtotal_excl_vat_cents: row
+                .try_get("subtotal_excl_vat_cents")
+                .map_err(d("subtotal"))?,
+            vat_total_cents: row.try_get("vat_total_cents").map_err(d("vat_total"))?,
+            total_incl_vat_cents: row.try_get("total_incl_vat_cents").map_err(d("total"))?,
+            discount_cents: row.try_get("discount_cents").map_err(d("discount"))?,
+            lines,
+            payments,
+        },
+    }))
+}
+
+/// The one place that decides whether a replayed request is the SAME checkout
+/// as the one already posted under this identity.
+///
+/// Returns `None` when the replay matches, or `Some((what, posted, replayed))`
+/// naming the first material difference.
+///
+/// A true retry re-sends the same cart, so this returns `None` for one. It
+/// fires when an identity is reused for a transaction nobody rang up under it —
+/// which would otherwise hand back a receipt for the wrong sale.
+fn sale_replay_matches_existing(
+    posted: &CanonicalSale,
+    replayed: &CanonicalSale,
+) -> Option<(&'static str, String, String)> {
+    macro_rules! compare {
+        ($what:literal, $field:ident) => {
+            if posted.$field != replayed.$field {
+                return Some((
+                    $what,
+                    format!("{:?}", posted.$field),
+                    format!("{:?}", replayed.$field),
+                ));
+            }
+        };
+    }
+
+    // --- Attribution: who rang this up, where, and against which shift. ---
+    compare!("store", store_id);
+    compare!("shift", shift_id);
+    compare!("cashier", cashier_user_id);
+    compare!("device", device_id);
+
+    // --- Monetary context locked at sale time. ---
+    compare!("exchange rate", exchange_rate_id);
+    compare!("exchange rate", exchange_rate_lbp_per_usd);
+    compare!("COGS method", cogs_method);
+    compare!("notes", notes);
+
+    // --- Header money. ---
+    compare!("subtotal", subtotal_excl_vat_cents);
+    compare!("VAT total", vat_total_cents);
+    compare!("total", total_incl_vat_cents);
+    compare!("discount", discount_cents);
+
+    // --- The basket, line for line: price, VAT code and rate, per-line VAT
+    //     and discount allocation, not just the aggregate. Two carts can share
+    //     a total and still be different transactions. ---
+    if posted.lines != replayed.lines {
+        let (was, now) = first_line_difference(&posted.lines, &replayed.lines);
+        return Some(("basket line", was, now));
+    }
+
+    // --- The tender: method and currency, not just the USD-equivalent sum.
+    //     Cash and card for the same amount are different transactions. ---
+    if posted.payments != replayed.payments {
+        let (was, now) = first_payment_difference(&posted.payments, &replayed.payments);
+        return Some(("tender", was, now));
+    }
+
+    None
+}
+
+fn first_line_difference(posted: &[CanonicalLine], replayed: &[CanonicalLine]) -> (String, String) {
+    if posted.len() != replayed.len() {
+        return (format!("{} line(s)", posted.len()), format!("{} line(s)", replayed.len()));
+    }
+    for (a, b) in posted.iter().zip(replayed) {
+        if a != b {
+            return (format!("{a:?}"), format!("{b:?}"));
+        }
+    }
+    (String::new(), String::new())
+}
+
+fn first_payment_difference(
+    posted: &[CanonicalPayment],
+    replayed: &[CanonicalPayment],
+) -> (String, String) {
+    if posted.len() != replayed.len() {
+        return (format!("{} row(s)", posted.len()), format!("{} row(s)", replayed.len()));
+    }
+    for (a, b) in posted.iter().zip(replayed) {
+        if a != b {
+            return (format!("{a:?}"), format!("{b:?}"));
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// Refuse a replay that reuses a posted checkout identity for materially
+/// different transaction content.
+fn assert_replay_matches(
+    existing: &PostedSale,
+    payload: &PostSalePayload,
+    subtotal: i64,
+    vat_total: i64,
+    total: i64,
+) -> Result<(), String> {
+    let replayed = CanonicalSale::from_payload(payload, subtotal, vat_total, total);
+    match sale_replay_matches_existing(&existing.canonical, &replayed) {
+        None => Ok(()),
+        Some((what, was, now)) => Err(format!(
+            "Sale {} already exists (receipt #{}) with a different {}: posted {}, replayed {}. \
+             Start a new checkout instead of reusing this one.",
+            payload.sale_id, existing.receipt_number, what, was, now
+        )),
+    }
+}
+
+/// Rebuild the original command result for an already-posted sale, so a retry
+/// reconciles to the sale that exists instead of creating a second one.
+async fn result_for_posted_sale(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    sale_id: &str,
+    existing: &PostedSale,
+) -> Result<PostSaleResult, String> {
+    let movement_ids: Vec<String> = sqlx::query(
+        "SELECT id FROM inventory_movements WHERE related_sale_id = ? ORDER BY rowid",
+    )
+    .bind(sale_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| format!("read movements for {sale_id}: {e}"))?
+    .into_iter()
+    .map(|r| r.try_get::<String, _>("id").map_err(|e| format!("decode movement id: {e}")))
+    .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(PostSaleResult {
+        sale_id: sale_id.to_string(),
+        receipt_number: existing.receipt_number,
+        posted_at: existing.posted_at.clone(),
+        movement_ids,
+        // Recomputed the same way `prepare_sale` computed it originally:
+        // tendered − amount due.
+        change_total_usd_cents: existing.canonical.tendered_usd_cents()
+            - existing.canonical.total_incl_vat_cents,
+    })
+}
+
+// ============================================================================
 // post_sale
 // ============================================================================
 
@@ -883,6 +1293,84 @@ pub(crate) struct PreparedSale {
     pub total: i64,
     pub change_total_usd: i64,
     pub change_row_index: Option<usize>,
+}
+
+/// Per-line financial reconciliation (GP-A06).
+///
+/// The application's convention — see `lib/discount.ts::postDiscountLineTotals`
+/// — is that a line's post-discount parts always satisfy
+/// `subtotal_excl_vat + vat = total_incl_vat` in exact integer cents, and that
+/// an exempt (0 bps) line carries no VAT at all. Anything else is an
+/// internally inconsistent line: the header it sums into would be wrong, and
+/// posted rows are immutable, so it has to be refused up front.
+///
+/// This deliberately does NOT re-derive the VAT split from the rate. Both
+/// legitimate decompositions in the codebase (per-unit-then-multiply in
+/// `lib/saleMath.ts`, total-then-strip in `lib/discount.ts`) can differ by a
+/// cent while both reconciling, and WP-02 does not redesign VAT policy.
+pub(crate) fn validate_line_financials(index: usize, line: &PostSaleLine) -> Result<(), String> {
+    let n = index + 1;
+    if line.line_subtotal_excl_vat_cents < 0
+        || line.line_vat_cents < 0
+        || line.line_total_incl_vat_cents < 0
+    {
+        return Err(format!("Line {} has a negative subtotal, VAT amount, or total.", n));
+    }
+    if line.vat_rate_bps_snapshot < 0 {
+        return Err(format!("Line {} has a negative VAT rate.", n));
+    }
+    if line.line_discount_cents < 0 {
+        return Err(format!("Line {} has a negative discount.", n));
+    }
+    let parts = line
+        .line_subtotal_excl_vat_cents
+        .checked_add(line.line_vat_cents)
+        .ok_or_else(|| format!("Line {} overflows when its parts are summed.", n))?;
+    if parts != line.line_total_incl_vat_cents {
+        return Err(format!(
+            "Line {} does not reconcile: subtotal {} + VAT {} != total {}.",
+            n,
+            line.line_subtotal_excl_vat_cents,
+            line.line_vat_cents,
+            line.line_total_incl_vat_cents
+        ));
+    }
+    if line.vat_rate_bps_snapshot == 0 && line.line_vat_cents != 0 {
+        return Err(format!(
+            "Line {} does not reconcile: VAT of {} cents at an exempt (0 bps) rate.",
+            n, line.line_vat_cents
+        ));
+    }
+    Ok(())
+}
+
+/// Base-UoM quantity for `qty_in_uom` under the conversion factor `num/den`.
+///
+/// Mirrors `lib/uom.ts::toBaseQty` exactly — `round(qty × num ÷ den)`, half
+/// away from zero — but in integer arithmetic, with no float step. Both inputs
+/// are positive in every calling path, which is asserted rather than assumed.
+pub(crate) fn derive_base_quantity(
+    qty_in_uom: i64,
+    factor_num: i64,
+    factor_den: i64,
+) -> Result<i64, String> {
+    if qty_in_uom <= 0 {
+        return Err("quantity in UoM must be positive".into());
+    }
+    if factor_num <= 0 || factor_den <= 0 {
+        return Err("UoM conversion factor must be positive".into());
+    }
+    let scaled = qty_in_uom
+        .checked_mul(factor_num)
+        .ok_or_else(|| "UoM conversion overflows".to_string())?;
+    let base = scaled
+        .checked_add(factor_den / 2)
+        .ok_or_else(|| "UoM conversion overflows".to_string())?
+        / factor_den;
+    if base <= 0 {
+        return Err("UoM conversion yields a non-positive base quantity".into());
+    }
+    Ok(base)
 }
 
 pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, String> {
@@ -917,6 +1405,7 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
         if line.unit_price_excl_vat_cents < 0 || line.unit_price_incl_vat_cents < 0 {
             return Err(format!("Line {} has negative price.", i + 1));
         }
+        validate_line_financials(i, line)?;
     }
 
     // ---- Validation: payments ----
@@ -956,6 +1445,29 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
     let total: i64 = payload.lines.iter().map(|l| l.line_total_incl_vat_cents).sum();
     if total <= 0 {
         return Err("Sale total must be positive.".into());
+    }
+    // The header is the sum of the lines, so this can only trip on overflow —
+    // but the header invariant is the one reports rely on, so state it here.
+    if subtotal + vat_total != total {
+        return Err(format!(
+            "Sale header does not reconcile: subtotal {} + VAT {} != total {}.",
+            subtotal, vat_total, total
+        ));
+    }
+
+    // ---- Discount reconciliation (GP-A07) ----
+    // `lib/discount.ts::allocateLineDiscounts` distributes the header discount
+    // across the lines to the exact cent (largest-remainder). Verify the
+    // allocation we were handed instead of trusting it: a sale whose line
+    // discounts do not add up to its header discount makes every downstream
+    // report disagree with itself, and it is immutable once posted.
+    let line_discount_total: i64 = payload.lines.iter().map(|l| l.line_discount_cents).sum();
+    if line_discount_total != payload.discount_cents {
+        return Err(format!(
+            "Discount does not reconcile: the line discounts total {} cents but the sale header \
+             declares a discount of {} cents.",
+            line_discount_total, payload.discount_cents
+        ));
     }
 
     // ---- Totals from payments ----
@@ -1018,7 +1530,19 @@ pub(crate) async fn post_sale_with_pool(
     post_sale_tx(pool, payload, prepared).await
 }
 
-/// The transactional body of `post_sale`, unchanged.
+/// One sale line after the database has had its say: the authoritative base
+/// quantity, conversion factor, service flag, and COGS snapshot. Everything
+/// written for a line comes from here, not from the payload.
+struct ResolvedLine {
+    quantity_base: i64,
+    factor_num: i64,
+    factor_den: i64,
+    is_service: bool,
+    unit_cogs_excl: i64,
+    unit_cogs_incl: i64,
+}
+
+/// The transactional body of `post_sale`.
 pub(crate) async fn post_sale_tx(
     pool: &SqlitePool,
     payload: PostSalePayload,
@@ -1036,15 +1560,34 @@ pub(crate) async fn post_sale_tx(
 
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
 
+    // ---- Idempotency: has this checkout identity already posted? ----
+    // Runs before anything is written, and in particular before a receipt
+    // number is consumed, so a replay costs the sequence nothing.
+    if let Some(existing) = load_sale_by_identity(&mut tx, &payload.sale_id).await? {
+        if existing.status != "posted" {
+            return Err(format!(
+                "Sale {} already exists with status '{}' and cannot be re-posted.",
+                payload.sale_id, existing.status
+            ));
+        }
+        assert_replay_matches(&existing, &payload, subtotal, vat_total, total)?;
+        let result = result_for_posted_sale(&mut tx, &payload.sale_id, &existing).await?;
+        // Nothing was written; end the transaction without a commit.
+        tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
+        return Ok(result);
+    }
+
     let receipt_number = next_receipt_number(&mut tx, &payload.store_id).await?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
 
-    // ---- Pre-compute COGS by reading each product once. We also use this
-    //      to validate is_active and stock availability for non-service lines.
-    let mut line_cogs_unit_excl: Vec<i64> = Vec::with_capacity(payload.lines.len());
-    let mut line_cogs_unit_incl: Vec<i64> = Vec::with_capacity(payload.lines.len());
+    // ---- Resolve every line against the database before writing anything.
+    //      The product row and its product_uoms row — never the payload — decide
+    //      the base quantity, the conversion factor, and whether the line moves
+    //      physical stock. We also validate is_active and stock availability
+    //      for non-service lines, and snapshot COGS.
+    let mut resolved: Vec<ResolvedLine> = Vec::with_capacity(payload.lines.len());
     let mut cogs_total: i64 = 0;
 
     for (i, line) in payload.lines.iter().enumerate() {
@@ -1091,17 +1634,84 @@ pub(crate) async fn post_sale_tx(
                 line.product_name_snapshot
             ));
         }
-        // Defense-in-depth: trust the DB's is_service, not the payload's.
+        // The DB decides whether this product is a service (GP-A05). A parked
+        // cart can hold a stale `isService: true` for a product that is stocked
+        // today; letting the payload suppress the stock effects would walk goods
+        // off the shelf with no movement row and no decrement.
         let is_service = is_service_db == 1;
-        if !is_service && !payload.allow_negative_inventory && line.quantity_base > qoh {
+
+        // ---- Authoritative UoM + base quantity (GP-A02) ----
+        // The selected UoM must be one this product actually sells in, and the
+        // base quantity is derived from ITS factor. A payload that understates
+        // quantity_base ("2 boxes, but only 1 piece of stock, please") must not
+        // be able to walk 24 pieces past the guard.
+        let uom_row = sqlx::query(
+            "SELECT factor_num, factor_den
+               FROM product_uoms
+              WHERE product_id = ? AND store_id = ? AND uom_code = ? AND is_active = 1",
+        )
+        .bind(&line.product_id)
+        .bind(&payload.store_id)
+        .bind(&line.uom_code_snapshot)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read product_uom for {}: {e}", line.product_id))?
+        .ok_or_else(|| {
+            format!(
+                "Line {}: UoM \"{}\" is not an active unit of measure for \"{}\".",
+                i + 1,
+                line.uom_code_snapshot,
+                line.product_name_snapshot
+            )
+        })?;
+        let factor_num: i64 = uom_row
+            .try_get("factor_num")
+            .map_err(|e| format!("decode factor_num: {e}"))?;
+        let factor_den: i64 = uom_row
+            .try_get("factor_den")
+            .map_err(|e| format!("decode factor_den: {e}"))?;
+        let quantity_base = derive_base_quantity(line.quantity_in_uom, factor_num, factor_den)
+            .map_err(|e| {
+                format!(
+                    "Line {}: invalid quantity for \"{}\" in UoM \"{}\" — {}.",
+                    i + 1,
+                    line.product_name_snapshot,
+                    line.uom_code_snapshot,
+                    e
+                )
+            })?;
+
+        // The guard runs on the AUTHORITATIVE quantity, and before the payload
+        // consistency check below: when there genuinely isn't enough stock, the
+        // cashier needs to hear that, not a payload diagnostic.
+        if !is_service && !payload.allow_negative_inventory && quantity_base > qoh {
             return Err(format!(
-                "Line {}: insufficient stock for \"{}\" (have {} {}, need {} {}).",
+                "Line {}: insufficient stock for \"{}\" (have {}, need {} — {} {}).",
                 i + 1,
                 line.product_name_snapshot,
                 qoh,
-                line.uom_code_snapshot,
-                line.quantity_base,
+                quantity_base,
+                line.quantity_in_uom,
                 line.uom_code_snapshot
+            ));
+        }
+
+        // A payload whose declared base quantity disagrees with the product's
+        // own conversion is structurally corrupt (a stale cart, a changed
+        // factor, a bad integration). Refuse it rather than post a quantity the
+        // cashier never saw.
+        if line.quantity_base != quantity_base {
+            return Err(format!(
+                "Line {}: declared base quantity {} does not match the authoritative UoM \
+                 conversion for \"{}\" ({} {} × {}/{} = {}).",
+                i + 1,
+                line.quantity_base,
+                line.product_name_snapshot,
+                line.quantity_in_uom,
+                line.uom_code_snapshot,
+                factor_num,
+                factor_den,
+                quantity_base
             ));
         }
 
@@ -1140,9 +1750,15 @@ pub(crate) async fn post_sale_tx(
             (avg_cost_excl, avg_cost_incl)
         };
 
-        line_cogs_unit_excl.push(unit_excl);
-        line_cogs_unit_incl.push(unit_incl);
-        cogs_total += unit_excl * line.quantity_base;
+        cogs_total += unit_excl * quantity_base;
+        resolved.push(ResolvedLine {
+            quantity_base,
+            factor_num,
+            factor_den,
+            is_service,
+            unit_cogs_excl: unit_excl,
+            unit_cogs_incl: unit_incl,
+        });
     }
 
     // ---- Insert sale header ----
@@ -1180,9 +1796,10 @@ pub(crate) async fn post_sale_tx(
     let mut movement_ids: Vec<String> = Vec::new();
 
     for (i, line) in payload.lines.iter().enumerate() {
-        let unit_cogs_excl = line_cogs_unit_excl[i];
-        let unit_cogs_incl = line_cogs_unit_incl[i];
-        let line_cogs = unit_cogs_excl * line.quantity_base;
+        let r = &resolved[i];
+        let unit_cogs_excl = r.unit_cogs_excl;
+        let unit_cogs_incl = r.unit_cogs_incl;
+        let line_cogs = unit_cogs_excl * r.quantity_base;
 
         sqlx::query(
             r#"INSERT INTO sale_items (
@@ -1207,7 +1824,7 @@ pub(crate) async fn post_sale_tx(
         .bind(&line.product_sku_snapshot)
         .bind(&line.vat_rate_id_snapshot)
         .bind(line.vat_rate_bps_snapshot)
-        .bind(line.quantity_base) // sale_items.quantity is the canonical base qty
+        .bind(r.quantity_base) // sale_items.quantity is the canonical base qty
         .bind(line.unit_price_excl_vat_cents)
         .bind(line.unit_price_incl_vat_cents)
         .bind(line.line_subtotal_excl_vat_cents)
@@ -1220,14 +1837,15 @@ pub(crate) async fn post_sale_tx(
         .bind(&line.barcode_type_snapshot)
         .bind(line.quantity_in_uom)
         .bind(&line.uom_code_snapshot)
-        .bind(line.factor_num_snapshot)
-        .bind(line.factor_den_snapshot)
+        .bind(r.factor_num)
+        .bind(r.factor_den)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert sale_item: {e}"))?;
 
         // Services don't move stock or generate inventory_movements rows.
-        if !line.is_service {
+        // The DB's is_service decides, never the payload's (GP-A05).
+        if !r.is_service {
             let movement_id = uuid::Uuid::new_v4().to_string();
             movement_ids.push(movement_id.clone());
 
@@ -1245,7 +1863,7 @@ pub(crate) async fn post_sale_tx(
             .bind(&movement_id)
             .bind(&payload.store_id)
             .bind(&line.product_id)
-            .bind(-line.quantity_base) // sale = stock OUT
+            .bind(-r.quantity_base) // sale = stock OUT
             .bind(unit_cogs_excl)
             .bind(unit_cogs_incl)
             .bind(&payload.sale_id)
@@ -1256,8 +1874,8 @@ pub(crate) async fn post_sale_tx(
             .bind(&now)
             .bind(line.quantity_in_uom)
             .bind(&line.uom_code_snapshot)
-            .bind(line.factor_num_snapshot)
-            .bind(line.factor_den_snapshot)
+            .bind(r.factor_num)
+            .bind(r.factor_den)
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("insert sale inventory_movement: {e}"))?;
@@ -1267,7 +1885,7 @@ pub(crate) async fn post_sale_tx(
                     SET quantity_on_hand = quantity_on_hand - ?
                   WHERE id = ? AND store_id = ?",
             )
-            .bind(line.quantity_base)
+            .bind(r.quantity_base)
             .bind(&line.product_id)
             .bind(&payload.store_id)
             .execute(&mut *tx)

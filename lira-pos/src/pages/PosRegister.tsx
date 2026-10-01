@@ -67,6 +67,12 @@ import {
 } from "../lib/money";
 import { computeSaleLineMath, type SaleLineMath } from "../lib/saleMath";
 import { allocateLineDiscounts, postDiscountLineTotals } from "../lib/discount";
+import {
+  createCheckoutRegistry,
+  createSubmissionGate,
+  type CheckoutRegistry,
+  type SubmissionGate,
+} from "../lib/checkout";
 import { fromBaseQty, type Factor } from "../lib/uom";
 import { newId } from "../lib/ids";
 import { useTranslation } from "../lib/i18n";
@@ -128,6 +134,15 @@ interface CartState {
   cardUsdInput: string;
   discountPctInput: string;
   discountAmountInput: string;
+  /**
+   * Checkout identity for this cart's current checkout attempt — the `saleId`
+   * sent to `post_sale`. Minted on the first Post press and reused by every
+   * retry of that attempt, which is what makes the backend able to recognise a
+   * retry (see `salesRepo.post`). Retired once the sale posts, so the next
+   * customer is a new transaction. Persisted with the cart, so a parked cart
+   * keeps its identity across a reload.
+   */
+  checkoutId?: string;
 }
 
 function createEmptyCart(seq: number): CartState {
@@ -273,8 +288,39 @@ export default function PosRegister() {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [receiptSale, setReceiptSale] = useState<SaleWithDetails | null>(null);
+  /**
+   * Which cart, if any, has a post that has not resolved yet. Mirrors the
+   * registry's own in-flight flag so the UI can disable that cart's Clear and
+   * Close — the registry is a ref and cannot trigger a rerender on its own.
+   */
+  const [postingCartId, setPostingCartId] = useState<string | null>(null);
 
-  // ----- Active-cart mutation helpers -----
+  // Synchronous submission safety — see lib/checkout.ts for why React state
+  // cannot do this job. The gate drops a second entry in the same frame; the
+  // registry keeps one checkout identity per cart across retries.
+  const gateRef = useRef<SubmissionGate | null>(null);
+  if (gateRef.current === null) gateRef.current = createSubmissionGate();
+
+  const checkoutsRef = useRef<CheckoutRegistry | null>(null);
+  if (checkoutsRef.current === null) {
+    checkoutsRef.current = createCheckoutRegistry(
+      newId,
+      Object.fromEntries(
+        initialCartsRef.current
+          .filter((c) => c.checkoutId)
+          .map((c) => [c.id, c.checkoutId as string]),
+      ),
+    );
+  }
+
+  // ----- Cart mutation helpers -----
+  const updateCartById = useCallback(
+    (cartId: string, updater: (c: CartState) => CartState) => {
+      setCarts((prev) => prev.map((c) => (c.id === cartId ? updater(c) : c)));
+    },
+    [],
+  );
+
   const updateActiveCart = useCallback(
     (updater: (c: CartState) => CartState) => {
       setCarts((prev) => prev.map((c) => (c.id === activeCartId ? updater(c) : c)));
@@ -487,9 +533,19 @@ export default function PosRegister() {
     setLines((prev) => prev.filter((l) => l.draftId !== draftId));
   }
 
-  // Clear the ACTIVE cart's contents (lines, discounts, payments).
-  function clearActiveCart() {
-    updateActiveCart((c) => ({
+  // Clear one cart's contents (lines, discounts, payments) and retire its
+  // checkout identity: whatever it held is finished, so the next basket in this
+  // cart is a new transaction.
+  //
+  // Refused while that cart's post is unresolved. If the backend committed but
+  // the answer was lost, the identity is the only thing that lets the retry
+  // reconcile to the sale that exists; retiring it here would ring the same
+  // basket up a second time. The button is disabled in that window too — this
+  // check covers every other path to the same function.
+  function clearCart(cartId: string) {
+    if (checkoutsRef.current?.isPosting(cartId)) return;
+    checkoutsRef.current?.retire(cartId);
+    updateCartById(cartId, (c) => ({
       ...c,
       lines: [],
       cashUsdInput: "",
@@ -497,9 +553,38 @@ export default function PosRegister() {
       cardUsdInput: "",
       discountPctInput: "",
       discountAmountInput: "",
+      checkoutId: undefined,
     }));
     setSubmitError(null);
     setScanError(null);
+  }
+
+  function clearActiveCart() {
+    clearCart(activeCartId);
+  }
+
+  /**
+   * Open a posting attempt on this cart and return its checkout identity,
+   * minting one if this is the first attempt. Synchronous: two handlers
+   * entering in the same frame get the SAME id, so even if both reached the
+   * backend they would be one checkout there.
+   *
+   * The attempt is marked unresolved until `settleAttempt`, which is what
+   * makes the identity un-retirable in the meantime.
+   */
+  /** Mark this cart's posting attempt resolved. Safe to call more than once. */
+  function settleCheckoutAttempt(cartId: string) {
+    checkoutsRef.current!.settleAttempt(cartId);
+    setPostingCartId((current) => (current === cartId ? null : current));
+  }
+
+  function beginCheckoutAttempt(cartId: string): string {
+    const { id, issued } = checkoutsRef.current!.beginAttempt(cartId);
+    setPostingCartId(cartId);
+    // Persist a newly minted identity with the cart, so a parked cart keeps it
+    // across a reload.
+    if (issued) updateCartById(cartId, (c) => ({ ...c, checkoutId: id }));
+    return id;
   }
 
   // ----- Multi-cart controls -----
@@ -523,10 +608,14 @@ export default function PosRegister() {
 
   function closeCart(id: string) {
     if (carts.length <= 1) return; // never delete the only remaining cart
+    // Closing a cart mid-post would discard the identity its unresolved
+    // attempt still needs — see clearCart. Disabled in the UI; guarded here.
+    if (checkoutsRef.current?.isPosting(id)) return;
     const cart = carts.find((c) => c.id === id);
     if (!cart) return;
     if (cart.lines.length > 0 && !window.confirm(t("pos.confirmCloseCart"))) return;
 
+    checkoutsRef.current?.retire(id);
     const remaining = carts.filter((c) => c.id !== id);
     setCarts(remaining);
     if (id === activeCartId) {
@@ -684,7 +773,24 @@ export default function PosRegister() {
     !!activeShift;
 
   // ----- Post (active cart only) -----
+  //
+  // Two guards, in this order:
+  //   1. the submission gate — synchronous, drops a second entry in the same
+  //      frame (double-click, or a click and an F5 together).
+  //   2. the checkout identity — reused by every retry, so the backend
+  //      recognises one and returns the sale that exists.
+  // Only the second is authoritative; the first just keeps the UI honest.
   async function handlePost() {
+    const gate = gateRef.current!;
+    if (!gate.tryEnter()) return;
+    try {
+      await runPost();
+    } finally {
+      gate.release();
+    }
+  }
+
+  async function runPost() {
     if (!storeId || !rate || !activeShift) return;
     setSubmitError(null);
     if (lines.length === 0) {
@@ -704,6 +810,12 @@ export default function PosRegister() {
       );
       return;
     }
+
+    // The cart this attempt belongs to, and its checkout identity. Both are
+    // captured now: the cashier may switch carts while the post is in flight,
+    // and the sale that comes back belongs to THIS cart.
+    const cartId = activeCartId;
+    const checkoutId = beginCheckoutAttempt(cartId);
 
     setSubmitting(true);
     try {
@@ -783,6 +895,7 @@ export default function PosRegister() {
       }
 
       const result = await salesRepo.post({
+        saleId: checkoutId,
         storeId,
         cashierUserId: userId,
         deviceId: null,
@@ -798,11 +911,22 @@ export default function PosRegister() {
       });
 
       const details = await salesRepo.findByIdWithDetails(result.saleId);
-      clearActiveCart();
+      // Definitive success. Settle the attempt FIRST — clearCart refuses to
+      // retire the identity of a cart that is still posting — then clear.
+      settleCheckoutAttempt(cartId);
+      clearCart(cartId);
       setReceiptSale(details);
     } catch (e) {
+      // Definitive failure. The identity is deliberately KEPT: if the cashier
+      // fixes the problem and posts again, that is the same checkout, and if
+      // the sale actually did commit before the error reached us, the retry
+      // reconciles to it instead of ringing it up twice.
+      settleCheckoutAttempt(cartId);
       setSubmitError(e instanceof Error ? e.message : String(e));
     } finally {
+      // Idempotent; the success and failure paths have normally settled
+      // already. Here so no path can leave a cart wedged as "posting".
+      settleCheckoutAttempt(cartId);
       setSubmitting(false);
     }
   }
@@ -1071,9 +1195,13 @@ export default function PosRegister() {
                     <button
                       type="button"
                       onClick={() => closeCart(c.id)}
+                      // A cart with an unresolved post must keep its checkout
+                      // identity until the attempt settles, or a retry would
+                      // ring the same basket up under a fresh one.
+                      disabled={postingCartId === c.id}
                       aria-label={t("pos.closeCart")}
                       title={t("pos.closeCart")}
-                      className="px-2 py-1.5 text-slate-400 hover:text-red-600"
+                      className="px-2 py-1.5 text-slate-400 hover:text-red-600 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:text-slate-300"
                     >
                       ×
                     </button>
@@ -1096,7 +1224,12 @@ export default function PosRegister() {
               }
               actions={
                 lines.length > 0 ? (
-                  <Button variant="ghost" onClick={() => { clearActiveCart(); focusScanInput(); }}>
+                  <Button
+                    variant="ghost"
+                    // Same reason as Close: clearing retires the identity.
+                    disabled={postingCartId === activeCartId}
+                    onClick={() => { clearActiveCart(); focusScanInput(); }}
+                  >
                     {t("pos.clearCart")}
                   </Button>
                 ) : undefined

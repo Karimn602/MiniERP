@@ -1,37 +1,36 @@
 // ============================================================================
-// KNOWN-DEFECT CHARACTERIZATION TESTS — all #[ignore]d on purpose.
+// KNOWN-DEFECT REGISTER TESTS
 // ============================================================================
 //
-// Each test below states the invariant the system SHOULD uphold. They are
-// ignored because the current implementation violates them; WP-01 deliberately
-// does not fix the behaviour, only records it.
+// Each test below states an invariant the system must uphold, and is named for
+// the audit finding that first reported it. A test that is `#[ignore]`d records
+// a defect the current implementation still has, owned by a later work package;
+// a test without the attribute is an invariant that is now ENFORCED and must
+// stay enforced.
 //
-// Remove the `#[ignore]` line as part of the owning work package. A test that
-// starts passing before then means the defect was fixed elsewhere — verify and
-// un-ignore it rather than leaving it dormant.
+// Fixed in WP-02 — these now pass and must never regress:
 //
-//   GP-A02  authoritative UoM base-quantity + stock guard   → WP-02
-//   GP-A05  stale is_service suppresses the stock movement  → WP-02
-//   GP-A06  backend line subtotal/VAT/total reconciliation  → WP-02
-//   GP-A07  line-discount vs header-discount reconciliation → WP-02
+//   GP-A02  authoritative UoM base-quantity + stock guard
+//   GP-A05  stale is_service must not suppress the stock movement
+//   GP-A06  backend line subtotal/VAT/total reconciliation
+//   GP-A07  line-discount vs header-discount reconciliation
+//
+// Still ignored, still defects:
+//
 //   GP-A03  fractional base-unit cost precision             → WP-03
 //   GP-A04  report / shift discount double subtraction      → WP-08 (TS layer)
 //
-// Two audit items have NO ignored test here, deliberately:
+// GP-A01 (checkout idempotency) was also fixed in WP-02. It never had an
+// ignored test here — the invariant could not be stated before a stable
+// checkout identity existed, and writing it as "two commercially identical
+// carts must collapse into one sale" would have licensed basket-content
+// deduplication, silently swallowing a second customer's money. Its real
+// coverage lives in `sales.rs` under "Checkout idempotency", alongside the
+// control test `two_identical_baskets_with_different_identities_both_post`.
 //
-//   GP-A01  checkout idempotency  → WP-02.  The production contract has no
-//           stable checkout identity yet, so no test can express the real
-//           invariant without inventing one. Writing the requirement as
-//           "two commercially identical carts must collapse into one sale"
-//           would be WRONG — it licenses basket-content deduplication, which
-//           would silently swallow a second customer buying the same items.
-//           `sales::two_identical_baskets_with_different_identities_both_post`
-//           is a PASSING control test guarding against exactly that mistake.
-//           See tests/README.md for what WP-02 must actually prove.
-//
-//   GP-A08  returns / credit memos  → WP-06.  Not implemented on this branch,
-//           so there is no behaviour to characterize. Recorded as a coverage
-//           gap in tests/README.md only — no placeholder test.
+// GP-A08 (returns / credit memos) → WP-06. Not implemented on this branch, so
+// there is no behaviour to characterize. Recorded as a coverage gap in
+// tests/README.md only — no placeholder test.
 //
 // See tests/README.md for the full register.
 
@@ -43,6 +42,8 @@ const P_COFFEE: &str = "00000000-0000-0000-0000-0000000000c1";
 const P_FLOUR: &str = "00000000-0000-0000-0000-0000000000c5";
 const SUPPLIER: &str = "00000000-0000-0000-0000-0000000000s1";
 
+/// A store with one stocked coffee product sold in `each` (base) or `box`
+/// (12 each) — the same shape `productsRepo.create` produces.
 async fn store_with_coffee(qty: i64) -> TempDb {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
@@ -56,20 +57,24 @@ async fn store_with_coffee(qty: i64) -> TempDb {
         },
     )
     .await;
+    seed_product_uom(&db, P_COFFEE, "box", 12, 1).await;
     db
 }
 
 // ============================================================================
-// GP-A02 — AUTHORITATIVE UoM BASE QUANTITY / STOCK GUARD             (→ WP-02)
+// GP-A02 — AUTHORITATIVE UoM BASE QUANTITY / STOCK GUARD        (fixed WP-02)
 // ============================================================================
 //
-// Current behaviour: `post_sale` trusts `quantity_base` straight from the
-// payload. It never recomputes it from `quantity_in_uom × num ÷ den`, so the
-// stock guard at posting.rs compares a client-supplied number against
-// quantity_on_hand. A stale or wrong frontend can sell 2 boxes (24 pieces)
-// while only declaring — and only decrementing — 1 piece.
+// Was: `post_sale` trusted `quantity_base` straight from the payload. It never
+// recomputed it from `quantity_in_uom × num ÷ den`, so the stock guard compared
+// a client-supplied number against quantity_on_hand — a stale or wrong frontend
+// could sell 2 boxes (24 pieces) while declaring, and decrementing, 1 piece.
+//
+// Now: `post_sale` loads the product's own `product_uoms` row and derives the
+// base quantity from ITS factor. That derived quantity drives the guard, the
+// movement, the decrement and the COGS basis, and a payload that declares a
+// different one is refused.
 
-#[ignore = "GP-A02: quantity_base is trusted from the payload; enable in WP-02"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gp_a02_base_quantity_must_be_derived_from_the_uom_factor() {
     let db = store_with_coffee(100).await;
@@ -98,7 +103,6 @@ async fn gp_a02_base_quantity_must_be_derived_from_the_uom_factor() {
     }
 }
 
-#[ignore = "GP-A02: the stock guard uses the payload's base quantity; enable in WP-02"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gp_a02_the_stock_guard_must_validate_the_true_base_quantity() {
     // 10 pieces on hand. Selling 2 boxes of 12 needs 24 — it must be refused.
@@ -175,20 +179,19 @@ async fn gp_a03_fractional_base_unit_costs_must_survive_conversion() {
 }
 
 // ============================================================================
-// GP-A05 — STALE is_service SUPPRESSES THE INVENTORY MOVEMENT        (→ WP-02)
+// GP-A05 — STALE is_service SUPPRESSES THE INVENTORY MOVEMENT   (fixed WP-02)
 // ============================================================================
 //
-// Current behaviour: `post_sale` reads `is_service` from the products table and
-// uses the DB value for the stock guard and for COGS — but it branches on the
-// PAYLOAD's `line.is_service` when deciding whether to write the
-// inventory_movements row and decrement stock.
+// Was: `post_sale` read `is_service` from the products table and used the DB
+// value for the stock guard and for COGS — but branched on the PAYLOAD's
+// `line.is_service` when deciding whether to write the inventory_movements row
+// and decrement stock. A stocked product sold from a frontend holding a stale
+// `isService: true` was charged COGS and checked against stock, yet left the
+// shelf with no movement row and no decrement: physical stock drifted away from
+// the books with no audit trail.
 //
-// So a stocked product sold from a frontend holding a stale `isService: true`
-// is charged COGS, is checked against stock, and yet leaves the shelf without
-// any movement row and without any decrement. Physical stock silently drifts
-// away from the books, and no audit trail records it.
+// Now: the products table is authoritative for the movement branch too.
 
-#[ignore = "GP-A05: the movement branch trusts the payload's is_service; enable in WP-02"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gp_a05_a_stocked_product_must_always_move_stock() {
     let db = store_with_coffee(100).await;
@@ -219,15 +222,17 @@ async fn gp_a05_a_stocked_product_must_always_move_stock() {
 }
 
 // ============================================================================
-// GP-A06 — BACKEND LINE RECONCILIATION                               (→ WP-02)
+// GP-A06 — BACKEND LINE RECONCILIATION                          (fixed WP-02)
 // ============================================================================
 //
-// Current behaviour: the backend sums whatever line figures the client sends
-// and writes the sums to the header. It never checks that a line's own
-// subtotal + VAT equals its total, so a frontend bug silently produces a sale
-// whose VAT does not match its net — and it is immutable once posted.
+// Was: the backend summed whatever line figures the client sent and wrote the
+// sums to the header. It never checked that a line's own subtotal + VAT equals
+// its total, so a frontend bug silently produced a sale whose VAT did not match
+// its net — immutable once posted.
+//
+// Now: `prepare_sale` enforces `subtotal + VAT = total` per line in exact
+// integer cents (and zero VAT on an exempt line) before the transaction opens.
 
-#[ignore = "GP-A06: per-line totals are not validated backend-side; enable in WP-02"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gp_a06_a_line_whose_parts_do_not_sum_must_be_rejected() {
     let db = store_with_coffee(100).await;
@@ -250,17 +255,18 @@ async fn gp_a06_a_line_whose_parts_do_not_sum_must_be_rejected() {
 }
 
 // ============================================================================
-// GP-A07 — LINE-DISCOUNT vs HEADER-DISCOUNT RECONCILIATION           (→ WP-02)
+// GP-A07 — LINE-DISCOUNT vs HEADER-DISCOUNT RECONCILIATION      (fixed WP-02)
 // ============================================================================
 //
-// Current behaviour: `lib/discount.ts::allocateLineDiscounts` allocates the
-// header discount exactly across the lines (proven by the TypeScript suite),
-// but `post_sale` never verifies the allocation it is handed. A different
-// caller — a future integration, an offline replay, a bug — can persist a sale
-// whose per-line discounts do not add up to `sales.discount_cents`, and every
-// downstream report then disagrees with itself.
+// Was: `lib/discount.ts::allocateLineDiscounts` allocates the header discount
+// exactly across the lines (proven by the TypeScript suite), but `post_sale`
+// never verified the allocation it was handed. Any other caller — a future
+// integration, an offline replay, a bug — could persist a sale whose per-line
+// discounts did not add up to `sales.discount_cents`, leaving every downstream
+// report disagreeing with itself.
+//
+// Now: `prepare_sale` requires SUM(line_discount_cents) == discount_cents.
 
-#[ignore = "GP-A07: the discount allocation is not verified backend-side; enable in WP-02"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gp_a07_line_discounts_must_sum_to_the_header_discount() {
     let db = store_with_coffee(100).await;

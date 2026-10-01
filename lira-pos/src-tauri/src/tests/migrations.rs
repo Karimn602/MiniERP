@@ -120,6 +120,21 @@ async fn seed_data_required_by_the_posting_commands_is_present() {
         db.scalar_string("SELECT value FROM app_settings WHERE key = 'next_purchase_number'").await,
         "1"
     );
+
+    // Since WP-02 `post_sale` resolves the sale UoM against product_uoms, so
+    // every seeded product must have one. `productsRepo.create` upholds the
+    // same rule for products made later.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM products p
+              WHERE NOT EXISTS (
+                SELECT 1 FROM product_uoms u
+                 WHERE u.product_id = p.id AND u.is_base = 1 AND u.is_active = 1)"
+        )
+        .await,
+        0,
+        "every product must have an active base UoM row"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

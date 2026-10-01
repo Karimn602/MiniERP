@@ -1,4 +1,4 @@
-# Greaz POS test harness (WP-01)
+# Greaz POS test harness (WP-01, extended by WP-02)
 
 A financial regression suite. Its job is to make the later hardening work
 packages safe: if a change breaks how money, stock, or VAT are recorded, one of
@@ -26,8 +26,8 @@ so cargo cannot build on a tree that has never been built.
 
 | Layer | Location | What it covers | Authority |
 |---|---|---|---|
-| **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, sale/purchase line math, discount allocation | Authoritative for `src/lib/` |
-| **B. Rust units** | `src-tauri/src/tests/pure.rs` | `new_weighted_avg`, the four commands' pure validators, `prepare_sale` totals and change routing | Authoritative for pre-DB posting logic |
+| **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, sale/purchase line math, discount allocation; the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
+| **B. Rust units** | `src-tauri/src/tests/pure.rs` | `new_weighted_avg`, the four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation | Authoritative for pre-DB posting logic |
 | **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, whole-ledger reconciliation, immutability triggers | **Authoritative for the database and all posting behaviour** |
 | **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation | Authoritative for read-model queries only |
 
@@ -66,6 +66,9 @@ integration layer.** Anything about how a transaction is written belongs there.
 - `PRAGMA foreign_keys = ON`, and `max_connections(1)`: a single connection is
   the most faithful, most deterministic representation of the app's
   transactional usage.
+- `seed_product` also creates the product's base `product_uoms` row, exactly as
+  `productsRepo.create` does, because `post_sale` resolves the sale UoM against
+  that table. `seed_product_uom` adds a derived one (e.g. `box` = 12 base).
 - `Drop` releases the pool *before* unlinking, then retries the unlink briefly
   (Windows will not delete a file with an open handle). A run leaves no files
   behind.
@@ -90,7 +93,22 @@ only makes the tests deterministic, it does not change the SQL.)
 
 - **Sale reconciliation** — `subtotal_excl_vat + vat = total_incl_vat`; the
   persisted header equals `SUM(sale_items)`; `tendered − change = amount due`;
-  header COGS equals the sum of the line snapshots.
+  header COGS equals the sum of the line snapshots. Enforced at the posting
+  boundary since WP-02: a line whose parts do not sum, or which charges VAT at
+  an exempt rate, is refused rather than summed into an immutable header.
+- **Checkout idempotency** — `sales.id` is the checkout identity. Replaying it
+  with the same canonical transaction returns the sale that exists (one sale,
+  one receipt number, one stock effect, one tender) without consuming a receipt
+  number; replaying it with materially different content is a conflict and is
+  refused; two identical baskets under different identities are two sales. An
+  unresolved posting attempt pins its identity — the cart cannot be cleared or
+  closed until the attempt settles, so a lost answer can still be retried
+  against the sale it may already have created.
+- **Authoritative posting inputs** — the base quantity comes from the product's
+  own `product_uoms` factor, and `products.is_service` decides whether a line
+  moves stock. Neither can be overridden by the payload.
+- **Discount reconciliation** — `SUM(sale_items.line_discount_cents)` equals
+  `sales.discount_cents`, enforced at the boundary.
 - **Inventory reconciliation** — `SUM(inventory_movements.quantity_delta)`
   equals `products.quantity_on_hand` across opening stock, purchases, sales and
   adjustments; one movement per stocked sale line, none for services.
@@ -126,66 +144,200 @@ To enable one: delete its `#[ignore = ...]` line (Rust) or change `it.skip` to
 
 | ID | Owner | Test | Invariant it will enforce |
 |---|---|---|---|
-| **GP-A01** | WP-02 | — (no ignored test; see below) | Checkout idempotency. The invariant cannot be stated yet — see "GP-A01" below for why, and for the control test that guards the fix. |
-| **GP-A02** | WP-02 | `known_defects::gp_a02_base_quantity_must_be_derived_from_the_uom_factor` | `quantity_base` must be recomputed from `quantity_in_uom × num ÷ den`, not trusted from the payload. |
-| **GP-A02** | WP-02 | `known_defects::gp_a02_the_stock_guard_must_validate_the_true_base_quantity` | The stock guard must compare the *true* base quantity against stock on hand. |
-| **GP-A03** | WP-03 | `known_defects::gp_a03_fractional_base_unit_costs_must_survive_conversion` | A sub-cent per-base cost must survive. Today $2.50/kg with a gram base rounds to $0.00/g and all COGS is zero. **Needs a schema/representation change**, which WP-01 was forbidden to make. |
+| **GP-A03** | WP-03 | `known_defects::gp_a03_fractional_base_unit_costs_must_survive_conversion` | A sub-cent per-base cost must survive. Today $2.50/kg with a gram base rounds to $0.00/g and all COGS is zero. **Needs a schema/representation change.** |
 | **GP-A03** | WP-03 | `uom.test.ts` › `GP-A03 … preserves sub-cent per-base costs` | The same defect at the pure-helper level: `unitCostInUomToBase(250, 1000/1) === 0`. |
 | **GP-A04** | WP-08 | `shifts.test.ts` › `getSalesSummary` › `GP-A04 … does not subtract the discount twice` | `netSalesExclVatCents` must not subtract the discount a second time. Lines are persisted post-discount, so `subtotal − discount` understates net sales (observed: 711 where 811 is correct). |
 | **GP-A04** | WP-08 | `shifts.test.ts` › `shiftSummaryRepo` › `GP-A04 … does not subtract the discount twice` | The same defect in the date-scoped day summary. |
-| **GP-A05** | WP-02 | `known_defects::gp_a05_a_stocked_product_must_always_move_stock` | A stocked product must produce its inventory movement and decrement stock regardless of a stale `isService` flag in the payload. `post_sale` uses the DB's `is_service` for the guard and COGS but the payload's for the movement. |
-| **GP-A06** | WP-02 | `known_defects::gp_a06_a_line_whose_parts_do_not_sum_must_be_rejected` | The backend must reject a line whose `subtotal + vat ≠ total` instead of summing it into an immutable header. |
-| **GP-A07** | WP-02 | `known_defects::gp_a07_line_discounts_must_sum_to_the_header_discount` | `SUM(sale_items.line_discount_cents)` must equal `sales.discount_cents`. The allocator gets this right; the backend never verifies it. |
 | **GP-A08** | WP-06 | — (coverage gap, no test) | See below. |
 
-Cross-package note: GP-A04's root cause is the post-discount persistence
-convention that GP-A07 also touches. If WP-02 changes what `post_sale` stores,
-re-check GP-A04's fixtures before WP-08 starts.
+Cross-package note for WP-08: GP-A04's root cause is the post-discount
+persistence convention. WP-02 did **not** change it — `post_sale` still stores
+post-discount line values and the header discount alongside them; it only
+started *verifying* that the two agree. GP-A04's fixtures are unaffected.
 
-### GP-A01 — checkout idempotency (WP-02)
+### Fixed by WP-02 — now enforced, must not regress
 
-**There is deliberately no ignored test for this**, because the invariant
-cannot be expressed against today's production contract without stating
-something false.
+These were ignored known defects. They are live tests now; the audit IDs are
+kept in the test names so the register stays greppable.
 
-The tempting formulation — *"two commercially identical sale requests must
-produce only one sale"* — **is wrong, and must not be written.** Two customers
-buying the same two coffees within a minute are two sales. A future
-implementation that deduplicated on basket *content* to make such a test pass
-would silently swallow the second customer's money. A red test must never be
-allowed to force a bad fix.
+| ID | Where the coverage lives | What is now enforced |
+|---|---|---|
+| **GP-A01** | `sales.rs` › "Checkout idempotency" (6 tests) and "Replay conflict detection" (12 tests), `checkout.test.ts` (23 tests) | `sales.id` is the checkout identity and `post_sale` is idempotent on it; a reused identity carrying materially different content is a conflict. An unresolved attempt pins the identity. See below. |
+| **GP-A02** | `known_defects::gp_a02_*`, `sales.rs` › "Authoritative UoM / base quantity" (5 tests), `pure.rs` › `base_quantity_*` | The base quantity is derived from the product's own `product_uoms` factor and drives the guard, the movement, the decrement and the COGS basis. A UoM the product does not actively sell in, and a payload quantity that contradicts the conversion, are both refused. |
+| **GP-A05** | `known_defects::gp_a05_*`, `sales.rs` › `the_database_decides_whether_a_line_moves_stock_not_the_payload` | `products.is_service` decides whether a line moves stock. A stale `isService: true` cannot suppress a stocked product's movement, and a stale `false` cannot invent one for a service. |
+| **GP-A06** | `known_defects::gp_a06_*`, `sales.rs` › "Line / header financial reconciliation" (3 tests), `pure.rs` | Per line, `subtotal + VAT = total` in exact integer cents, and an exempt (0 bps) line carries no VAT. Refused before the transaction opens. |
+| **GP-A07** | `known_defects::gp_a07_*`, `sales.rs` › "Discount reconciliation" (3 tests), `pure.rs` | `SUM(line_discount_cents) == sales.discount_cents`. The allocator was already exact; the boundary now verifies it. |
 
-The real problem is that Greaz has **no stable checkout identity**:
-`db/repos/sales.ts::post` mints a fresh `saleId` (and fresh sale-item and
-payment ids) on every call, so a retried checkout is indistinguishable at the
-backend boundary from a brand-new one.
+WP-02 deliberately did **not** touch the VAT split itself. Both legitimate
+decompositions in the codebase — per-unit-then-multiply (`lib/saleMath.ts`) and
+total-then-strip (`lib/discount.ts`) — can differ by a cent while both
+reconciling, so the boundary enforces the additive identity and not a
+re-derivation from the rate.
 
-Two **passing** tests in `sales.rs` fence the area off:
+### GP-A01 — checkout idempotency (fixed in WP-02)
 
-- `two_identical_baskets_with_different_identities_both_post` — a control test.
-  Two identical carts with distinct transaction identities must both post, both
-  decrement stock, and both bank their tender. **This is what stops WP-02 from
-  implementing content-based deduplication.**
-- `replaying_a_payload_with_the_same_primary_keys_is_rejected_and_rolls_back` —
-  a characterization of what the backend does today when the *exact same
-  identifiers* are replayed: the `sales.id` primary key refuses the second row
-  and the whole transaction rolls back (no stock movement, no receipt number
-  consumed). **Scope: this is protection from duplicate primary identifiers
-  only. It is not checkout idempotency and does not solve double-submit** —
-  the real client mints a new `saleId` per attempt, so a retry never reaches
-  this path.
+WP-01 recorded no ignored test for this, because the invariant could not be
+stated against the contract of the time without stating something false. The
+tempting formulation — *"two commercially identical sale requests must produce
+only one sale"* — **is wrong and must never be written.** Two customers buying
+the same two coffees within a minute are two sales; deduplicating on basket
+*content* would silently swallow the second customer's money.
 
-**WP-02 must introduce or define a stable checkout/idempotency identity that
-survives a retry** (issued before the first attempt, reused unchanged by every
-retry of that checkout). Its regression test must prove *both* halves:
+#### The identity rule
 
-1. the **same** idempotency identity replayed → exactly one financial
-   transaction and one stock effect;
-2. two identical baskets with **different** idempotency identities → two
-   legitimate sales.
+`sales.id` **is** the checkout identity. Everything follows from that:
 
-WP-01 deliberately did not invent a test-only idempotency mechanism, and added
-no idempotency field to production.
+| Situation | Outcome |
+|---|---|
+| Same identity, same canonical transaction | The existing posted result is returned. One sale, one receipt number, one stock effect, one tender. |
+| Same identity, materially different canonical transaction | **Conflict — the request is refused.** Nothing is written and the posted sale is left exactly as it was. |
+| Same identity, existing sale not in `posted` state (e.g. voided) | Refused. A voided sale cannot be resurrected by replaying its identity. |
+| Same basket, different identity | A legitimate separate sale. Both post, both decrement stock, both bank their tender. |
+
+Idempotency is keyed on the identity **alone**. Content is never used to decide
+that two requests are the same checkout — only to detect the opposite mistake,
+one identity reused for a transaction nobody rang up under it.
+
+- `pages/PosRegister.tsx` issues one identity per cart on its first Post press,
+  keeps it in the cart (so a parked cart keeps it across a reload), reuses it
+  unchanged for every retry of that attempt, and retires it once the sale
+  posts. It is *kept* on failure, so a retry after a fixed error — or after an
+  answer the client never saw — is the same checkout.
+- `posting.rs::post_sale` looks the identity up **before** it writes anything,
+  and in particular before `next_receipt_number` is consumed, so a replay costs
+  the receipt sequence nothing. The read happens inside the transaction, which
+  is then rolled back rather than committed, because a replay writes nothing.
+
+Two tests fence the area off:
+
+- `sales.rs::two_identical_baskets_with_different_identities_both_post` — the
+  control test. **This is what stops a future change from sliding into
+  content-based deduplication.**
+- `sales.rs::a_new_checkout_identity_posts_normally_after_a_replayed_one` — a
+  retry storm must not affect the next customer's receipt number.
+
+`replaying_a_payload_with_the_same_primary_keys_is_rejected_and_rolls_back` was
+WP-01's characterization of the old behaviour (the `sales.id` primary key
+refusing a second row). WP-02 replaced it: that replay is now the supported
+retry path, so the test became
+`replaying_the_same_checkout_identity_posts_exactly_one_sale`.
+
+#### What "the same canonical transaction" compares
+
+`posting.rs::CanonicalSale` reduces both the incoming payload and the persisted
+sale to the same shape, and `sale_replay_matches_existing` compares them field
+by field, naming the first material difference in the error. The comparison
+covers the **materially relevant persisted content**, not just the headline
+total — two carts can share a total and still be different transactions:
+
+| Group | Compared |
+|---|---|
+| Attribution | `store_id`, `shift_id`, `cashier_user_id`, `device_id` |
+| Exchange-rate context | `exchange_rate_id`, `exchange_rate_lbp_per_usd` |
+| Costing | `cogs_method` |
+| Notes | `notes` — part of the persisted transaction contract, so a replay may not rewrite it |
+| Header money | `subtotal_excl_vat_cents`, `vat_total_cents`, `total_incl_vat_cents`, `discount_cents` |
+| Per line | `product_id`, `uom_code`, `quantity_in_uom` |
+| Per line — price | `unit_price_excl_vat_cents`, `unit_price_incl_vat_cents` |
+| Per line — VAT | `vat_rate_id`, `vat_rate_bps`, `line_vat_cents`, `line_subtotal_excl_vat_cents`, `line_total_incl_vat_cents` |
+| Per line — discount | `line_discount_cents`, so moving a discount between lines is a conflict even when the header is unchanged |
+| Per tender row | `method`, `currency`, `amount_native_usd_cents`, `amount_native_lbp`, `amount_usd_cents_equivalent`, `reference` |
+
+Lines and payments are **sorted before comparison**, so equality is multiset
+equality: row order alone never makes an honest retry fail, and a repeated line
+is not collapsed into one.
+
+`sales.rs` › "Replay conflict detection" (12 tests) exercises this group by
+group — swapping cash for card at the same USD value, changing a tender
+currency or native amount, changing a payment reference, changing the exchange
+rate, changing the COGS method, repricing lines while holding the total
+constant, moving the discount between lines, changing a VAT code, and changing
+shift or cashier attribution — and asserts each is refused **and** that the
+posted sale, its receipt number and `quantity_on_hand` are untouched. Two more
+assert the sorting rules: order alone is never a conflict, and repeated lines
+compare as a multiset.
+
+#### Fields deliberately excluded from replay equality
+
+Comparing these would reject honest retries, so they are left out by design:
+
+| Excluded | Why |
+|---|---|
+| `sale_item_id`, `payment_id` | Regenerated per request by `db/repos/sales.ts::post`. Request noise, not business content. |
+| The client's `quantity_base` | Non-authoritative since GP-A02 — the backend derives the base quantity from `product_uoms`. `quantity_in_uom` + `uom_code` are compared instead, and the authoritative base follows from them. |
+| The client's `is_service` | Non-authoritative since GP-A05 — `products.is_service` decides. A parked cart may legitimately carry a stale value. |
+| `cogs_total_cents` and per-line COGS | Read from product cost at post time. A retry after an intervening purchase would legitimately recompute them. |
+| `change_given_*` | Derived from tender minus amount due, so it is recomputed, not compared. |
+| `receipt_number`, `posted_at` | Assigned by the first post. The replay's job is to *return* them, not to match them. |
+
+#### Clear / Close while a post is in flight
+
+An **unresolved** posting attempt prevents the affected cart from being cleared
+or closed, and its checkout identity must survive until the attempt definitively
+settles. This is the rule that makes a lost response safe: if the backend
+committed but the answer never arrived, the cart must still hold the identity
+that names that sale, so the retry reconciles to it instead of ringing the same
+basket up again under a fresh identity.
+
+`lib/checkout.ts::createCheckoutRegistry` implements it:
+
+- `beginAttempt(cartId)` takes the cart's identity (minting one if needed) and
+  marks the attempt unresolved.
+- `settleAttempt(cartId)` marks it resolved — success *or* failure. It is
+  idempotent, so `PosRegister`'s `finally` can call it unconditionally and no
+  path leaves a cart wedged as "posting".
+- `retire(cartId)` **refuses** while an attempt is unresolved, returning `false`
+  and changing nothing. Clear and Close are also disabled in the UI for a
+  posting cart, but the rule lives in the registry so no future caller can
+  retire an identity an in-flight post may still need.
+
+On settlement:
+
+- **Success** retires the identity — that checkout is finished, so the next
+  basket in that cart is a new transaction.
+- **Failure** preserves it for retry — the next Post press is the *same*
+  checkout, which is exactly what makes a retry after a fixed error, or after a
+  lost answer, safe.
+
+Other carts stay fully usable while one is posting.
+
+`checkout.test.ts` › "cart controls during an unresolved post" (12 tests) covers
+this: clear and close are blocked with the identity intact, direct `retire` is
+refused, the identity is unchanged for the whole unresolved window, success
+retires it, failure keeps it available, clear and close work normally once
+settled, other carts are unaffected, `settleAttempt` is idempotent, and the
+lost-response scenario runs end to end.
+
+#### Frontend submission safety
+
+`lib/checkout.ts::createSubmissionGate` (`checkout.test.ts` holds 23 tests in
+total, across the gate, the registry and the cart controls) is a second,
+**non-authoritative** layer: a synchronous gate so a double-click, rapid F5, or
+a click and an F5 in the same frame cannot launch two independent attempts
+before React rerenders. `submitting` is React state and is invisible to a
+second handler in the same tick, so it cannot do this job. The gate is a
+convenience — it lives in one renderer process and cannot see a retry that
+arrives after a reload or from another window — and the backend remains the
+authority.
+
+#### Remaining limitation — true concurrency
+
+Two *genuinely simultaneous* backend posts of the same identity, where both
+transactions read "no such sale" before either inserts, **cannot both commit**:
+
+- Duplicate financial and inventory effects are prevented. The `sales.id`
+  primary key makes a second sale row impossible.
+- The losing transaction rolls back **in full**, including its receipt-number
+  advancement: `next_receipt_number` increments the `app_settings` counter
+  inside the same transaction, so a rolled-back loser leaves the sequence where
+  it was.
+- But the loser may receive an **error** rather than automatically reconciling
+  to the winner's result, which is what a sequential replay would get.
+
+That last point is a **UX gap, not a correctness gap**, and remains a later
+hardening item. The register's submission gate makes the interleaving
+unreachable from a single window, and the suite cannot reach it either: layer C
+uses `max_connections(1)` by design (see *Remaining gaps*).
 
 ### GP-A08 — returns / credit memos (WP-06)
 
@@ -230,11 +382,27 @@ Rust 1.7x/cargo (`rustc 1.95.0`). Two notes on the TypeScript layer:
 Not covered by this harness, and worth knowing before relying on it:
 
 - **No UI or component tests.** `PosRegister.tsx` cart state, scanning, and
-  multi-cart behaviour are untested; only the discount helpers were extracted.
+  multi-cart behaviour are untested. The pure pieces have been extracted and
+  are covered: the discount helpers (WP-01) and the checkout submission gate
+  and identity registry (WP-02, `lib/checkout.ts`). Nothing tests that the page
+  *wires* them correctly — that a second click really reaches the gate, that the
+  identity really reaches the payload, or that the Clear and Close buttons are
+  really disabled while a cart is posting. The registry refuses to retire an
+  in-flight identity regardless, so the invariant holds even if the UI guard is
+  wired wrongly; only the disabled-button affordance is unverified.
 - **No end-to-end Tauri test.** Nothing exercises the real IPC boundary, the
   plugin's connection pool, or `App.tsx`'s three-stage boot.
 - **No concurrency tests.** The suite uses `max_connections(1)`; it cannot
-  detect races between simultaneous posts. This matters for GP-A01.
+  detect races between simultaneous posts. For checkout idempotency this leaves
+  one case unproven: two *genuinely concurrent* posts of the same identity,
+  where both transactions read "no such sale" before either inserts. Both
+  cannot commit — the `sales.id` primary key makes a duplicate sale impossible,
+  so duplicate financial and inventory effects are prevented and the loser
+  rolls back in full, including its receipt-number advancement. The loser may
+  however surface an error instead of automatically reconciling to the winner's
+  result. That is a UX gap rather than a correctness one, it remains a later
+  hardening item, and the register's submission gate makes the interleaving
+  unreachable from a single window. See *GP-A01 — Remaining limitation* above.
 - **Timezone handling in reports** is pinned to UTC rather than tested. The
   `localtime` grouping in `reports.ts` is a latent correctness issue.
 - **Repositories other than reports/shifts** — products, barcodes, suppliers,

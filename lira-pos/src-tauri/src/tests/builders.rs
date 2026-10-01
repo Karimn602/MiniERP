@@ -218,6 +218,79 @@ pub fn lines_total(lines: &[PostSaleLine]) -> i64 {
     lines.iter().map(|l| l.line_total_incl_vat_cents).sum()
 }
 
+/// A faithful replay of a sale payload: the same checkout identity, the same
+/// line and payment identifiers, the same figures. This is what a retried
+/// checkout sends — the cashier pressing Post twice, or the client resending
+/// after an answer it never saw.
+pub fn replay_of(p: &PostSalePayload) -> PostSalePayload {
+    PostSalePayload {
+        sale_id: p.sale_id.clone(),
+        store_id: p.store_id.clone(),
+        cashier_user_id: p.cashier_user_id.clone(),
+        device_id: p.device_id.clone(),
+        shift_id: p.shift_id.clone(),
+        exchange_rate_id: p.exchange_rate_id.clone(),
+        exchange_rate_lbp_per_usd: p.exchange_rate_lbp_per_usd,
+        notes: p.notes.clone(),
+        cogs_method: p.cogs_method.clone(),
+        discount_cents: p.discount_cents,
+        allow_negative_inventory: p.allow_negative_inventory,
+        lines: p.lines.iter().map(clone_sale_line).collect(),
+        payments: p.payments.iter().map(clone_sale_payment).collect(),
+    }
+}
+
+/// `replay_of`, but with freshly minted sale-item and payment ids: the same
+/// checkout identity carrying new child identifiers. Idempotency must key on
+/// the sale identity alone, so this is still one checkout.
+pub fn replay_of_with_new_child_ids(p: &PostSalePayload) -> PostSalePayload {
+    let mut replay = replay_of(p);
+    for line in &mut replay.lines {
+        line.sale_item_id = uuid();
+    }
+    for payment in &mut replay.payments {
+        payment.payment_id = uuid();
+    }
+    replay
+}
+
+pub fn clone_sale_line(l: &PostSaleLine) -> PostSaleLine {
+    PostSaleLine {
+        sale_item_id: l.sale_item_id.clone(),
+        product_id: l.product_id.clone(),
+        product_name_snapshot: l.product_name_snapshot.clone(),
+        product_sku_snapshot: l.product_sku_snapshot.clone(),
+        uom_code_snapshot: l.uom_code_snapshot.clone(),
+        factor_num_snapshot: l.factor_num_snapshot,
+        factor_den_snapshot: l.factor_den_snapshot,
+        quantity_in_uom: l.quantity_in_uom,
+        quantity_base: l.quantity_base,
+        unit_price_excl_vat_cents: l.unit_price_excl_vat_cents,
+        unit_price_incl_vat_cents: l.unit_price_incl_vat_cents,
+        vat_rate_id_snapshot: l.vat_rate_id_snapshot.clone(),
+        vat_rate_bps_snapshot: l.vat_rate_bps_snapshot,
+        line_subtotal_excl_vat_cents: l.line_subtotal_excl_vat_cents,
+        line_vat_cents: l.line_vat_cents,
+        line_total_incl_vat_cents: l.line_total_incl_vat_cents,
+        line_discount_cents: l.line_discount_cents,
+        barcode_used_snapshot: l.barcode_used_snapshot.clone(),
+        barcode_type_snapshot: l.barcode_type_snapshot.clone(),
+        is_service: l.is_service,
+    }
+}
+
+pub fn clone_sale_payment(p: &PostSalePayment) -> PostSalePayment {
+    PostSalePayment {
+        payment_id: p.payment_id.clone(),
+        method: p.method.clone(),
+        currency: p.currency.clone(),
+        amount_native_usd_cents: p.amount_native_usd_cents,
+        amount_native_lbp: p.amount_native_lbp,
+        amount_usd_cents_equivalent: p.amount_usd_cents_equivalent,
+        reference: p.reference.clone(),
+    }
+}
+
 // ============================================================================
 // Purchase
 // ============================================================================

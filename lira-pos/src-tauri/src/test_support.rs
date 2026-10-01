@@ -246,6 +246,21 @@ pub async fn seed_exchange_rate(db: &TempDb) {
     .expect("seed exchange rate");
 }
 
+/// A second exchange rate, for tests that need a rate a replay could wrongly
+/// switch to. `effective_date` differs so the (store, date) unique key holds.
+pub async fn seed_exchange_rate_at(db: &TempDb, id: &str, rate_lbp_per_usd: i64) {
+    sqlx::query(
+        "INSERT INTO exchange_rates (id, store_id, effective_date, rate_lbp_per_usd, source)
+         VALUES (?, ?, '2026-01-02', ?, 'manual')",
+    )
+    .bind(id)
+    .bind(STORE_ID)
+    .bind(rate_lbp_per_usd)
+    .execute(db.pool())
+    .await
+    .expect("seed second exchange rate");
+}
+
 pub struct ProductSpec<'a> {
     pub id: &'a str,
     pub sku: &'a str,
@@ -258,6 +273,10 @@ pub struct ProductSpec<'a> {
     pub avg_cost_incl_vat_cents: i64,
     pub is_service: bool,
     pub is_active: bool,
+    /// UoM code of the product's base row in `product_uoms`. `seed_product`
+    /// always creates that row, because `productsRepo.create` always does —
+    /// and since WP-02 `post_sale` requires it.
+    pub base_uom_code: &'a str,
 }
 
 impl<'a> ProductSpec<'a> {
@@ -275,6 +294,7 @@ impl<'a> ProductSpec<'a> {
             avg_cost_incl_vat_cents: 0,
             is_service: false,
             is_active: true,
+            base_uom_code: "each",
         }
     }
 }
@@ -303,6 +323,42 @@ pub async fn seed_product(db: &TempDb, spec: &ProductSpec<'_>) {
     .execute(db.pool())
     .await
     .unwrap_or_else(|e| panic!("seed product {}: {e}", spec.id));
+
+    // Mirror `productsRepo.create`: every product gets a base UoM row that is
+    // also its default sale and purchase UoM, with factor (1, 1).
+    sqlx::query(
+        "INSERT INTO product_uoms (
+           id, store_id, product_id, uom_code, factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active
+         ) VALUES (?, ?, ?, ?, 1, 1, 1, 1, 1, 1)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(STORE_ID)
+    .bind(spec.id)
+    .bind(spec.base_uom_code)
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("seed base UoM for product {}: {e}", spec.id));
+}
+
+/// Add a non-base sale UoM to a product: `1 <uom_code> = num/den` base units.
+/// The frontend only ever offers active rows, so this row is active.
+pub async fn seed_product_uom(db: &TempDb, product_id: &str, uom_code: &str, num: i64, den: i64) {
+    sqlx::query(
+        "INSERT INTO product_uoms (
+           id, store_id, product_id, uom_code, factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 1)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(STORE_ID)
+    .bind(product_id)
+    .bind(uom_code)
+    .bind(num)
+    .bind(den)
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("seed UoM {uom_code} for product {product_id}: {e}"));
 }
 
 pub async fn seed_supplier(db: &TempDb, id: &str, name: &str) {
