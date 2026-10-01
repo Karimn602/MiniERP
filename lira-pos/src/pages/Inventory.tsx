@@ -11,6 +11,7 @@ import type {
   VatPricingMode,
 } from "../db/types";
 import { formatUsd, parseUsdInput } from "../lib/money";
+import { extendedCostCents, formatUnitCostUsd } from "../lib/cost";
 import { toBaseQty } from "../lib/uom";
 import { todayLocalDate } from "../lib/dates";
 import { computeLineMath, type PurchaseLineMath } from "../lib/purchaseMath";
@@ -174,10 +175,16 @@ function StockView({
     for (const vr of valuationRows) {
       map.set(vr.productId, vr);
       if (vr.quantityOnHand <= 0) continue;
-      const avgVal = Math.round(vr.quantityOnHand * vr.avgCostExclVatCents);
+      // Stock value = precise unit-cost RATE x quantity, rounded to cents once
+      // (GP-A03). Rounding the rate first values a shelf of gram-stocked flour
+      // at $0.00.
+      const avgVal = extendedCostCents(vr.avgCostExclVatMicrocents, vr.quantityOnHand);
       totalAvgCostValue += avgVal;
-      if (vr.lastPurchaseCostExclVatCents !== null) {
-        const lastVal = Math.round(vr.quantityOnHand * vr.lastPurchaseCostExclVatCents);
+      if (vr.lastPurchaseCostExclVatMicrocents !== null) {
+        const lastVal = extendedCostCents(
+          vr.lastPurchaseCostExclVatMicrocents,
+          vr.quantityOnHand,
+        );
         totalLastPurchValue += lastVal;
         totalDifference += lastVal - avgVal;
         coveredCount++;
@@ -309,10 +316,13 @@ function StockView({
                     p.quantityOnHand <= p.reorderPoint;
                   const avgCostValue = p.isService
                     ? null
-                    : Math.round(p.quantityOnHand * p.avgCostExclVatCents);
+                    : extendedCostCents(p.avgCostExclVatMicrocents, p.quantityOnHand);
                   const lastPurchValue =
-                    !p.isService && vRow?.lastPurchaseCostExclVatCents != null
-                      ? Math.round(p.quantityOnHand * vRow.lastPurchaseCostExclVatCents)
+                    !p.isService && vRow?.lastPurchaseCostExclVatMicrocents != null
+                      ? extendedCostCents(
+                          vRow.lastPurchaseCostExclVatMicrocents,
+                          p.quantityOnHand,
+                        )
                       : null;
                   const rowDiff =
                     avgCostValue !== null && lastPurchValue !== null
@@ -356,7 +366,7 @@ function StockView({
                         {p.isService ? (
                           <span className="text-xs text-slate-400">—</span>
                         ) : (
-                          formatUsd(p.avgCostExclVatCents)
+                          formatUnitCostUsd(p.avgCostExclVatMicrocents)
                         )}
                       </td>
                       <td className="px-5 py-2 text-right font-medium text-slate-900">
@@ -369,8 +379,8 @@ function StockView({
                       <td className="px-5 py-2 text-right text-slate-700">
                         {p.isService ? (
                           <span className="text-xs text-slate-400">—</span>
-                        ) : vRow?.lastPurchaseCostExclVatCents != null ? (
-                          formatUsd(vRow.lastPurchaseCostExclVatCents)
+                        ) : vRow?.lastPurchaseCostExclVatMicrocents != null ? (
+                          formatUnitCostUsd(vRow.lastPurchaseCostExclVatMicrocents)
                         ) : (
                           <span className="text-xs text-amber-600">{t("inventory.noPurchaseCost")}</span>
                         )}
@@ -466,7 +476,7 @@ function MovementsDrawer({
               {t("inventory.drawerSubtitle", {
                 qty: String(product.quantityOnHand),
                 uom: product.baseUom.uomCode,
-                cost: formatUsd(product.avgCostInclVatCents),
+                cost: formatUnitCostUsd(product.avgCostInclVatMicrocents),
               })}
             </p>
           </div>
@@ -510,7 +520,7 @@ function MovementsDrawer({
                         )}
                     </td>
                     <td className="px-4 py-2 text-right text-xs text-slate-600">
-                      {formatUsd(m.unitCostInclVatCents)}
+                      {formatUnitCostUsd(m.unitCostInclVatMicrocents)}
                     </td>
                     <td className="px-4 py-2 text-xs text-slate-600">
                       {m.notes ?? m.supplierReference ?? "—"}
@@ -676,7 +686,7 @@ function MovementsView({ storeId }: { storeId: string }) {
                       </span>
                     </td>
                     <td className="px-5 py-2 text-right text-xs text-slate-600">
-                      {formatUsd(m.unitCostInclVatCents)}
+                      {formatUnitCostUsd(m.unitCostInclVatMicrocents)}
                     </td>
                     <td className="px-5 py-2 text-xs text-slate-600">
                       {m.notes ?? m.supplierReference ?? "—"}

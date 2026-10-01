@@ -12,6 +12,7 @@ import { StatCard } from "../components/ui/StatCard";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Badge } from "../components/ui/Badge";
 import { formatLbp, formatUsd, usdCentsToLbp } from "../lib/money";
+import { formatUnitCostUsd } from "../lib/cost";
 import { formatPrettyDate, relativeFromToday } from "../lib/dates";
 import { ReceiptPrint } from "../components/ReceiptPrint";
 import { useTranslation } from "../lib/i18n";
@@ -481,7 +482,7 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
                 </td>
 
                 <td className="px-4 py-2 text-end tabular-nums text-slate-700">
-                  {formatUsd(line.unitCogsExclVatCents)}
+                  {formatUnitCostUsd(line.unitCogsExclVatMicrocents)}
                 </td>
 
                 <td className="px-4 py-2 text-end tabular-nums font-medium text-slate-900">

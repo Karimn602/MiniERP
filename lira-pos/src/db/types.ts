@@ -12,6 +12,14 @@
 
 import type { Factor } from "../lib/uom";
 import type { UsdCents } from "../lib/money";
+import type { Microcents } from "../lib/cost";
+
+// A note on COST fields (WP-03, GP-A03). Money is `UsdCents` everywhere. A UNIT
+// COST is a rate, not an amount, and is `Microcents` (1 cent = 1,000,000) so a
+// cost below one cent per base unit survives — flour at $2.50/kg stocked in
+// grams is $0.0025/g. Where a `*Microcents` and a `*Cents` field sit side by
+// side, the microcent one is the accounting value and the cents one is its
+// rounded display mirror. Never compute from the mirror.
 
 // ---------- VAT ----------
 
@@ -61,6 +69,9 @@ export interface Product {
   vatPricingMode: VatPricingMode;
   priceExclVatCents: UsdCents;
   priceInclVatCents: UsdCents;
+  avgCostExclVatMicrocents: Microcents;
+  avgCostInclVatMicrocents: Microcents;
+  /** Rounded mirror of the two above. Display only. */
   avgCostExclVatCents: UsdCents;
   avgCostInclVatCents: UsdCents;
   quantityOnHand: number;
@@ -177,6 +188,9 @@ export interface PurchaseItem {
   quantityBase: number;
   unitCostExclVatInUomCents: UsdCents;
   unitCostInclVatInUomCents: UsdCents;
+  unitCostExclVatBaseMicrocents: Microcents;
+  unitCostInclVatBaseMicrocents: Microcents;
+  /** Rounded mirror of the two above. Display only. */
   unitCostExclVatBaseCents: UsdCents;
   unitCostInclVatBaseCents: UsdCents;
   vatRateIdSnapshot: string;
@@ -210,6 +224,9 @@ export interface InventoryMovement {
   productId: string;
   movementType: MovementType;
   quantityDelta: number;
+  unitCostExclVatMicrocents: Microcents;
+  unitCostInclVatMicrocents: Microcents;
+  /** Rounded mirror of the two above. Display only. */
   unitCostExclVatCents: UsdCents;
   unitCostInclVatCents: UsdCents;
   relatedSaleId: string | null;
@@ -319,7 +336,11 @@ export interface SaleItem {
   lineVatCents: UsdCents;
   lineTotalInclVatCents: UsdCents;
   lineDiscountCents: UsdCents;
+  /** The COGS rate this line was costed at, snapshotted at post time. */
+  unitCogsExclVatMicrocents: Microcents;
+  /** Rounded mirror of the rate above. Display only. */
   unitCogsExclVatCents: UsdCents;
+  /** The line's COGS as money: round(rate x quantity). */
   lineCogsExclVatCents: UsdCents;
   barcodeUsedSnapshot: string | null;
   barcodeTypeSnapshot: string | null;

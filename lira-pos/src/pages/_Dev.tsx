@@ -9,6 +9,7 @@ import { suppliersRepo } from "../db/repos/suppliers";
 import { purchasesRepo } from "../db/repos/purchases";
 import { movementsRepo } from "../db/repos/movements";
 import { formatUsd } from "../lib/money";
+import { formatUnitCostUsd } from "../lib/cost";
 import { formatBps } from "../lib/vat";
 import { todayLocalDate } from "../lib/dates";
 
@@ -96,7 +97,7 @@ export default function DevProbe() {
               return products.map((p) => ({
                 name: p.name,
                 stock: `${p.quantityOnHand} ${p.baseUom.uomCode}`,
-                avgCost: formatUsd(p.avgCostInclVatCents),
+                avgCost: formatUnitCostUsd(p.avgCostInclVatMicrocents),
                 sale: formatUsd(p.priceInclVatCents),
               }));
             })
@@ -208,7 +209,7 @@ export default function DevProbe() {
                 when: m.postedAt,
                 type: m.movementType,
                 delta: m.quantityDelta,
-                unitCost: formatUsd(m.unitCostInclVatCents),
+                unitCost: formatUnitCostUsd(m.unitCostInclVatMicrocents),
               })),
             )
           }
@@ -236,7 +237,7 @@ export default function DevProbe() {
 
               const product = products[0];
               const beforeQoh = product.quantityOnHand;
-              const beforeAvg = product.avgCostInclVatCents;
+              const beforeAvg = product.avgCostInclVatMicrocents;
               const uom = product.baseUom;
 
               const result = await purchasesRepo.post({
@@ -281,8 +282,8 @@ export default function DevProbe() {
                 movementsCreated: result.movementIds.length,
                 stockBefore: `${beforeQoh} ${uom.uomCode}`,
                 stockAfter: `${after!.quantityOnHand} ${uom.uomCode}`,
-                avgCostBefore: formatUsd(beforeAvg),
-                avgCostAfter: formatUsd(after!.avgCostInclVatCents),
+                avgCostBefore: formatUnitCostUsd(beforeAvg),
+                avgCostAfter: formatUnitCostUsd(after!.avgCostInclVatMicrocents),
               };
             });
           }}

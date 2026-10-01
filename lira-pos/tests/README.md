@@ -1,4 +1,4 @@
-# Greaz POS test harness (WP-01, extended by WP-02)
+# Greaz POS test harness (WP-01, extended by WP-02 and WP-03)
 
 A financial regression suite. Its job is to make the later hardening work
 packages safe: if a change breaks how money, stock, or VAT are recorded, one of
@@ -26,10 +26,10 @@ so cargo cannot build on a tree that has never been built.
 
 | Layer | Location | What it covers | Authority |
 |---|---|---|---|
-| **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, sale/purchase line math, discount allocation; the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
-| **B. Rust units** | `src-tauri/src/tests/pure.rs` | `new_weighted_avg`, the four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation | Authoritative for pre-DB posting logic |
-| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, whole-ledger reconciliation, immutability triggers | **Authoritative for the database and all posting behaviour** |
-| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation | Authoritative for read-model queries only |
+| **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, the fixed-point cost scale (`cost.test.ts`), sale/purchase line math, discount allocation; the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
+| **B. Rust units** | `src-tauri/src/tests/pure.rs`, `cost.rs` | The four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation; the whole `crate::cost` abstraction — scale, rounding, weighted average, overflow | Authoritative for pre-DB posting logic |
+| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`) | **Authoritative for the database and all posting behaviour** |
+| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation | Authoritative for read-model queries only |
 
 ### A note on what layer C2 is *not*
 
@@ -104,9 +104,15 @@ only makes the tests deterministic, it does not change the SQL.)
   unresolved posting attempt pins its identity — the cart cannot be cleared or
   closed until the attempt settles, so a lost answer can still be retried
   against the sale it may already have created.
-- **Authoritative posting inputs** — the base quantity comes from the product's
-  own `product_uoms` factor, and `products.is_service` decides whether a line
-  moves stock. Neither can be overridden by the payload.
+- **Authoritative posting inputs** — on BOTH sides of the ledger, the conversion
+  comes from the product's own `product_uoms` row: `post_sale` since WP-02
+  (GP-A02) and `post_purchase` since WP-03. The UoM code is a lookup key scoped
+  by `product_id` and `is_active`, the base quantity is derived from the resolved
+  factor, and that one resolved factor drives the per-base cost, the persisted
+  snapshots, the movement, stock, the weighted average and the last-purchase
+  rate. A payload declaring a different factor, base quantity or `product_uoms`
+  row id is refused, not normalized. `products.is_service` decides whether a sale
+  line moves stock. None of it can be overridden by the payload.
 - **Discount reconciliation** — `SUM(sale_items.line_discount_cents)` equals
   `sales.discount_cents`, enforced at the boundary.
 - **Inventory reconciliation** — `SUM(inventory_movements.quantity_delta)`
@@ -119,8 +125,17 @@ only makes the tests deterministic, it does not change the SQL.)
 - **Discounts** — the allocator distributes the header discount across lines to
   the exact cent, with no cent lost to proportional rounding; post-discount line
   parts still satisfy `excl + vat = total`.
+- **Unit cost precision** — a unit cost is a RATE in microcents
+  (1 cent = 1,000,000), not an amount in cents, so a cost below a cent per base
+  unit survives: flour bought at $2.50/kg and stocked in grams costs $0.0025/g,
+  not $0.00. One scale constant, one rounding rule (half away from zero), one
+  monetary boundary (`extended_cost_cents`: rate × quantity, rounded once).
+  Whole-cent costs give byte-identical results to the pre-WP-03 code, and a cost
+  or inventory value too large to represent errors instead of wrapping.
 - **COGS** — line snapshots are immutable once posted and survive later cost
-  changes; `weighted_average` and `last_purchase` use their own cost bases, and
+  changes; the header equals the sum of the rounded line amounts, so reports
+  that group by product reconcile to the day's total; `weighted_average` and
+  `last_purchase` use their own cost bases at full precision, and
   `last_purchase` falls back to the weighted average without purchase history.
 - **Purchases** — header reconciles to lines; weighted-average cost blends
   correctly; credit purchases raise the payable by exactly the gross total while
@@ -130,7 +145,12 @@ only makes the tests deterministic, it does not change the SQL.)
   DELETE; the one carve-out (posted → voided) still refuses to rewrite money.
 - **Migrations** — every migration applies to a virgin database, re-running is a
   no-op, and two independent databases end up with identical schema and
-  checksums.
+  checksums. Since WP-03 the UPGRADE path is covered too: migration 008 applies
+  to a populated pre-WP-03 database, backfills every existing cost exactly
+  (`cents × 1,000,000`, a change of units and not a recomputation), restores the
+  three append-only triggers its backfill has to lift, is idempotent through the
+  real runner, and leaves an upgraded database on byte-identical schema to a
+  fresh install.
 
 ## Known-defect register
 
@@ -144,8 +164,6 @@ To enable one: delete its `#[ignore = ...]` line (Rust) or change `it.skip` to
 
 | ID | Owner | Test | Invariant it will enforce |
 |---|---|---|---|
-| **GP-A03** | WP-03 | `known_defects::gp_a03_fractional_base_unit_costs_must_survive_conversion` | A sub-cent per-base cost must survive. Today $2.50/kg with a gram base rounds to $0.00/g and all COGS is zero. **Needs a schema/representation change.** |
-| **GP-A03** | WP-03 | `uom.test.ts` › `GP-A03 … preserves sub-cent per-base costs` | The same defect at the pure-helper level: `unitCostInUomToBase(250, 1000/1) === 0`. |
 | **GP-A04** | WP-08 | `shifts.test.ts` › `getSalesSummary` › `GP-A04 … does not subtract the discount twice` | `netSalesExclVatCents` must not subtract the discount a second time. Lines are persisted post-discount, so `subtotal − discount` understates net sales (observed: 711 where 811 is correct). |
 | **GP-A04** | WP-08 | `shifts.test.ts` › `shiftSummaryRepo` › `GP-A04 … does not subtract the discount twice` | The same defect in the date-scoped day summary. |
 | **GP-A08** | WP-06 | — (coverage gap, no test) | See below. |
@@ -154,6 +172,43 @@ Cross-package note for WP-08: GP-A04's root cause is the post-discount
 persistence convention. WP-02 did **not** change it — `post_sale` still stores
 post-discount line values and the header discount alongside them; it only
 started *verifying* that the two agree. GP-A04's fixtures are unaffected.
+
+### Fixed by WP-03 — now enforced, must not regress
+
+| ID | Where the coverage lives | What is now enforced |
+|---|---|---|
+| **GP-A03** | `known_defects::gp_a03_*` (enabled), `cost.rs` (20 tests), `cost_precision.rs` (16 tests), `migrations.rs` › "Migration 008" (5 tests), `cost.test.ts` (25 tests), `uom.test.ts` › the two `GP-A03` tests, `purchaseMath.test.ts` › "per-base unit cost precision", `valuation.test.ts` | A unit cost is a microcent rate throughout: derived once at microcent scale from the invoice's per-UoM cost, blended by the weighted average without intermediate rounding, read back by `last_purchase` at full precision, and turned into money exactly once per line. |
+| **Purchase UoM authority** | `purchase_authority.rs` (16 tests) | `post_purchase` resolves the product's own active `product_uoms` row and derives the base quantity from ITS factor. One resolved conversion drives cost, snapshots, movement, stock, weighted average and last-purchase rate; a contradictory factor, base quantity or UoM row id refuses the whole invoice atomically. Found by the WP-03 release-gate review: precision over a client-supplied quantity is precision over a quantity nobody received. |
+
+Two notes on how the GP-A03 characterizations changed when they were enabled —
+both tighten the assertion rather than relax it:
+
+- The Rust test asserted `avg_cost_excl_vat_cents > 0`. It now names
+  `avg_cost_excl_vat_microcents` and pins the **exact** rate (250,000 µ¢ for
+  $2.50/kg in grams). The cents column still rounds $0.0025 to 0, because it is
+  now a display mirror — which is the point: nothing costs from it. The money
+  assertion (`line_cogs_excl_vat_cents == 125` for 500 g) is unchanged from the
+  original characterization.
+- The TypeScript test asserted `unitCostInUomToBase(250, 1000/1) > 0`, i.e. that
+  a cents-returning function preserve a sub-cent value — which it cannot. It now
+  targets `unitCostInUomToBaseMicrocents`, the helper the purchase path actually
+  uses, with the exact expected rate; a second test pins
+  `unitCostInUomToBase(250, …) === 0` deliberately, to record that the old
+  behaviour is still there and is still display-only.
+
+Two fixtures changed when purchase authority landed, and the change is worth
+understanding: `purchases.rs::store_with_supplier_and_products` and the GP-A03
+fixture in `known_defects.rs` both purchased in a derived UoM (`box`, `kg`) that
+was never seeded on the product. Those payloads were only ever accepted because
+the backend trusted the client's factor. Both fixtures now seed the row via
+`seed_product_uom`; **no assertion was relaxed**, and the GP-A03 expectations are
+unchanged.
+
+`purchase_authority.rs` was confirmed to detect the defect: with the two mismatch
+guards disabled, `an_understated_client_base_quantity_is_refused_atomically`,
+`a_client_factor_that_contradicts_the_product_is_refused_atomically`,
+`the_base_quantity_mismatch_error_names_the_authoritative_conversion` and
+`one_bad_line_rolls_back_the_entire_multi_line_purchase` all fail.
 
 ### Fixed by WP-02 — now enforced, must not regress
 
@@ -409,4 +464,24 @@ Not covered by this harness, and worth knowing before relying on it:
   purchases read-side, movements — have no query coverage.
 - **Accounting tables** (`accounts`, `journal_entries`, `journal_lines`) are
   created by migration 001 but nothing posts to them, so nothing is asserted.
+- **Migration 008's backfill multiplication is not range-guarded.** It computes
+  `old_cents * 1000000` in SQLite, which would leave INTEGER range only above
+  roughly **$92.23 billion** in a single legacy unit-cost field; SQLite would
+  promote the result to REAL rather than error. Classified non-blocking by the
+  WP-03 release-gate review — it is unreachable with any realistic production
+  data — and recorded here as a later defensive-hardening item. The *runtime*
+  path is already guarded: `cost::cents_to_microcents` and every other helper in
+  `crate::cost` use checked i128 arithmetic and error rather than wrap.
+- **`post_adjustment` does not resolve its UoM against `product_uoms`.** It takes
+  `quantity_base_signed` and the factor snapshot from the payload, the way
+  `post_purchase` used to. Adjustments are a manager-entered correction rather
+  than a document from outside the system, and WP-03's scope was explicitly
+  limited to the purchase boundary, so this was left alone. The cost it snapshots
+  *is* authoritative (read from `products`, at microcent precision).
+- **The legacy `*_cents` cost mirrors.** Since WP-03 every cost column has a
+  microcent sibling that is the accounting value, and the posting commands keep
+  the cents column as `round(rate)` beside it. Tests assert the mirror is
+  maintained, but nothing *prevents* a future query from costing off the mirror
+  and silently reintroducing GP-A03. The mirrors are documented at every
+  declaration; retiring them is a later package's call.
 - **`sync_queue`** is scaffolding; untested by design.

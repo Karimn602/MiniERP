@@ -20,6 +20,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { centsToMicrocents, microcentsToCents } from "../../src/lib/cost";
 
 const MIGRATIONS_DIR = fileURLToPath(new URL("../../src/db/migrations", import.meta.url));
 
@@ -205,9 +206,11 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
          product_name_snapshot, vat_rate_id_snapshot, vat_rate_bps_snapshot,
          quantity, unit_price_excl_vat_cents, unit_price_incl_vat_cents,
          line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
-         line_discount_cents, unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
+         line_discount_cents,
+         unit_cogs_excl_vat_cents, unit_cogs_excl_vat_microcents,
+         line_cogs_excl_vat_cents,
          quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1)`,
     ).run(
       id("item"),
       saleId,
@@ -223,7 +226,11 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
       line.vat,
       line.totalInclVat,
       line.lineDiscount ?? 0,
+      // `post_sale` stores a per-unit COGS RATE in microcents and the line
+      // amount in cents (WP-03). The fixture derives both from the line COGS the
+      // test states, so the shape matches what the real command persists.
       Math.round((line.cogs ?? 0) / line.quantity),
+      Math.round(centsToMicrocents(line.cogs ?? 0) / line.quantity),
       line.cogs ?? 0,
       line.quantity,
     );
@@ -291,4 +298,87 @@ export function insertPurchase(
     `${opts.purchaseDate}T10:00:00.000Z`,
   );
   return purchaseId;
+}
+
+/**
+ * Give a seeded product a stock level and a weighted-average cost, stated as a
+ * RATE in microcents (WP-03). The rounded `*_cents` mirror is maintained
+ * alongside, exactly as `post_purchase` maintains it — a fixture that set only
+ * one of the pair would not match anything the real command writes.
+ */
+export function seedProductCost(
+  db: DatabaseSync,
+  opts: {
+    productId: string;
+    quantityOnHand: number;
+    avgCostExclVatMicrocents: number;
+    avgCostInclVatMicrocents?: number;
+  },
+): void {
+  const incl = opts.avgCostInclVatMicrocents ?? opts.avgCostExclVatMicrocents;
+  db.prepare(
+    `UPDATE products
+        SET quantity_on_hand             = ?,
+            avg_cost_excl_vat_microcents = ?,
+            avg_cost_incl_vat_microcents = ?,
+            avg_cost_excl_vat_cents      = ?,
+            avg_cost_incl_vat_cents      = ?
+      WHERE id = ?`,
+  ).run(
+    opts.quantityOnHand,
+    opts.avgCostExclVatMicrocents,
+    incl,
+    microcentsToCents(opts.avgCostExclVatMicrocents),
+    microcentsToCents(incl),
+    opts.productId,
+  );
+}
+
+/**
+ * A purchase line on an existing purchase, carrying a per-base cost rate in
+ * microcents. `productsRepo.listForValuation` reads the latest of these as the
+ * product's last purchase cost.
+ */
+export function insertPurchaseItem(
+  db: DatabaseSync,
+  opts: {
+    purchaseId: string;
+    productId: string;
+    productName: string;
+    quantityBase: number;
+    unitCostExclVatBaseMicrocents: number;
+  },
+): string {
+  const itemId = id("purchase-item");
+  db.prepare(
+    `INSERT INTO purchase_items (
+       id, purchase_id, store_id, product_id, product_name_snapshot,
+       uom_code_snapshot, factor_num_snapshot, factor_den_snapshot,
+       quantity_in_uom, quantity_base,
+       unit_cost_excl_vat_in_uom_cents, unit_cost_incl_vat_in_uom_cents,
+       unit_cost_excl_vat_base_cents, unit_cost_incl_vat_base_cents,
+       unit_cost_excl_vat_base_microcents, unit_cost_incl_vat_base_microcents,
+       vat_rate_id_snapshot, vat_rate_bps_snapshot,
+       line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+     ) VALUES (?, ?, ?, ?, ?, 'each', 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+  ).run(
+    itemId,
+    opts.purchaseId,
+    STORE_ID,
+    opts.productId,
+    opts.productName,
+    opts.quantityBase,
+    opts.quantityBase,
+    microcentsToCents(opts.unitCostExclVatBaseMicrocents),
+    microcentsToCents(opts.unitCostExclVatBaseMicrocents),
+    microcentsToCents(opts.unitCostExclVatBaseMicrocents),
+    microcentsToCents(opts.unitCostExclVatBaseMicrocents),
+    opts.unitCostExclVatBaseMicrocents,
+    opts.unitCostExclVatBaseMicrocents,
+    VAT_STD_ID,
+    VAT_STD_BPS,
+    0,
+    0,
+  );
+  return itemId;
 }

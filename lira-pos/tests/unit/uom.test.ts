@@ -12,6 +12,11 @@ import {
   unitCostInUomToBase,
   type Factor,
 } from "../../src/lib/uom";
+import {
+  extendedCostCents,
+  microcentsToCents,
+  unitCostInUomToBaseMicrocents,
+} from "../../src/lib/cost";
 
 const BASE: Factor = { num: 1, den: 1 };
 const BOX_OF_12: Factor = { num: 12, den: 1 };
@@ -116,18 +121,38 @@ describe("cost conversion between UoMs", () => {
   });
 
   // ---------------------------------------------------------------------
-  // GP-A03 — fractional base-unit cost precision.  Owner: WP-03
+  // GP-A03 — fractional base-unit cost precision.  Fixed in WP-03.
   //
-  // A per-base cost below one cent cannot be represented: the cost columns
-  // are INTEGER USD cents. Buying flour at $2.50/kg with a base UoM of grams
-  // collapses to $0.00/g, so all downstream COGS is zero.
+  // Was: a per-base cost below one cent could not be represented, because
+  // every cost column — and this helper — was INTEGER USD cents. Buying flour
+  // at $2.50/kg with a base UoM of grams collapsed to $0.00/g and all
+  // downstream COGS was zero.
   //
-  // Fixing this needs a schema/representation change, which WP-01 must not
-  // make. The Rust twin of this test is
-  // `known_defects::gp_a03_fractional_base_unit_costs_must_survive_conversion`.
+  // Now: the purchase path converts at MICROCENT precision, via
+  // `lib/cost.ts::unitCostInUomToBaseMicrocents`, and `purchaseMath` derives
+  // the cents figure from that for display. So the assertion moves to the
+  // helper that is actually on the accounting path, and tightens from "greater
+  // than zero" to the exact rate — at the new precision, being non-zero is no
+  // longer the interesting part. `unitCostInUomToBase` keeps its old
+  // cents-rounding behaviour, which the test below pins deliberately: that
+  // behaviour is now presentation, which is why it is no longer what anything
+  // costs from.
+  //
+  // The Rust twin is
+  // `known_defects::gp_a03_fractional_base_unit_costs_must_survive_conversion`;
+  // the full microcent suite is `tests/unit/cost.test.ts` and
+  // `src-tauri/src/tests/cost.rs`.
   // ---------------------------------------------------------------------
-  it.skip("GP-A03 (WP-03): preserves sub-cent per-base costs", () => {
-    expect(unitCostInUomToBase(250, KG_IN_GRAMS)).toBeGreaterThan(0);
+  it("GP-A03: preserves sub-cent per-base costs", () => {
+    expect(unitCostInUomToBaseMicrocents(250, KG_IN_GRAMS)).toBeGreaterThan(0);
+    expect(unitCostInUomToBaseMicrocents(250, KG_IN_GRAMS)).toBe(250_000); // $0.0025/g
+    // 20 kg of it is still the $50.00 that was spent.
+    expect(extendedCostCents(unitCostInUomToBaseMicrocents(250, KG_IN_GRAMS), 20_000)).toBe(5_000);
+  });
+
+  it("GP-A03: the cents-rounding conversion is kept, and is why it is display only", () => {
+    expect(unitCostInUomToBase(250, KG_IN_GRAMS)).toBe(0);
+    expect(microcentsToCents(unitCostInUomToBaseMicrocents(250, KG_IN_GRAMS))).toBe(0);
   });
 });
 

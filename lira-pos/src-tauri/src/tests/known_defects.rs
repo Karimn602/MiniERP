@@ -34,6 +34,7 @@
 //
 // See tests/README.md for the full register.
 
+use crate::cost::{extended_cost_cents, COST_SCALE};
 use crate::posting::{post_purchase_with_pool, post_sale_with_pool};
 use crate::test_support::*;
 use crate::tests::builders::*;
@@ -123,27 +124,43 @@ async fn gp_a02_the_stock_guard_must_validate_the_true_base_quantity() {
 }
 
 // ============================================================================
-// GP-A03 — FRACTIONAL BASE-UNIT COST PRECISION                       (→ WP-03)
+// GP-A03 — FRACTIONAL BASE-UNIT COST PRECISION                  (fixed WP-03)
 // ============================================================================
 //
-// Current behaviour: every cost column is INTEGER USD cents, so the smallest
-// representable per-base-unit cost is $0.01. A low-cost ingredient bought by
-// the kilo but stocked in grams collapses to zero:
+// Was: every cost column was INTEGER USD cents, so the smallest representable
+// per-base-unit cost was $0.01. A low-cost ingredient bought by the kilo but
+// stocked in grams collapsed to zero:
 //   unitCostInUomToBase(250 ¢/kg, 1000/1) = round(250 ÷ 1000) = 0 ¢/g
-// Every gram then costs nothing, COGS is zero, and gross margin is overstated.
+// Every gram then cost nothing, COGS was zero, and gross margin was overstated
+// with nothing visibly wrong anywhere.
 //
-// This CANNOT be fixed without a schema change (a scaled/минor-unit cost
-// column, or a rational cost), which WP-01 is forbidden from making. WP-03 owns
-// both the representation decision and this test.
+// Now: a unit cost is a RATE, not an amount, and is held in MICROCENTS
+// (1 cent = `cost::COST_SCALE` = 1,000,000) in `products.avg_cost_*_microcents`,
+// `inventory_movements.unit_cost_*_microcents`,
+// `purchase_items.unit_cost_*_base_microcents` and
+// `sale_items.unit_cogs_excl_vat_microcents`. `post_purchase` derives the
+// per-base cost from the invoice's per-UoM cost with ONE division at microcent
+// scale, and cost becomes money exactly once, at
+// `cost::extended_cost_cents` — unit rate × base quantity, rounded once.
+//
+// The assertion on the stored per-gram cost now names the microcent column
+// rather than its rounded cents mirror, and pins the exact expected value
+// instead of merely `> 0`: at the new precision "non-zero" is no longer the
+// interesting part. Rounding $0.0025/g to a whole cent still gives 0 — that
+// mirror is display only, which is precisely why it is no longer what anything
+// costs from. The money assertion below ($1.25 of COGS) is unchanged from the
+// original characterization.
 
-#[ignore = "GP-A03: sub-cent base costs are unrepresentable in the current schema; enable in WP-03"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gp_a03_fractional_base_unit_costs_must_survive_conversion() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
     seed_supplier(&db, SUPPLIER, "Beirut Wholesale").await;
-    // Flour: base UoM is the gram.
+    // Flour: base UoM is the gram, bought by the kilo. `post_purchase` resolves
+    // the purchase UoM against `product_uoms`, so the kilo has to be a real
+    // active row on the product.
     seed_product(&db, &ProductSpec::stocked(P_FLOUR, "SKU-F1", "Flour (g)")).await;
+    seed_product_uom(&db, P_FLOUR, "kg", 1_000, 1).await;
 
     // Buy 20 kg at $2.50/kg = $50.00. Per gram that is $0.0025.
     let line = PurchaseLineBuilder::new(P_FLOUR, "Flour (g)")
@@ -158,12 +175,22 @@ async fn gp_a03_fractional_base_unit_costs_must_survive_conversion() {
         .unwrap();
 
     let avg = db
-        .scalar_i64(&format!("SELECT avg_cost_excl_vat_cents FROM products WHERE id='{P_FLOUR}'"))
+        .scalar_i64(&format!(
+            "SELECT avg_cost_excl_vat_microcents FROM products WHERE id='{P_FLOUR}'"
+        ))
         .await;
     assert!(
         avg > 0,
         "GP-A03: a $50 purchase must not leave a zero per-gram cost (got {avg})"
     );
+    assert_eq!(
+        avg,
+        COST_SCALE / 4,
+        "GP-A03: $2.50/kg is $0.0025/g — a quarter of a cent, or 250,000 microcents"
+    );
+    // The whole purchase is still accounted for: 20,000 g at that rate is the
+    // $50.00 that was actually spent, to the cent.
+    assert_eq!(extended_cost_cents(avg, 20_000).unwrap(), 5_000);
 
     // Selling 500 g of a $50/20kg stock should cost about $1.25.
     let sale_line = SaleLineBuilder::new(P_FLOUR, "Flour (g)").qty(500).unit_incl(400).build();
@@ -176,6 +203,18 @@ async fn gp_a03_fractional_base_unit_costs_must_survive_conversion() {
         .scalar_i64(&format!("SELECT line_cogs_excl_vat_cents FROM sale_items WHERE sale_id='{sale_id}'"))
         .await;
     assert_eq!(cogs, 125, "GP-A03: 500 g at $0.0025/g is $1.25 of COGS");
+    // The header agrees with the line, and the rate itself was snapshotted.
+    assert_eq!(
+        db.scalar_i64(&format!("SELECT cogs_total_cents FROM sales WHERE id='{sale_id}'")).await,
+        125
+    );
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT unit_cogs_excl_vat_microcents FROM sale_items WHERE sale_id='{sale_id}'"
+        ))
+        .await,
+        250_000
+    );
 }
 
 // ============================================================================

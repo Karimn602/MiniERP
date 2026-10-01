@@ -295,6 +295,14 @@ pub fn clone_sale_payment(p: &PostSalePayment) -> PostSalePayment {
 // Purchase
 // ============================================================================
 
+/// `round(qty x num / den)`, half away from zero — what `lib/uom.ts::toBaseQty`
+/// computes on the client and what `posting::derive_base_quantity` derives on
+/// the server. The builder uses it so a legitimate line never looks like a
+/// mismatch merely because the harness rounded differently.
+fn base_qty(qty_in_uom: i64, num: i64, den: i64) -> i64 {
+    (qty_in_uom * num + den / 2) / den
+}
+
 pub struct PurchaseLineBuilder {
     line: PostPurchaseLine,
 }
@@ -328,8 +336,11 @@ impl PurchaseLineBuilder {
 
     pub fn qty(mut self, qty_in_uom: i64) -> Self {
         self.line.quantity_in_uom = qty_in_uom;
-        self.line.quantity_base =
-            qty_in_uom * self.line.factor_num_snapshot / self.line.factor_den_snapshot;
+        self.line.quantity_base = base_qty(
+            qty_in_uom,
+            self.line.factor_num_snapshot,
+            self.line.factor_den_snapshot,
+        );
         self
     }
 
@@ -337,7 +348,33 @@ impl PurchaseLineBuilder {
         self.line.uom_code_snapshot = code.to_string();
         self.line.factor_num_snapshot = num;
         self.line.factor_den_snapshot = den;
-        self.line.quantity_base = self.line.quantity_in_uom * num / den;
+        self.line.quantity_base = base_qty(self.line.quantity_in_uom, num, den);
+        self
+    }
+
+    /// Name a specific `product_uoms` row, the way the Purchases page does
+    /// (`productUomIdSnapshot`). `post_purchase` cross-checks it against the row
+    /// it resolves from `uom_code`.
+    pub fn product_uom_id(mut self, id: &str) -> Self {
+        self.line.product_uom_id_snapshot = Some(id.to_string());
+        self
+    }
+
+    /// Override the declared base quantity independently of the factor — a stale
+    /// or buggy client. Used only by the purchase-authority tests.
+    pub fn raw_quantity_base(mut self, base: i64) -> Self {
+        self.line.quantity_base = base;
+        self
+    }
+
+    /// Declare a conversion factor that disagrees with the product's own, while
+    /// leaving the derived base quantity consistent with the DECLARED factor —
+    /// i.e. a client that is internally coherent but wrong about the product.
+    /// Used only by the purchase-authority tests.
+    pub fn raw_factor_snapshot(mut self, num: i64, den: i64) -> Self {
+        self.line.factor_num_snapshot = num;
+        self.line.factor_den_snapshot = den;
+        self.line.quantity_base = base_qty(self.line.quantity_in_uom, num, den);
         self
     }
 

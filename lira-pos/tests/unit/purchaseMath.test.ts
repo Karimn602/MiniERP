@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { computeLineMath } from "../../src/lib/purchaseMath";
 import type { Factor } from "../../src/lib/uom";
+import { COST_SCALE, extendedCostCents, microcentsToCents } from "../../src/lib/cost";
 
 const BASE: Factor = { num: 1, den: 1 };
 const BOX_OF_12: Factor = { num: 12, den: 1 };
@@ -144,6 +145,78 @@ describe("computeLineMath — boundaries", () => {
           );
           expect(Number.isInteger(line.unitCostExclVatBaseCents)).toBe(true);
           expect(Number.isInteger(line.unitCostInclVatBaseCents)).toBe(true);
+        }
+      }
+    }
+  });
+});
+
+describe("computeLineMath — per-base unit cost precision (GP-A03)", () => {
+  const KG_IN_GRAMS: Factor = { num: 1000, den: 1 };
+
+  it("keeps a sub-cent per-base cost as a microcent rate", () => {
+    // 20 kg of flour at $2.50/kg, stocked in grams.
+    const line = computeLineMath({
+      quantityInUom: 20,
+      unitCostInUomCents: 250,
+      unitCostInUomMode: "exclusive",
+      factor: KG_IN_GRAMS,
+      vatBps: STANDARD,
+    });
+
+    expect(line.quantityBase).toBe(20_000);
+    // The accounting rate: $0.0025 per gram.
+    expect(line.unitCostExclVatBaseMicrocents).toBe(250_000);
+    expect(line.unitCostInclVatBaseMicrocents).toBe(278_000);
+    // The rounded mirror is zero — which is exactly the old defect, and exactly
+    // why nothing costs from this field any more.
+    expect(line.unitCostExclVatBaseCents).toBe(0);
+    // The invoice itself is still exact cents: $50.00 net.
+    expect(line.lineSubtotalExclVatCents).toBe(5_000);
+    expect(line.lineSubtotalExclVatCents + line.lineVatCents).toBe(line.lineTotalInclVatCents);
+    // And the rate values the whole receipt back to that $50.00.
+    expect(extendedCostCents(line.unitCostExclVatBaseMicrocents, line.quantityBase)).toBe(5_000);
+  });
+
+  it("agrees with the mirror for an ordinary whole-cent cost", () => {
+    const line = computeLineMath({
+      quantityInUom: 5,
+      unitCostInUomCents: 2_400, // $24.00 per box of 12
+      unitCostInUomMode: "exclusive",
+      factor: BOX_OF_12,
+      vatBps: STANDARD,
+    });
+    expect(line.unitCostExclVatBaseMicrocents).toBe(200 * COST_SCALE);
+    expect(line.unitCostInclVatBaseMicrocents).toBe(222 * COST_SCALE);
+    expect(microcentsToCents(line.unitCostExclVatBaseMicrocents)).toBe(
+      line.unitCostExclVatBaseCents,
+    );
+    expect(microcentsToCents(line.unitCostInclVatBaseMicrocents)).toBe(
+      line.unitCostInclVatBaseCents,
+    );
+  });
+
+  it("keeps the cents field as exactly the rounded rate, across a sweep", () => {
+    // The invariant that lets the legacy column stay trustworthy as a display
+    // value: it is never anything other than the rate, rounded.
+    for (const mode of ["exclusive", "inclusive"] as const) {
+      for (const cost of [1, 7, 99, 250, 333, 1_001, 99_999]) {
+        for (const factor of [BASE, BOX_OF_12, KG_IN_GRAMS]) {
+          const line = computeLineMath({
+            quantityInUom: 4,
+            unitCostInUomCents: cost,
+            unitCostInUomMode: mode,
+            factor,
+            vatBps: STANDARD,
+          });
+          expect(Number.isInteger(line.unitCostExclVatBaseMicrocents)).toBe(true);
+          expect(Number.isInteger(line.unitCostInclVatBaseMicrocents)).toBe(true);
+          expect(line.unitCostExclVatBaseCents).toBe(
+            microcentsToCents(line.unitCostExclVatBaseMicrocents),
+          );
+          expect(line.unitCostInclVatBaseCents).toBe(
+            microcentsToCents(line.unitCostInclVatBaseMicrocents),
+          );
         }
       }
     }

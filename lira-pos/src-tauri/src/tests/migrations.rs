@@ -1,6 +1,9 @@
 // Layer C — migrations against a virgin temporary database.
 
-use crate::test_support::{app_migrator, assert_not_production_db, TempDb, STORE_ID};
+use crate::cost::{cents_to_microcents, COST_SCALE};
+use crate::test_support::{
+    app_migrator, assert_not_production_db, TempDb, RATE_ID, STORE_ID, USER_ID, VAT_STD_ID,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_migrations_apply_to_a_virgin_database() {
@@ -39,16 +42,16 @@ async fn migration_versions_are_recorded_in_order() {
     let applied = db
         .count("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
         .await;
-    assert_eq!(applied, 7, "all seven migrations must be recorded");
+    assert_eq!(applied, 8, "all eight migrations must be recorded");
 
     assert_eq!(db.scalar_i64("SELECT MIN(version) FROM _sqlx_migrations").await, 1);
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 7);
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 8);
 
-    // Versions are exactly 1..=7 with no gaps or duplicates.
+    // Versions are exactly 1..=8 with no gaps or duplicates.
     let distinct = db
         .count("SELECT COUNT(DISTINCT version) FROM _sqlx_migrations")
         .await;
-    assert_eq!(distinct, 7);
+    assert_eq!(distinct, 8);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -158,4 +161,320 @@ fn the_production_database_cannot_be_opened_from_a_test() {
 #[should_panic(expected = "test databases must live under")]
 fn databases_outside_the_temp_root_are_rejected() {
     assert_not_production_db(std::path::Path::new("C:/Users/someone/AppData/Roaming/app/x.db"));
+}
+
+// ============================================================================
+// Migration 008 — cost precision (GP-A03)
+// ============================================================================
+//
+// The upgrade path is the risky one. A fresh database is covered by the tests
+// above; these cover a database an EARLIER release of the app already wrote
+// money into, which is what every existing shop has. They run migrations 1..=7
+// through the real runner, fill the four cost-bearing tables with whole-cent
+// data, and only then apply 008.
+
+const P_UPGRADE: &str = "00000000-0000-0000-0000-0000000000u1";
+const SUP_UPGRADE: &str = "00000000-0000-0000-0000-0000000000u2";
+
+/// A v7 database holding one product, one posted purchase, one posted sale and
+/// the matching inventory movements — all with whole-cent costs, exactly as the
+/// pre-WP-03 posting commands wrote them.
+async fn pre_wp03_database_with_cost_data() -> TempDb {
+    let db = TempDb::at_schema_version(7).await;
+
+    db.exec(&format!(
+        "INSERT INTO exchange_rates (id, store_id, effective_date, rate_lbp_per_usd, source)
+         VALUES ('{RATE_ID}', '{STORE_ID}', '2026-01-01', 89500, 'manual')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO suppliers (id, store_id, name)
+         VALUES ('{SUP_UPGRADE}', '{STORE_ID}', 'Legacy Co')"
+    ))
+    .await;
+    // Whole-cent average cost, the only kind a v7 database can hold.
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents,
+           avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
+           quantity_on_hand, is_active, is_service, updated_at
+         ) VALUES ('{P_UPGRADE}', '{STORE_ID}', 'SKU-LEGACY', 'Legacy Coffee',
+                   '{VAT_STD_ID}', 'inclusive', 1000, 1110, 237, 263, 40, 1, 0,
+                   '2026-01-01T00:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO product_uoms (
+           id, store_id, product_id, uom_code, factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active
+         ) VALUES ('{P_UPGRADE}-u', '{STORE_ID}', '{P_UPGRADE}', 'each', 1, 1, 1, 1, 1, 1)"
+    ))
+    .await;
+
+    // A posted purchase and its line.
+    db.exec(&format!(
+        "INSERT INTO purchases (
+           id, store_id, supplier_id, purchase_type, purchase_number, purchase_date,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+           status, created_by_user_id, posted_at
+         ) VALUES ('pur-legacy', '{STORE_ID}', '{SUP_UPGRADE}', 'normal', 1, '2026-01-02',
+                   9480, 1043, 10523, 'posted', '{USER_ID}', '2026-01-02T10:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO purchase_items (
+           id, purchase_id, store_id, product_id, product_name_snapshot,
+           uom_code_snapshot, factor_num_snapshot, factor_den_snapshot,
+           quantity_in_uom, quantity_base,
+           unit_cost_excl_vat_in_uom_cents, unit_cost_incl_vat_in_uom_cents,
+           unit_cost_excl_vat_base_cents, unit_cost_incl_vat_base_cents,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+         ) VALUES ('pi-legacy', 'pur-legacy', '{STORE_ID}', '{P_UPGRADE}', 'Legacy Coffee',
+                   'each', 1, 1, 40, 40, 237, 263, 237, 263,
+                   '{VAT_STD_ID}', 1100, 9480, 1043, 10523)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO inventory_movements (
+           id, store_id, product_id, movement_type, quantity_delta,
+           unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+           related_purchase_id, related_purchase_item_id, posted_at
+         ) VALUES ('mv-legacy-pur', '{STORE_ID}', '{P_UPGRADE}', 'purchase', 40,
+                   237, 263, 'pur-legacy', 'pi-legacy', '2026-01-02T10:00:00.000Z')"
+    ))
+    .await;
+
+    // A posted sale and its line, carrying a COGS snapshot.
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, exchange_rate_id,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+           discount_cents, cogs_total_cents, cogs_method, status, posted_at
+         ) VALUES ('sale-legacy', '{STORE_ID}', '{USER_ID}', 1, 89500, '{RATE_ID}',
+                   900, 100, 1000, 0, 474, 'weighted_average', 'posted',
+                   '2026-01-03T10:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_items (
+           id, sale_id, store_id, product_id, product_name_snapshot,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot, quantity,
+           unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+           line_discount_cents, unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
+           quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
+         ) VALUES ('si-legacy', 'sale-legacy', '{STORE_ID}', '{P_UPGRADE}', 'Legacy Coffee',
+                   '{VAT_STD_ID}', 1100, 2, 450, 500, 900, 100, 1000, 0, 237, 474,
+                   2, 'each', 1, 1)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO inventory_movements (
+           id, store_id, product_id, movement_type, quantity_delta,
+           unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+           related_sale_id, related_sale_item_id, posted_at
+         ) VALUES ('mv-legacy-sale', '{STORE_ID}', '{P_UPGRADE}', 'sale', -2,
+                   237, 263, 'sale-legacy', 'si-legacy', '2026-01-03T10:00:00.000Z')"
+    ))
+    .await;
+
+    db
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_008_applies_to_an_existing_pre_wp03_database() {
+    let db = pre_wp03_database_with_cost_data().await;
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        7,
+        "the fixture must start on the pre-WP-03 schema"
+    );
+
+    db.migrate_again()
+        .await
+        .expect("migration 008 must apply to a populated v7 database");
+
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 8);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_008_backfills_every_existing_cost_exactly() {
+    let db = pre_wp03_database_with_cost_data().await;
+    db.migrate_again().await.expect("migration 008 must apply");
+
+    // Backfill is `cents x COST_SCALE` — an exact change of units, never a
+    // recomputation. Each assertion states the expected value independently of
+    // the migration SQL.
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT avg_cost_excl_vat_microcents FROM products WHERE id='{P_UPGRADE}'"
+        ))
+        .await,
+        cents_to_microcents(237).unwrap(),
+        "the weighted-average cost must survive the unit change exactly"
+    );
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT avg_cost_incl_vat_microcents FROM products WHERE id='{P_UPGRADE}'"
+        ))
+        .await,
+        263 * COST_SCALE
+    );
+    assert_eq!(
+        db.scalar_i64(
+            "SELECT unit_cost_excl_vat_base_microcents FROM purchase_items WHERE id='pi-legacy'"
+        )
+        .await,
+        237 * COST_SCALE
+    );
+    assert_eq!(
+        db.scalar_i64(
+            "SELECT unit_cost_incl_vat_base_microcents FROM purchase_items WHERE id='pi-legacy'"
+        )
+        .await,
+        263 * COST_SCALE
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT unit_cogs_excl_vat_microcents FROM sale_items WHERE id='si-legacy'")
+            .await,
+        237 * COST_SCALE,
+        "a posted sale COGS rate must be re-expressed, not re-derived"
+    );
+    for movement in ["mv-legacy-pur", "mv-legacy-sale"] {
+        assert_eq!(
+            db.scalar_i64(&format!(
+                "SELECT unit_cost_excl_vat_microcents FROM inventory_movements WHERE id='{movement}'"
+            ))
+            .await,
+            237 * COST_SCALE,
+            "movement {movement} must keep its cost snapshot"
+        );
+        assert_eq!(
+            db.scalar_i64(&format!(
+                "SELECT unit_cost_incl_vat_microcents FROM inventory_movements WHERE id='{movement}'"
+            ))
+            .await,
+            263 * COST_SCALE
+        );
+    }
+
+    // Nothing else moved. In particular the legacy cents columns are untouched,
+    // the posted monetary COGS is untouched, and `products.updated_at` was not
+    // rewritten by the backfill.
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT avg_cost_excl_vat_cents FROM products WHERE id='{P_UPGRADE}'"
+        ))
+        .await,
+        237
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT line_cogs_excl_vat_cents FROM sale_items WHERE id='si-legacy'")
+            .await,
+        474,
+        "a posted sale COGS amount must not be recomputed by the migration"
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT cogs_total_cents FROM sales WHERE id='sale-legacy'").await,
+        474
+    );
+    assert_eq!(
+        db.scalar_string(&format!("SELECT updated_at FROM products WHERE id='{P_UPGRADE}'"))
+            .await,
+        "2026-01-01T00:00:00.000Z",
+        "the backfill must not disturb product housekeeping timestamps"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_008_restores_the_append_only_guards_it_lifts() {
+    // The backfill has to drop three immutability triggers to write its new
+    // columns. If it ever forgot to put one back, posted history would become
+    // editable — a far worse defect than the one being fixed.
+    let db = pre_wp03_database_with_cost_data().await;
+    db.migrate_again().await.expect("migration 008 must apply");
+
+    for trigger in [
+        "trg_inv_mov_no_update",
+        "trg_sale_items_no_update_after_post",
+        "trg_purchase_items_no_update_after_post",
+        "trg_products_updated_at",
+    ] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='{trigger}'"
+            ))
+            .await,
+            1,
+            "migration 008 must restore `{trigger}`"
+        );
+    }
+
+    // And they actually fire.
+    assert!(
+        db.try_exec(
+            "UPDATE inventory_movements SET unit_cost_excl_vat_microcents = 1
+              WHERE id='mv-legacy-pur'"
+        )
+        .await
+        .is_err(),
+        "inventory movements must still be append-only after migration 008"
+    );
+    assert!(
+        db.try_exec(
+            "UPDATE sale_items SET unit_cogs_excl_vat_microcents = 1 WHERE id='si-legacy'"
+        )
+        .await
+        .is_err(),
+        "the items of a posted sale must still be immutable after migration 008"
+    );
+    assert!(
+        db.try_exec(
+            "UPDATE purchase_items SET unit_cost_excl_vat_base_microcents = 1
+              WHERE id='pi-legacy'"
+        )
+        .await
+        .is_err(),
+        "the items of a posted purchase must still be immutable after migration 008"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_008_is_idempotent_through_the_real_runner() {
+    let db = pre_wp03_database_with_cost_data().await;
+    db.migrate_again().await.expect("first upgrade");
+    let before = db.count("SELECT COUNT(*) FROM _sqlx_migrations").await;
+
+    db.migrate_again().await.expect("second run must be a no-op");
+    db.migrate_again().await.expect("third run must be a no-op");
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM _sqlx_migrations").await, before);
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT avg_cost_excl_vat_microcents FROM products WHERE id='{P_UPGRADE}'"
+        ))
+        .await,
+        237 * COST_SCALE,
+        "re-running must not re-scale an already-backfilled cost"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgraded_database_matches_a_fresh_one_schema_for_schema() {
+    // An existing shop that upgrades must end up on exactly the schema a new
+    // install gets — otherwise the two diverge silently from here on.
+    let upgraded = pre_wp03_database_with_cost_data().await;
+    upgraded.migrate_again().await.expect("upgrade");
+    let fresh = TempDb::new().await;
+
+    let schema_sql =
+        "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+         (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        upgraded.scalar_string(schema_sql).await,
+        fresh.scalar_string(schema_sql).await
+    );
 }

@@ -167,13 +167,19 @@ export function fromBaseQtyWithRemainder(
 // ---------- Cost conversion ----------
 
 /**
- * Convert a per-UoM cost to per-base-UoM cost.
- * Used at purchase time: shop buys 10 boxes @ $24/box; we need to record
- * the cost as $/pcs in the inventory movement.
+ * Convert a per-UoM cost to per-base-UoM cost, IN WHOLE CENTS.
  *
  *   costPerBase = costPerUom × den ÷ num
  *
- * Both costs are in USD cents (integer). Rounded to nearest cent.
+ * ⚠ PRESENTATION ONLY. This was the purchase path's cost conversion and it is
+ * the GP-A03 defect in one line: a cost below a cent per base unit rounds to
+ * zero, so flour at $2.50/kg stocked in grams used to cost nothing per gram.
+ * The accounting conversion is `lib/cost.ts::unitCostInUomToBaseMicrocents`,
+ * which performs the same division at microcent scale; `purchaseMath` uses that
+ * one and derives this value from it for display.
+ *
+ * Kept for the places that want a cents figure to show, and because the rounded
+ * `*_base_cents` columns still exist beside their microcent siblings.
  */
 export function unitCostInUomToBase(
   costPerUomCents: UsdCents,

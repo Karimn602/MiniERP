@@ -13,6 +13,11 @@ async fn store_with_supplier_and_products() -> TempDb {
     seed_supplier(&db, SUPPLIER, "Beirut Wholesale").await;
     seed_product(&db, &ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee 250g")).await;
     seed_product(&db, &ProductSpec::stocked(P_WATER, "SKU-W1", "Water 1.5L")).await;
+    // Coffee is also bought by the box of 12. Since WP-03 `post_purchase`
+    // resolves the purchase UoM against `product_uoms`, so a derived purchase
+    // UoM has to actually exist on the product — exactly as it must on the sale
+    // side since WP-02.
+    seed_product_uom(&db, P_COFFEE, "box", 12, 1).await;
     db
 }
 

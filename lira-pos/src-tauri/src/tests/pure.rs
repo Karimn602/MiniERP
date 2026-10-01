@@ -1,8 +1,9 @@
 // Layer B — pure Rust unit tests. No database.
 
+use crate::cost::new_weighted_avg;
 use crate::posting::{
-    derive_base_quantity, new_weighted_avg, prepare_sale, validate_adjustment_payload,
-    validate_purchase_payload, validate_supplier_payment_payload,
+    derive_base_quantity, prepare_sale, validate_adjustment_payload, validate_purchase_payload,
+    validate_supplier_payment_payload,
 };
 use crate::test_support::{VAT_EXEMPT_ID, VAT_STD_BPS, VAT_STD_ID};
 use crate::tests::builders::*;

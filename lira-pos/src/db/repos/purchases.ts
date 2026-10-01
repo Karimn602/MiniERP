@@ -51,6 +51,8 @@ interface PurchaseItemRow {
   unit_cost_incl_vat_in_uom_cents: number;
   unit_cost_excl_vat_base_cents: number;
   unit_cost_incl_vat_base_cents: number;
+  unit_cost_excl_vat_base_microcents: number;
+  unit_cost_incl_vat_base_microcents: number;
   vat_rate_id_snapshot: string;
   vat_rate_bps_snapshot: number;
   line_subtotal_excl_vat_cents: number;
@@ -99,6 +101,8 @@ function toPurchaseItem(r: PurchaseItemRow): PurchaseItem {
     quantityBase: r.quantity_base,
     unitCostExclVatInUomCents: r.unit_cost_excl_vat_in_uom_cents,
     unitCostInclVatInUomCents: r.unit_cost_incl_vat_in_uom_cents,
+    unitCostExclVatBaseMicrocents: r.unit_cost_excl_vat_base_microcents,
+    unitCostInclVatBaseMicrocents: r.unit_cost_incl_vat_base_microcents,
     unitCostExclVatBaseCents: r.unit_cost_excl_vat_base_cents,
     unitCostInclVatBaseCents: r.unit_cost_incl_vat_base_cents,
     vatRateIdSnapshot: r.vat_rate_id_snapshot,
@@ -123,8 +127,16 @@ export interface PostPurchaseLineInput {
   factorDenSnapshot: number;
   quantityInUom: number;
   quantityBase: number;
+  /** The invoice cost per purchasing UoM, in exact cents. Authoritative. */
   unitCostExclVatInUomCents: number;
   unitCostInclVatInUomCents: number;
+  /**
+   * The client's cents-rounded per-base cost. NON-AUTHORITATIVE and accepted
+   * only for wire compatibility: rounding a per-base cost to whole cents is the
+   * GP-A03 defect, so `post_purchase` re-derives the rate from
+   * `unitCost*InUomCents` and the factor at microcent precision and persists
+   * that. Sent so the payload shape is unchanged; never relied on.
+   */
   unitCostExclVatBaseCents: number;
   unitCostInclVatBaseCents: number;
   vatRateIdSnapshot: string;

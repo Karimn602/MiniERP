@@ -18,6 +18,7 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { Badge } from "../components/ui/Badge";
 import { BarcodeManager } from "../components/BarcodeManager";
 import { formatUsd, parseUsdInput } from "../lib/money";
+import { formatUnitCostUsd } from "../lib/cost";
 import { addVat, stripVat } from "../lib/vat";
 import { classifyBarcode as inferBarcodeType, isValidEan13 } from "../lib/barcode";
 import { gcd, makeFactor, type Factor } from "../lib/uom";
@@ -315,8 +316,15 @@ export default function Products() {
           ? splitInclVat(typedPriceCents, currentVatBps)
           : splitExclVat(typedPriceCents, currentVatBps);
 
-      const avgCostExclVatCents =
-        form.mode === "edit" ? (selectedProduct?.avgCostExclVatCents ?? 0) : 0;
+      // Cost is never edited on this form — it is owned by posting. Carry the
+      // product's existing RATE through untouched: reading the rounded cents
+      // mirror back and writing it would destroy a sub-cent cost (GP-A03) on
+      // any unrelated edit, and the incl-VAT rate has to come from its own
+      // field rather than be copied from the excl-VAT one.
+      const avgCostExclVatMicrocents =
+        form.mode === "edit" ? (selectedProduct?.avgCostExclVatMicrocents ?? 0) : 0;
+      const avgCostInclVatMicrocents =
+        form.mode === "edit" ? (selectedProduct?.avgCostInclVatMicrocents ?? 0) : 0;
 
       const quantityOnHand = form.isService
         ? 0
@@ -363,8 +371,8 @@ export default function Products() {
           vatPricingMode: form.vatPricingMode,
           priceExclVatCents: price.exclVatCents,
           priceInclVatCents: price.inclVatCents,
-          avgCostExclVatCents,
-          avgCostInclVatCents: avgCostExclVatCents,
+          avgCostExclVatMicrocents,
+          avgCostInclVatMicrocents,
           quantityOnHand,
           reorderPoint,
           isService: form.isService,
@@ -389,8 +397,8 @@ export default function Products() {
           vatPricingMode: form.vatPricingMode,
           priceExclVatCents: price.exclVatCents,
           priceInclVatCents: price.inclVatCents,
-          avgCostExclVatCents,
-          avgCostInclVatCents: avgCostExclVatCents,
+          avgCostExclVatMicrocents,
+          avgCostInclVatMicrocents,
           quantityOnHand,
           reorderPoint,
           isService: form.isService,
@@ -537,7 +545,7 @@ export default function Products() {
                       </td>
 
                       <td className="whitespace-nowrap px-5 py-3 text-right tabular-nums text-slate-500">
-                        {formatUsd(p.avgCostExclVatCents)}
+                        {formatUnitCostUsd(p.avgCostExclVatMicrocents)}
                       </td>
 
                       <td className="whitespace-nowrap px-5 py-3 text-right tabular-nums">
@@ -755,7 +763,7 @@ export default function Products() {
                   <div className="text-xs text-slate-500">
                     {t("products.avgCostLabel")}{" "}
                     <span className="font-medium text-slate-700">
-                      {formatUsd(selectedProduct.avgCostExclVatCents)}
+                      {formatUnitCostUsd(selectedProduct.avgCostExclVatMicrocents)}
                     </span>
                     <span className="ml-1 text-slate-400">{t("products.avgCostNote")}</span>
                   </div>

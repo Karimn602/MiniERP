@@ -11,6 +11,7 @@ import type {
   BarcodeType,
 } from "../types";
 import type { Factor } from "../../lib/uom";
+import { microcentsToCents } from "../../lib/cost";
 
 export class DuplicateSkuError extends Error {
   constructor() {
@@ -31,6 +32,8 @@ interface ProductRow {
   price_incl_vat_cents: number;
   avg_cost_excl_vat_cents: number;
   avg_cost_incl_vat_cents: number;
+  avg_cost_excl_vat_microcents: number;
+  avg_cost_incl_vat_microcents: number;
   quantity_on_hand: number;
   reorder_point: number | null;
   is_active: number;
@@ -78,8 +81,13 @@ type ProductCreateArgs = {
   vatPricingMode: VatPricingMode;
   priceExclVatCents: number;
   priceInclVatCents: number;
-  avgCostExclVatCents: number;
-  avgCostInclVatCents: number;
+  /**
+   * The product's weighted-average cost, as a rate in MICROCENTS. The repo
+   * derives the rounded `*_cents` mirror itself, so a caller cannot write an
+   * inconsistent pair or silently truncate a sub-cent cost (GP-A03).
+   */
+  avgCostExclVatMicrocents: number;
+  avgCostInclVatMicrocents: number;
   quantityOnHand: number;
   reorderPoint: number | null;
   isService: boolean;
@@ -100,8 +108,9 @@ type ProductUpdateArgs = {
   vatPricingMode: VatPricingMode;
   priceExclVatCents: number;
   priceInclVatCents: number;
-  avgCostExclVatCents: number;
-  avgCostInclVatCents: number;
+  /** As in `ProductCreateArgs`: the rate in microcents, mirror derived here. */
+  avgCostExclVatMicrocents: number;
+  avgCostInclVatMicrocents: number;
   quantityOnHand: number;
   reorderPoint: number | null;
   isService: boolean;
@@ -136,6 +145,8 @@ function rowToProduct(r: ProductRow): Product {
     vatPricingMode: r.vat_pricing_mode,
     priceExclVatCents: r.price_excl_vat_cents,
     priceInclVatCents: r.price_incl_vat_cents,
+    avgCostExclVatMicrocents: r.avg_cost_excl_vat_microcents,
+    avgCostInclVatMicrocents: r.avg_cost_incl_vat_microcents,
     avgCostExclVatCents: r.avg_cost_excl_vat_cents,
     avgCostInclVatCents: r.avg_cost_incl_vat_cents,
     quantityOnHand: r.quantity_on_hand,
@@ -233,8 +244,13 @@ export interface InventoryValuationRow {
   name: string;
   sku: string | null;
   quantityOnHand: number;
-  avgCostExclVatCents: number;
-  lastPurchaseCostExclVatCents: number | null;
+  /**
+   * Costs here are RATES in microcents, not amounts in cents: an inventory
+   * valuation of a gram-stocked ingredient has to multiply by the precise rate
+   * before it rounds, or a whole shelf of flour is worth $0.00 (GP-A03).
+   */
+  avgCostExclVatMicrocents: number;
+  lastPurchaseCostExclVatMicrocents: number | null;
 }
 
 export const productsRepo = {
@@ -360,10 +376,11 @@ export const productsRepo = {
            id, store_id, sku, name, description,
            vat_rate_id, vat_pricing_mode,
            price_excl_vat_cents, price_incl_vat_cents,
+           avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
            avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
            quantity_on_hand, reorder_point,
            is_active, is_service
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
         [
           productId,
           args.storeId,
@@ -374,8 +391,10 @@ export const productsRepo = {
           args.vatPricingMode,
           args.priceExclVatCents,
           args.priceInclVatCents,
-          args.avgCostExclVatCents,
-          args.avgCostInclVatCents,
+          args.avgCostExclVatMicrocents,
+          args.avgCostInclVatMicrocents,
+          microcentsToCents(args.avgCostExclVatMicrocents),
+          microcentsToCents(args.avgCostInclVatMicrocents),
           args.quantityOnHand,
           args.reorderPoint,
           args.isService ? 1 : 0,
@@ -462,6 +481,8 @@ export const productsRepo = {
                 vat_pricing_mode = ?,
                 price_excl_vat_cents = ?,
                 price_incl_vat_cents = ?,
+                avg_cost_excl_vat_microcents = ?,
+                avg_cost_incl_vat_microcents = ?,
                 avg_cost_excl_vat_cents = ?,
                 avg_cost_incl_vat_cents = ?,
                 quantity_on_hand = ?,
@@ -477,8 +498,10 @@ export const productsRepo = {
           args.vatPricingMode,
           args.priceExclVatCents,
           args.priceInclVatCents,
-          args.avgCostExclVatCents,
-          args.avgCostInclVatCents,
+          args.avgCostExclVatMicrocents,
+          args.avgCostInclVatMicrocents,
+          microcentsToCents(args.avgCostExclVatMicrocents),
+          microcentsToCents(args.avgCostInclVatMicrocents),
           args.quantityOnHand,
           args.reorderPoint,
           args.isService ? 1 : 0,
@@ -593,8 +616,8 @@ export const productsRepo = {
       name: string;
       sku: string | null;
       quantity_on_hand: number;
-      avg_cost_excl_vat_cents: number;
-      last_purchase_cost_excl_vat_cents: number | null;
+      avg_cost_excl_vat_microcents: number;
+      last_purchase_cost_excl_vat_microcents: number | null;
     }
     const rows = await query<ValRow>(
       `SELECT
@@ -602,9 +625,9 @@ export const productsRepo = {
          p.name,
          p.sku,
          p.quantity_on_hand,
-         p.avg_cost_excl_vat_cents,
+         p.avg_cost_excl_vat_microcents,
          (
-           SELECT pi.unit_cost_excl_vat_base_cents
+           SELECT pi.unit_cost_excl_vat_base_microcents
            FROM purchase_items pi
            JOIN purchases pur ON pur.id = pi.purchase_id
            WHERE pi.product_id = p.id
@@ -612,7 +635,7 @@ export const productsRepo = {
              AND pur.status    = 'posted'
            ORDER BY pur.posted_at DESC, pur.id DESC
            LIMIT 1
-         ) AS last_purchase_cost_excl_vat_cents
+         ) AS last_purchase_cost_excl_vat_microcents
        FROM products p
        WHERE p.store_id  = ?
          AND p.is_active  = 1
@@ -626,8 +649,8 @@ export const productsRepo = {
       name: r.name,
       sku: r.sku,
       quantityOnHand: r.quantity_on_hand,
-      avgCostExclVatCents: r.avg_cost_excl_vat_cents,
-      lastPurchaseCostExclVatCents: r.last_purchase_cost_excl_vat_cents,
+      avgCostExclVatMicrocents: r.avg_cost_excl_vat_microcents,
+      lastPurchaseCostExclVatMicrocents: r.last_purchase_cost_excl_vat_microcents,
     }));
   },
 };

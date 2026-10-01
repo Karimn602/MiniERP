@@ -13,6 +13,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use crate::cost::{cents_to_microcents, microcents_to_cents};
 use sqlx::migrate::{Migration as SqlxMigration, MigrationType, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -82,6 +83,27 @@ pub fn app_migrator() -> Migrator {
     }
 }
 
+/// A `Migrator` over the application's migration list truncated at
+/// `max_version` — the schema a database created by an EARLIER release is
+/// sitting on. Used to prove that an upgrade migration applies to, and
+/// correctly backfills, a real pre-existing database rather than only a virgin
+/// one. The migrations themselves are the application's own, resolved exactly as
+/// `app_migrator` resolves them.
+pub fn app_migrator_through(max_version: i64) -> Migrator {
+    let list: Vec<Migration> = crate::migrations()
+        .into_iter()
+        .filter(|m| m.version <= max_version)
+        .collect();
+    assert!(
+        !list.is_empty(),
+        "no migration at or below version {max_version}"
+    );
+    Migrator {
+        migrations: Cow::Owned(to_sqlx_migrations(list)),
+        ..Migrator::DEFAULT
+    }
+}
+
 /// A disposable SQLite database for one test.
 ///
 /// The pool is held in an `Option` so `Drop` can release it *before* deleting
@@ -102,6 +124,19 @@ impl TempDb {
             .run(db.pool())
             .await
             .expect("application migrations must apply to a virgin database");
+        db
+    }
+
+    /// Create a fresh database file carrying only the migrations up to
+    /// `max_version` — i.e. a database as an older release left it. Call
+    /// `migrate_again()` afterwards to run the remaining migrations through the
+    /// real runner, which is what a user's upgrade actually does.
+    pub async fn at_schema_version(max_version: i64) -> Self {
+        let db = Self::empty().await;
+        app_migrator_through(max_version)
+            .run(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("migrations 1..={max_version} must apply: {e}"));
         db
     }
 
@@ -300,13 +335,25 @@ impl<'a> ProductSpec<'a> {
 }
 
 pub async fn seed_product(db: &TempDb, spec: &ProductSpec<'_>) {
+    // The spec states cost in whole cents, which is what a fixture normally
+    // wants. Both representations are written, the microcent one derived the
+    // same way migration 008 backfills a pre-WP-03 database — exactly
+    // `cents x COST_SCALE` — because `post_purchase` maintains the pair and a
+    // product seeded with only one of them would be costed at zero.
+    // `seed_product_avg_cost_microcents` sets a sub-cent cost that whole cents
+    // cannot express.
+    let avg_excl_mc = cents_to_microcents(spec.avg_cost_excl_vat_cents)
+        .expect("fixture average cost must be representable");
+    let avg_incl_mc = cents_to_microcents(spec.avg_cost_incl_vat_cents)
+        .expect("fixture average cost must be representable");
     sqlx::query(
         "INSERT INTO products (
            id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
            price_excl_vat_cents, price_incl_vat_cents,
            avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
+           avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
            quantity_on_hand, is_active, is_service
-         ) VALUES (?, ?, ?, ?, ?, 'inclusive', ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, 'inclusive', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(spec.id)
     .bind(STORE_ID)
@@ -317,6 +364,8 @@ pub async fn seed_product(db: &TempDb, spec: &ProductSpec<'_>) {
     .bind(spec.price_incl_vat_cents)
     .bind(spec.avg_cost_excl_vat_cents)
     .bind(spec.avg_cost_incl_vat_cents)
+    .bind(avg_excl_mc)
+    .bind(avg_incl_mc)
     .bind(spec.quantity_on_hand)
     .bind(i64::from(spec.is_active))
     .bind(i64::from(spec.is_service))
@@ -341,6 +390,35 @@ pub async fn seed_product(db: &TempDb, spec: &ProductSpec<'_>) {
     .unwrap_or_else(|e| panic!("seed base UoM for product {}: {e}", spec.id));
 }
 
+/// Set a product's weighted-average cost directly in microcents, for the
+/// fractional per-base costs whole cents cannot express (a gram of flour at
+/// 250,000 microcents = $0.0025). The rounded cents mirror is maintained
+/// alongside, exactly as `post_purchase` maintains it.
+pub async fn seed_product_avg_cost_microcents(
+    db: &TempDb,
+    product_id: &str,
+    excl_microcents: i64,
+    incl_microcents: i64,
+) {
+    sqlx::query(
+        "UPDATE products
+            SET avg_cost_excl_vat_microcents = ?,
+                avg_cost_incl_vat_microcents = ?,
+                avg_cost_excl_vat_cents      = ?,
+                avg_cost_incl_vat_cents      = ?
+          WHERE id = ? AND store_id = ?",
+    )
+    .bind(excl_microcents)
+    .bind(incl_microcents)
+    .bind(microcents_to_cents(excl_microcents).expect("representable"))
+    .bind(microcents_to_cents(incl_microcents).expect("representable"))
+    .bind(product_id)
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("seed microcent cost for {product_id}: {e}"));
+}
+
 /// Add a non-base sale UoM to a product: `1 <uom_code> = num/den` base units.
 /// The frontend only ever offers active rows, so this row is active.
 pub async fn seed_product_uom(db: &TempDb, product_id: &str, uom_code: &str, num: i64, den: i64) {
@@ -359,6 +437,46 @@ pub async fn seed_product_uom(db: &TempDb, product_id: &str, uom_code: &str, num
     .execute(db.pool())
     .await
     .unwrap_or_else(|e| panic!("seed UoM {uom_code} for product {product_id}: {e}"));
+}
+
+/// A non-base UoM that has been RETIRED: present on the product but inactive.
+/// `post_sale` and `post_purchase` both resolve only active rows, so this is the
+/// fixture for "the shop stopped buying by the case".
+pub async fn seed_inactive_product_uom(
+    db: &TempDb,
+    product_id: &str,
+    uom_code: &str,
+    num: i64,
+    den: i64,
+) {
+    sqlx::query(
+        "INSERT INTO product_uoms (
+           id, store_id, product_id, uom_code, factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(STORE_ID)
+    .bind(product_id)
+    .bind(uom_code)
+    .bind(num)
+    .bind(den)
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("seed inactive UoM {uom_code} for product {product_id}: {e}"));
+}
+
+/// The `product_uoms.id` of a product's row for `uom_code` — what the Purchases
+/// page sends as `productUomIdSnapshot`.
+pub async fn product_uom_id(db: &TempDb, product_id: &str, uom_code: &str) -> String {
+    sqlx::query("SELECT id FROM product_uoms WHERE product_id = ? AND uom_code = ?")
+        .bind(product_id)
+        .bind(uom_code)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("read product_uom id for {product_id}/{uom_code}: {e}"))
+        .try_get::<String, _>(0)
+        .expect("decode String")
 }
 
 pub async fn seed_supplier(db: &TempDb, id: &str, name: &str) {

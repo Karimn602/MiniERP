@@ -537,13 +537,17 @@ async fn the_cogs_method_is_recorded_and_changes_the_snapshot() {
         },
     )
     .await;
-    // A purchase movement whose cost differs from the weighted average.
+    // A purchase movement whose cost differs from the weighted average. Both
+    // cost representations are written, as `post_purchase` writes them: the
+    // microcent column is the rate `last_purchase` costs from, the cents column
+    // its rounded mirror.
     db.exec(&format!(
         "INSERT INTO inventory_movements
            (id, store_id, product_id, movement_type, quantity_delta,
-            unit_cost_excl_vat_cents, unit_cost_incl_vat_cents, posted_at)
+            unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+            unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents, posted_at)
          VALUES ('m-last', '{STORE_ID}', '{P_COFFEE}', 'purchase', 0, 350, 389,
-                 '2026-03-01T10:00:00.000Z')"
+                 350000000, 389000000, '2026-03-01T10:00:00.000Z')"
     ))
     .await;
 

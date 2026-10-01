@@ -58,6 +58,7 @@ interface SaleItemRow {
   line_total_incl_vat_cents: number;
   line_discount_cents: number;
   unit_cogs_excl_vat_cents: number;
+  unit_cogs_excl_vat_microcents: number;
   line_cogs_excl_vat_cents: number;
   barcode_used_snapshot: string | null;
   barcode_type_snapshot: string | null;
@@ -129,6 +130,7 @@ function toSaleItem(r: SaleItemRow): SaleItem {
     lineVatCents: r.line_vat_cents,
     lineTotalInclVatCents: r.line_total_incl_vat_cents,
     lineDiscountCents: r.line_discount_cents,
+    unitCogsExclVatMicrocents: r.unit_cogs_excl_vat_microcents,
     unitCogsExclVatCents: r.unit_cogs_excl_vat_cents,
     lineCogsExclVatCents: r.line_cogs_excl_vat_cents,
     barcodeUsedSnapshot: r.barcode_used_snapshot,

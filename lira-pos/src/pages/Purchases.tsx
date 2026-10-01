@@ -11,6 +11,7 @@ import type {
   VatPricingMode,
 } from "../db/types";
 import { formatUsd, parseUsdInput } from "../lib/money";
+import { formatUnitCostUsd } from "../lib/cost";
 import { formatBps } from "../lib/vat";
 import { todayLocalDate, formatPrettyDate, relativeFromToday } from "../lib/dates";
 import { computeLineMath, type PurchaseLineMath } from "../lib/purchaseMath";
@@ -916,7 +917,8 @@ function LineRow({
 
         {line.math && selectedUom && !selectedUom.isBase && (
           <div className="mt-0.5 text-[10px] text-slate-500">
-            {formatUsd(line.math.unitCostExclVatBaseCents)}/{product.baseUom.uomCode} net
+            {formatUnitCostUsd(line.math.unitCostExclVatBaseMicrocents)}/
+            {product.baseUom.uomCode} net
           </div>
         )}
       </td>

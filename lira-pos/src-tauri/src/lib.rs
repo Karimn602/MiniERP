@@ -1,6 +1,7 @@
 // src-tauri/src/lib.rs
 use tauri_plugin_sql::{Migration, MigrationKind};
 
+mod cost;
 mod posting;
 use posting::DbState;
 
@@ -56,6 +57,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             version: 7,
             description: "sales_cogs_method",
             sql: include_str!("../../src/db/migrations/007_sales_cogs_method.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 8,
+            description: "cost_precision",
+            sql: include_str!("../../src/db/migrations/008_cost_precision.sql"),
             kind: MigrationKind::Up,
         },
     ]

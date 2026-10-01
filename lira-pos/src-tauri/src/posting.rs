@@ -11,7 +11,24 @@
 //   - All USD values are INTEGER cents.
 //   - All quantities are INTEGER in the product's BASE UoM.
 //   - All rate/bps are INTEGER.
+//
+// Cost convention (WP-03, GP-A03) — the one exception to "everything is cents":
+//   - A UNIT COST is a rate, not an amount, and is held in MICROCENTS
+//     (1 cent = cost::COST_SCALE = 1_000_000), so a cost below one cent per
+//     base unit survives. `products.avg_cost_*_microcents`,
+//     `inventory_movements.unit_cost_*_microcents`,
+//     `purchase_items.unit_cost_*_base_microcents` and
+//     `sale_items.unit_cogs_excl_vat_microcents` are the accounting source of
+//     truth; the matching `*_cents` columns are a rounded display mirror this
+//     module maintains and never reads back into a calculation.
+//   - Cost becomes money exactly once, at `cost::extended_cost_cents`.
+//   - All cost arithmetic goes through `crate::cost`. Nothing here scales,
+//     divides or rounds a cost by hand.
 
+use crate::cost::{
+    extended_cost_cents, microcents_to_cents, new_weighted_avg,
+    unit_cost_in_uom_to_base_microcents,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, Sqlite, SqlitePool};
 use tauri::{Manager, State};
@@ -89,17 +106,40 @@ pub struct PostPurchaseLine {
     pub product_name_snapshot: String,
     pub product_sku_snapshot: Option<String>,
 
+    // The UoM the goods were invoiced in. `uom_code_snapshot` is the LOOKUP KEY:
+    // `post_purchase` resolves the product's own `product_uoms` row from it and
+    // takes the conversion factor from there (WP-03 correction, mirroring
+    // GP-A02 on the sale side).
+    //
+    // `product_uom_id_snapshot` and the two factor snapshots are the client's
+    // CLAIM about that row. They are cross-checked against the resolved row and
+    // a disagreement is refused, but they are never the source of the factor.
     pub product_uom_id_snapshot: Option<String>,
     pub uom_code_snapshot: String,
     pub factor_num_snapshot: i64,
     pub factor_den_snapshot: i64,
 
+    // `quantity_in_uom` is what the buyer entered and is authoritative.
+    // `quantity_base` is the client's claim about the conversion; the backend
+    // derives the real one from the resolved factor and refuses a payload that
+    // contradicts it.
     pub quantity_in_uom: i64,
     pub quantity_base: i64,
 
+    // What the supplier invoice says, per purchasing UoM, in exact cents. This
+    // is the authoritative cost input: the user typed it to the cent.
     pub unit_cost_excl_vat_in_uom_cents: i64,
     pub unit_cost_incl_vat_in_uom_cents: i64,
+
+    // What the CLIENT derived as the per-base cost, in cents. Accepted for wire
+    // compatibility and NEVER acted on: rounding a per-base cost to whole cents
+    // is the GP-A03 defect itself, so `post_purchase` derives the per-base cost
+    // from the per-UoM cost and the conversion factor at microcent precision
+    // (`cost::unit_cost_in_uom_to_base_microcents`) and writes both the
+    // microcent column and its rounded cents mirror from that.
+    #[allow(dead_code)]
     pub unit_cost_excl_vat_base_cents: i64,
+    #[allow(dead_code)]
     pub unit_cost_incl_vat_base_cents: i64,
 
     pub vat_rate_id_snapshot: String,
@@ -205,28 +245,6 @@ async fn next_purchase_number(
     Ok(current)
 }
 
-pub(crate) fn new_weighted_avg(
-    old_qty: i64,
-    old_avg_cents: i64,
-    new_qty: i64,
-    new_cost_cents: i64,
-) -> Result<i64, String> {
-    let total_qty = old_qty + new_qty;
-    if total_qty <= 0 {
-        return Err("total quantity must be positive after purchase".into());
-    }
-    let total_value = old_qty
-        .checked_mul(old_avg_cents)
-        .and_then(|v| v.checked_add(new_qty.checked_mul(new_cost_cents)?))
-        .ok_or_else(|| "weighted-avg overflow".to_string())?;
-    let rounded = if total_value >= 0 {
-        (total_value + total_qty / 2) / total_qty
-    } else {
-        (total_value - total_qty / 2) / total_qty
-    };
-    Ok(rounded)
-}
-
 async fn current_supplier_balance(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     supplier_id: &str,
@@ -262,8 +280,14 @@ pub(crate) fn validate_purchase_payload(payload: &PostPurchasePayload) -> Result
         if line.quantity_base <= 0 {
             return Err(format!("Line {} has non-positive base quantity.", i + 1));
         }
+        if line.quantity_in_uom <= 0 {
+            return Err(format!("Line {} has non-positive quantity.", i + 1));
+        }
         if line.factor_num_snapshot <= 0 || line.factor_den_snapshot <= 0 {
             return Err(format!("Line {} has invalid UoM factor.", i + 1));
+        }
+        if line.uom_code_snapshot.trim().is_empty() {
+            return Err(format!("Line {} does not name a unit of measure.", i + 1));
         }
     }
     Ok(())
@@ -342,7 +366,8 @@ pub(crate) async fn post_purchase_tx(
     line.purchase_item_id.clone()
 };
         let row = sqlx::query(
-            "SELECT quantity_on_hand, avg_cost_excl_vat_cents, avg_cost_incl_vat_cents
+            "SELECT quantity_on_hand,
+                    avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents
              FROM products WHERE id = ? AND store_id = ?",
         )
         .bind(&line.product_id)
@@ -353,15 +378,135 @@ pub(crate) async fn post_purchase_tx(
         .ok_or_else(|| format!("Product {} not found in store {}", line.product_id, payload.store_id))?;
 
         let old_qty: i64 = row.try_get("quantity_on_hand").map_err(|e| format!("decode qoh: {e}"))?;
-        let old_avg_excl: i64 = row.try_get("avg_cost_excl_vat_cents").map_err(|e| format!("decode avg_excl: {e}"))?;
-        let old_avg_incl: i64 = row.try_get("avg_cost_incl_vat_cents").map_err(|e| format!("decode avg_incl: {e}"))?;
+        let old_avg_excl: i64 = row
+            .try_get("avg_cost_excl_vat_microcents")
+            .map_err(|e| format!("decode avg_excl: {e}"))?;
+        let old_avg_incl: i64 = row
+            .try_get("avg_cost_incl_vat_microcents")
+            .map_err(|e| format!("decode avg_incl: {e}"))?;
 
-        let new_avg_excl = new_weighted_avg(
-            old_qty, old_avg_excl, line.quantity_base, line.unit_cost_excl_vat_base_cents,
-        )?;
-        let new_avg_incl = new_weighted_avg(
-            old_qty, old_avg_incl, line.quantity_base, line.unit_cost_incl_vat_base_cents,
-        )?;
+        // ---- Authoritative UoM + base quantity ----
+        // The product's own `product_uoms` row — never the payload — decides the
+        // conversion. `uom_code_snapshot` is only the lookup key; scoping the
+        // query by `product_id` is what makes a UoM belonging to another product
+        // unresolvable here, and `is_active = 1` is what makes a retired UoM
+        // unusable. Receiving goods moves physical stock and rewrites the cost
+        // pool, so it needs the same DB authority `post_sale` has had since
+        // WP-02 (GP-A02): without it a stale client could post 2 boxes of 12 as
+        // 2 base units, and the weighted average would blend a precise cost
+        // against a quantity nobody received.
+        let uom_row = sqlx::query(
+            "SELECT id, factor_num, factor_den
+               FROM product_uoms
+              WHERE product_id = ? AND store_id = ? AND uom_code = ? AND is_active = 1",
+        )
+        .bind(&line.product_id)
+        .bind(&payload.store_id)
+        .bind(&line.uom_code_snapshot)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read product_uom for {}: {e}", line.product_id))?
+        .ok_or_else(|| {
+            format!(
+                "Line for \"{}\": UoM \"{}\" is not an active unit of measure for this product.",
+                line.product_name_snapshot, line.uom_code_snapshot
+            )
+        })?;
+        let resolved_uom_id: String = uom_row
+            .try_get("id")
+            .map_err(|e| format!("decode product_uom id: {e}"))?;
+        let factor_num: i64 = uom_row
+            .try_get("factor_num")
+            .map_err(|e| format!("decode factor_num: {e}"))?;
+        let factor_den: i64 = uom_row
+            .try_get("factor_den")
+            .map_err(|e| format!("decode factor_den: {e}"))?;
+
+        // A client that names a specific `product_uoms` row must name the one
+        // that resolved. This is where another product's UoM id, or a stale id
+        // for a since-replaced row, is caught.
+        if let Some(claimed_uom_id) = line.product_uom_id_snapshot.as_deref() {
+            if !claimed_uom_id.is_empty() && claimed_uom_id != resolved_uom_id {
+                return Err(format!(
+                    "Line for \"{}\": the declared UoM row {} is not the active \"{}\" unit of \
+                     measure for this product ({}).",
+                    line.product_name_snapshot,
+                    claimed_uom_id,
+                    line.uom_code_snapshot,
+                    resolved_uom_id
+                ));
+            }
+        }
+
+        // A payload whose declared factor contradicts the product's own
+        // conversion is structurally corrupt (a stale cart, an edited UoM, a bad
+        // integration). Refuse it rather than silently normalize: the buyer
+        // priced the goods against the conversion they believed in, so posting
+        // under a different one would invent a cost they never agreed to.
+        if line.factor_num_snapshot != factor_num || line.factor_den_snapshot != factor_den {
+            return Err(format!(
+                "Line for \"{}\": declared UoM factor {}/{} does not match the authoritative \
+                 conversion for \"{}\" ({}/{}).",
+                line.product_name_snapshot,
+                line.factor_num_snapshot,
+                line.factor_den_snapshot,
+                line.uom_code_snapshot,
+                factor_num,
+                factor_den
+            ));
+        }
+
+        let quantity_base = derive_base_quantity(line.quantity_in_uom, factor_num, factor_den)
+            .map_err(|e| {
+                format!(
+                    "Line for \"{}\": invalid quantity in UoM \"{}\" — {}.",
+                    line.product_name_snapshot, line.uom_code_snapshot, e
+                )
+            })?;
+        if line.quantity_base != quantity_base {
+            return Err(format!(
+                "Line for \"{}\": declared base quantity {} does not match the authoritative UoM \
+                 conversion ({} {} × {}/{} = {}).",
+                line.product_name_snapshot,
+                line.quantity_base,
+                line.quantity_in_uom,
+                line.uom_code_snapshot,
+                factor_num,
+                factor_den,
+                quantity_base
+            ));
+        }
+
+        // ---- Per-base unit cost, at microcent precision (GP-A03) ----
+        // Derived here from the invoice's per-UoM cost and the AUTHORITATIVE
+        // factor resolved above, NOT taken from the payload: the payload only
+        // carries a cents-rounded copy, which is zero for anything cheaper than
+        // a cent per base unit. One division, at microcent scale, no
+        // intermediate rounding to cents — and over the same conversion that
+        // drives the quantity, so cost and stock cannot disagree.
+        let unit_cost_excl_base_mc = unit_cost_in_uom_to_base_microcents(
+            line.unit_cost_excl_vat_in_uom_cents,
+            factor_num,
+            factor_den,
+        )
+        .map_err(|e| format!("Line for \"{}\": {}.", line.product_name_snapshot, e))?;
+        let unit_cost_incl_base_mc = unit_cost_in_uom_to_base_microcents(
+            line.unit_cost_incl_vat_in_uom_cents,
+            factor_num,
+            factor_den,
+        )
+        .map_err(|e| format!("Line for \"{}\": {}.", line.product_name_snapshot, e))?;
+        // The rounded mirrors the legacy cents columns keep. Presentation only.
+        let unit_cost_excl_base_cents = microcents_to_cents(unit_cost_excl_base_mc)?;
+        let unit_cost_incl_base_cents = microcents_to_cents(unit_cost_incl_base_mc)?;
+
+        // The weighted average blends the precise cost against the DERIVED base
+        // quantity, so the pool's value and its quantity come from one resolved
+        // conversion.
+        let new_avg_excl =
+            new_weighted_avg(old_qty, old_avg_excl, quantity_base, unit_cost_excl_base_mc)?;
+        let new_avg_incl =
+            new_weighted_avg(old_qty, old_avg_incl, quantity_base, unit_cost_incl_base_mc)?;
 
         let movement_id = uuid::Uuid::new_v4().to_string();
         movement_ids.push(movement_id.clone());
@@ -377,10 +522,11 @@ pub(crate) async fn post_purchase_tx(
                  quantity_in_uom, quantity_base,
                  unit_cost_excl_vat_in_uom_cents, unit_cost_incl_vat_in_uom_cents,
                  unit_cost_excl_vat_base_cents,  unit_cost_incl_vat_base_cents,
+                 unit_cost_excl_vat_base_microcents, unit_cost_incl_vat_base_microcents,
                  vat_rate_id_snapshot, vat_rate_bps_snapshot,
                  line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
                  related_movement_id
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&purchase_item_id)
         .bind(&payload.purchase_id)
@@ -388,16 +534,18 @@ pub(crate) async fn post_purchase_tx(
         .bind(&line.product_id)
         .bind(&line.product_name_snapshot)
         .bind(&line.product_sku_snapshot)
-        .bind(&line.product_uom_id_snapshot)
+        .bind(&resolved_uom_id)
         .bind(&line.uom_code_snapshot)
-        .bind(line.factor_num_snapshot)
-        .bind(line.factor_den_snapshot)
+        .bind(factor_num)
+        .bind(factor_den)
         .bind(line.quantity_in_uom)
-        .bind(line.quantity_base)
+        .bind(quantity_base)
         .bind(line.unit_cost_excl_vat_in_uom_cents)
         .bind(line.unit_cost_incl_vat_in_uom_cents)
-        .bind(line.unit_cost_excl_vat_base_cents)
-        .bind(line.unit_cost_incl_vat_base_cents)
+        .bind(unit_cost_excl_base_cents)
+        .bind(unit_cost_incl_base_cents)
+        .bind(unit_cost_excl_base_mc)
+        .bind(unit_cost_incl_base_mc)
         .bind(&line.vat_rate_id_snapshot)
         .bind(line.vat_rate_bps_snapshot)
         .bind(line.line_subtotal_excl_vat_cents)
@@ -411,20 +559,23 @@ pub(crate) async fn post_purchase_tx(
             r#"INSERT INTO inventory_movements (
                  id, store_id, product_id, movement_type, quantity_delta,
                  unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+                 unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents,
                  related_purchase_id, related_purchase_item_id,
                  supplier_reference, notes,
                  created_by_user_id, device_id, posted_at,
                  quantity_in_uom, uom_code_snapshot,
                  factor_num_snapshot, factor_den_snapshot
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&movement_id)
         .bind(&payload.store_id)
         .bind(&line.product_id)
         .bind(movement_type)
-        .bind(line.quantity_base)
-        .bind(line.unit_cost_excl_vat_base_cents)
-        .bind(line.unit_cost_incl_vat_base_cents)
+        .bind(quantity_base)
+        .bind(unit_cost_excl_base_cents)
+        .bind(unit_cost_incl_base_cents)
+        .bind(unit_cost_excl_base_mc)
+        .bind(unit_cost_incl_base_mc)
         .bind(&payload.purchase_id)
         .bind(&purchase_item_id)
         .bind(&payload.supplier_reference)
@@ -434,8 +585,8 @@ pub(crate) async fn post_purchase_tx(
         .bind(&now)
         .bind(line.quantity_in_uom)
         .bind(&line.uom_code_snapshot)
-        .bind(line.factor_num_snapshot)
-        .bind(line.factor_den_snapshot)
+        .bind(factor_num)
+        .bind(factor_den)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert inventory_movement: {e}"))?;
@@ -453,14 +604,18 @@ pub(crate) async fn post_purchase_tx(
 
         sqlx::query(
             r#"UPDATE products
-                  SET quantity_on_hand        = quantity_on_hand + ?,
-                      avg_cost_excl_vat_cents = ?,
-                      avg_cost_incl_vat_cents = ?
+                  SET quantity_on_hand             = quantity_on_hand + ?,
+                      avg_cost_excl_vat_microcents = ?,
+                      avg_cost_incl_vat_microcents = ?,
+                      avg_cost_excl_vat_cents      = ?,
+                      avg_cost_incl_vat_cents      = ?
                 WHERE id = ? AND store_id = ?"#,
         )
-        .bind(line.quantity_base)
+        .bind(quantity_base)
         .bind(new_avg_excl)
         .bind(new_avg_incl)
+        .bind(microcents_to_cents(new_avg_excl)?)
+        .bind(microcents_to_cents(new_avg_incl)?)
         .bind(&line.product_id)
         .bind(&payload.store_id)
         .execute(&mut *tx)
@@ -599,8 +754,11 @@ pub(crate) async fn post_adjustment_tx(
             }
         }
 
+        // An adjustment is valued at the product's CURRENT weighted-average
+        // cost, snapshotted at microcent precision so a sub-cent ingredient's
+        // write-off is not valued at zero.
         let cost_row = sqlx::query(
-            "SELECT avg_cost_excl_vat_cents, avg_cost_incl_vat_cents
+            "SELECT avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents
              FROM products WHERE id = ? AND store_id = ?",
         )
         .bind(&line.product_id)
@@ -608,26 +766,33 @@ pub(crate) async fn post_adjustment_tx(
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| format!("read avg cost: {e}"))?;
-        let avg_excl: i64 = cost_row.try_get("avg_cost_excl_vat_cents").map_err(|e| format!("decode: {e}"))?;
-        let avg_incl: i64 = cost_row.try_get("avg_cost_incl_vat_cents").map_err(|e| format!("decode: {e}"))?;
+        let avg_excl_mc: i64 = cost_row
+            .try_get("avg_cost_excl_vat_microcents")
+            .map_err(|e| format!("decode: {e}"))?;
+        let avg_incl_mc: i64 = cost_row
+            .try_get("avg_cost_incl_vat_microcents")
+            .map_err(|e| format!("decode: {e}"))?;
 
         sqlx::query(
             r#"INSERT INTO inventory_movements (
                  id, store_id, product_id, movement_type, quantity_delta,
                  unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+                 unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents,
                  notes,
                  created_by_user_id, device_id, posted_at,
                  quantity_in_uom, uom_code_snapshot,
                  factor_num_snapshot, factor_den_snapshot
-               ) VALUES (?, ?, ?, 'adjustment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, 'adjustment', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
-        
+
         .bind(&line.movement_id)
         .bind(&payload.store_id)
         .bind(&line.product_id)
         .bind(line.quantity_base_signed)
-        .bind(avg_excl)
-        .bind(avg_incl)
+        .bind(microcents_to_cents(avg_excl_mc)?)
+        .bind(microcents_to_cents(avg_incl_mc)?)
+        .bind(avg_excl_mc)
+        .bind(avg_incl_mc)
         .bind(&payload.reason)
         .bind(&payload.created_by_user_id)
         .bind(&payload.device_id)
@@ -1538,8 +1703,13 @@ struct ResolvedLine {
     factor_num: i64,
     factor_den: i64,
     is_service: bool,
-    unit_cogs_excl: i64,
-    unit_cogs_incl: i64,
+    /// Per-base-unit COGS in MICROCENTS — the precise rate the line is costed
+    /// at, never rounded to cents before it is multiplied out.
+    unit_cogs_excl_mc: i64,
+    unit_cogs_incl_mc: i64,
+    /// The line's COGS as money: `round(unit_cogs_excl_mc x quantity_base /
+    /// COST_SCALE)`, the single rounding boundary between cost and cents.
+    line_cogs_cents: i64,
 }
 
 /// The transactional body of `post_sale`.
@@ -1593,7 +1763,7 @@ pub(crate) async fn post_sale_tx(
     for (i, line) in payload.lines.iter().enumerate() {
         let row = sqlx::query(
             "SELECT quantity_on_hand,
-                    avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
+                    avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
                     is_active, is_service
              FROM products WHERE id = ? AND store_id = ?",
         )
@@ -1614,11 +1784,11 @@ pub(crate) async fn post_sale_tx(
         let qoh: i64 = row
             .try_get("quantity_on_hand")
             .map_err(|e| format!("decode qoh: {e}"))?;
-        let avg_cost_excl: i64 = row
-            .try_get("avg_cost_excl_vat_cents")
+        let avg_cost_excl_mc: i64 = row
+            .try_get("avg_cost_excl_vat_microcents")
             .map_err(|e| format!("decode avg_cost_excl: {e}"))?;
-        let avg_cost_incl: i64 = row
-            .try_get("avg_cost_incl_vat_cents")
+        let avg_cost_incl_mc: i64 = row
+            .try_get("avg_cost_incl_vat_microcents")
             .map_err(|e| format!("decode avg_cost_incl: {e}"))?;
         let is_active: i64 = row
             .try_get("is_active")
@@ -1715,16 +1885,21 @@ pub(crate) async fn post_sale_tx(
             ));
         }
 
-        let (unit_excl, unit_incl) = if is_service {
+        // ---- COGS basis, in microcents (GP-A03) ----
+        // The costing POLICY is unchanged — weighted average or last purchase,
+        // whichever the sale declares — only its precision. Both bases are read
+        // from the microcent columns, so an ingredient costing a fraction of a
+        // cent per base unit is costed at that fraction and not at zero.
+        let (unit_excl_mc, unit_incl_mc) = if is_service {
             (0, 0)
         } else if cogs_method == "last_purchase" {
             let last_cost_row = sqlx::query(
-                "SELECT unit_cost_excl_vat_cents, unit_cost_incl_vat_cents
+                "SELECT unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents
                    FROM inventory_movements
                   WHERE store_id = ?
                     AND product_id = ?
                     AND movement_type IN ('purchase', 'opening')
-                    AND unit_cost_excl_vat_cents >= 0
+                    AND unit_cost_excl_vat_microcents >= 0
                   ORDER BY posted_at DESC
                   LIMIT 1",
             )
@@ -1736,28 +1911,43 @@ pub(crate) async fn post_sale_tx(
 
             if let Some(cost_row) = last_cost_row {
                 let last_excl: i64 = cost_row
-                    .try_get("unit_cost_excl_vat_cents")
+                    .try_get("unit_cost_excl_vat_microcents")
                     .map_err(|e| format!("decode last_cost_excl: {e}"))?;
                 let last_incl: i64 = cost_row
-                    .try_get("unit_cost_incl_vat_cents")
+                    .try_get("unit_cost_incl_vat_microcents")
                     .map_err(|e| format!("decode last_cost_incl: {e}"))?;
                 (last_excl, last_incl)
             } else {
                 // Fallback: products without a purchase/opening movement still use WAC.
-                (avg_cost_excl, avg_cost_incl)
+                (avg_cost_excl_mc, avg_cost_incl_mc)
             }
         } else {
-            (avg_cost_excl, avg_cost_incl)
+            (avg_cost_excl_mc, avg_cost_incl_mc)
         };
 
-        cogs_total += unit_excl * quantity_base;
+        // The one rounding boundary: multiply the precise rate by the
+        // authoritative base quantity, THEN round to cents. Rounding the rate
+        // first is what made a 500 g sale of $0.0025/g flour cost $0.00.
+        let line_cogs_cents = extended_cost_cents(unit_excl_mc, quantity_base).map_err(|e| {
+            format!(
+                "Line {}: cannot value \"{}\" — {}.",
+                i + 1,
+                line.product_name_snapshot,
+                e
+            )
+        })?;
+
+        cogs_total = cogs_total
+            .checked_add(line_cogs_cents)
+            .ok_or_else(|| "Sale COGS total overflows.".to_string())?;
         resolved.push(ResolvedLine {
             quantity_base,
             factor_num,
             factor_den,
             is_service,
-            unit_cogs_excl: unit_excl,
-            unit_cogs_incl: unit_incl,
+            unit_cogs_excl_mc: unit_excl_mc,
+            unit_cogs_incl_mc: unit_incl_mc,
+            line_cogs_cents,
         });
     }
 
@@ -1797,9 +1987,10 @@ pub(crate) async fn post_sale_tx(
 
     for (i, line) in payload.lines.iter().enumerate() {
         let r = &resolved[i];
-        let unit_cogs_excl = r.unit_cogs_excl;
-        let unit_cogs_incl = r.unit_cogs_incl;
-        let line_cogs = unit_cogs_excl * r.quantity_base;
+        // The microcent rates are the snapshot; the cents values beside them are
+        // the rounded display mirror, derived from the same numbers.
+        let unit_cogs_excl_cents = microcents_to_cents(r.unit_cogs_excl_mc)?;
+        let line_cogs = r.line_cogs_cents;
 
         sqlx::query(
             r#"INSERT INTO sale_items (
@@ -1811,10 +2002,11 @@ pub(crate) async fn post_sale_tx(
                  line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
                  line_discount_cents,
                  unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
+                 unit_cogs_excl_vat_microcents,
                  barcode_used_snapshot, barcode_type_snapshot,
                  quantity_in_uom, uom_code_snapshot,
                  factor_num_snapshot, factor_den_snapshot
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&line.sale_item_id)
         .bind(&payload.sale_id)
@@ -1831,8 +2023,9 @@ pub(crate) async fn post_sale_tx(
         .bind(line.line_vat_cents)
         .bind(line.line_total_incl_vat_cents)
         .bind(line.line_discount_cents)
-        .bind(unit_cogs_excl)
+        .bind(unit_cogs_excl_cents)
         .bind(line_cogs)
+        .bind(r.unit_cogs_excl_mc)
         .bind(&line.barcode_used_snapshot)
         .bind(&line.barcode_type_snapshot)
         .bind(line.quantity_in_uom)
@@ -1853,19 +2046,22 @@ pub(crate) async fn post_sale_tx(
                 r#"INSERT INTO inventory_movements (
                      id, store_id, product_id, movement_type, quantity_delta,
                      unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+                     unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents,
                      related_sale_id, related_sale_item_id,
                      notes,
                      created_by_user_id, device_id, posted_at,
                      quantity_in_uom, uom_code_snapshot,
                      factor_num_snapshot, factor_den_snapshot
-                   ) VALUES (?, ?, ?, 'sale', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                   ) VALUES (?, ?, ?, 'sale', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&movement_id)
             .bind(&payload.store_id)
             .bind(&line.product_id)
             .bind(-r.quantity_base) // sale = stock OUT
-            .bind(unit_cogs_excl)
-            .bind(unit_cogs_incl)
+            .bind(unit_cogs_excl_cents)
+            .bind(microcents_to_cents(r.unit_cogs_incl_mc)?)
+            .bind(r.unit_cogs_excl_mc)
+            .bind(r.unit_cogs_incl_mc)
             .bind(&payload.sale_id)
             .bind(&line.sale_item_id)
             .bind(format!("Sale #{}", receipt_number))

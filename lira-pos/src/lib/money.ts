@@ -111,10 +111,14 @@ export function multiplyUsd(cents: UsdCents, qty: number): UsdCents {
 }
 
 /**
- * Weighted-average cost recalculation (per Phase 1 spec).
+ * Weighted-average cost recalculation, IN WHOLE CENTS.
  *   new_avg = (old_qty * old_avg + new_qty * new_cost) / total_qty
- * All inputs/outputs in USD cents; quantities are integers.
- * Rounds the resulting average to the nearest cent.
+ *
+ * ⚠ NOT the accounting path. A unit cost is a rate and is carried in microcents
+ * (`lib/cost.ts::newWeightedAvgMicrocents`, mirrored by
+ * `cost::new_weighted_avg` in Rust, which is what `post_purchase` actually
+ * runs); averaging costs that have already been rounded to cents is the GP-A03
+ * defect. Kept as the cents-scale reference for display-level arithmetic.
  */
 export function newWeightedAvgCost(args: {
   oldQty: number;

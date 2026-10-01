@@ -11,6 +11,8 @@ interface MovementRow {
   quantity_delta: number;
   unit_cost_excl_vat_cents: number;
   unit_cost_incl_vat_cents: number;
+  unit_cost_excl_vat_microcents: number;
+  unit_cost_incl_vat_microcents: number;
   related_sale_id: string | null;
   related_sale_item_id: string | null;
   related_purchase_id: string | null;
@@ -33,6 +35,8 @@ function toDomain(r: MovementRow): InventoryMovement {
     productId: r.product_id,
     movementType: r.movement_type,
     quantityDelta: r.quantity_delta,
+    unitCostExclVatMicrocents: r.unit_cost_excl_vat_microcents,
+    unitCostInclVatMicrocents: r.unit_cost_incl_vat_microcents,
     unitCostExclVatCents: r.unit_cost_excl_vat_cents,
     unitCostInclVatCents: r.unit_cost_incl_vat_cents,
     relatedSaleId: r.related_sale_id,

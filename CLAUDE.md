@@ -39,10 +39,11 @@ lira-pos/src/
     migrate.ts       — bootstrap: PRAGMAs + schema validation on startup
     types.ts         — all TypeScript domain interfaces
     repos/           — typed data accessors (products, sales, purchases, suppliers, ...)
-    migrations/      — 7 numbered SQL files; Rust registers them on app init
+    migrations/      — 8 numbered SQL files; Rust registers them on app init
     seed.ts          — demo data
   lib/
     money.ts         — USD ↔ LBP conversion; integer-only arithmetic
+    cost.ts          — fixed-point UNIT COST (microcents); mirrors src-tauri/src/cost.rs
     uom.ts           — Unit-of-Measure rational conversion (num/den)
     saleMath.ts      — sale line-item calculations
     purchaseMath.ts  — purchase line-item calculations
@@ -52,6 +53,7 @@ lira-pos/src/
 
 src-tauri/src/
   lib.rs             — Tauri entry point; registers migrations and invoke handlers
+  cost.rs            — fixed-point UNIT COST arithmetic: scale, rounding, WAC, overflow
   posting.rs         — All transactional writes (purchase, sale, adjustment, payment)
 ```
 
@@ -59,15 +61,28 @@ src-tauri/src/
 
 **Money is always integers.** USD stored as cents, LBP stored as whole lira. Never use floats for money. Exchange rates and VAT rates are stored as integer basis points (e.g., 1100 = 11%).
 
+**Unit cost is a rate, not an amount — it is stored in microcents.** Money (line totals, VAT, tender, COGS amounts, the supplier ledger) is cents. A *unit cost* is money per base unit, and when the purchasing UoM dwarfs the base UoM that rate is legitimately below a cent: flour at $2.50/kg stocked in grams is $0.0025/g. So every per-unit cost column has a microcent sibling (`1 cent = 1,000,000 microcents`) which is the accounting source of truth:
+
+| cents (display mirror) | microcents (authoritative) |
+|---|---|
+| `products.avg_cost_*_vat_cents` | `products.avg_cost_*_vat_microcents` |
+| `inventory_movements.unit_cost_*_vat_cents` | `inventory_movements.unit_cost_*_vat_microcents` |
+| `purchase_items.unit_cost_*_vat_base_cents` | `purchase_items.unit_cost_*_vat_base_microcents` |
+| `sale_items.unit_cogs_excl_vat_cents` | `sale_items.unit_cogs_excl_vat_microcents` |
+
+Rules: all cost arithmetic goes through `src-tauri/src/cost.rs` (or `src/lib/cost.ts`), never a hand-rolled multiply-and-divide. Rounding is half away from zero, in one helper. Cost becomes money exactly once, at `extended_cost_cents` — precise rate × base quantity, rounded once; never round the rate first. The `*_cents` columns are maintained by the posting commands as `round(rate)` for display and back-compatibility, and must never feed a calculation. The per-UoM invoice cost (`unit_cost_*_in_uom_cents`) stays in cents: it is what the supplier billed, exact to the cent.
+
 **UoM conversions use rational fractions.** Each `product_uom` row has `conversion_num` / `conversion_den` to preserve precision when converting between units (e.g., kg → g).
 
 **Transactions run in Rust, not JavaScript.** The four `invoke` handlers in `posting.rs` (`post_purchase`, `post_sale`, `post_adjustment`, `post_supplier_payment`) are the only place that mutates financial and inventory state. This avoids JS connection-pool race conditions. Frontend repos are read-only query helpers.
+
+**The database decides the UoM conversion, not the payload.** `post_sale` and `post_purchase` both resolve the product's own active `product_uoms` row — looked up by `(product_id, store_id, uom_code, is_active)` — and derive `quantity_base` from *its* factor. That single resolved conversion drives the per-base cost, the persisted snapshots, the inventory movement, `quantity_on_hand`, the weighted average and the last-purchase rate. A payload that declares a different factor, base quantity or `product_uoms` row id is **refused**, not silently normalized: the buyer priced the goods against the conversion they believed in. Client-supplied `quantity_base` / `factor_*_snapshot` / `product_uom_id_snapshot` remain on the wire for compatibility and are cross-checks only.
 
 **Snapshots at post time.** `sale_items` and `purchase_items` snapshot price, VAT, COGS, and UoM at the moment of posting. These values never change after posting.
 
 **Posted rows are immutable.** Database triggers prevent UPDATE/DELETE on posted sales, purchases, and inventory movements. Corrections are made via reversal rows, never edits.
 
-**Weighted-average COGS.** `products.avg_cost_usd` is recalculated on every purchase post using `(existing_qty * old_cost + new_qty * new_cost) / total_qty`.
+**Weighted-average COGS.** `products.avg_cost_*_microcents` is recalculated on every purchase post using `(existing_qty * old_cost + new_qty * new_cost) / total_qty`, accumulated in i128 at full microcent precision and divided once. No component is rounded to cents on the way.
 
 ### Data Flow: POS Sale
 
@@ -83,7 +98,7 @@ src-tauri/src/
 
 ### Database Schema Highlights
 
-23 tables across 7 migrations. Key groups:
+23 tables across 8 migrations. Key groups:
 
 | Group | Tables |
 |---|---|
