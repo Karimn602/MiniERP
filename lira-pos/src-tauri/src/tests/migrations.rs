@@ -42,16 +42,16 @@ async fn migration_versions_are_recorded_in_order() {
     let applied = db
         .count("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
         .await;
-    assert_eq!(applied, 8, "all eight migrations must be recorded");
+    assert_eq!(applied, 9, "all nine migrations must be recorded");
 
     assert_eq!(db.scalar_i64("SELECT MIN(version) FROM _sqlx_migrations").await, 1);
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 8);
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 9);
 
-    // Versions are exactly 1..=8 with no gaps or duplicates.
+    // Versions are exactly 1..=9 with no gaps or duplicates.
     let distinct = db
         .count("SELECT COUNT(DISTINCT version) FROM _sqlx_migrations")
         .await;
-    assert_eq!(distinct, 8);
+    assert_eq!(distinct, 9);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -297,7 +297,9 @@ async fn migration_008_applies_to_an_existing_pre_wp03_database() {
         .await
         .expect("migration 008 must apply to a populated v7 database");
 
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 8);
+    // `migrate_again` runs the whole remaining list, so a v7 database lands on
+    // the current head rather than stopping at 8.
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 9);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -477,4 +479,247 @@ async fn an_upgraded_database_matches_a_fresh_one_schema_for_schema() {
         upgraded.scalar_string(schema_sql).await,
         fresh.scalar_string(schema_sql).await
     );
+}
+
+// ============================================================================
+// Migration 009 — shift lifecycle integrity (GZ-HI-03)
+// ============================================================================
+//
+// The uniqueness scope is the STORE, which is the scope the application already
+// queried by. The risky path is a database that has ALREADY drifted: a shop on
+// an earlier release could accumulate two or more open shifts for one store,
+// and the unique index cannot be created over them. These tests run migrations
+// 1..=8, produce exactly that drift, and only then apply 009.
+
+const SHIFT_OLD: &str = "00000000-0000-0000-0000-0000000009a1";
+const SHIFT_MID: &str = "00000000-0000-0000-0000-0000000009a2";
+const SHIFT_NEW: &str = "00000000-0000-0000-0000-0000000009a3";
+
+/// A v8 database holding `count` simultaneously-open shifts for the seeded
+/// store — the state the pre-WP-04 check-then-insert could leave behind.
+async fn pre_wp04_database_with_open_shifts(shifts: &[(&str, &str)]) -> TempDb {
+    let db = TempDb::at_schema_version(8).await;
+    for (id, opened_at) in shifts {
+        db.exec(&format!(
+            "INSERT INTO shifts (
+               id, store_id, opened_by_user_id, opened_at,
+               opening_cash_usd_cents, opening_cash_lbp, status
+             ) VALUES ('{id}', '{STORE_ID}', '{USER_ID}', '{opened_at}', 5000, 100000, 'open')"
+        ))
+        .await;
+    }
+    db
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_009_applies_to_a_v8_database_with_one_open_shift() {
+    // The ordinary upgrade: a shop mid-shift when it installs the new version.
+    // Its open shift must survive untouched — the migration is not allowed to
+    // close a drawer somebody is still trading out of.
+    let db = pre_wp04_database_with_open_shifts(&[(SHIFT_NEW, "2026-03-01T08:00:00.000Z")]).await;
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 8);
+
+    db.migrate_again().await.expect("migration 009 must apply to a populated v8 database");
+
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 9);
+    assert_eq!(db.scalar_string(&format!("SELECT status FROM shifts WHERE id='{SHIFT_NEW}'")).await, "open");
+    assert_eq!(
+        db.count(&format!("SELECT COUNT(*) FROM shifts WHERE id='{SHIFT_NEW}' AND closed_at IS NULL")).await,
+        1,
+        "an untouched open shift keeps its NULL close columns"
+    );
+    assert_eq!(
+        db.count(&format!("SELECT COUNT(*) FROM shifts WHERE id='{SHIFT_NEW}' AND notes IS NULL")).await,
+        1,
+        "and is not annotated"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_009_reconciles_a_database_that_already_held_two_open_shifts() {
+    let db = pre_wp04_database_with_open_shifts(&[
+        (SHIFT_OLD, "2026-03-01T06:00:00.000Z"),
+        (SHIFT_MID, "2026-03-01T10:00:00.000Z"),
+        (SHIFT_NEW, "2026-03-01T14:00:00.000Z"),
+    ])
+    .await;
+    assert_eq!(db.count("SELECT COUNT(*) FROM shifts WHERE status='open'").await, 3);
+
+    db.migrate_again().await.expect("migration 009 must repair the drift, not fail on it");
+
+    // The newest stays open; the older two are closed. Deterministic, by
+    // `opened_at` then `id`.
+    assert_eq!(db.count("SELECT COUNT(*) FROM shifts WHERE status='open'").await, 1);
+    assert_eq!(db.scalar_string(&format!("SELECT status FROM shifts WHERE id='{SHIFT_NEW}'")).await, "open");
+    assert_eq!(db.scalar_string(&format!("SELECT status FROM shifts WHERE id='{SHIFT_OLD}'")).await, "closed");
+    assert_eq!(db.scalar_string(&format!("SELECT status FROM shifts WHERE id='{SHIFT_MID}'")).await, "closed");
+
+    // Nothing is INVENTED for the drawers nobody counted: counted, expected and
+    // variance stay NULL, and the row says in words why it was closed.
+    for id in [SHIFT_OLD, SHIFT_MID] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM shifts
+                  WHERE id='{id}'
+                    AND closing_cash_usd_cents IS NULL AND closing_cash_lbp IS NULL
+                    AND expected_cash_usd_cents IS NULL AND expected_cash_lbp IS NULL
+                    AND variance_usd_cents IS NULL AND variance_lbp IS NULL
+                    AND closed_at IS NOT NULL"
+            ))
+            .await,
+            1,
+            "an auto-closed shift records 'never reconciled', not a fabricated count"
+        );
+        assert!(
+            db.scalar_string(&format!("SELECT notes FROM shifts WHERE id='{id}'"))
+                .await
+                .contains("Auto-closed by migration 009"),
+            "the repair must be visible in the audit trail"
+        );
+    }
+
+    // The opening floats — real money somebody did hand over — are preserved.
+    assert_eq!(
+        db.scalar_i64(&format!("SELECT opening_cash_usd_cents FROM shifts WHERE id='{SHIFT_OLD}'")).await,
+        5_000
+    );
+
+    // And the invariant now holds against a direct write.
+    let err = db
+        .try_exec(&format!(
+            "INSERT INTO shifts (id, store_id, opened_by_user_id, opening_cash_usd_cents,
+                                 opening_cash_lbp, status)
+             VALUES ('another', '{STORE_ID}', '{USER_ID}', 0, 0, 'open')"
+        ))
+        .await
+        .expect_err("after the repair the index must be in force");
+    assert!(err.to_string().contains("UNIQUE") || err.to_string().contains("ux_shifts_one_open_per_store"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_009_leaves_each_store_its_own_open_shift() {
+    // The scope is per store, so two stores trading at once is NOT drift. A
+    // migration that closed one of them would shut a branch down.
+    let db = TempDb::at_schema_version(8).await;
+    db.exec("INSERT INTO stores (id, name) VALUES ('store-2', 'Second Branch')").await;
+    db.exec(&format!(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opened_at,
+                             opening_cash_usd_cents, opening_cash_lbp, status)
+         VALUES ('{SHIFT_NEW}', '{STORE_ID}', '{USER_ID}', '2026-03-01T08:00:00.000Z', 0, 0, 'open')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opened_at,
+                             opening_cash_usd_cents, opening_cash_lbp, status)
+         VALUES ('{SHIFT_MID}', 'store-2', '{USER_ID}', '2026-03-01T09:00:00.000Z', 0, 0, 'open')"
+    ))
+    .await;
+
+    db.migrate_again().await.expect("migration 009 must apply");
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM shifts WHERE status='open'").await, 2);
+    assert_eq!(db.scalar_string(&format!("SELECT status FROM shifts WHERE id='{SHIFT_NEW}'")).await, "open");
+    assert_eq!(db.scalar_string(&format!("SELECT status FROM shifts WHERE id='{SHIFT_MID}'")).await, "open");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_009_keeps_closed_and_voided_shifts_unconstrained() {
+    // Only OPEN rows are constrained — that is what a partial index is for. A
+    // store accumulates a closed shift per day for ever, plus any voided ones.
+    let db = TempDb::new().await;
+    for i in 0..5 {
+        db.exec(&format!(
+            "INSERT INTO shifts (id, store_id, opened_by_user_id, opened_at, closed_at,
+                                 opening_cash_usd_cents, opening_cash_lbp, status)
+             VALUES ('closed-{i}', '{STORE_ID}', '{USER_ID}',
+                     '2026-03-0{}T08:00:00.000Z', '2026-03-0{}T16:00:00.000Z', 0, 0, 'closed')",
+            i + 1,
+            i + 1
+        ))
+        .await;
+    }
+    db.exec(&format!(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opening_cash_usd_cents,
+                             opening_cash_lbp, status)
+         VALUES ('voided-1', '{STORE_ID}', '{USER_ID}', 0, 0, 'voided')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opening_cash_usd_cents,
+                             opening_cash_lbp, status)
+         VALUES ('open-1', '{STORE_ID}', '{USER_ID}', 0, 0, 'open')"
+    ))
+    .await;
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM shifts").await, 7);
+    assert_eq!(db.count("SELECT COUNT(*) FROM shifts WHERE status='open'").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgraded_database_converges_on_the_same_schema_as_a_fresh_one() {
+    // Fresh install and upgrade must end up in the same place: same tables, same
+    // indexes, same triggers. A partial index or a trigger that only ever
+    // appeared on one of the two paths would make the invariant depend on how
+    // old the shop's database is.
+    let fresh = TempDb::new().await;
+    let upgraded = pre_wp04_database_with_open_shifts(&[
+        (SHIFT_OLD, "2026-03-01T06:00:00.000Z"),
+        (SHIFT_NEW, "2026-03-01T14:00:00.000Z"),
+    ])
+    .await;
+    upgraded.migrate_again().await.expect("migration 009 must apply");
+
+    let schema_sql = "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+                      (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        fresh.scalar_string(schema_sql).await,
+        upgraded.scalar_string(schema_sql).await,
+        "a fresh database and an upgraded one must carry identical schema"
+    );
+
+    for db in [&fresh, &upgraded] {
+        assert_eq!(
+            db.count(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='index' AND name='ux_shifts_one_open_per_store'"
+            )
+            .await,
+            1,
+            "the one-open-shift index must exist on both paths"
+        );
+        assert_eq!(
+            db.count(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='trigger' AND name='trg_shifts_no_update_after_close'"
+            )
+            .await,
+            1,
+            "the closed-shift immutability trigger must exist on both paths"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_009_does_not_disturb_the_earlier_immutability_guards() {
+    // Migration 008 had to drop and restore the append-only triggers to backfill.
+    // 009 adds a trigger of its own; the existing ones must still be in force.
+    let db = TempDb::at_schema_version(8).await;
+    db.migrate_again().await.expect("migration 009 must apply");
+
+    for trigger in [
+        "trg_inv_mov_no_update",
+        "trg_sale_items_no_update_after_post",
+        "trg_purchase_items_no_update_after_post",
+        "trg_products_updated_at",
+        "trg_shifts_no_update_after_close",
+    ] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='{trigger}'"
+            ))
+            .await,
+            1,
+            "`{trigger}` must be present after migration 009"
+        );
+    }
 }

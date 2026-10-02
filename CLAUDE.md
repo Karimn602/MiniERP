@@ -39,7 +39,7 @@ lira-pos/src/
     migrate.ts       — bootstrap: PRAGMAs + schema validation on startup
     types.ts         — all TypeScript domain interfaces
     repos/           — typed data accessors (products, sales, purchases, suppliers, ...)
-    migrations/      — 8 numbered SQL files; Rust registers them on app init
+    migrations/      — 9 numbered SQL files; Rust registers them on app init
     seed.ts          — demo data
   lib/
     money.ts         — USD ↔ LBP conversion; integer-only arithmetic
@@ -74,9 +74,13 @@ Rules: all cost arithmetic goes through `src-tauri/src/cost.rs` (or `src/lib/cos
 
 **UoM conversions use rational fractions.** Each `product_uom` row has `conversion_num` / `conversion_den` to preserve precision when converting between units (e.g., kg → g).
 
-**Transactions run in Rust, not JavaScript.** The four `invoke` handlers in `posting.rs` (`post_purchase`, `post_sale`, `post_adjustment`, `post_supplier_payment`) are the only place that mutates financial and inventory state. This avoids JS connection-pool race conditions. Frontend repos are read-only query helpers.
+**Transactions run in Rust, not JavaScript.** The six `invoke` handlers in `posting.rs` (`post_purchase`, `post_sale`, `post_adjustment`, `post_supplier_payment`, `open_shift`, `close_shift`) are the only place that mutates financial and inventory state. This avoids JS connection-pool race conditions. Frontend repos are read-only query helpers.
 
 **The database decides the UoM conversion, not the payload.** `post_sale` and `post_purchase` both resolve the product's own active `product_uoms` row — looked up by `(product_id, store_id, uom_code, is_active)` — and derive `quantity_base` from *its* factor. That single resolved conversion drives the per-base cost, the persisted snapshots, the inventory movement, `quantity_on_hand`, the weighted average and the last-purchase rate. A payload that declares a different factor, base quantity or `product_uoms` row id is **refused**, not silently normalized: the buyer priced the goods against the conversion they believed in. Client-supplied `quantity_base` / `factor_*_snapshot` / `product_uom_id_snapshot` remain on the wire for compatibility and are cross-checks only.
+
+**One open shift per store, and the shift is checked when a sale posts.** The shift scope is the store — `getOpenShift(storeId)` queries `(store_id, status='open')`, `device_id` is never populated, and the cashier is recorded but not scoped on. `open_shift` decides uniqueness in a single `INSERT ... WHERE NOT EXISTS` statement, backed by the partial unique index `ux_shifts_one_open_per_store`; `close_shift` computes the cash reconciliation and writes it in the same transaction that marks the shift closed, and a closed shift is immutable (`trg_shifts_no_update_after_close`). **A new sale must name an open shift of its store** — `post_sale` refuses one that does not, inside its own transaction and before any receipt number or row is written. The check runs *after* the idempotency resolution, so retrying a sale that already posted still returns its original receipt, including a historical row whose `shift_id` is NULL. `sales.shift_id` stays nullable in the schema: the rule governs what may be written from now on, and history is not rewritten.
+
+**Tender is validated, never trusted; change is cash.** A payment row's `amount_usd_cents_equivalent` is *derived*: a USD tender's is itself, an LBP tender's is its lira at the rate locked on the sale, and that locked rate is matched against the `exchange_rates` row (scoped by store) before anything is written. Non-cash tender may never exceed the amount due, so a card overpayment is refused rather than written as drawer change, and the row absorbing an overpayment is always a cash row (USD cash preferred, else LBP cash, in that row's own currency). Expected drawer cash is `opening float + cash in − change out` per currency, counting only `cash_usd`/`cash_lbp` rows in both terms.
 
 **Snapshots at post time.** `sale_items` and `purchase_items` snapshot price, VAT, COGS, and UoM at the moment of posting. These values never change after posting.
 
@@ -98,7 +102,7 @@ Rules: all cost arithmetic goes through `src-tauri/src/cost.rs` (or `src/lib/cos
 
 ### Database Schema Highlights
 
-23 tables across 8 migrations. Key groups:
+23 tables across 9 migrations. Key groups:
 
 | Group | Tables |
 |---|---|

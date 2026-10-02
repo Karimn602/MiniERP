@@ -4,6 +4,7 @@ import {
   shiftsRepo,
   type ShiftSalesSummary,
   type ShiftPaymentRow,
+  type ShiftDrawerExpectation,
 } from "../db/repos/shifts";
 import type { Shift } from "../db/types";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
@@ -115,6 +116,7 @@ export default function ShiftSummary() {
   const [activeShift, setActiveShift] = useState<Shift | null | undefined>(undefined);
   const [salesSummary, setSalesSummary] = useState<ShiftSalesSummary | null>(null);
   const [payments, setPayments] = useState<ShiftPaymentRow[]>([]);
+  const [drawerCash, setDrawerCash] = useState<ShiftDrawerExpectation | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -132,12 +134,14 @@ export default function ShiftSummary() {
 
   const loadShiftData = useCallback(async (shift: Shift) => {
     if (!storeId) return;
-    const [summary, breakdown] = await Promise.all([
+    const [summary, breakdown, cash] = await Promise.all([
       shiftsRepo.getSalesSummary(shift.id, storeId),
       shiftsRepo.getPaymentBreakdown(shift.id, storeId),
+      shiftsRepo.getDrawerExpectation(shift.id, storeId),
     ]);
     setSalesSummary(summary);
     setPayments(breakdown);
+    setDrawerCash(cash);
   }, [storeId]);
 
   const loadShift = useCallback(async () => {
@@ -152,6 +156,7 @@ export default function ShiftSummary() {
       } else {
         setSalesSummary(null);
         setPayments([]);
+        setDrawerCash(null);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -177,15 +182,16 @@ export default function ShiftSummary() {
   // ---------- Drawer math ----------
 
   const drawer = useMemo(() => {
-    const cashUsdRow = payments.find((p) => p.method === "cash_usd");
-    const cashLbpRow = payments.find((p) => p.method === "cash_lbp");
-
-    const cashUsdReceived = cashUsdRow?.amountNativeUsdCents ?? 0;
-    const cashLbpReceived = cashLbpRow?.amountNativeLbp ?? 0;
-
-    // Change is stored on exactly one payment row per sale; summing is safe.
-    const changeUsd = payments.reduce((s, p) => s + p.changeGivenUsdCents, 0);
-    const changeLbp = payments.reduce((s, p) => s + p.changeGivenLbp, 0);
+    // Cash in and change out come from `getDrawerExpectation`, which runs the
+    // same SQL `close_shift` runs inside its transaction. This preview must not
+    // compute the drawer a second way in React: the figure the cashier counts
+    // against is the one that gets persisted (WP-04, parts E/K). In particular
+    // the change terms are cash-only there, so a card row can neither inflate
+    // nor reduce what the till is expected to hold.
+    const cashUsdReceived = drawerCash?.cashUsdInCents ?? 0;
+    const cashLbpReceived = drawerCash?.cashLbpIn ?? 0;
+    const changeUsd = drawerCash?.changeUsdOutCents ?? 0;
+    const changeLbp = drawerCash?.changeLbpOut ?? 0;
 
     const openingUsd = activeShift?.openingCashUsdCents ?? 0;
     const openingLbp = activeShift?.openingCashLbp ?? 0;
@@ -227,7 +233,7 @@ export default function ShiftSummary() {
       varianceUsd: closingUsdValid ? closingUsd - expectedUsd : null,
       varianceLbp: closingLbpValid ? closingLbp - expectedLbp : null,
     };
-  }, [payments, activeShift, closingUsdInput, closingLbpInput]);
+  }, [drawerCash, activeShift, closingUsdInput, closingLbpInput]);
 
   // ---------- Actions ----------
 
@@ -253,15 +259,28 @@ export default function ShiftSummary() {
       setActiveShift(shift);
       setSalesSummary({ receiptCount: 0, totalInclVatCents: 0, subtotalExclVatCents: 0, discountCents: 0, vatTotalCents: 0, netSalesExclVatCents: 0 });
       setPayments([]);
+      setDrawerCash({ cashUsdInCents: 0, cashLbpIn: 0, changeUsdOutCents: 0, changeLbpOut: 0 });
       setOpeningUsdInput("");
       setOpeningLbpInput("");
       setClosingUsdInput("");
       setClosingLbpInput("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // The backend owns this decision now, so its refusal is the truth and the
+      // local view may be stale — "a shift is already open" means one exists
+      // that this page never saw. Re-read the real state, then state the
+      // refusal: `loadShift` clears `error` on entry, so setting it first would
+      // make the message flash and vanish.
+      await resyncAfterFailure(e);
     } finally {
       setSubmitting(false);
     }
+  }
+
+  /** Re-read the authoritative shift state, then show why the command failed. */
+  async function resyncAfterFailure(e: unknown): Promise<void> {
+    const message = e instanceof Error ? e.message : String(e);
+    await loadShift();
+    setError(message);
   }
 
   async function handleCloseShift() {
@@ -284,14 +303,13 @@ export default function ShiftSummary() {
         closingCashUsdCents: closingUsdCents,
         closingCashLbp: closingLbp,
       });
-      // Transition back to "no open shift"
-      setActiveShift(null);
-      setSalesSummary(null);
-      setPayments([]);
       setClosingUsdInput("");
       setClosingLbpInput("");
+      // Re-read rather than assume: the committed shift state is whatever
+      // `close_shift` wrote, and the store may already have a new shift open.
+      await loadShift();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      await resyncAfterFailure(e);
     } finally {
       setSubmitting(false);
     }
@@ -313,7 +331,7 @@ export default function ShiftSummary() {
           <p className="text-sm text-slate-600">{t("shift.subtitle")}</p>
         </div>
         {activeShift && (
-          <Button variant="ghost" onClick={refreshSummary} disabled={loading}>
+          <Button variant="ghost" onClick={refreshSummary} disabled={loading || submitting}>
             {t("shift.refresh")}
           </Button>
         )}

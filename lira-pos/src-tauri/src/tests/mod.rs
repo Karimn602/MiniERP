@@ -19,4 +19,6 @@ mod purchases;
 mod pure;
 mod reconciliation;
 mod sales;
+mod shifts;
 mod supplier_payments;
+mod tenders;

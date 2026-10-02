@@ -26,6 +26,7 @@ async fn assert_rejected(db: &TempDb, sql: &str, expected_fragment: &str) {
 async fn a_posted_sale() -> (TempDb, String) {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {

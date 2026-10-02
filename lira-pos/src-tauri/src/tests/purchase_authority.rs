@@ -41,6 +41,7 @@ const FLOUR_PER_GRAM: i64 = 250_000;
 async fn store_with_derived_purchase_uoms() -> TempDb {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_supplier(&db, SUPPLIER, "Beirut Wholesale").await;
     seed_product(&db, &ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee")).await;
     seed_product_uom(&db, P_COFFEE, "box", 12, 1).await;

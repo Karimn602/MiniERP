@@ -206,7 +206,14 @@ export interface PostSaleInput {
   storeId: string;
   cashierUserId: string | null;
   deviceId: string | null;
-  shiftId: string | null;
+  /**
+   * REQUIRED. `post_sale` refuses a new sale that does not name an open shift
+   * of its store (WP-04, GZ-HI-03), so this is not nullable on the way in —
+   * `PosRegister` already gates Post on an active shift. `sales.shift_id`
+   * itself stays nullable: rows written before the rule existed keep their
+   * NULL and remain replayable.
+   */
+  shiftId: string;
   exchangeRateId: string;
   exchangeRateLbpPerUsd: number;
   notes: string | null;

@@ -1,4 +1,5 @@
-import { query, execute } from "../client";
+import { invoke } from "@tauri-apps/api/core";
+import { query } from "../client";
 import { newId } from "../../lib/ids";
 import type { Shift, ShiftStatus, PaymentMethod, PaymentCurrency } from "../types";
 
@@ -67,6 +68,19 @@ export interface ShiftPaymentRow {
   changeGivenLbp: number;
 }
 
+/**
+ * The cash movements that actually passed through one shift's drawer, stated
+ * per currency in that currency's own unit (USD cents / whole lira). Card,
+ * transfer and wallet tenders are absent by construction: they never reach the
+ * till.
+ */
+export interface ShiftDrawerExpectation {
+  cashUsdInCents: number;
+  cashLbpIn: number;
+  changeUsdOutCents: number;
+  changeLbpOut: number;
+}
+
 // ---------- Repo ----------
 
 export const shiftsRepo = {
@@ -81,28 +95,40 @@ export const shiftsRepo = {
     return rows[0] ? toShift(rows[0]) : null;
   },
 
+  /**
+   * Open a shift for this store.
+   *
+   * Transactional, in Rust (WP-04, GZ-HI-03). This used to read "is anything
+   * open?" and then INSERT as two separate statements dispatched across
+   * tauri-plugin-sql's connection pool, so two tabs or a double-click could
+   * both see nothing open and both insert — after which `getOpenShift`'s
+   * `LIMIT 1` quietly hid one of the two drawers. `open_shift` decides it in
+   * one statement inside one transaction, with
+   * `ux_shifts_one_open_per_store` (migration 009) as the engine-level
+   * backstop. A conflicting open fails with the backend's message; surface it.
+   *
+   * The returned shift is the row the command committed, so there is no
+   * follow-up SELECT that could observe a different state.
+   */
   async openShift(args: {
     storeId: string;
     userId: string;
     openingCashUsdCents: number;
     openingCashLbp: number;
+    deviceId?: string | null;
+    notes?: string | null;
   }): Promise<Shift> {
-    const existing = await this.getOpenShift(args.storeId);
-    if (existing) {
-      throw new Error("A shift is already open. Close it before opening a new one.");
-    }
-    const id = newId();
-    await execute(
-      `INSERT INTO shifts (
-         id, store_id, opened_by_user_id,
-         opening_cash_usd_cents, opening_cash_lbp,
-         status
-       ) VALUES (?, ?, ?, ?, ?, 'open')`,
-      [id, args.storeId, args.userId, args.openingCashUsdCents, args.openingCashLbp],
-    );
-    const rows = await query<ShiftRow>(`SELECT * FROM shifts WHERE id = ?`, [id]);
-    if (!rows[0]) throw new Error("Failed to read newly opened shift.");
-    return toShift(rows[0]);
+    return invoke<Shift>("open_shift", {
+      payload: {
+        shiftId: newId(),
+        storeId: args.storeId,
+        openedByUserId: args.userId,
+        deviceId: args.deviceId ?? null,
+        openingCashUsdCents: args.openingCashUsdCents,
+        openingCashLbp: args.openingCashLbp,
+        notes: args.notes ?? null,
+      },
+    });
   },
 
   async getSalesSummary(
@@ -188,6 +214,78 @@ export const shiftsRepo = {
     }));
   },
 
+  /**
+   * The cash this shift's drawer should be holding, from actual
+   * drawer-affecting events only.
+   *
+   * A READ-ONLY MIRROR of the figure `close_shift` computes and stores. The
+   * authoritative calculation is `posting.rs::drawer_cash_for_shift`, run inside
+   * the closing transaction; this query exists so the Shift page can show a
+   * live "expected" and a live variance while the cashier is still counting,
+   * and it is deliberately the same SQL so the preview cannot disagree with
+   * the figure that gets persisted.
+   *
+   * Only `cash_usd` and `cash_lbp` tenders move physical money, so only they
+   * appear — in both the money-in and the change-out term. Filtering the change
+   * term by method is the GZ-HI-04 correction: a card row that carries change
+   * (which `post_sale` now refuses to write, but an older release did) must not
+   * make the till look short.
+   */
+  async getDrawerExpectation(
+    shiftId: string,
+    storeId: string,
+  ): Promise<ShiftDrawerExpectation> {
+    interface Row {
+      cash_usd_in: number;
+      cash_lbp_in: number;
+      change_usd_out: number;
+      change_lbp_out: number;
+    }
+    const rows = await query<Row>(
+      `SELECT
+         COALESCE(SUM(CASE WHEN sp.method = 'cash_usd'
+                           THEN sp.amount_native_usd_cents ELSE 0 END), 0) AS cash_usd_in,
+         COALESCE(SUM(CASE WHEN sp.method = 'cash_lbp'
+                           THEN sp.amount_native_lbp ELSE 0 END), 0)       AS cash_lbp_in,
+         COALESCE(SUM(CASE WHEN sp.method IN ('cash_usd','cash_lbp')
+                           THEN sp.change_given_usd_cents ELSE 0 END), 0)  AS change_usd_out,
+         COALESCE(SUM(CASE WHEN sp.method IN ('cash_usd','cash_lbp')
+                           THEN sp.change_given_lbp ELSE 0 END), 0)        AS change_lbp_out
+       FROM sale_payments sp
+       JOIN sales s ON s.id = sp.sale_id
+       WHERE s.store_id = ?
+         AND s.shift_id = ?
+         AND s.status = 'posted'`,
+      [storeId, shiftId],
+    );
+    const r = rows[0] ?? {
+      cash_usd_in: 0,
+      cash_lbp_in: 0,
+      change_usd_out: 0,
+      change_lbp_out: 0,
+    };
+    return {
+      cashUsdInCents: r.cash_usd_in,
+      cashLbpIn: r.cash_lbp_in,
+      changeUsdOutCents: r.change_usd_out,
+      changeLbpOut: r.change_lbp_out,
+    };
+  },
+
+  /**
+   * Close a shift: count the drawer, reconcile it, lock it.
+   *
+   * Transactional, in Rust (WP-04, GZ-HI-03). This used to read the shift,
+   * aggregate the till, UPDATE, and re-read as four separate statements, so a
+   * sale could land between the aggregate and the UPDATE and end up inside a
+   * shift whose stored snapshot does not include it. `close_shift` does all of
+   * it in one transaction, so the figures written ARE the state that was marked
+   * closed.
+   *
+   * Closing twice is refused — the counted cash and variance of a closed shift
+   * are final, and `trg_shifts_no_update_after_close` (migration 009) enforces
+   * that against any caller. The returned shift is the committed row.
+   */
   async closeShift(args: {
     shiftId: string;
     storeId: string;
@@ -195,81 +293,14 @@ export const shiftsRepo = {
     closingCashUsdCents: number;
     closingCashLbp: number;
   }): Promise<Shift> {
-    // Read opening cash + verify status
-    const shiftRows = await query<ShiftRow>(
-      `SELECT * FROM shifts WHERE id = ? AND store_id = ? AND status = 'open'`,
-      [args.shiftId, args.storeId],
-    );
-    const shift = shiftRows[0];
-    if (!shift) throw new Error("No open shift found — it may already be closed.");
-
-    // Aggregate drawer cash from all posted sales in this shift
-    interface DrawerRow {
-      cash_usd_received: number;
-      cash_lbp_received: number;
-      change_usd: number;
-      change_lbp: number;
-    }
-    const drawerRows = await query<DrawerRow>(
-      `SELECT
-         COALESCE(SUM(CASE WHEN sp.method = 'cash_usd' THEN sp.amount_native_usd_cents ELSE 0 END), 0) AS cash_usd_received,
-         COALESCE(SUM(CASE WHEN sp.method = 'cash_lbp' THEN sp.amount_native_lbp        ELSE 0 END), 0) AS cash_lbp_received,
-         COALESCE(SUM(sp.change_given_usd_cents), 0) AS change_usd,
-         COALESCE(SUM(sp.change_given_lbp),       0) AS change_lbp
-       FROM sale_payments sp
-       JOIN sales s ON s.id = sp.sale_id
-       WHERE s.store_id = ?
-         AND s.shift_id = ?
-         AND s.status = 'posted'`,
-      [args.storeId, args.shiftId],
-    );
-    const d = drawerRows[0] ?? {
-      cash_usd_received: 0,
-      cash_lbp_received: 0,
-      change_usd: 0,
-      change_lbp: 0,
-    };
-
-    // expected = opening + received − change given back
-    const expectedUsd =
-      shift.opening_cash_usd_cents + d.cash_usd_received - d.change_usd;
-    const expectedLbp =
-      shift.opening_cash_lbp + d.cash_lbp_received - d.change_lbp;
-    const varianceUsd = args.closingCashUsdCents - expectedUsd;
-    const varianceLbp = args.closingCashLbp - expectedLbp;
-
-    const now = new Date().toISOString();
-    await execute(
-      `UPDATE shifts SET
-         status                 = 'closed',
-         closed_at              = ?,
-         closed_by_user_id      = ?,
-         closing_cash_usd_cents = ?,
-         closing_cash_lbp       = ?,
-         expected_cash_usd_cents = ?,
-         expected_cash_lbp      = ?,
-         variance_usd_cents     = ?,
-         variance_lbp           = ?
-       WHERE id = ? AND store_id = ? AND status = 'open'`,
-      [
-        now,
-        args.userId,
-        args.closingCashUsdCents,
-        args.closingCashLbp,
-        expectedUsd,
-        expectedLbp,
-        varianceUsd,
-        varianceLbp,
-        args.shiftId,
-        args.storeId,
-      ],
-    );
-
-    const updatedRows = await query<ShiftRow>(
-      `SELECT * FROM shifts WHERE id = ?`,
-      [args.shiftId],
-    );
-    if (!updatedRows[0]) throw new Error("Failed to read closed shift.");
-    return toShift(updatedRows[0]);
+    return invoke<Shift>("close_shift", {
+      payload: {
+        shiftId: args.shiftId,
+        storeId: args.storeId,
+        closedByUserId: args.userId,
+        closingCashUsdCents: args.closingCashUsdCents,
+        closingCashLbp: args.closingCashLbp,
+      },
+    });
   },
 };

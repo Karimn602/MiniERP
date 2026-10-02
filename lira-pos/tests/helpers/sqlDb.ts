@@ -118,16 +118,40 @@ export function seedProduct(
   return opts.id;
 }
 
+/**
+ * A shift for the fixture store.
+ *
+ * `status` defaults to `'open'`, and since migration 009 a store may hold only
+ * one open shift at a time — a test that needs a second shift to exist
+ * alongside it must seed that one as `'closed'`, which is what a real handover
+ * produces anyway.
+ */
 export function seedShift(
   db: DatabaseSync,
-  opts: { id: string; openingUsdCents?: number; openingLbp?: number },
+  opts: {
+    id: string;
+    openingUsdCents?: number;
+    openingLbp?: number;
+    status?: "open" | "closed";
+  },
 ): string {
+  const closed = opts.status === "closed";
   db.prepare(
     `INSERT INTO shifts (
        id, store_id, opened_by_user_id, opened_at,
+       closed_at, closed_by_user_id,
        opening_cash_usd_cents, opening_cash_lbp, status
-     ) VALUES (?, ?, ?, '2026-03-01T08:00:00.000Z', ?, ?, 'open')`,
-  ).run(opts.id, STORE_ID, USER_ID, opts.openingUsdCents ?? 0, opts.openingLbp ?? 0);
+     ) VALUES (?, ?, ?, '2026-03-01T08:00:00.000Z', ?, ?, ?, ?, ?)`,
+  ).run(
+    opts.id,
+    STORE_ID,
+    USER_ID,
+    closed ? "2026-03-01T16:00:00.000Z" : null,
+    closed ? USER_ID : null,
+    opts.openingUsdCents ?? 0,
+    opts.openingLbp ?? 0,
+    closed ? "closed" : "open",
+  );
   return opts.id;
 }
 

@@ -3,7 +3,7 @@
 // Every test asserts on PERSISTED rows, not on the command's return value
 // alone, because persistence is what later work packages must not regress.
 
-use crate::posting::{post_sale_with_pool, PostSalePayload};
+use crate::posting::{close_shift_with_pool, post_sale_with_pool, CloseShiftPayload, PostSalePayload};
 use crate::test_support::*;
 use crate::tests::builders::*;
 
@@ -12,11 +12,32 @@ const P_WATER: &str = "00000000-0000-0000-0000-0000000000c2";
 const P_BREAD: &str = "00000000-0000-0000-0000-0000000000c3";
 const P_DELIVERY: &str = "00000000-0000-0000-0000-0000000000c4";
 
+/// Close the fixture's own open shift, so a test can open one of its own.
+///
+/// `store_with_coffee` seeds `SHIFT_ID` because a new sale needs an open shift
+/// (WP-04), and a store may hold only one (migration 009). A test that wants to
+/// name its own shift retires that one first, exactly as a real handover does.
+async fn close_the_fixture_shift(db: &TempDb) {
+    close_shift_with_pool(
+        db.pool(),
+        CloseShiftPayload {
+            shift_id: SHIFT_ID.to_string(),
+            store_id: STORE_ID.to_string(),
+            closed_by_user_id: USER_ID.to_string(),
+            closing_cash_usd_cents: 0,
+            closing_cash_lbp: 0,
+        },
+    )
+    .await
+    .expect("close the fixture shift");
+}
+
 /// A store with one stocked product: 100 on hand at a $2.00 weighted-average
 /// cost (excl VAT) / $2.22 incl.
 async fn store_with_coffee() -> TempDb {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {
@@ -158,6 +179,7 @@ async fn receipt_numbers_increment_and_never_repeat() {
 async fn a_mixed_vat_sale_reconciles_at_transaction_level() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 50, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },
@@ -228,6 +250,7 @@ async fn a_mixed_vat_sale_reconciles_at_transaction_level() {
 async fn service_items_never_touch_physical_stock() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {
@@ -271,6 +294,7 @@ async fn a_service_line_can_be_sold_below_zero_stock_without_a_guard_error() {
     // Services have no stock to run out of; the guard must not fire.
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { is_service: true, ..ProductSpec::stocked(P_DELIVERY, "SKU-D1", "Delivery") },
@@ -397,6 +421,7 @@ async fn exact_payment_records_no_change() {
 async fn selling_more_than_is_on_hand_is_refused_and_nothing_persists() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 2, ..ProductSpec::stocked(P_WATER, "SKU-W1", "Water") },
@@ -420,6 +445,7 @@ async fn selling_more_than_is_on_hand_is_refused_and_nothing_persists() {
 async fn selling_exactly_the_stock_on_hand_is_allowed() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 3, ..ProductSpec::stocked(P_WATER, "SKU-W1", "Water") },
@@ -437,6 +463,7 @@ async fn selling_exactly_the_stock_on_hand_is_allowed() {
 async fn allow_negative_inventory_bypasses_the_guard_but_still_moves_stock() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 1, ..ProductSpec::stocked(P_WATER, "SKU-W1", "Water") },
@@ -456,6 +483,7 @@ async fn allow_negative_inventory_bypasses_the_guard_but_still_moves_stock() {
 async fn an_inactive_product_cannot_be_sold() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {
@@ -527,6 +555,7 @@ async fn cogs_snapshots_survive_later_cost_changes() {
 async fn the_cogs_method_is_recorded_and_changes_the_snapshot() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {
@@ -602,6 +631,7 @@ async fn last_purchase_falls_back_to_weighted_average_without_purchase_history()
 async fn a_multi_line_multi_uom_sale_decrements_each_product_in_base_units() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 100, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },
@@ -702,6 +732,7 @@ async fn a_sale_with_no_value_is_refused() {
 async fn large_value_sales_stay_exact_in_integer_cents() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {
@@ -735,13 +766,37 @@ async fn large_value_sales_stay_exact_in_integer_cents() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sales_are_attributable_to_their_shift() {
     let db = store_with_coffee().await;
-    seed_shift(&db, "shift-1", 10_000, 500_000).await;
-    seed_shift(&db, "shift-2", 0, 0).await;
 
-    for (shift, qty) in [("shift-1", 1), ("shift-1", 2), ("shift-2", 1)] {
+    // A store holds one open shift at a time (migration 009), and a sale may
+    // only post into an open one, so the two shifts here run in sequence: ring
+    // up shift-1, close it, open shift-2. That is also the real sequence a
+    // handover produces. The fixture's own empty shift is closed first to make
+    // room for shift-1 and its float.
+    close_the_fixture_shift(&db).await;
+    seed_shift(&db, "shift-1", 10_000, 500_000).await;
+    for qty in [1, 2] {
         let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(qty).unit_incl(500).build()];
         let mut payload = sale_payload(lines, vec![cash_usd(500 * qty)]);
-        payload.shift_id = Some(shift.to_string());
+        payload.shift_id = Some("shift-1".to_string());
+        post_sale_with_pool(db.pool(), payload).await.unwrap();
+    }
+    close_shift_with_pool(
+        db.pool(),
+        CloseShiftPayload {
+            shift_id: "shift-1".to_string(),
+            store_id: STORE_ID.to_string(),
+            closed_by_user_id: USER_ID.to_string(),
+            closing_cash_usd_cents: 0,
+            closing_cash_lbp: 0,
+        },
+    )
+    .await
+    .expect("close shift-1");
+    seed_shift(&db, "shift-2", 0, 0).await;
+    {
+        let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).build()];
+        let mut payload = sale_payload(lines, vec![cash_usd(500)]);
+        payload.shift_id = Some("shift-2".to_string());
         post_sale_with_pool(db.pool(), payload).await.unwrap();
     }
 
@@ -1209,6 +1264,7 @@ async fn a_stale_conversion_factor_in_the_payload_does_not_change_what_is_sold()
 async fn the_database_decides_whether_a_line_moves_stock_not_the_payload() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     // Stocked in the DB; the payload will claim it is a service.
     seed_product(
         &db,
@@ -1296,6 +1352,7 @@ async fn an_internally_inconsistent_line_is_refused_and_nothing_persists() {
 async fn a_line_charging_vat_at_an_exempt_rate_is_refused() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {
@@ -1324,6 +1381,7 @@ async fn a_line_charging_vat_at_an_exempt_rate_is_refused() {
 async fn a_valid_taxable_line_and_a_valid_exempt_line_both_post() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 50, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },
@@ -1431,6 +1489,7 @@ async fn a_multi_line_discount_with_an_awkward_remainder_reconciles_to_the_cent(
     // largest line → 51/35/15.
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     for (id, sku, name) in
         [(P_COFFEE, "SKU-C1", "Coffee"), (P_WATER, "SKU-W1", "Water"), (P_BREAD, "SKU-B1", "Bread")]
     {
@@ -1604,9 +1663,15 @@ async fn a_replay_that_changes_the_tender_currency_or_native_amount_is_a_conflic
         .expect_err("a different tender currency is a different transaction");
     assert!(err.contains("different tender"), "got: {err}");
 
-    // Same currency and USD-equivalent, different native lira handed over.
+    // Same currency, a different number of lira actually handed over. The tender
+    // is built through `cash_lbp` so its USD equivalent is the one the locked
+    // rate gives for 900,000 lira: an internally CONSISTENT tender that is
+    // nevertheless a different transaction, which is what the replay comparison
+    // has to catch. (A payload claiming 900,000 lira at $10.00 would be refused
+    // one step earlier, by the WP-04 tender check, and would prove nothing
+    // about replay detection.)
     let mut retry = replay_of(&original);
-    retry.payments[0].amount_native_lbp = 900_000;
+    retry.payments = vec![cash_lbp(900_000)];
     let err = post_sale_with_pool(db.pool(), retry)
         .await
         .expect_err("a different native amount is a different transaction");
@@ -1693,6 +1758,7 @@ async fn a_replay_that_reprices_lines_but_keeps_the_total_is_a_conflict() {
     // sale — different per-product margin, different reports.
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 100, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },
@@ -1747,6 +1813,7 @@ async fn a_replay_that_moves_the_discount_between_lines_is_a_conflict() {
     // allocation differs. That is still a different set of persisted lines.
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 100, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },
@@ -1807,6 +1874,7 @@ async fn a_replay_that_moves_the_discount_between_lines_is_a_conflict() {
 async fn a_replay_that_changes_the_vat_code_is_a_conflict() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 100, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },
@@ -1848,8 +1916,11 @@ async fn a_replay_that_changes_the_vat_code_is_a_conflict() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replay_that_changes_shift_or_cashier_attribution_is_a_conflict() {
     let db = store_with_coffee().await;
+    close_the_fixture_shift(&db).await;
     seed_shift(&db, "shift-1", 0, 0).await;
-    seed_shift(&db, "shift-2", 0, 0).await;
+    // shift-2 only ever appears in a payload that is refused, so it is the
+    // store's closed shift rather than a second open one (migration 009).
+    seed_closed_shift(&db, "shift-2", 0, 0).await;
 
     let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(2).unit_incl(500).build()];
     let mut original = sale_payload(lines, vec![cash_usd(1000)]);
@@ -1887,6 +1958,7 @@ async fn line_and_payment_order_alone_never_makes_a_retry_fail() {
     // a multiset. A reordered retry is still the same checkout.
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 100, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },

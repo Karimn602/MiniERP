@@ -741,6 +741,19 @@ export default function PosRegister() {
       rate && cashLbp > 0 ? lbpToUsdCents(cashLbp, rate.rateLbpPerUsd) : 0;
     const totalPaidUsdCents = cashUsdCents + cashLbpAsUsdCents + cardUsdCents;
 
+    // A card may never be charged more than the bill (WP-04, GZ-HI-04): change
+    // is cash out of the drawer, and there is no card refund to give. The
+    // backend refuses this outright; catching it here is what keeps the Post
+    // button honest instead of letting the cashier swipe and then fail.
+    if (cardUsdCents > totals.postDiscountTotal && totals.postDiscountTotal > 0) {
+      errs.push(
+        t("pos.errCardOverpaid", {
+          card: formatUsd(cardUsdCents),
+          total: formatUsd(totals.postDiscountTotal),
+        }),
+      );
+    }
+
     return {
       cashUsdCents,
       cashLbp,
@@ -749,7 +762,7 @@ export default function PosRegister() {
       totalPaidUsdCents,
       errors: errs,
     };
-  }, [cashUsdInput, cashLbpInput, cardUsdInput, rate, t]);
+  }, [cashUsdInput, cashLbpInput, cardUsdInput, rate, totals.postDiscountTotal, t]);
 
   const remainingCents = totals.postDiscountTotal - payments.totalPaidUsdCents;
   const changeCents = payments.totalPaidUsdCents - totals.postDiscountTotal;

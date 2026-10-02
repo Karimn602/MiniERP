@@ -121,6 +121,8 @@ const en = {
     errCashLbpInvalid: "Cash LBP: not a valid whole-lira amount.",
     errCardUsdInvalid: "Card USD: not a valid amount.",
     errUnderpaid: "Underpaid: tendered {{tendered}}, total {{total}}.",
+    errCardOverpaid:
+      "Card {{card}} is more than the {{total}} due. Charge the card the amount owed — change can only be given from cash.",
   },
   shift: {
     title: "Shift Summary",

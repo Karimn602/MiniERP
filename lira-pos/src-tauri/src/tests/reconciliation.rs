@@ -26,6 +26,7 @@ async fn assert_movements_reconcile(db: &TempDb, product_id: &str) {
 async fn a_full_trading_day_reconciles_stock_to_its_movement_trail() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_supplier(&db, SUPPLIER, "Beirut Wholesale").await;
     // Both products start at zero so movements alone must explain the balance.
     seed_product(&db, &ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee")).await;
@@ -119,6 +120,7 @@ async fn a_full_trading_day_reconciles_stock_to_its_movement_trail() {
 async fn every_stocked_sale_line_has_exactly_one_movement_and_services_have_none() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 50, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },
@@ -169,6 +171,7 @@ async fn every_stocked_sale_line_has_exactly_one_movement_and_services_have_none
 async fn header_totals_reconcile_to_line_totals_across_many_sales() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec { quantity_on_hand: 5_000, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },

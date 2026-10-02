@@ -65,6 +65,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/008_cost_precision.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 9,
+            description: "shift_integrity",
+            sql: include_str!("../../src/db/migrations/009_shift_integrity.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -84,6 +90,8 @@ pub fn run() {
             posting::post_adjustment,
             posting::post_supplier_payment,
             posting::post_sale,
+            posting::open_shift,
+            posting::close_shift,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

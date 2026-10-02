@@ -923,6 +923,13 @@ pub struct PostSalePayload {
     pub store_id: String,
     pub cashier_user_id: Option<String>,
     pub device_id: Option<String>,
+
+    // REQUIRED for a new sale, despite the `Option`: `post_sale_tx` refuses a
+    // payload that omits it, and refuses one naming a shift that is not an open
+    // shift of `store_id` (WP-04, GZ-HI-03). The type stays optional because the
+    // replay path must still accept `None` — a sale posted before that rule
+    // exists carries a NULL `shift_id`, and retrying it has to return the
+    // receipt it already has rather than fail on history nobody can change.
     pub shift_id: Option<String>,
 
     // Exchange rate LOCKED at sale time. Required (even on USD-only sales) so
@@ -1509,6 +1516,72 @@ pub(crate) fn validate_line_financials(index: usize, line: &PostSaleLine) -> Res
     Ok(())
 }
 
+// ============================================================================
+// Tender vocabulary and currency conversion (WP-04)
+// ============================================================================
+
+/// Every `sale_payments.method` the schema's CHECK constraint allows.
+pub(crate) const PAYMENT_METHODS: [&str; 8] = [
+    "cash_usd",
+    "cash_lbp",
+    "card_usd",
+    "card_lbp",
+    "bank_transfer",
+    "wallet",
+    "store_credit",
+    "other",
+];
+
+/// Whether a tender method puts money in, or takes money out of, the physical
+/// cash drawer. This is the ONE definition of "cash" in the backend: the change
+/// rules in `prepare_sale` and the expected-drawer figure in `close_shift` both
+/// derive from it, so they cannot disagree about whether a card touches cash.
+pub(crate) fn is_cash_method(method: &str) -> bool {
+    method == "cash_usd" || method == "cash_lbp"
+}
+
+/// The currency a method's name commits it to, if it names one at all.
+/// `bank_transfer`, `wallet`, `store_credit` and `other` may be either.
+pub(crate) fn method_currency(method: &str) -> Option<&'static str> {
+    match method {
+        "cash_usd" | "card_usd" => Some("USD"),
+        "cash_lbp" | "card_lbp" => Some("LBP"),
+        _ => None,
+    }
+}
+
+/// LBP to USD cents at `rate_lbp_per_usd`: `round(lbp x 100 / rate)`, half away
+/// from zero.
+///
+/// Mirrors `lib/money.ts::lbpToUsdCents` exactly, but in integer arithmetic
+/// with no float step: the product is taken in i128 so a large lira amount
+/// cannot overflow on the way, and the half-up adjustment is exact rather than
+/// the result of an f64 division that happened to land near a boundary.
+pub(crate) fn lbp_to_usd_cents(lbp: i64, rate_lbp_per_usd: i64) -> Result<i64, String> {
+    if lbp < 0 {
+        return Err("an LBP tender cannot be negative".into());
+    }
+    if rate_lbp_per_usd <= 0 {
+        return Err("exchange rate must be positive".into());
+    }
+    let rate = i128::from(rate_lbp_per_usd);
+    let cents = (i128::from(lbp) * 100 + rate / 2) / rate;
+    i64::try_from(cents).map_err(|_| "LBP tender overflows when converted to USD cents".to_string())
+}
+
+/// USD cents to LBP at `rate_lbp_per_usd`: `round(cents x rate / 100)`, half
+/// away from zero. Mirrors `lib/money.ts::usdCentsToLbp`.
+pub(crate) fn usd_cents_to_lbp(cents: i64, rate_lbp_per_usd: i64) -> Result<i64, String> {
+    if cents < 0 {
+        return Err("a USD amount converted to LBP cannot be negative".into());
+    }
+    if rate_lbp_per_usd <= 0 {
+        return Err("exchange rate must be positive".into());
+    }
+    let lbp = (i128::from(cents) * i128::from(rate_lbp_per_usd) + 50) / 100;
+    i64::try_from(lbp).map_err(|_| "USD amount overflows when converted to LBP".to_string())
+}
+
 /// Base-UoM quantity for `qty_in_uom` under the conversion factor `num/den`.
 ///
 /// Mirrors `lib/uom.ts::toBaseQty` exactly — `round(qty × num ÷ den)`, half
@@ -1573,23 +1646,50 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
         validate_line_financials(i, line)?;
     }
 
-    // ---- Validation: payments ----
-    let allowed_methods = [
-        "cash_usd", "cash_lbp", "card_usd", "card_lbp",
-        "bank_transfer", "wallet", "store_credit", "other",
-    ];
+    // ---- Validation: payments (GZ-HI-04) ----
+    //
+    // THE SUPPORTED TENDER MATRIX. `method` says how the money arrived and,
+    // for the four methods whose name names a currency, in which currency.
+    // `currency` must agree with it, and the native amount must be the one
+    // that currency is denominated in:
+    //
+    //   method         | currency | native column           | drawer cash?
+    //   ---------------|----------|-------------------------|--------------
+    //   cash_usd       | USD      | amount_native_usd_cents | yes, USD
+    //   cash_lbp       | LBP      | amount_native_lbp       | yes, LBP
+    //   card_usd       | USD      | amount_native_usd_cents | no
+    //   card_lbp       | LBP      | amount_native_lbp       | no
+    //   bank_transfer  | either   | matching native column  | no
+    //   wallet         | either   | matching native column  | no
+    //   store_credit   | either   | matching native column  | no
+    //   other          | either   | matching native column  | no
+    //
+    // The POS emits the first three; the rest are schema-legal and left
+    // accepted so WP-05/WP-06 need not reopen this list. A row that
+    // contradicts itself — `cash_usd` declared in LBP, a USD row carrying an
+    // LBP amount, a USD equivalent that is not what the native amount converts
+    // to — is not a tender anyone took, and it is immutable once posted.
     for (i, p) in payload.payments.iter().enumerate() {
-        if !allowed_methods.contains(&p.method.as_str()) {
-            return Err(format!("Payment {} has invalid method: {}", i + 1, p.method));
+        let n = i + 1;
+        if !PAYMENT_METHODS.contains(&p.method.as_str()) {
+            return Err(format!("Payment {} has invalid method: {}", n, p.method));
         }
         if p.currency != "USD" && p.currency != "LBP" {
-            return Err(format!("Payment {} has invalid currency: {}", i + 1, p.currency));
+            return Err(format!("Payment {} has invalid currency: {}", n, p.currency));
+        }
+        if let Some(required) = method_currency(&p.method) {
+            if p.currency != required {
+                return Err(format!(
+                    "Payment {}: method \"{}\" is a {} tender, but the row declares currency {}.",
+                    n, p.method, required, p.currency
+                ));
+            }
         }
         if p.amount_usd_cents_equivalent <= 0 {
-            return Err(format!("Payment {} has non-positive amount.", i + 1));
+            return Err(format!("Payment {} has non-positive amount.", n));
         }
         // Enforce the same CHECK the schema enforces, so the error is friendly
-        // (the trigger would otherwise raise a raw constraint error).
+        // (the constraint would otherwise raise a raw driver error).
         let usd_ok = p.amount_native_usd_cents > 0
             && p.currency == "USD"
             && p.amount_native_lbp == 0;
@@ -1599,7 +1699,39 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
         if !(usd_ok || lbp_ok) {
             return Err(format!(
                 "Payment {}: native amounts inconsistent with currency.",
-                i + 1
+                n
+            ));
+        }
+
+        // ---- The USD equivalent is DERIVED, not declared (GZ-HI-04) ----
+        // A USD tender's USD equivalent is the amount itself. An LBP tender's
+        // is its native amount converted at the rate this sale declares as
+        // locked. That declared rate is not taken on trust either:
+        // `post_sale_tx` proves it equals the `exchange_rates` row named by
+        // `exchange_rate_id` before anything is written, so the two checks
+        // together mean every LBP equivalent persisted was computed from the
+        // stored locked rate — never from an arbitrary client figure.
+        let derived = if p.currency == "USD" {
+            p.amount_native_usd_cents
+        } else {
+            lbp_to_usd_cents(p.amount_native_lbp, payload.exchange_rate_lbp_per_usd)
+                .map_err(|e| format!("Payment {}: {}.", n, e))?
+        };
+        if p.amount_usd_cents_equivalent != derived {
+            let native = if p.currency == "USD" {
+                p.amount_native_usd_cents
+            } else {
+                p.amount_native_lbp
+            };
+            return Err(format!(
+                "Payment {}: declared USD equivalent of {} cents does not match {} {} at the \
+                 locked rate of {} LBP/USD, which is {} cents.",
+                n,
+                p.amount_usd_cents_equivalent,
+                native,
+                p.currency,
+                payload.exchange_rate_lbp_per_usd,
+                derived
             ));
         }
     }
@@ -1649,18 +1781,84 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
     }
     let change_total_usd: i64 = total_paid_usd - total;
 
+    // ---- Change is a CASH movement, and only cash can create it (GZ-HI-04) ----
+    //
+    // Change is physical money handed back out of the till. Two rules follow,
+    // and together they make an invented drawer movement impossible:
+    //
+    // 1. NON-CASH TENDER MAY NEVER EXCEED THE AMOUNT DUE. A card swiped for
+    //    more than the bill is not change owed from the drawer — it is an
+    //    over-charge on the card, and the remedy is a smaller swipe or a refund
+    //    through the card network. This application has no refund operation
+    //    (returns and credit memos are WP-06), so there is nothing honest to do
+    //    with the surplus and the sale is refused. Previously the surplus was
+    //    written to `change_given_usd_cents` on the card row, and shift close
+    //    then subtracted it from expected physical cash: a card overpayment
+    //    made the drawer look short by the overpaid amount, for ever.
+    //
+    // 2. THE ROW THAT ABSORBS THE CHANGE IS ALWAYS A CASH ROW. With rule 1 in
+    //    force the overpayment is necessarily covered by cash tendered, so such
+    //    a row always exists; the lookup below returns an error rather than
+    //    falling back to row 0, which is how a card row used to acquire change.
+    let non_cash_usd: i64 = payload
+        .payments
+        .iter()
+        .filter(|p| !is_cash_method(&p.method))
+        .map(|p| p.amount_usd_cents_equivalent)
+        .sum();
+    if non_cash_usd > total {
+        return Err(format!(
+            "Non-cash tender of {} USD-cents exceeds the {} USD-cents due. A card, transfer or \
+             wallet payment cannot be over-collected and handed back as cash from the drawer — \
+             charge the amount that is owed.",
+            non_cash_usd, total
+        ));
+    }
+
     // ---- Decide which payment row absorbs the change (if any) ----
-    // Preference: first cash_usd → first cash_lbp → first row.
+    // Preference: first cash_usd, then first cash_lbp. A till holding both
+    // hands USD back. This is the currency policy the application has always
+    // implemented — see the `pos.changeDue` / `pos.lbpChange` pair in
+    // `pages/PosRegister.tsx`, which shows the USD figure with its LBP
+    // equivalent beside it — and WP-04 preserves it unchanged.
     let change_row_index: Option<usize> = if change_total_usd > 0 {
-        payload
+        let cash_row = payload
             .payments
             .iter()
             .position(|p| p.method == "cash_usd")
-            .or_else(|| payload.payments.iter().position(|p| p.method == "cash_lbp"))
-            .or(Some(0))
+            .or_else(|| payload.payments.iter().position(|p| p.method == "cash_lbp"));
+        match cash_row {
+            Some(i) => Some(i),
+            None => {
+                return Err(format!(
+                    "Overpayment of {} USD-cents with no cash tender to hand it back from. Change \
+                     is cash out of the drawer, so a non-cash tender cannot produce it.",
+                    change_total_usd
+                ))
+            }
+        }
     } else {
         None
     };
+
+    // Defence in depth. The two rules above already imply it, but the drawer
+    // going negative on a non-cash overpayment is the exact failure this work
+    // package exists to prevent, so the invariant is stated rather than
+    // inferred: no later edit to either rule can quietly reintroduce it.
+    if change_total_usd > 0 {
+        let cash_usd: i64 = payload
+            .payments
+            .iter()
+            .filter(|p| is_cash_method(&p.method))
+            .map(|p| p.amount_usd_cents_equivalent)
+            .sum();
+        if change_total_usd > cash_usd {
+            return Err(format!(
+                "Change of {} USD-cents exceeds the {} USD-cents of cash tendered.",
+                change_total_usd, cash_usd
+            ));
+        }
+    }
 
     Ok(PreparedSale {
         cogs_method,
@@ -1746,6 +1944,81 @@ pub(crate) async fn post_sale_tx(
         tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
         return Ok(result);
     }
+
+    // ---- The locked exchange rate is the DATABASE's, not the payload's (WP-04) ----
+    //
+    // `exchange_rate_id` names the rate this sale is locked to; the FK already
+    // guarantees that row exists. What it does not guarantee is that the row
+    // belongs to this store, or that `exchange_rate_lbp_per_usd` is the rate the
+    // row actually carries. Both matter, because `prepare_sale` converted every
+    // LBP tender at the declared rate: proving the declared rate IS the stored
+    // one is what makes those USD equivalents equivalents of the locked rate
+    // rather than of a number the client chose. It also makes the LBP change
+    // below, and every historical reprint of this receipt, use one single rate.
+    //
+    // Checked before a receipt number is consumed, so a bad rate costs the
+    // sequence nothing.
+    let locked_rate: i64 = {
+        let row = sqlx::query(
+            "SELECT rate_lbp_per_usd FROM exchange_rates WHERE id = ? AND store_id = ?",
+        )
+        .bind(&payload.exchange_rate_id)
+        .bind(&payload.store_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read exchange rate {}: {e}", payload.exchange_rate_id))?
+        .ok_or_else(|| {
+            format!(
+                "Exchange rate {} is not a rate of store {}.",
+                payload.exchange_rate_id, payload.store_id
+            )
+        })?;
+        row.try_get("rate_lbp_per_usd")
+            .map_err(|e| format!("decode rate_lbp_per_usd: {e}"))?
+    };
+    if locked_rate != payload.exchange_rate_lbp_per_usd {
+        return Err(format!(
+            "Exchange rate mismatch: rate {} is {} LBP/USD, but the sale declares {} LBP/USD. \
+             Reload the register so it locks the rate that is on record.",
+            payload.exchange_rate_id, locked_rate, payload.exchange_rate_lbp_per_usd
+        ));
+    }
+
+    // ---- A NEW sale belongs to an open shift of its store (GZ-HI-03) ----
+    //
+    // MANDATORY, not merely validated-if-present. A sale with no shift is a sale
+    // outside the cash-control model entirely: the register disables Post
+    // without an active shift and always sends `activeShift.id`, drawer
+    // reconciliation only counts sales attributed to a shift, and no Greaz
+    // workflow produces an unattributed new sale. One that slipped through would
+    // take cash that no drawer count could ever reconcile against.
+    //
+    // Checked INSIDE the transaction that writes the sale, so a shift that
+    // closes between the cashier pressing Post and this statement cannot acquire
+    // a sale afterwards. See the second call, just before the commit.
+    //
+    // Deliberately AFTER the idempotency block above, and that ordering is load
+    // bearing in BOTH directions:
+    //
+    //   * a replay of a sale that already posted writes nothing, so it must keep
+    //     reconciling to its original receipt even once its shift has been
+    //     closed and counted, and even if that historical row predates this rule
+    //     and carries a NULL `shift_id` (WP-02 GP-A01). Rejecting a retry would
+    //     hand the cashier a failure for money that is already banked.
+    //   * nothing below this point is reached by a new sale that fails the
+    //     check: no receipt number, no row, no movement, no stock change.
+    //
+    // `sales.shift_id` stays nullable in the schema on purpose. The rule is
+    // about what may be WRITTEN from now on; history is not rewritten.
+    let shift_id = payload
+        .shift_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "This sale is not attached to a shift. Open a shift before taking payment.".to_string()
+        })?;
+    assert_shift_is_open(&mut tx, shift_id, &payload.store_id).await?;
 
     let receipt_number = next_receipt_number(&mut tx, &payload.store_id).await?;
     let now = chrono::Utc::now()
@@ -2097,11 +2370,9 @@ pub(crate) async fn post_sale_tx(
             if p.currency == "USD" {
                 (change_total_usd, 0i64)
             } else {
-                // LBP: convert USD-cents → LBP using the LOCKED rate.
-                // lbp = round(usd_cents * rate / 100)
-                let rate = payload.exchange_rate_lbp_per_usd;
-                let lbp = (change_total_usd * rate + 50) / 100; // round-half-up
-                (0i64, lbp)
+                // LBP: convert USD-cents to LBP at the rate proved above to be
+                // the one `exchange_rates` holds for this sale.
+                (0i64, usd_cents_to_lbp(change_total_usd, locked_rate)?)
             }
         } else {
             (0i64, 0i64)
@@ -2133,6 +2404,17 @@ pub(crate) async fn post_sale_tx(
         .map_err(|e| format!("insert sale_payment: {e}"))?;
     }
 
+    // ---- The shift is still open, now that the sale is written (GZ-HI-03) ----
+    //
+    // Belt to the brace above. SQLite already makes the interleaving this
+    // guards against impossible — a close is itself a write transaction, so it
+    // and this one cannot both commit; whichever loses gets a locking error
+    // (rollback-journal mode) or a snapshot conflict (WAL). Re-reading here
+    // means the rule "a sale never commits into a closed shift" holds on the
+    // transaction's own terms rather than on an argument about lock modes, and
+    // the cashier gets the shift error instead of a raw driver one.
+    assert_shift_is_open(&mut tx, shift_id, &payload.store_id).await?;
+
     tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
 
     Ok(PostSaleResult {
@@ -2142,4 +2424,504 @@ pub(crate) async fn post_sale_tx(
         movement_ids,
         change_total_usd_cents: change_total_usd,
     })
+}
+// ============================================================================
+// Shift lifecycle (GZ-HI-03)
+// ============================================================================
+//
+// THE SHIFT SCOPE IS THE STORE. One open shift per store, which is the scope
+// the application has always queried by — `shiftsRepo.getOpenShift(storeId)`
+// selects on `(store_id, status = 'open')`, `idx_shifts_store_status` indexes
+// exactly that pair, `shifts.device_id` has never been populated (the active
+// context hard-codes `deviceId: null`), and the cashier is recorded but never
+// scoped on, so any cashier may ring up against the store's open shift. WP-04
+// enforces that model; it does not replace it with a different one.
+//
+// WHY THESE ARE RUST COMMANDS. Opening a shift used to be a JavaScript read
+// followed by a separate INSERT, and closing one was a read, an aggregate, an
+// UPDATE and a re-read — four round-trips dispatched across
+// tauri-plugin-sql's connection pool, where neither sequence is atomic. Two
+// opens could both see "nothing open" and both insert; a close could aggregate
+// the till, have a sale land, and then write a snapshot that omits it. Both
+// operations decide money, so both belong where every other financial write in
+// this application lives: one SQLite transaction, in Rust.
+//
+// Migration 009 backs the same invariants in the engine: a partial unique index
+// `ux_shifts_one_open_per_store` and a trigger that makes a closed shift
+// immutable. The commands below produce the friendly errors; the schema is what
+// makes the rules true even for a caller that never reaches this module.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenShiftPayload {
+    pub shift_id: String,
+    pub store_id: String,
+    pub opened_by_user_id: String,
+    pub device_id: Option<String>,
+    pub opening_cash_usd_cents: i64,
+    pub opening_cash_lbp: i64,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloseShiftPayload {
+    pub shift_id: String,
+    pub store_id: String,
+    pub closed_by_user_id: String,
+    pub closing_cash_usd_cents: i64,
+    pub closing_cash_lbp: i64,
+}
+
+/// A whole `shifts` row, as the UI's `Shift` interface expects it. Both
+/// commands return the row they just wrote, read back inside their own
+/// transaction, so the caller never has to follow up with a SELECT that could
+/// observe a different state than the one the command committed.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShiftSnapshot {
+    pub id: String,
+    pub store_id: String,
+    pub device_id: Option<String>,
+    pub opened_by_user_id: String,
+    pub closed_by_user_id: Option<String>,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+    pub opening_cash_usd_cents: i64,
+    pub opening_cash_lbp: i64,
+    pub closing_cash_usd_cents: Option<i64>,
+    pub closing_cash_lbp: Option<i64>,
+    pub expected_cash_usd_cents: Option<i64>,
+    pub expected_cash_lbp: Option<i64>,
+    pub variance_usd_cents: Option<i64>,
+    pub variance_lbp: Option<i64>,
+    pub status: String,
+    pub notes: Option<String>,
+}
+
+/// Read one shift back in full, inside the caller's transaction.
+async fn load_shift_snapshot(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    shift_id: &str,
+) -> Result<ShiftSnapshot, String> {
+    let row = sqlx::query(
+        "SELECT id, store_id, device_id, opened_by_user_id, closed_by_user_id,
+                opened_at, closed_at,
+                opening_cash_usd_cents, opening_cash_lbp,
+                closing_cash_usd_cents, closing_cash_lbp,
+                expected_cash_usd_cents, expected_cash_lbp,
+                variance_usd_cents, variance_lbp,
+                status, notes
+           FROM shifts WHERE id = ?",
+    )
+    .bind(shift_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("read shift {shift_id}: {e}"))?
+    .ok_or_else(|| format!("Shift {shift_id} disappeared while it was being written."))?;
+
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+    Ok(ShiftSnapshot {
+        id: row.try_get("id").map_err(d("id"))?,
+        store_id: row.try_get("store_id").map_err(d("store_id"))?,
+        device_id: row.try_get("device_id").map_err(d("device_id"))?,
+        opened_by_user_id: row.try_get("opened_by_user_id").map_err(d("opened_by_user_id"))?,
+        closed_by_user_id: row.try_get("closed_by_user_id").map_err(d("closed_by_user_id"))?,
+        opened_at: row.try_get("opened_at").map_err(d("opened_at"))?,
+        closed_at: row.try_get("closed_at").map_err(d("closed_at"))?,
+        opening_cash_usd_cents: row
+            .try_get("opening_cash_usd_cents")
+            .map_err(d("opening_cash_usd_cents"))?,
+        opening_cash_lbp: row.try_get("opening_cash_lbp").map_err(d("opening_cash_lbp"))?,
+        closing_cash_usd_cents: row
+            .try_get("closing_cash_usd_cents")
+            .map_err(d("closing_cash_usd_cents"))?,
+        closing_cash_lbp: row.try_get("closing_cash_lbp").map_err(d("closing_cash_lbp"))?,
+        expected_cash_usd_cents: row
+            .try_get("expected_cash_usd_cents")
+            .map_err(d("expected_cash_usd_cents"))?,
+        expected_cash_lbp: row.try_get("expected_cash_lbp").map_err(d("expected_cash_lbp"))?,
+        variance_usd_cents: row.try_get("variance_usd_cents").map_err(d("variance_usd_cents"))?,
+        variance_lbp: row.try_get("variance_lbp").map_err(d("variance_lbp"))?,
+        status: row.try_get("status").map_err(d("status"))?,
+        notes: row.try_get("notes").map_err(d("notes"))?,
+    })
+}
+
+/// Refuse unless `shift_id` is a shift of `store_id` that is still open.
+///
+/// Called by `post_sale_tx` at the top of its transaction and again just before
+/// it commits, and by `close_shift_tx` before it computes anything. The error
+/// text names the state it found, because "the shift closed under you" and "that
+/// shift belongs to another store" need different fixes from the cashier.
+async fn assert_shift_is_open(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    shift_id: &str,
+    store_id: &str,
+) -> Result<(), String> {
+    let row = sqlx::query("SELECT status FROM shifts WHERE id = ? AND store_id = ?")
+        .bind(shift_id)
+        .bind(store_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("read shift {shift_id}: {e}"))?;
+
+    match row {
+        None => Err(format!("Shift {shift_id} is not a shift of store {store_id}.")),
+        Some(r) => {
+            let status: String = r.try_get("status").map_err(|e| format!("decode status: {e}"))?;
+            if status == "open" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Shift {shift_id} is {status}, not open. Open a new shift before taking \
+                     payment."
+                ))
+            }
+        }
+    }
+}
+
+/// The cash that actually moved through one shift's drawer.
+///
+/// THE definition of a drawer-affecting event, and the only one: cash tendered
+/// in, and change handed back out, on POSTED sales attributed to this shift.
+///
+/// `is_cash_method` decides what counts, which is why a card can neither inflate
+/// nor reduce the figure. The change terms are filtered by the SAME method test
+/// as the tender terms: `prepare_sale` now refuses to put change on a non-cash
+/// row at all, but a database written by an earlier release can hold exactly
+/// that, and such a row must not go on quietly making the drawer look short.
+///
+/// Events this deliberately does NOT model, because the application does not
+/// have them yet: refunds and credit memos (WP-06), supplier payments out of
+/// the till (WP-05), and petty cash / cash-in / cash-out. There is no flow that
+/// produces them, so there is nothing to include; each lands here when its own
+/// work package adds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrawerCash {
+    pub cash_usd_in_cents: i64,
+    pub cash_lbp_in: i64,
+    pub change_usd_out_cents: i64,
+    pub change_lbp_out: i64,
+}
+
+async fn drawer_cash_for_shift(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    store_id: &str,
+    shift_id: &str,
+) -> Result<DrawerCash, String> {
+    let row = sqlx::query(
+        "SELECT
+           COALESCE(SUM(CASE WHEN sp.method = 'cash_usd'
+                             THEN sp.amount_native_usd_cents ELSE 0 END), 0) AS cash_usd_in,
+           COALESCE(SUM(CASE WHEN sp.method = 'cash_lbp'
+                             THEN sp.amount_native_lbp ELSE 0 END), 0)       AS cash_lbp_in,
+           COALESCE(SUM(CASE WHEN sp.method IN ('cash_usd','cash_lbp')
+                             THEN sp.change_given_usd_cents ELSE 0 END), 0)  AS change_usd_out,
+           COALESCE(SUM(CASE WHEN sp.method IN ('cash_usd','cash_lbp')
+                             THEN sp.change_given_lbp ELSE 0 END), 0)        AS change_lbp_out
+         FROM sale_payments sp
+         JOIN sales s ON s.id = sp.sale_id
+        WHERE s.store_id = ?
+          AND s.shift_id = ?
+          AND s.status = 'posted'",
+    )
+    .bind(store_id)
+    .bind(shift_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("aggregate drawer cash for shift {shift_id}: {e}"))?;
+
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+    Ok(DrawerCash {
+        cash_usd_in_cents: row.try_get("cash_usd_in").map_err(d("cash_usd_in"))?,
+        cash_lbp_in: row.try_get("cash_lbp_in").map_err(d("cash_lbp_in"))?,
+        change_usd_out_cents: row.try_get("change_usd_out").map_err(d("change_usd_out"))?,
+        change_lbp_out: row.try_get("change_lbp_out").map_err(d("change_lbp_out"))?,
+    })
+}
+
+// ----------------------------------------------------------------------------
+// open_shift
+// ----------------------------------------------------------------------------
+
+/// One wording for "this store already has an open shift", whether the
+/// `NOT EXISTS` guard or the unique index caught it. Kept close to the frontend
+/// string it replaces so the cashier reads the same sentence as before.
+const ALREADY_OPEN_MESSAGE: &str =
+    "A shift is already open for this store. Close it before opening a new one.";
+
+/// Pure pre-DB validation for `open_shift`.
+pub(crate) fn validate_open_shift_payload(payload: &OpenShiftPayload) -> Result<(), String> {
+    if payload.shift_id.trim().is_empty() {
+        return Err("A shift needs an identifier.".into());
+    }
+    if payload.store_id.trim().is_empty() {
+        return Err("A shift needs a store.".into());
+    }
+    if payload.opened_by_user_id.trim().is_empty() {
+        return Err("A shift needs the user who opened it.".into());
+    }
+    if payload.opening_cash_usd_cents < 0 || payload.opening_cash_lbp < 0 {
+        return Err("Opening cash cannot be negative.".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn open_shift(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: OpenShiftPayload,
+) -> Result<ShiftSnapshot, String> {
+    validate_open_shift_payload(&payload)?;
+    let pool = pool(&app, &state).await?;
+    open_shift_tx(&pool, payload).await
+}
+
+/// Validate-then-open against an already-resolved pool (test seam).
+#[cfg(test)]
+pub(crate) async fn open_shift_with_pool(
+    pool: &SqlitePool,
+    payload: OpenShiftPayload,
+) -> Result<ShiftSnapshot, String> {
+    validate_open_shift_payload(&payload)?;
+    open_shift_tx(pool, payload).await
+}
+
+/// The transactional body of `open_shift`.
+///
+/// The uniqueness decision is ONE statement — an `INSERT ... SELECT ... WHERE
+/// NOT EXISTS` — rather than a SELECT the caller then branches on. That is what
+/// removes the check-then-insert window: within the statement there is no point
+/// at which another connection's shift can slip between the test and the write.
+/// `ux_shifts_one_open_per_store` from migration 009 is the backstop for the
+/// remaining case, two transactions whose statements interleave across
+/// connections; whichever loses is translated into the same message a caller
+/// gets from the `NOT EXISTS` arm, so a conflicting open always fails the same
+/// deterministic way.
+pub(crate) async fn open_shift_tx(
+    pool: &SqlitePool,
+    payload: OpenShiftPayload,
+) -> Result<ShiftSnapshot, String> {
+    let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+
+    let inserted = sqlx::query(
+        "INSERT INTO shifts (
+           id, store_id, device_id, opened_by_user_id, opened_at,
+           opening_cash_usd_cents, opening_cash_lbp, status, notes
+         )
+         SELECT ?, ?, ?, ?, ?, ?, ?, 'open', ?
+          WHERE NOT EXISTS (
+                SELECT 1 FROM shifts WHERE store_id = ? AND status = 'open'
+          )",
+    )
+    .bind(&payload.shift_id)
+    .bind(&payload.store_id)
+    .bind(&payload.device_id)
+    .bind(&payload.opened_by_user_id)
+    .bind(&now)
+    .bind(payload.opening_cash_usd_cents)
+    .bind(payload.opening_cash_lbp)
+    .bind(&payload.notes)
+    .bind(&payload.store_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        let message = e.to_string();
+        // `ux_shifts_one_open_per_store` is the engine refusing a second open
+        // shift for this store. Any other constraint failure (a duplicate shift
+        // id, an unknown store or user) is a different mistake and keeps its own
+        // diagnostic.
+        if message.contains("ux_shifts_one_open_per_store") {
+            ALREADY_OPEN_MESSAGE.to_string()
+        } else {
+            format!("open shift: {message}")
+        }
+    })?;
+
+    if inserted.rows_affected() == 0 {
+        return Err(ALREADY_OPEN_MESSAGE.to_string());
+    }
+
+    let snapshot = load_shift_snapshot(&mut tx, &payload.shift_id).await?;
+    tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+    Ok(snapshot)
+}
+
+// ----------------------------------------------------------------------------
+// close_shift
+// ----------------------------------------------------------------------------
+
+/// Pure pre-DB validation for `close_shift`.
+pub(crate) fn validate_close_shift_payload(payload: &CloseShiftPayload) -> Result<(), String> {
+    if payload.shift_id.trim().is_empty() {
+        return Err("A shift needs an identifier.".into());
+    }
+    if payload.store_id.trim().is_empty() {
+        return Err("A shift needs a store.".into());
+    }
+    if payload.closed_by_user_id.trim().is_empty() {
+        return Err("A shift needs the user who closed it.".into());
+    }
+    if payload.closing_cash_usd_cents < 0 || payload.closing_cash_lbp < 0 {
+        return Err("Counted cash cannot be negative.".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn close_shift(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: CloseShiftPayload,
+) -> Result<ShiftSnapshot, String> {
+    validate_close_shift_payload(&payload)?;
+    let pool = pool(&app, &state).await?;
+    close_shift_tx(&pool, payload).await
+}
+
+/// Validate-then-close against an already-resolved pool (test seam).
+#[cfg(test)]
+pub(crate) async fn close_shift_with_pool(
+    pool: &SqlitePool,
+    payload: CloseShiftPayload,
+) -> Result<ShiftSnapshot, String> {
+    validate_close_shift_payload(&payload)?;
+    close_shift_tx(pool, payload).await
+}
+
+/// The transactional body of `close_shift`.
+///
+/// Everything happens in one transaction: the status check, the opening float,
+/// the drawer aggregate over posted sales, the UPDATE, and the read-back that is
+/// returned. So the financial snapshot stored on the row IS the state that was
+/// marked closed — a sale cannot land between the aggregate and the write, which
+/// is exactly what the previous four-round-trip JavaScript close allowed.
+///
+/// Repeated close is REJECTED, which is the contract the previous implementation
+/// had (its UPDATE carried `AND status = 'open'`, and the repo then threw "No
+/// open shift found — it may already be closed"). A re-close cannot silently
+/// succeed with different counted cash and overwrite a reconciliation someone
+/// signed off, and migration 009's `trg_shifts_no_update_after_close` makes that
+/// true for any caller, not just this one.
+pub(crate) async fn close_shift_tx(
+    pool: &SqlitePool,
+    payload: CloseShiftPayload,
+) -> Result<ShiftSnapshot, String> {
+    let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    let row = sqlx::query(
+        "SELECT status, closed_at, opening_cash_usd_cents, opening_cash_lbp
+           FROM shifts WHERE id = ? AND store_id = ?",
+    )
+    .bind(&payload.shift_id)
+    .bind(&payload.store_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("read shift {}: {e}", payload.shift_id))?
+    .ok_or_else(|| {
+        format!(
+            "No open shift found — shift {} is not a shift of store {}.",
+            payload.shift_id, payload.store_id
+        )
+    })?;
+
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+    let status: String = row.try_get("status").map_err(d("status"))?;
+    if status != "open" {
+        let closed_at: Option<String> = row.try_get("closed_at").map_err(d("closed_at"))?;
+        return Err(match closed_at {
+            Some(at) => format!(
+                "No open shift found — shift {} was already closed at {}. Its counted cash and \
+                 variance are final.",
+                payload.shift_id, at
+            ),
+            None => format!("No open shift found — shift {} is {}.", payload.shift_id, status),
+        });
+    }
+
+    let opening_usd: i64 = row
+        .try_get("opening_cash_usd_cents")
+        .map_err(d("opening_cash_usd_cents"))?;
+    let opening_lbp: i64 = row.try_get("opening_cash_lbp").map_err(d("opening_cash_lbp"))?;
+
+    let drawer = drawer_cash_for_shift(&mut tx, &payload.store_id, &payload.shift_id).await?;
+
+    // expected = opening float + cash in - change out, per currency. Card,
+    // transfer and wallet tenders appear in neither term: they never reach the
+    // till. Checked arithmetic because this is money and the alternative is a
+    // silent wrap.
+    let expected_usd = opening_usd
+        .checked_add(drawer.cash_usd_in_cents)
+        .and_then(|v| v.checked_sub(drawer.change_usd_out_cents))
+        .ok_or_else(|| "Expected USD drawer cash overflows.".to_string())?;
+    let expected_lbp = opening_lbp
+        .checked_add(drawer.cash_lbp_in)
+        .and_then(|v| v.checked_sub(drawer.change_lbp_out))
+        .ok_or_else(|| "Expected LBP drawer cash overflows.".to_string())?;
+
+    // variance = counted - expected. Negative is SHORT, positive is OVER, in
+    // both currencies, matching `shifts.variance_*`'s own documentation and the
+    // sign the UI renders.
+    let variance_usd = payload
+        .closing_cash_usd_cents
+        .checked_sub(expected_usd)
+        .ok_or_else(|| "USD cash variance overflows.".to_string())?;
+    let variance_lbp = payload
+        .closing_cash_lbp
+        .checked_sub(expected_lbp)
+        .ok_or_else(|| "LBP cash variance overflows.".to_string())?;
+
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+
+    let updated = sqlx::query(
+        "UPDATE shifts SET
+           status                  = 'closed',
+           closed_at               = ?,
+           closed_by_user_id       = ?,
+           closing_cash_usd_cents  = ?,
+           closing_cash_lbp        = ?,
+           expected_cash_usd_cents = ?,
+           expected_cash_lbp       = ?,
+           variance_usd_cents      = ?,
+           variance_lbp            = ?
+         WHERE id = ? AND store_id = ? AND status = 'open'",
+    )
+    .bind(&now)
+    .bind(&payload.closed_by_user_id)
+    .bind(payload.closing_cash_usd_cents)
+    .bind(payload.closing_cash_lbp)
+    .bind(expected_usd)
+    .bind(expected_lbp)
+    .bind(variance_usd)
+    .bind(variance_lbp)
+    .bind(&payload.shift_id)
+    .bind(&payload.store_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("close shift {}: {e}", payload.shift_id))?;
+
+    // `AND status = 'open'` is still on the UPDATE, so this cannot be reached
+    // while the transaction holds a consistent read — but if it ever were, the
+    // transaction is rolled back whole and the shift is left exactly as it was.
+    // A failed close leaves no partial closed state.
+    if updated.rows_affected() != 1 {
+        return Err(format!(
+            "No open shift found — shift {} was closed by another operation while this close was \
+             in flight.",
+            payload.shift_id
+        ));
+    }
+
+    let snapshot = load_shift_snapshot(&mut tx, &payload.shift_id).await?;
+    tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+    Ok(snapshot)
 }

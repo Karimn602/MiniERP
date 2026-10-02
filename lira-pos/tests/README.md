@@ -1,4 +1,4 @@
-# Greaz POS test harness (WP-01, extended by WP-02 and WP-03)
+# Greaz POS test harness (WP-01, extended by WP-02, WP-03 and WP-04)
 
 A financial regression suite. Its job is to make the later hardening work
 packages safe: if a change breaks how money, stock, or VAT are recorded, one of
@@ -28,8 +28,8 @@ so cargo cannot build on a tree that has never been built.
 |---|---|---|---|
 | **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, the fixed-point cost scale (`cost.test.ts`), sale/purchase line math, discount allocation; the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
 | **B. Rust units** | `src-tauri/src/tests/pure.rs`, `cost.rs` | The four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation; the whole `crate::cost` abstraction — scale, rounding, weighted average, overflow | Authoritative for pre-DB posting logic |
-| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`) | **Authoritative for the database and all posting behaviour** |
-| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation | Authoritative for read-model queries only |
+| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, `open_shift`, `close_shift`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`), shift lifecycle and concurrency (`shifts.rs`), tender/change/rate authority (`tenders.rs`) | **Authoritative for the database and all posting behaviour** |
+| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation; the `invoke` wire format of the shift commands | Authoritative for read-model queries only |
 
 ### A note on what layer C2 is *not*
 
@@ -140,9 +140,46 @@ only makes the tests deterministic, it does not change the SQL.)
 - **Purchases** — header reconciles to lines; weighted-average cost blends
   correctly; credit purchases raise the payable by exactly the gross total while
   opening stock raises nothing.
+- **Shift lifecycle** — at most one OPEN shift per store, the scope the
+  application has always queried by. Enforced transactionally by `open_shift`
+  and in the engine by the partial unique index
+  `ux_shifts_one_open_per_store`, so two concurrent opens resolve into exactly
+  one open shift. `close_shift` computes the reconciliation and writes it in one
+  transaction, so the stored snapshot IS the state that was marked closed. A
+  failed close writes no part of a reconciliation, and a closed shift is
+  immutable (`trg_shifts_no_update_after_close`), so a second Close cannot
+  overwrite a count somebody signed off.
+- **Sale ↔ shift** — a NEW sale must name an open shift of its own store.
+  `post_sale` verifies inside its own transaction that the shift is given, that
+  it exists, that it belongs to the sale's store and that it is still open —
+  at the top and again immediately before the commit. A sale never commits
+  into a closed shift or into no shift at all, and a close never omits a sale
+  that committed into the shift it closed. Replay is exempt by design and the
+  ordering is what makes that true: a replay writes nothing, so it still
+  reconciles to its original receipt after the shift has been counted, and even
+  when the historical row carries a NULL `shift_id` from before the rule
+  existed. `sales.shift_id` stays nullable; the rule governs writes, not
+  history.
+- **Tender authority** — a payment row cannot contradict itself. `method`
+  decides the currency where its name names one, the native amount must be the
+  one that currency is denominated in, and
+  `amount_usd_cents_equivalent` is DERIVED: a USD tender's equivalent is itself,
+  an LBP tender's is its lira at the rate locked on the sale. That locked rate is
+  itself verified against the `exchange_rates` row named by `exchange_rate_id`,
+  scoped by store, before anything is written — so every LBP equivalent in the
+  database was computed from one stored rate and no client figure.
+- **Change is cash** — non-cash tender may never exceed the amount due, and the
+  row that absorbs an overpayment is always a cash row (USD cash preferred, then
+  LBP cash, expressed in that row's own currency at the locked rate). A card
+  overpayment is refused outright rather than written as drawer change. Expected
+  drawer cash is `opening float + cash in − change out` per currency, counting
+  only `cash_usd` / `cash_lbp` rows in BOTH terms — so a card can neither inflate
+  nor reduce physical cash, including on rows an earlier release wrote. Variance
+  is `counted − expected`: negative short, positive over.
 - **Immutability** — posted sales, sale items, payments, purchases, purchase
   items, inventory movements and supplier-ledger entries reject UPDATE and
   DELETE; the one carve-out (posted → voided) still refuses to rewrite money.
+  Since WP-04, closed shifts too.
 - **Migrations** — every migration applies to a virgin database, re-running is a
   no-op, and two independent databases end up with identical schema and
   checksums. Since WP-03 the UPGRADE path is covered too: migration 008 applies
@@ -150,7 +187,12 @@ only makes the tests deterministic, it does not change the SQL.)
   (`cents × 1,000,000`, a change of units and not a recomputation), restores the
   three append-only triggers its backfill has to lift, is idempotent through the
   real runner, and leaves an upgraded database on byte-identical schema to a
-  fresh install.
+  fresh install. Migration 009 is covered the same way: it applies to a
+  populated v8 database, leaves a single open shift and each store's own open
+  shift alone, deterministically closes the older of several open shifts for one
+  store without inventing a cash count for a drawer nobody counted, keeps closed
+  and voided shifts unconstrained, preserves migration 008's restored triggers,
+  and converges on byte-identical schema with a fresh install.
 
 ## Known-defect register
 
@@ -172,6 +214,121 @@ Cross-package note for WP-08: GP-A04's root cause is the post-discount
 persistence convention. WP-02 did **not** change it — `post_sale` still stores
 post-discount line values and the header discount alongside them; it only
 started *verifying* that the two agree. GP-A04's fixtures are unaffected.
+
+### Fixed by WP-04 — now enforced, must not regress
+
+| ID | Where the coverage lives | What is now enforced |
+|---|---|---|
+| **GZ-HI-03** | `shifts.rs` (28 tests), `migrations.rs` › "Migration 009" (6 tests), `pure.rs` › the two shift-validator tests, `shifts.test.ts` › "the shift lifecycle commands" (3 tests) | Shift open and close are transactional Rust commands. One open shift per store, enforced by a single `INSERT … WHERE NOT EXISTS` statement and by `ux_shifts_one_open_per_store`; the close snapshot is computed and written in the same transaction that marks the shift closed; a NEW sale must name an open shift of its store, verified inside the posting transaction; a closed shift is immutable. |
+| **GZ-HI-04** | `tenders.rs` (16 tests), `pure.rs` › "Tender authority" and "Change is a cash movement" (6 tests), `shifts.test.ts` › `getDrawerExpectation` (6 tests), `shifts.rs` › the drawer tests | A payment row cannot contradict itself; the USD equivalent is derived from the native amount and the locked rate; only cash can generate change; expected drawer cash counts cash rows only, in both the money-in and change-out terms. |
+
+#### The fixture shift
+
+`builders::sale_payload` attributes its sale to `test_support::SHIFT_ID`, and
+every fixture that posts a sale calls `seed_open_shift`. A shift is not seed
+data — migration 001 seeds the store, the user, the VAT rates and the units of
+measure, but a cashier opens a shift — so leaving the call out is how a test
+says *this store has no open shift*, which is now a posting error rather than a
+quiet success. `sales.rs::close_the_fixture_shift` retires it for the two tests
+that name shifts of their own, because a store may hold only one open shift.
+
+`builders::seed_posted_sale_without_shift` writes a posted NULL-shift sale
+directly. It has to: an unattributed new sale is exactly what `post_sale` now
+refuses, so the historical row the replay path must keep honouring cannot be
+produced through the command.
+
+#### The shift scope, and why the constraint is `store_id`
+
+WP-04 enforces the model the application already had rather than choosing a new
+one. Four things in the code say the scope is the store and nothing finer:
+
+- `shiftsRepo.getOpenShift(storeId)` selects on `(store_id, status = 'open')`
+- migration 001 indexes exactly that pair (`idx_shifts_store_status`)
+- `shifts.device_id` has never been populated — `state/activeContext.ts`
+  hard-codes `deviceId: null` and no `devices` row is ever created
+- the cashier is recorded (`opened_by_user_id`) but never scoped on: any cashier
+  rings up against the store's open shift
+
+So `ux_shifts_one_open_per_store` is a partial unique index on `store_id` where
+`status = 'open'`. A per-device or per-cashier scope would have been a different
+operating model, not a fix to this one.
+
+`migration_009_leaves_each_store_its_own_open_shift` pins the other half of that
+decision: two stores trading at once is correct, not drift.
+
+#### Three tests that document deliberate boundaries
+
+- `a_retry_still_reconciles_after_its_shift_has_been_closed` — the shift check
+  sits *after* the idempotency check on purpose. A replay writes nothing, so a
+  cashier retrying a sale that is already banked gets the original receipt back
+  rather than an error about a drawer that has since been counted. Moving that
+  check earlier would break WP-02's GP-A01 guarantee.
+- `a_historical_null_shift_sale_can_still_be_replayed` and
+  `a_historical_null_shift_identity_still_fails_canonical_comparison` — the two
+  halves of the replay exemption. The first cut of WP-04 validated `shift_id`
+  only when present, so a payload that simply omitted it posted; the release
+  gate caught it. A NEW sale now requires an open shift of its store, but a
+  retry of a sale that already posted must still return its original receipt —
+  including a row written before the rule existed, whose `shift_id` is NULL.
+  The exemption is exactly that: a replay writes nothing. It is not a hole in
+  the canonical comparison, which is why the second test reuses a NULL-shift
+  identity for different content, a different tender, and a newly attached
+  shift, and requires a conflict for each.
+- `a_non_cash_tender_can_never_be_over_collected`, last case — cash handed over,
+  then the card swiped for the *whole* bill and the cash given straight back
+  ("put it all on the card") is ALLOWED. The card is charged exactly what is
+  owed, both cash movements really happened, and the drawer nets to zero. That is
+  why the rule is "non-cash may not exceed the amount due" rather than "the
+  tender must equal the amount due".
+
+#### How the concurrency tests work
+
+`shifts.rs` has the suite's first real races. They use
+`TempDb::rival_pool()` — a second connection pool against the same database
+file, configured exactly as `posting::pool` configures production (same
+`sqlite://…?mode=rwc` URL, same `PRAGMA foreign_keys = ON`, sqlx's default
+five-second busy timeout). `TempDb`'s own pool holds one connection, which makes
+posting tests deterministic but serialises everything before SQLite sees it, so
+two commands on it could never contend.
+
+Nothing in the rival pool is made more forgiving than the real application, so a
+lock error a test sees is one a cashier could see. Each race therefore asserts
+the *set* of acceptable serialisations rather than a single winner:
+
+- `two_simultaneous_opens_cannot_both_produce_an_open_shift` — exactly one
+  succeeds, the store ends with exactly one open shift, and the loser leaves no
+  row at all.
+- `two_simultaneous_closes_reconcile_the_shift_exactly_once` — exactly one
+  succeeds; the persisted count, expected figure and variance are the winner's
+  and agree with each other.
+- `a_sale_racing_a_close_resolves_into_one_of_two_valid_outcomes` — either the
+  sale committed and the close that followed counted it, or the shift closed and
+  the sale was refused with no row behind it. A lock error on either side is a
+  legitimate loser. Whatever happens, the shift is asserted to be *wholly* open
+  or *wholly* closed — never half-reconciled.
+
+This narrows, but does not close, the "no concurrency tests" gap recorded under
+**Remaining gaps**: these three cover the shift boundary. Concurrent posts of the
+same checkout identity are still unproven, and general busy/lock retry behaviour
+is WP-07.
+
+#### What WP-04 deliberately left alone
+
+- **GP-A04** (report/shift discount double subtraction) is untouched and its two
+  tests stay skipped. It belongs to WP-08.
+- `shiftsRepo.getSalesSummary` and `shiftSummaryRepo` keep their current
+  semantics, including that defect.
+- Refunds and credit memos (WP-06), supplier payments out of the till (WP-05),
+  and petty cash / cash-in / cash-out are *not* in the expected-drawer
+  calculation, because no flow produces them yet.
+  `posting.rs::drawer_cash_for_shift` names each one, so the package that adds a
+  flow knows where its drawer effect belongs.
+- **Shift DELETE is not guarded.** Migration 009's
+  `trg_shifts_no_update_after_close` blocks UPDATE on a closed shift but not
+  DELETE. Not a WP-04 issue: there is no production delete path, and
+  `sales.shift_id REFERENCES shifts(id) ON DELETE RESTRICT` already protects
+  any shift that has sales. A shift with no sales could still be deleted by a
+  direct statement. Recorded here for WP-07 / database hardening.
 
 ### Fixed by WP-03 — now enforced, must not regress
 
@@ -447,8 +604,11 @@ Not covered by this harness, and worth knowing before relying on it:
   wired wrongly; only the disabled-button affordance is unverified.
 - **No end-to-end Tauri test.** Nothing exercises the real IPC boundary, the
   plugin's connection pool, or `App.tsx`'s three-stage boot.
-- **No concurrency tests.** The suite uses `max_connections(1)`; it cannot
-  detect races between simultaneous posts. For checkout idempotency this leaves
+- **Concurrency is covered only at the shift boundary.** Most of the suite uses
+  `max_connections(1)`. Since WP-04, `shifts.rs` opens a second real pool via
+  `TempDb::rival_pool()` and races two opens, two closes, and a sale against a
+  close — see *Fixed by WP-04* above. Everything else still cannot detect races
+  between simultaneous posts. For checkout idempotency this leaves
   one case unproven: two *genuinely concurrent* posts of the same identity,
   where both transactions read "no such sale" before either inserts. Both
   cannot commit — the `sales.id` primary key makes a duplicate sale impossible,

@@ -48,6 +48,7 @@ const SUPPLIER: &str = "00000000-0000-0000-0000-0000000000s1";
 async fn store_with_coffee(qty: i64) -> TempDb {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {
@@ -155,6 +156,7 @@ async fn gp_a02_the_stock_guard_must_validate_the_true_base_quantity() {
 async fn gp_a03_fractional_base_unit_costs_must_survive_conversion() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_supplier(&db, SUPPLIER, "Beirut Wholesale").await;
     // Flour: base UoM is the gram, bought by the kilo. `post_purchase` resolves
     // the purchase UoM against `product_uoms`, so the kilo has to be a real

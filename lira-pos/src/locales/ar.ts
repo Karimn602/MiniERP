@@ -126,6 +126,8 @@ const ar: TranslationDict = {
     errCardUsdInvalid: "البطاقة بالدولار: مبلغ غير صحيح.",
     errUnderpaid:
       "المبلغ المدفوع غير كافٍ: المدفوع {{tendered}}، الإجمالي {{total}}.",
+    errCardOverpaid:
+      "مبلغ البطاقة {{card}} أكبر من المستحق {{total}}. اخسم من البطاقة المبلغ المستحق فقط — لا يمكن إعادة الفرق إلا نقداً.",
   },
   shift: {
     title: "ملخص الوردية",

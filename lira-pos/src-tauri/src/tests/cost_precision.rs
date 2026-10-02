@@ -30,6 +30,7 @@ const FLOUR_PER_GRAM: i64 = 250_000;
 async fn store_with_flour() -> TempDb {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_supplier(&db, SUPPLIER, "Beirut Wholesale").await;
     seed_product(
         &db,
@@ -416,6 +417,7 @@ async fn last_purchase_still_falls_back_to_the_weighted_average_at_full_precisio
 async fn a_whole_cent_product_produces_the_same_figures_as_before() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_supplier(&db, SUPPLIER, "Beirut Wholesale").await;
     seed_product(&db, &ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee")).await;
     seed_product_uom(&db, P_COFFEE, "box", 12, 1).await;
@@ -608,6 +610,7 @@ async fn an_adjustment_is_valued_at_the_current_fractional_average() {
 async fn a_service_line_still_carries_no_cost_at_all() {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
     seed_product(
         &db,
         &ProductSpec {

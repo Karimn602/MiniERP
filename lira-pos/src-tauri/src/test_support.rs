@@ -178,6 +178,32 @@ impl TempDb {
         &self.path
     }
 
+    /// A SECOND, independent connection pool against the same database file.
+    ///
+    /// For the WP-04 concurrency tests. `TempDb`'s own pool holds a single
+    /// connection, which is the most deterministic shape for a posting test but
+    /// serialises everything before SQLite ever sees it — so two "simultaneous"
+    /// commands on it could never actually contend. A separate pool contends for
+    /// real, through the engine.
+    ///
+    /// Configured exactly as `posting::pool` configures production: the same
+    /// `sqlite://<path>?mode=rwc` URL through `SqlitePool::connect`, and the same
+    /// `PRAGMA foreign_keys = ON`. Nothing is made more forgiving than the real
+    /// application, so a lock error a test sees here is one a cashier could see.
+    pub async fn rival_pool(&self) -> SqlitePool {
+        assert_not_production_db(&self.path);
+        let url = format!("sqlite://{}?mode=rwc", self.path.display());
+        let pool = SqlitePool::connect(&url)
+            .await
+            .unwrap_or_else(|e| panic!("open rival pool on {}: {e}", self.path.display()));
+        sqlx::query("PRAGMA foreign_keys = ON;")
+            .execute(&pool)
+            .await
+            .expect("enable foreign keys on the rival pool");
+        pool
+    }
+
+
     /// Re-run the migrator against this database (idempotency checks).
     pub async fn migrate_again(&self) -> Result<(), sqlx::migrate::MigrateError> {
         app_migrator().run(self.pool()).await
@@ -263,6 +289,16 @@ pub const VAT_EXEMPT_BPS: i64 = 0;
 
 pub const RATE_ID: &str = "00000000-0000-0000-0000-00000000e001";
 pub const RATE_LBP_PER_USD: i64 = 89_500;
+
+/// The store's open shift — the one `builders::sale_payload` attributes a sale
+/// to by default.
+///
+/// Not seed data: migration 001 seeds the store, the user, the VAT rates and the
+/// units of measure, but a shift is something a cashier opens. Since WP-04 a NEW
+/// sale must name an open shift of its store, so every fixture that posts a sale
+/// calls `seed_open_shift`. Leaving it out is how a test says "this store has no
+/// open shift", which is now a posting error rather than a quiet success.
+pub const SHIFT_ID: &str = "00000000-0000-0000-0000-00000000f001";
 
 // ============================================================================
 // Fixture builders
@@ -489,21 +525,69 @@ pub async fn seed_supplier(db: &TempDb, id: &str, name: &str) {
         .expect("seed supplier");
 }
 
+/// The default open shift (`SHIFT_ID`) with an empty float — the precondition
+/// for posting a sale through `builders::sale_payload`.
+pub async fn seed_open_shift(db: &TempDb) {
+    seed_shift(db, SHIFT_ID, 0, 0).await;
+}
+
+/// An OPEN shift for the fixture store.
+///
+/// Since migration 009 a store may hold only one of these at a time, which is
+/// the application's actual model — use `seed_closed_shift` for the second shift
+/// a test needs to exist alongside it.
 pub async fn seed_shift(db: &TempDb, id: &str, opening_usd_cents: i64, opening_lbp: i64) {
+    seed_shift_with_status(db, id, opening_usd_cents, opening_lbp, "open").await;
+}
+
+/// A shift that has already been closed and counted. `closing`/`expected`/
+/// `variance` are left NULL: a test that cares about those figures should post
+/// sales and run `close_shift`, which is what computes them.
+pub async fn seed_closed_shift(db: &TempDb, id: &str, opening_usd_cents: i64, opening_lbp: i64) {
+    seed_shift_with_status(db, id, opening_usd_cents, opening_lbp, "closed").await;
+}
+
+async fn seed_shift_with_status(
+    db: &TempDb,
+    id: &str,
+    opening_usd_cents: i64,
+    opening_lbp: i64,
+    status: &str,
+) {
     sqlx::query(
         "INSERT INTO shifts (
-           id, store_id, opened_by_user_id, opened_at,
+           id, store_id, opened_by_user_id, opened_at, closed_at, closed_by_user_id,
            opening_cash_usd_cents, opening_cash_lbp, status
-         ) VALUES (?, ?, ?, '2026-01-01T08:00:00.000Z', ?, ?, 'open')",
+         ) VALUES (
+           ?, ?, ?, '2026-01-01T08:00:00.000Z',
+           CASE WHEN ? = 'closed' THEN '2026-01-01T16:00:00.000Z' END,
+           CASE WHEN ? = 'closed' THEN ? END,
+           ?, ?, ?
+         )",
     )
     .bind(id)
     .bind(STORE_ID)
     .bind(USER_ID)
+    .bind(status)
+    .bind(status)
+    .bind(USER_ID)
     .bind(opening_usd_cents)
     .bind(opening_lbp)
+    .bind(status)
     .execute(db.pool())
     .await
-    .expect("seed shift");
+    .unwrap_or_else(|e| panic!("seed {status} shift {id}: {e}"));
+}
+
+/// The `status` of one shift.
+pub async fn shift_status(db: &TempDb, shift_id: &str) -> String {
+    sqlx::query("SELECT status FROM shifts WHERE id = ?")
+        .bind(shift_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("read status of shift {shift_id}: {e}"))
+        .try_get::<String, _>(0)
+        .expect("decode String")
 }
 
 /// Sum of every inventory movement for a product — the reconciliation target

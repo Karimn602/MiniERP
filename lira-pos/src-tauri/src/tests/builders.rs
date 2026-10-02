@@ -6,10 +6,13 @@
 // against explicit expected numbers; the builders only remove boilerplate.
 
 use crate::posting::{
-    PostAdjustmentLine, PostAdjustmentPayload, PostPurchaseLine, PostPurchasePayload,
-    PostSaleLine, PostSalePayload, PostSalePayment, PostSupplierPaymentPayload,
+    lbp_to_usd_cents, PostAdjustmentLine, PostAdjustmentPayload, PostPurchaseLine,
+    PostPurchasePayload, PostSaleLine, PostSalePayload, PostSalePayment,
+    PostSupplierPaymentPayload,
 };
-use crate::test_support::{RATE_ID, RATE_LBP_PER_USD, STORE_ID, USER_ID, VAT_STD_BPS, VAT_STD_ID};
+use crate::test_support::{
+    TempDb, RATE_ID, RATE_LBP_PER_USD, SHIFT_ID, STORE_ID, USER_ID, VAT_STD_BPS, VAT_STD_ID,
+};
 
 pub fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -182,7 +185,10 @@ pub fn card_usd(cents: i64) -> PostSalePayment {
 }
 
 /// An LBP cash tender. The USD-cent equivalent uses the locked rate, exactly
-/// like `lib/money.ts::lbpToUsdCents`.
+/// like `lib/money.ts::lbpToUsdCents` and `posting::lbp_to_usd_cents` — in
+/// integer arithmetic, because since WP-04 the backend derives this value and
+/// refuses a payload that declares a different one. A fixture that rounded its
+/// own way would look like a corrupt tender rather than a legitimate sale.
 pub fn cash_lbp(lbp: i64) -> PostSalePayment {
     PostSalePayment {
         payment_id: uuid(),
@@ -190,7 +196,22 @@ pub fn cash_lbp(lbp: i64) -> PostSalePayment {
         currency: "LBP".to_string(),
         amount_native_usd_cents: 0,
         amount_native_lbp: lbp,
-        amount_usd_cents_equivalent: ((lbp * 100) as f64 / RATE_LBP_PER_USD as f64).round() as i64,
+        amount_usd_cents_equivalent: lbp_to_usd_cents(lbp, RATE_LBP_PER_USD)
+            .expect("fixture LBP tender must convert"),
+        reference: None,
+    }
+}
+
+/// A card tender in lira: non-cash, so it can never carry change.
+pub fn card_lbp(lbp: i64) -> PostSalePayment {
+    PostSalePayment {
+        payment_id: uuid(),
+        method: "card_lbp".to_string(),
+        currency: "LBP".to_string(),
+        amount_native_usd_cents: 0,
+        amount_native_lbp: lbp,
+        amount_usd_cents_equivalent: lbp_to_usd_cents(lbp, RATE_LBP_PER_USD)
+            .expect("fixture LBP tender must convert"),
         reference: None,
     }
 }
@@ -201,7 +222,11 @@ pub fn sale_payload(lines: Vec<PostSaleLine>, payments: Vec<PostSalePayment>) ->
         store_id: STORE_ID.to_string(),
         cashier_user_id: Some(USER_ID.to_string()),
         device_id: None,
-        shift_id: None,
+        // A new sale must belong to an open shift of its store (WP-04), so the
+        // default payload names the fixture shift. The test's database needs
+        // `seed_open_shift`; a test that wants the "no shift" case clears this
+        // field explicitly.
+        shift_id: Some(SHIFT_ID.to_string()),
         exchange_rate_id: RATE_ID.to_string(),
         exchange_rate_lbp_per_usd: RATE_LBP_PER_USD,
         notes: None,
@@ -289,6 +314,167 @@ pub fn clone_sale_payment(p: &PostSalePayment) -> PostSalePayment {
         amount_usd_cents_equivalent: p.amount_usd_cents_equivalent,
         reference: p.reference.clone(),
     }
+}
+
+
+/// Write a POSTED sale directly, with a NULL `shift_id`, the way a release
+/// BEFORE WP-04 wrote one.
+///
+/// This cannot go through `post_sale_with_pool`: an unattributed new sale is
+/// exactly what that command now refuses, so the only way to produce the
+/// historical row the replay path has to keep honouring is to insert it. The
+/// columns written are the ones the canonical replay comparison reads, with the
+/// same values the payload carries, so a faithful replay of `payload` compares
+/// equal and anything materially different does not.
+///
+/// Stock is decremented and a movement written, as the original post would
+/// have, so "the replay did not decrement again" is an assertion with teeth.
+/// COGS is left at zero: WP-02 deliberately excludes it from replay equality
+/// (it is re-read from product cost at post time), so it is not part of what
+/// this fixture has to reproduce.
+pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePayload) {
+    let subtotal: i64 = payload.lines.iter().map(|l| l.line_subtotal_excl_vat_cents).sum();
+    let vat_total: i64 = payload.lines.iter().map(|l| l.line_vat_cents).sum();
+    let total: i64 = payload.lines.iter().map(|l| l.line_total_incl_vat_cents).sum();
+    let posted_at = "2026-01-01T09:00:00.000Z";
+
+    sqlx::query(
+        "INSERT INTO sales (
+           id, store_id, shift_id, device_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, exchange_rate_id,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+           discount_cents, cogs_total_cents, cogs_method,
+           sale_type, status, posted_at, notes
+         ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 'normal', 'posted', ?, ?)",
+    )
+    .bind(&payload.sale_id)
+    .bind(&payload.store_id)
+    .bind(&payload.device_id)
+    .bind(&payload.cashier_user_id)
+    .bind(payload.exchange_rate_lbp_per_usd)
+    .bind(&payload.exchange_rate_id)
+    .bind(subtotal)
+    .bind(vat_total)
+    .bind(total)
+    .bind(payload.discount_cents)
+    .bind(&payload.cogs_method)
+    .bind(posted_at)
+    .bind(&payload.notes)
+    .execute(db.pool())
+    .await
+    .expect("seed historical sale header");
+
+    for line in &payload.lines {
+        sqlx::query(
+            "INSERT INTO sale_items (
+               id, sale_id, store_id, product_id,
+               product_name_snapshot, product_sku_snapshot,
+               vat_rate_id_snapshot, vat_rate_bps_snapshot,
+               quantity, unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+               line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+               line_discount_cents,
+               unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
+               unit_cogs_excl_vat_microcents,
+               quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)",
+        )
+        .bind(&line.sale_item_id)
+        .bind(&payload.sale_id)
+        .bind(&payload.store_id)
+        .bind(&line.product_id)
+        .bind(&line.product_name_snapshot)
+        .bind(&line.product_sku_snapshot)
+        .bind(&line.vat_rate_id_snapshot)
+        .bind(line.vat_rate_bps_snapshot)
+        .bind(line.quantity_base)
+        .bind(line.unit_price_excl_vat_cents)
+        .bind(line.unit_price_incl_vat_cents)
+        .bind(line.line_subtotal_excl_vat_cents)
+        .bind(line.line_vat_cents)
+        .bind(line.line_total_incl_vat_cents)
+        .bind(line.line_discount_cents)
+        .bind(line.quantity_in_uom)
+        .bind(&line.uom_code_snapshot)
+        .bind(line.factor_num_snapshot)
+        .bind(line.factor_den_snapshot)
+        .execute(db.pool())
+        .await
+        .expect("seed historical sale item");
+
+        sqlx::query(
+            "INSERT INTO inventory_movements (
+               id, store_id, product_id, movement_type, quantity_delta,
+               unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+               unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents,
+               related_sale_id, related_sale_item_id,
+               created_by_user_id, posted_at
+             ) VALUES (?, ?, ?, 'sale', ?, 0, 0, 0, 0, ?, ?, ?, ?)",
+        )
+        .bind(uuid())
+        .bind(&payload.store_id)
+        .bind(&line.product_id)
+        .bind(-line.quantity_base)
+        .bind(&payload.sale_id)
+        .bind(&line.sale_item_id)
+        .bind(&payload.cashier_user_id)
+        .bind(posted_at)
+        .execute(db.pool())
+        .await
+        .expect("seed historical inventory movement");
+
+        sqlx::query(
+            "UPDATE products SET quantity_on_hand = quantity_on_hand - ?
+              WHERE id = ? AND store_id = ?",
+        )
+        .bind(line.quantity_base)
+        .bind(&line.product_id)
+        .bind(&payload.store_id)
+        .execute(db.pool())
+        .await
+        .expect("decrement stock for the historical sale");
+    }
+
+    // Change on the first cash row, exactly where the old command put it.
+    let tendered: i64 = payload.payments.iter().map(|p| p.amount_usd_cents_equivalent).sum();
+    let change_row = payload
+        .payments
+        .iter()
+        .position(|p| p.method == "cash_usd")
+        .or_else(|| payload.payments.iter().position(|p| p.method == "cash_lbp"));
+
+    for (i, p) in payload.payments.iter().enumerate() {
+        let change_usd = if Some(i) == change_row && p.currency == "USD" {
+            tendered - total
+        } else {
+            0
+        };
+        sqlx::query(
+            "INSERT INTO sale_payments (
+               id, sale_id, store_id, method, currency,
+               amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent,
+               change_given_usd_cents, change_given_lbp, reference
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        )
+        .bind(&p.payment_id)
+        .bind(&payload.sale_id)
+        .bind(&payload.store_id)
+        .bind(&p.method)
+        .bind(&p.currency)
+        .bind(p.amount_native_usd_cents)
+        .bind(p.amount_native_lbp)
+        .bind(p.amount_usd_cents_equivalent)
+        .bind(change_usd)
+        .bind(&p.reference)
+        .execute(db.pool())
+        .await
+        .expect("seed historical sale payment");
+    }
+
+    // The sequence has been consumed by receipt #1, as it would have been.
+    sqlx::query("UPDATE app_settings SET value = '2' WHERE key = 'next_receipt_number'")
+        .execute(db.pool())
+        .await
+        .expect("advance the receipt sequence past the historical sale");
 }
 
 // ============================================================================
