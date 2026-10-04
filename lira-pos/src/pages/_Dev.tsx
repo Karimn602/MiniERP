@@ -261,6 +261,9 @@ export default function DevProbe() {
                     factorDenSnapshot: uom.factor.den,
                     quantityInUom: 10,
                     quantityBase: 10,
+                    // $1.00 net, which at 11% is $1.11 gross — the probe
+                    // states the net figure and the backend derives the rest.
+                    vatPricingMode: "exclusive",
                     unitCostExclVatInUomCents: 100,
                     unitCostInclVatInUomCents: 111,
                     unitCostExclVatBaseCents: 100,

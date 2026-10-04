@@ -2,12 +2,16 @@
 
 use crate::cost::new_weighted_avg;
 use crate::posting::{
-    derive_base_quantity, lbp_to_usd_cents, prepare_sale, usd_cents_to_lbp,
-    validate_adjustment_payload, validate_close_shift_payload, validate_open_shift_payload,
-    validate_purchase_payload, validate_supplier_payment_payload, CloseShiftPayload,
-    OpenShiftPayload,
+    add_vat, derive_base_quantity, derive_purchase_line_amounts, derive_unit_cost_pair,
+    lbp_to_usd_cents, ledger_direction, prepare_purchase, prepare_sale, resolve_ledger_amount,
+    strip_vat as strip_vat_cents, usd_cents_to_lbp, validate_adjustment_payload,
+    validate_close_shift_payload,
+    validate_open_shift_payload, validate_purchase_payload, validate_supplier_payment_payload,
+    CloseShiftPayload, LedgerDirection, OpenShiftPayload, VatPricingMode,
 };
-use crate::test_support::{RATE_LBP_PER_USD, STORE_ID, USER_ID, VAT_EXEMPT_ID, VAT_STD_BPS, VAT_STD_ID};
+use crate::test_support::{
+    RATE_LBP_PER_USD, STORE_ID, USER_ID, VAT_EXEMPT_BPS, VAT_EXEMPT_ID, VAT_STD_BPS, VAT_STD_ID,
+};
 use crate::tests::builders::*;
 
 // ============================================================================
@@ -659,4 +663,379 @@ fn close_shift_validation_requires_identity_and_non_negative_count() {
     p = close_payload("shift-1");
     p.closing_cash_lbp = -1;
     assert!(validate_close_shift_payload(&p).unwrap_err().contains("negative"));
+}
+
+// ============================================================================
+// Supplier-ledger sign authority (WP-05 Part A)
+//
+// `resolve_ledger_amount` is the one place that turns "how much" into "which
+// way", so it is worth pinning down on its own, away from any database.
+// ============================================================================
+
+#[test]
+fn every_schema_entry_type_has_a_direction_and_nothing_else_does() {
+    use LedgerDirection::*;
+
+    // Exactly the five types `supplier_ledger.entry_type`'s CHECK allows.
+    assert_eq!(ledger_direction("purchase"), Some(Increase));
+    assert_eq!(ledger_direction("payment"), Some(Decrease));
+    assert_eq!(ledger_direction("credit_note"), Some(Decrease));
+    assert_eq!(ledger_direction("opening_balance"), Some(Signed));
+    assert_eq!(ledger_direction("adjustment"), Some(Signed));
+
+    for unknown in ["refund", "", "PAYMENT", "write_off"] {
+        assert_eq!(ledger_direction(unknown), None, "{unknown:?} is not an entry type");
+    }
+}
+
+#[test]
+fn a_fixed_direction_entry_takes_its_sign_from_its_type_not_from_the_caller() {
+    // The magnitude decides how much; the type decides which way. Whichever
+    // sign a caller attaches to a payment, the payable goes DOWN.
+    for signed in [-5_000_i64, 5_000] {
+        assert_eq!(
+            resolve_ledger_amount("payment", Some(5_000), signed).unwrap(),
+            -5_000
+        );
+        assert_eq!(
+            resolve_ledger_amount("credit_note", Some(5_000), signed).unwrap(),
+            -5_000
+        );
+        assert_eq!(
+            resolve_ledger_amount("purchase", Some(5_000), signed).unwrap(),
+            5_000
+        );
+    }
+
+    // And on the legacy contract, where the magnitude is absent, the absolute
+    // value supplies it and the sign is still ignored.
+    assert_eq!(resolve_ledger_amount("payment", None, -5_000).unwrap(), -5_000);
+    assert_eq!(resolve_ledger_amount("payment", None, 5_000).unwrap(), -5_000);
+}
+
+#[test]
+fn a_bidirectional_entry_takes_its_direction_from_the_signed_amount() {
+    assert_eq!(resolve_ledger_amount("adjustment", Some(300), 300).unwrap(), 300);
+    assert_eq!(resolve_ledger_amount("adjustment", Some(300), -300).unwrap(), -300);
+    assert_eq!(resolve_ledger_amount("opening_balance", None, 900).unwrap(), 900);
+    assert_eq!(resolve_ledger_amount("opening_balance", None, -900).unwrap(), -900);
+
+    // With a magnitude but no signed amount there is no direction to take, and
+    // picking one would be inventing the instruction.
+    let err = resolve_ledger_amount("adjustment", Some(300), 0).unwrap_err();
+    assert!(err.contains("bidirectional"), "got: {err}");
+}
+
+#[test]
+fn a_zero_or_negative_magnitude_is_refused() {
+    for entry_type in ["payment", "credit_note", "opening_balance", "adjustment"] {
+        let err = resolve_ledger_amount(entry_type, Some(0), -100).unwrap_err();
+        assert!(err.contains("positive number of cents"), "{entry_type}: {err}");
+
+        let err = resolve_ledger_amount(entry_type, Some(-100), -100).unwrap_err();
+        assert!(err.contains("positive number of cents"), "{entry_type}: {err}");
+
+        // Nothing at all, on either field.
+        let err = resolve_ledger_amount(entry_type, None, 0).unwrap_err();
+        assert!(err.contains("non-zero"), "{entry_type}: {err}");
+    }
+}
+
+#[test]
+fn the_magnitude_and_the_legacy_amount_must_agree_about_how_much_moved() {
+    // Same money, stated twice, in either sign — fine.
+    assert!(resolve_ledger_amount("payment", Some(4_000), -4_000).is_ok());
+    assert!(resolve_ledger_amount("payment", Some(4_000), 4_000).is_ok());
+
+    // Different money — the request does not know its own amount.
+    let err = resolve_ledger_amount("payment", Some(4_000), -5_000).unwrap_err();
+    assert!(err.contains("disagrees with itself"), "got: {err}");
+}
+
+#[test]
+fn an_unknown_entry_type_has_no_resolvable_amount() {
+    let err = resolve_ledger_amount("refund", Some(100), -100).unwrap_err();
+    assert!(err.contains("Invalid entry_type"), "got: {err}");
+}
+
+// ============================================================================
+// Purchase line money (WP-05 Part C)
+// ============================================================================
+
+#[test]
+fn a_purchase_line_amount_is_derived_from_the_invoice_cost_and_the_quantity() {
+    // The convention is `lib/purchaseMath.ts::computeLineMath`: extend the
+    // per-UoM cost by the quantity in that UoM, and take VAT as the difference.
+    let line = PurchaseLineBuilder::new("p1", "Coffee").qty(10).unit_cost_excl(200).build();
+    let a = derive_purchase_line_amounts(0, &line).unwrap();
+    assert_eq!(a.subtotal_excl_vat_cents, 2_000);
+    assert_eq!(a.vat_cents, 220);
+    assert_eq!(a.total_incl_vat_cents, 2_220);
+
+    // Free goods are a real invoice line and cost nothing.
+    let line = PurchaseLineBuilder::new("p1", "Coffee").qty(10).unit_cost_excl(0).build();
+    let a = derive_purchase_line_amounts(0, &line).unwrap();
+    assert_eq!(
+        (a.subtotal_excl_vat_cents, a.vat_cents, a.total_incl_vat_cents),
+        (0, 0, 0)
+    );
+
+    // An exempt line carries no VAT.
+    let line = PurchaseLineBuilder::new("p1", "Bread")
+        .vat(VAT_EXEMPT_ID, VAT_EXEMPT_BPS)
+        .qty(3)
+        .unit_cost_excl(150)
+        .build();
+    let a = derive_purchase_line_amounts(0, &line).unwrap();
+    assert_eq!((a.subtotal_excl_vat_cents, a.vat_cents, a.total_incl_vat_cents), (450, 0, 450));
+}
+
+#[test]
+fn a_purchase_line_that_declares_a_total_its_costs_do_not_support_is_refused() {
+    // The payable is summed from these figures, so a line that books more debt
+    // than it bought goods is refused rather than totalled.
+    let mut line = PurchaseLineBuilder::new("p1", "Coffee").qty(10).unit_cost_excl(200).build();
+    line.line_total_incl_vat_cents = 99_900;
+    let err = derive_purchase_line_amounts(0, &line).unwrap_err();
+    assert!(err.contains("does not reconcile against its invoice cost"), "got: {err}");
+
+    // The subtotal alone is enough to refuse it.
+    let mut line = PurchaseLineBuilder::new("p1", "Coffee").qty(10).unit_cost_excl(200).build();
+    line.line_subtotal_excl_vat_cents = 1_999;
+    assert!(derive_purchase_line_amounts(0, &line).is_err());
+
+    // And so is a VAT amount that does not bridge the two.
+    let mut line = PurchaseLineBuilder::new("p1", "Coffee").qty(10).unit_cost_excl(200).build();
+    line.line_vat_cents = 0;
+    assert!(derive_purchase_line_amounts(0, &line).is_err());
+}
+
+#[test]
+fn a_structurally_impossible_purchase_line_is_refused() {
+    // Cheaper with VAT than without it.
+    let mut line = PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_excl(200).build();
+    line.unit_cost_incl_vat_in_uom_cents = 100;
+    let err = derive_purchase_line_amounts(0, &line).unwrap_err();
+    assert!(err.contains("costs less with VAT"), "got: {err}");
+
+    // A negative cost.
+    let mut line = PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_excl(200).build();
+    line.unit_cost_excl_vat_in_uom_cents = -1;
+    let err = derive_purchase_line_amounts(0, &line).unwrap_err();
+    assert!(err.contains("negative unit cost"), "got: {err}");
+
+    // VAT charged at an exempt rate.
+    let mut line = PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_excl(200).build();
+    line.vat_rate_bps_snapshot = 0;
+    let err = derive_purchase_line_amounts(0, &line).unwrap_err();
+    assert!(err.contains("exempt"), "got: {err}");
+
+    // An extension that overflows rather than wrapping into a plausible total.
+    let mut line = PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_excl(200).build();
+    line.quantity_in_uom = i64::MAX;
+    line.unit_cost_excl_vat_in_uom_cents = 2;
+    line.unit_cost_incl_vat_in_uom_cents = 2;
+    let err = derive_purchase_line_amounts(0, &line).unwrap_err();
+    assert!(err.contains("overflows"), "got: {err}");
+}
+
+#[test]
+fn a_prepared_purchase_header_is_the_sum_of_its_derived_lines() {
+    let payload = purchase_payload(
+        "normal",
+        Some("s1"),
+        vec![
+            PurchaseLineBuilder::new("p1", "Coffee").qty(10).unit_cost_excl(200).build(),
+            PurchaseLineBuilder::new("p2", "Sugar").qty(4).unit_cost_excl(150).build(),
+        ],
+    );
+    let prepared = prepare_purchase(&payload).unwrap();
+
+    assert_eq!(prepared.lines.len(), 2);
+    assert_eq!(prepared.subtotal_excl_vat_cents, 2_000 + 600);
+    assert_eq!(
+        prepared.total_incl_vat_cents,
+        prepared.subtotal_excl_vat_cents + prepared.vat_total_cents
+    );
+    assert_eq!(
+        prepared.total_incl_vat_cents,
+        prepared.lines.iter().map(|l| l.total_incl_vat_cents).sum::<i64>(),
+        "the header is the lines, not a figure of its own"
+    );
+}
+
+// ============================================================================
+// VAT arithmetic, and the one authoritative unit price per purchase line
+// ============================================================================
+
+#[test]
+fn add_vat_and_strip_vat_mirror_the_frontend_helpers() {
+    // The figures `lib/vat.ts` documents on `addVat` and `stripVat` themselves.
+    assert_eq!(add_vat(10_000, VAT_STD_BPS).unwrap(), 11_100);
+    assert_eq!(strip_vat_cents(11_100, VAT_STD_BPS).unwrap(), 10_000);
+
+    // An exempt rate adds and strips nothing.
+    assert_eq!(add_vat(12_345, 0).unwrap(), 12_345);
+    assert_eq!(strip_vat_cents(12_345, 0).unwrap(), 12_345);
+
+    // Zero is zero at any rate.
+    assert_eq!(add_vat(0, VAT_STD_BPS).unwrap(), 0);
+    assert_eq!(strip_vat_cents(0, VAT_STD_BPS).unwrap(), 0);
+
+    // A finer-than-whole-percent rate, since bps exist to express one.
+    assert_eq!(add_vat(10_000, 1_050).unwrap(), 11_050);
+}
+
+#[test]
+fn the_half_cent_vat_boundary_rounds_away_from_zero() {
+    // 50 x 11% = 5.5 cents exactly. `Math.round` takes a positive half upward,
+    // which is the same half-away-from-zero rule `crate::cost` uses, so the
+    // backend must land on 6 and not on 5.
+    assert_eq!(add_vat(50, VAT_STD_BPS).unwrap(), 56);
+    // 150 x 11% = 16.5 → 17.
+    assert_eq!(add_vat(150, VAT_STD_BPS).unwrap(), 167);
+    // And the strip side: 550000/11100 = 49.5495 → 50.
+    assert_eq!(strip_vat_cents(55, VAT_STD_BPS).unwrap(), 50);
+}
+
+#[test]
+fn the_integer_vat_helpers_agree_with_the_frontend_decomposition_everywhere() {
+    // `builders::strip_vat` is the harness's statement of the client rule and
+    // now delegates to the production helper, so this sweeps the whole
+    // low-value range where cent rounding actually bites and pins the two
+    // together rather than trusting that they look alike.
+    for gross in 0..2_000 {
+        assert_eq!(
+            strip_vat_cents(gross, VAT_STD_BPS).unwrap(),
+            strip_vat(gross, VAT_STD_BPS),
+            "stripVat disagreed at {gross}"
+        );
+    }
+    // Grossing up and stripping back is NOT an identity at cent precision —
+    // that is what rounding means, and it is exactly why the pricing mode has
+    // to choose the direction instead of the backend guessing.
+    assert_eq!(strip_vat_cents(55, VAT_STD_BPS).unwrap(), 50);
+    assert_ne!(add_vat(50, VAT_STD_BPS).unwrap(), 55);
+}
+
+#[test]
+fn vat_helpers_refuse_negatives_and_overflow_rather_than_wrapping() {
+    assert!(add_vat(-1, VAT_STD_BPS).is_err());
+    assert!(strip_vat_cents(-1, VAT_STD_BPS).is_err());
+    assert!(add_vat(100, -1).is_err());
+    assert!(strip_vat_cents(100, -1).is_err());
+    assert!(add_vat(i64::MAX, VAT_STD_BPS).is_err(), "must error, not wrap");
+}
+
+#[test]
+fn an_exclusive_line_derives_its_gross_and_an_inclusive_line_derives_its_net() {
+    let excl_line = PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_excl(200).build();
+    let pair = derive_unit_cost_pair(0, &excl_line, VatPricingMode::Exclusive).unwrap();
+    assert_eq!(pair.excl_vat_in_uom_cents, 200);
+    assert_eq!(pair.incl_vat_in_uom_cents, 222);
+
+    let incl_line = PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_incl(55).build();
+    let pair = derive_unit_cost_pair(0, &incl_line, VatPricingMode::Inclusive).unwrap();
+    assert_eq!(pair.incl_vat_in_uom_cents, 55);
+    assert_eq!(pair.excl_vat_in_uom_cents, 50);
+}
+
+#[test]
+fn a_cost_pair_that_is_not_one_price_is_refused() {
+    // The release-gate blocker, at the arithmetic: $20.00 net declared with
+    // $999.00 gross at 11%.
+    let line = PurchaseLineBuilder::new("p1", "Coffee")
+        .qty(1)
+        .unit_cost_excl(2_000)
+        .raw_unit_costs(2_000, 99_900)
+        .build();
+    let err = derive_unit_cost_pair(0, &line, VatPricingMode::Exclusive).unwrap_err();
+    assert!(err.contains("are not one price"), "got: {err}");
+    assert!(err.contains("2220"), "the error names the derived gross: {err}");
+
+    // And symmetrically, a gross-quoted line with an invented net.
+    let line = PurchaseLineBuilder::new("p1", "Coffee")
+        .qty(1)
+        .unit_cost_incl(111)
+        .raw_unit_costs(20, 111)
+        .build();
+    let err = derive_unit_cost_pair(0, &line, VatPricingMode::Inclusive).unwrap_err();
+    assert!(err.contains("are not one price"), "got: {err}");
+}
+
+#[test]
+fn the_same_pair_can_be_coherent_in_one_mode_and_incoherent_in_the_other() {
+    // (50, 55) at 11%: a real gross-quoted bill, and an impossible net-quoted
+    // one, because add_vat(50) is 56. The mode is what decides, which is why it
+    // cannot be inferred.
+    let line = PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_incl(55).build();
+    assert!(derive_unit_cost_pair(0, &line, VatPricingMode::Inclusive).is_ok());
+    assert!(derive_unit_cost_pair(0, &line, VatPricingMode::Exclusive).is_err());
+}
+
+#[test]
+fn an_exempt_line_must_state_the_same_figure_on_both_sides() {
+    let line = PurchaseLineBuilder::new("p1", "Bread")
+        .vat(VAT_EXEMPT_ID, VAT_EXEMPT_BPS)
+        .qty(1)
+        .unit_cost_excl(150)
+        .build();
+    for mode in [VatPricingMode::Exclusive, VatPricingMode::Inclusive] {
+        let pair = derive_unit_cost_pair(0, &line, mode).unwrap();
+        assert_eq!(pair.excl_vat_in_uom_cents, 150);
+        assert_eq!(pair.incl_vat_in_uom_cents, 150);
+    }
+
+    // A gross figure above the net one at 0 bps is VAT charged on an exempt
+    // line, whichever way it is read.
+    let line = PurchaseLineBuilder::new("p1", "Bread")
+        .vat(VAT_EXEMPT_ID, VAT_EXEMPT_BPS)
+        .qty(1)
+        .unit_cost_excl(150)
+        .raw_unit_costs(150, 167)
+        .build();
+    assert!(derive_unit_cost_pair(0, &line, VatPricingMode::Exclusive).is_err());
+    assert!(derive_unit_cost_pair(0, &line, VatPricingMode::Inclusive).is_err());
+}
+
+#[test]
+fn a_negative_unit_cost_or_vat_rate_is_refused_before_any_derivation() {
+    let line = PurchaseLineBuilder::new("p1", "Coffee")
+        .qty(1)
+        .unit_cost_excl(200)
+        .raw_unit_costs(-1, 222)
+        .build();
+    assert!(derive_unit_cost_pair(0, &line, VatPricingMode::Exclusive)
+        .unwrap_err()
+        .contains("negative unit cost"));
+
+    let mut line = PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_excl(200).build();
+    line.vat_rate_bps_snapshot = -1;
+    assert!(derive_unit_cost_pair(0, &line, VatPricingMode::Exclusive)
+        .unwrap_err()
+        .contains("negative VAT rate"));
+}
+
+#[test]
+fn a_pricing_mode_the_application_does_not_have_is_refused() {
+    assert!(VatPricingMode::parse("exclusive").is_ok());
+    assert!(VatPricingMode::parse("inclusive").is_ok());
+    for bad in ["", "Exclusive", "net", "incl"] {
+        let err = VatPricingMode::parse(bad).unwrap_err();
+        assert!(err.contains("Invalid VAT pricing mode"), "{bad:?}: {err}");
+    }
+
+    // And the payload-shape validator rejects one before the pool is acquired.
+    let mut p = purchase_payload(
+        "normal",
+        Some("s1"),
+        vec![PurchaseLineBuilder::new("p1", "Coffee").qty(1).unit_cost_excl(200).build()],
+    );
+    p.lines[0].vat_pricing_mode = Some("net_of_discount".to_string());
+    let err = validate_purchase_payload(&p).unwrap_err();
+    assert!(err.contains("Invalid VAT pricing mode"), "got: {err}");
+
+    // Omitting it is legal — `post_purchase` falls back to the product's mode.
+    p.lines[0].vat_pricing_mode = None;
+    assert!(validate_purchase_payload(&p).is_ok());
 }

@@ -8,6 +8,7 @@ import type {
   PurchaseStatus,
   PurchaseType,
   PurchaseWithLines,
+  VatPricingMode,
 } from "../types";
 
 // ---------- Row shapes ----------
@@ -127,7 +128,24 @@ export interface PostPurchaseLineInput {
   factorDenSnapshot: number;
   quantityInUom: number;
   quantityBase: number;
-  /** The invoice cost per purchasing UoM, in exact cents. Authoritative. */
+  /**
+   * Which side of the cost pair below the supplier's invoice states. The
+   * Purchases page sends the line's Incl/Excl toggle here; when omitted,
+   * `post_purchase` falls back to the product's own `vat_pricing_mode`.
+   *
+   * This is what makes exactly ONE of the two fields below authoritative.
+   */
+  vatPricingMode: VatPricingMode;
+  /**
+   * The invoice cost per purchasing UoM, in exact cents.
+   *
+   * Exactly one of the two is authoritative — the one `vatPricingMode` names.
+   * The other is a CROSS-CHECK: `post_purchase` derives it from the
+   * authoritative side with the same VAT rounding `lib/vat.ts` uses and refuses
+   * the line if the declared counterpart disagrees. `computeLineMath` already
+   * derives both this way, so the UI keeps sending the pair; it simply no
+   * longer decides it.
+   */
   unitCostExclVatInUomCents: number;
   unitCostInclVatInUomCents: number;
   /**
@@ -225,12 +243,21 @@ export const purchasesRepo = {
    * The hot path. Hands the entire payload to the Rust transactional command.
    * Throws on validation failure or DB error — the transaction rolls back
    * before the error returns.
+   *
+   * `purchaseId` is the DOCUMENT IDENTITY and the caller may supply it. Since
+   * WP-05 `post_purchase` is idempotent on it: retrying the same id with the
+   * same bill reconciles to the purchase that already posted instead of
+   * creating a second one, with a second payable and a second stock receipt.
+   * A caller that retries after a lost answer must therefore send the SAME id
+   * it sent the first time — which is why minting one here, per call, is not
+   * the default any more.
    */
-  async post(input: Omit<PostPurchaseInput, "purchaseId">): Promise<PostPurchaseResult> {
-    const purchaseId = newId();
+  async post(
+    input: Omit<PostPurchaseInput, "purchaseId"> & { purchaseId?: string },
+  ): Promise<PostPurchaseResult> {
     const payload: PostPurchaseInput = {
       ...input,
-      purchaseId,
+      purchaseId: input.purchaseId || newId(),
       lines: input.lines.map((l) => ({
         ...l,
         purchaseItemId: l.purchaseItemId || newId(),

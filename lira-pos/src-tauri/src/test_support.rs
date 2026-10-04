@@ -348,6 +348,11 @@ pub struct ProductSpec<'a> {
     /// always creates that row, because `productsRepo.create` always does —
     /// and since WP-02 `post_sale` requires it.
     pub base_uom_code: &'a str,
+    /// `products.vat_pricing_mode` — "inclusive" or "exclusive". Since the
+    /// WP-05 correction this is what `post_purchase` falls back to when a
+    /// purchase line does not say which side of its cost pair the invoice
+    /// states, so a fixture that cares about the fallback sets it.
+    pub vat_pricing_mode: &'a str,
 }
 
 impl<'a> ProductSpec<'a> {
@@ -366,6 +371,7 @@ impl<'a> ProductSpec<'a> {
             is_service: false,
             is_active: true,
             base_uom_code: "each",
+            vat_pricing_mode: "inclusive",
         }
     }
 }
@@ -389,13 +395,14 @@ pub async fn seed_product(db: &TempDb, spec: &ProductSpec<'_>) {
            avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
            avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
            quantity_on_hand, is_active, is_service
-         ) VALUES (?, ?, ?, ?, ?, 'inclusive', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(spec.id)
     .bind(STORE_ID)
     .bind(spec.sku)
     .bind(spec.name)
     .bind(spec.vat_rate_id)
+    .bind(spec.vat_pricing_mode)
     .bind(spec.price_excl_vat_cents)
     .bind(spec.price_incl_vat_cents)
     .bind(spec.avg_cost_excl_vat_cents)
@@ -516,13 +523,46 @@ pub async fn product_uom_id(db: &TempDb, product_id: &str, uom_code: &str) -> St
 }
 
 pub async fn seed_supplier(db: &TempDb, id: &str, name: &str) {
+    seed_supplier_in_store(db, id, name, STORE_ID).await;
+}
+
+/// A supplier owned by a NAMED store. A supplier row belongs to exactly one
+/// store, and since WP-05 both posting commands prove that the store they are
+/// writing for is the one that owns the supplier — so a test needs a way to
+/// create the mismatch.
+pub async fn seed_supplier_in_store(db: &TempDb, id: &str, name: &str, store_id: &str) {
     sqlx::query("INSERT INTO suppliers (id, store_id, name) VALUES (?, ?, ?)")
         .bind(id)
-        .bind(STORE_ID)
+        .bind(store_id)
         .bind(name)
         .execute(db.pool())
         .await
         .expect("seed supplier");
+}
+
+/// A second store, for the cross-store scoping tests. Migration 001 seeds one
+/// store (`STORE_ID`); a second one is not seed data because Greaz is
+/// single-store in practice, but the scoping rules are written in terms of the
+/// store and have to be provable.
+pub async fn seed_store(db: &TempDb, id: &str, name: &str) {
+    sqlx::query("INSERT INTO stores (id, name, default_currency) VALUES (?, ?, 'USD')")
+        .bind(id)
+        .bind(name)
+        .execute(db.pool())
+        .await
+        .expect("seed store");
+}
+
+/// A supplier's outstanding payable, read the way every read model reads it:
+/// `SUM(supplier_ledger.amount_cents)`. Positive means the shop owes money.
+pub async fn supplier_balance(db: &TempDb, supplier_id: &str) -> i64 {
+    sqlx::query("SELECT COALESCE(SUM(amount_cents), 0) FROM supplier_ledger WHERE supplier_id = ?")
+        .bind(supplier_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("read supplier balance")
+        .try_get::<i64, _>(0)
+        .expect("decode i64")
 }
 
 /// The default open shift (`SHIFT_ID`) with an empty float — the precondition

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
 import { purchasesRepo, type PostPurchaseLineInput } from "../db/repos/purchases";
 import type {
@@ -340,6 +340,18 @@ function NewPurchaseForm({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
+  // The document identity of the bill being entered, minted once per form
+  // session and REUSED by every attempt.
+  //
+  // `post_purchase` is idempotent on it (WP-05): if the first attempt reached
+  // the database but its answer was lost, pressing Post again reconciles to
+  // the purchase that already posted instead of booking the delivery — and the
+  // payable for it — a second time. Minting a fresh id per attempt, which is
+  // what the repo used to do, is exactly what made that retry a duplicate.
+  const purchaseIdRef = useRef<string | null>(null);
+
+  if (purchaseIdRef.current === null) purchaseIdRef.current = newId();
+
   function addLine(product: ProductWithUoms) {
     const defaultUom: ProductUom =
       product.uoms.find((u) => u.isDefaultPurchase) ??
@@ -437,6 +449,10 @@ function NewPurchaseForm({
           factorDenSnapshot: uom.factor.den,
           quantityInUom: m.quantityInUom,
           quantityBase: m.quantityBase,
+          // Which of the two unit costs below is the invoice's. The backend
+          // derives the other from it and refuses the line if the pair
+          // disagrees, so this is the field that makes the price unambiguous.
+          vatPricingMode: l.costMode,
           unitCostExclVatInUomCents: m.unitCostExclVatInUomCents,
           unitCostInclVatInUomCents: m.unitCostInclVatInUomCents,
           unitCostExclVatBaseCents: m.unitCostExclVatBaseCents,
@@ -450,6 +466,7 @@ function NewPurchaseForm({
       });
 
       const result = await purchasesRepo.post({
+        purchaseId: purchaseIdRef.current ?? newId(),
         storeId,
         supplierId: supplier?.id ?? null,
         purchaseType: "normal",

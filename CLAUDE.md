@@ -39,7 +39,7 @@ lira-pos/src/
     migrate.ts       — bootstrap: PRAGMAs + schema validation on startup
     types.ts         — all TypeScript domain interfaces
     repos/           — typed data accessors (products, sales, purchases, suppliers, ...)
-    migrations/      — 9 numbered SQL files; Rust registers them on app init
+    migrations/      — 10 numbered SQL files; Rust registers them on app init
     seed.ts          — demo data
   lib/
     money.ts         — USD ↔ LBP conversion; integer-only arithmetic
@@ -82,6 +82,20 @@ Rules: all cost arithmetic goes through `src-tauri/src/cost.rs` (or `src/lib/cos
 
 **Tender is validated, never trusted; change is cash.** A payment row's `amount_usd_cents_equivalent` is *derived*: a USD tender's is itself, an LBP tender's is its lira at the rate locked on the sale, and that locked rate is matched against the `exchange_rates` row (scoped by store) before anything is written. Non-cash tender may never exceed the amount due, so a card overpayment is refused rather than written as drawer change, and the row absorbing an overpayment is always a cash row (USD cash preferred, else LBP cash, in that row's own currency). Expected drawer cash is `opening float + cash in − change out` per currency, counting only `cash_usd`/`cash_lbp` rows in both terms.
 
+**One authoritative unit price per purchase line.** A supplier invoice quotes ONE price per unit, and `vat_pricing_mode` on the line says which side of the excl/incl pair that is — the payload's value (the Purchases page's per-line Incl/Excl toggle), or the product's own `products.vat_pricing_mode` when the payload omits it. The counterpart is *derived* by `post_purchase` with the application's own VAT rounding (`posting.rs::add_vat` / `strip_vat`, mirroring `lib/vat.ts` in integer arithmetic), and a declared counterpart that disagrees is **refused**. Exclusive mode → `unit_cost_excl_vat_in_uom_cents` is authoritative; inclusive mode → `unit_cost_incl_vat_in_uom_cents` is. At 0 bps the two must be the same figure. Rounding to whole cents means `add_vat` and `strip_vat` are not exact inverses, so the mode is what fixes the direction rather than the backend guessing. Without this, a line could declare "$20.00 net, $999.00 gross" at 11% and stock inventory at a $20 cost basis while raising $999 of supplier debt.
+
+**A purchase's payable is derived, and a supplier invoice posts once.** The AP liability a purchase raises is the purchase's own VAT-inclusive total, and that total is *derived* by `post_purchase` from the authoritative inputs — the proven-coherent per-UoM cost pair and the quantity in that UoM — using the application's own convention (`lib/purchaseMath.ts`: extend the per-UoM cost by the quantity, VAT is the gross/net difference). The client's declared line subtotal/VAT/total are cross-checks only and a disagreement is refused, so there is no second amount a caller could book debt with. The purchase, its lines, its movements, its stock and cost updates and its `supplier_ledger` row commit in one transaction, and a failure rolls back the purchase number with everything else. The pricing-pair check is a pre-pass that runs before the purchase number is consumed, so a malformed line leaves nothing behind at all.
+
+A supplier invoice reference may be POSTED once per `(store, supplier)`. The canonical normalized form is `purchases.supplier_reference_key`, a generated column defined as `NULLIF(TRIM(UPPER(supplier_reference), char(9,10,13,32)), '')` — trim + uppercase, the same convention migration 002 uses for `product_barcodes.lookup_value`. A blank or whitespace-only reference normalizes to NULL and constrains nothing. The rule is enforced by `post_purchase` before a purchase number is consumed, and by `trg_purchases_no_duplicate_supplier_invoice_{ins,upd}` as the backstop. It is a trigger rather than a unique index on purpose: a database that already holds a duplicate could not have the index created over it, and the only ways around that would be to rewrite or delete a real financial document. The rule governs writes from now on; history stands as recorded.
+
+**Both AP commands are idempotent on identity.** `purchases.id` and `supplier_ledger.id` are document identities the caller mints once. Replaying one with the same canonical content reconciles to the row that already posted — one payable, one stock receipt, one cost blend, no receipt or purchase number consumed — and replaying it with materially different content is a conflict. This is *technical retry* idempotency and is kept strictly separate from *business duplicate-invoice* detection: two genuinely separate deliveries under two identities are two purchases, refused only if they quote the same invoice reference, and two separate payments of the same amount are two payments.
+
+**Supplier-ledger sign is the backend's, not the caller's.** Positive means the shop owes more. `purchase` → +, `payment` → −, `credit_note` → −, while `opening_balance` and `adjustment` are deliberately bidirectional and take the caller's sign (the Supplier screen has an explicit +/− toggle for adjustments). `post_supplier_payment` takes a positive `amountMagnitudeCents` and applies the direction itself, so a payment sent with the wrong sign still pays the balance down instead of adding to it; the legacy signed `amountCents` stays on the wire and its magnitude is honoured, its sign is not. `trg_supplier_ledger_sign_discipline` enforces the same convention against every other writer, and also that an entry is filed against the supplier's own store.
+
+**Supplier payments may not create an advance.** Greaz models no supplier advance or receivable, so `post_supplier_payment` refuses a `payment` larger than the outstanding payable, reading that payable inside the posting transaction rather than trusting a displayed figure. Partial payments are supplier-level, not invoice-allocated. A negative balance stays reachable through the two explicitly-signed instruments — a `credit_note` the supplier issued, or a signed-off `adjustment` — which is what the Supplier screen shows as "credit on file".
+
+**Supplier payments are not drawer events.** A `supplier_ledger` payment records an amount and nothing else: no method, no currency, no shift. `close_shift` therefore counts only `cash_usd`/`cash_lbp` sale tender, and WP-05 left it that way deliberately. Giving supplier payments a tender model is an open product decision.
+
 **Snapshots at post time.** `sale_items` and `purchase_items` snapshot price, VAT, COGS, and UoM at the moment of posting. These values never change after posting.
 
 **Posted rows are immutable.** Database triggers prevent UPDATE/DELETE on posted sales, purchases, and inventory movements. Corrections are made via reversal rows, never edits.
@@ -102,7 +116,7 @@ Rules: all cost arithmetic goes through `src-tauri/src/cost.rs` (or `src/lib/cos
 
 ### Database Schema Highlights
 
-23 tables across 9 migrations. Key groups:
+23 tables across 10 migrations. Key groups:
 
 | Group | Tables |
 |---|---|

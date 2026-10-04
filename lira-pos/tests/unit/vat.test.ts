@@ -91,3 +91,42 @@ describe("formatBps", () => {
     expect(formatBps(1125)).toBe("11.25%");
   });
 });
+
+describe("the boundary figures the purchase cost pair is derived with", () => {
+  // Since the WP-05 correction `post_purchase` treats exactly ONE side of a
+  // purchase line's excl/incl cost pair as the invoice's and derives the other
+  // with these two functions' exact rules — `posting.rs::add_vat` and
+  // `strip_vat` mirror them in integer arithmetic — then refuses the line if
+  // the client's counterpart disagrees.
+  //
+  // So these are no longer only client display figures: they are a cross-
+  // language contract. If this rounding ever changes on one side only, every
+  // invoice landing on a half-cent starts being rejected as "not one price".
+  // The Rust side pins the same numbers in `pure.rs`; this is the other half.
+  const STD = 1100;
+
+  it("rounds an exact half-cent of VAT away from zero", () => {
+    // 50 × 11% = 5.5 cents exactly.
+    expect(addVat(50, STD)).toBe(56);
+    // 150 × 11% = 16.5 cents exactly.
+    expect(addVat(150, STD)).toBe(167);
+  });
+
+  it("is not an exact round trip at cent precision, which is why the mode decides", () => {
+    // A gross price of 55 strips to a net of 50, but grossing 50 back up gives
+    // 56 — so (50, 55) is a coherent gross-quoted invoice and an impossible
+    // net-quoted one. The backend cannot infer which side was typed; the line's
+    // pricing mode has to say.
+    expect(stripVat(55, STD)).toBe(50);
+    expect(addVat(50, STD)).not.toBe(55);
+    // Whereas (50, 56) reads coherently from either side.
+    expect(stripVat(56, STD)).toBe(50);
+  });
+
+  it("adds and strips nothing at an exempt rate, so the pair is one figure", () => {
+    for (const amount of [1, 150, 99_999]) {
+      expect(addVat(amount, 0)).toBe(amount);
+      expect(stripVat(amount, 0)).toBe(amount);
+    }
+  });
+});

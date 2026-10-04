@@ -42,16 +42,16 @@ async fn migration_versions_are_recorded_in_order() {
     let applied = db
         .count("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
         .await;
-    assert_eq!(applied, 9, "all nine migrations must be recorded");
+    assert_eq!(applied, 10, "all ten migrations must be recorded");
 
     assert_eq!(db.scalar_i64("SELECT MIN(version) FROM _sqlx_migrations").await, 1);
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 9);
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
 
-    // Versions are exactly 1..=9 with no gaps or duplicates.
+    // Versions are exactly 1..=10 with no gaps or duplicates.
     let distinct = db
         .count("SELECT COUNT(DISTINCT version) FROM _sqlx_migrations")
         .await;
-    assert_eq!(distinct, 9);
+    assert_eq!(distinct, 10);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -299,7 +299,7 @@ async fn migration_008_applies_to_an_existing_pre_wp03_database() {
 
     // `migrate_again` runs the whole remaining list, so a v7 database lands on
     // the current head rather than stopping at 8.
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 9);
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -521,7 +521,7 @@ async fn migration_009_applies_to_a_v8_database_with_one_open_shift() {
 
     db.migrate_again().await.expect("migration 009 must apply to a populated v8 database");
 
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 9);
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
     assert_eq!(db.scalar_string(&format!("SELECT status FROM shifts WHERE id='{SHIFT_NEW}'")).await, "open");
     assert_eq!(
         db.count(&format!("SELECT COUNT(*) FROM shifts WHERE id='{SHIFT_NEW}' AND closed_at IS NULL")).await,
@@ -722,4 +722,306 @@ async fn migration_009_does_not_disturb_the_earlier_immutability_guards() {
             "`{trigger}` must be present after migration 009"
         );
     }
+}
+
+// ============================================================================
+// Migration 010 — supplier / accounts-payable integrity (GZ-HI-05)
+// ============================================================================
+//
+// 010 adds a generated column, an index and three triggers. The risky paths are
+// both about a database that has ALREADY drifted, because nothing before this
+// release stopped it:
+//
+//   * a shop that keyed one supplier invoice twice — which is exactly why the
+//     duplicate rule is a trigger and not a unique index, since the index
+//     could not be created over that data and the only ways around it would be
+//     to rewrite or delete one of two real financial documents;
+//   * a ledger holding a payment row with the wrong sign, which the new sign
+//     trigger would reject on insert but must not retroactively condemn.
+//
+// These tests run migrations 1..=9, produce exactly that drift, and only then
+// apply 010.
+
+const AP_SUPPLIER: &str = "00000000-0000-0000-0000-00000000a0a1";
+const AP_SUPPLIER_B: &str = "00000000-0000-0000-0000-00000000a0a2";
+
+/// A v9 database with one supplier and `purchases` rows as an earlier release
+/// left them: posted, each quoting the reference given, with the matching
+/// invoice liability in the supplier ledger.
+async fn pre_wp05_database(purchases: &[(&str, &str, i64)]) -> TempDb {
+    let db = TempDb::at_schema_version(9).await;
+    for (id, name) in [(AP_SUPPLIER, "Beirut Wholesale"), (AP_SUPPLIER_B, "Tripoli Imports")] {
+        db.exec(&format!(
+            "INSERT INTO suppliers (id, store_id, name) VALUES ('{id}', '{STORE_ID}', '{name}')"
+        ))
+        .await;
+    }
+    for (i, (id, reference, total)) in purchases.iter().enumerate() {
+        let number = i as i64 + 1;
+        db.exec(&format!(
+            "INSERT INTO purchases (
+               id, store_id, supplier_id, purchase_type, supplier_reference,
+               purchase_number, purchase_date,
+               subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+               status, posted_at
+             ) VALUES ('{id}', '{STORE_ID}', '{AP_SUPPLIER}', 'normal', '{reference}',
+                       {number}, '2026-02-0{number}', {total}, 0, {total},
+                       'posted', '2026-02-0{number}T10:00:00.000Z')"
+        ))
+        .await;
+        db.exec(&format!(
+            "INSERT INTO supplier_ledger (
+               id, store_id, supplier_id, entry_type, amount_cents, entry_date,
+               related_purchase_id, posted_at
+             ) VALUES ('led-{number}', '{STORE_ID}', '{AP_SUPPLIER}', 'purchase', {total},
+                       '2026-02-0{number}', '{id}', '2026-02-0{number}T10:00:00.000Z')"
+        ))
+        .await;
+    }
+    db
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_010_applies_to_a_populated_v9_database() {
+    // The ordinary upgrade: a shop with purchase history and a supplier ledger
+    // installs the new version. Every document survives untouched.
+    let db = pre_wp05_database(&[("pur-1", "INV-1", 2_220), ("pur-2", "INV-2", 1_110)]).await;
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 9);
+
+    db.migrate_again()
+        .await
+        .expect("migration 010 must apply to a populated v9 database");
+
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
+    assert_eq!(db.count("SELECT COUNT(*) FROM purchases WHERE status='posted'").await, 2);
+    assert_eq!(db.count("SELECT COUNT(*) FROM supplier_ledger").await, 2);
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT COALESCE(SUM(amount_cents),0) FROM supplier_ledger WHERE supplier_id='{AP_SUPPLIER}'"
+        ))
+        .await,
+        3_330,
+        "the payable a shop carried in must be exactly what it was"
+    );
+
+    // The generated column is populated for history, with no backfill — which
+    // is the point of generating it: an UPDATE over `purchases` would have had
+    // to lift the posted-purchase immutability trigger.
+    assert_eq!(
+        db.scalar_string("SELECT supplier_reference_key FROM purchases WHERE id='pur-1'").await,
+        "INV-1"
+    );
+    // So a NEW purchase quoting a reference a shop used BEFORE the upgrade is
+    // still caught.
+    db.exec(&format!(
+        "INSERT INTO purchases (
+           id, store_id, supplier_id, purchase_type, supplier_reference,
+           purchase_number, purchase_date, status
+         ) VALUES ('pur-new', '{STORE_ID}', '{AP_SUPPLIER}', 'normal', 'inv-1',
+                   99, '2026-03-01', 'draft')"
+    ))
+    .await;
+    let err = db
+        .try_exec("UPDATE purchases SET status='posted', posted_at='2026-03-01T09:00:00.000Z' WHERE id='pur-new'")
+        .await
+        .expect_err("a historical reference must still be protected after the upgrade");
+    assert!(err.to_string().contains("already posted"), "got: {err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_010_upgrades_a_database_that_already_held_a_duplicate_invoice() {
+    // THE dirty-data case. A shop on an earlier release keyed invoice "INV-1"
+    // twice and owes double for one delivery. That is the defect — and it is
+    // not this migration's business to restate a shop's books: both documents
+    // and both liabilities stay exactly as recorded.
+    let db = pre_wp05_database(&[
+        ("pur-1", "INV-1", 2_220),
+        ("pur-2", "inv-1 ", 2_220),
+        ("pur-3", "INV-2", 500),
+    ])
+    .await;
+
+    db.migrate_again()
+        .await
+        .expect("migration 010 must upgrade a drifted database, not refuse to start");
+
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
+
+    // Nothing deleted, nothing rewritten, nothing annotated.
+    assert_eq!(db.count("SELECT COUNT(*) FROM purchases").await, 3);
+    assert_eq!(db.count("SELECT COUNT(*) FROM supplier_ledger").await, 3);
+    assert_eq!(
+        db.scalar_string("SELECT supplier_reference FROM purchases WHERE id='pur-2'").await,
+        "inv-1 ",
+        "the second document keeps its reference exactly as it was typed"
+    );
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT COALESCE(SUM(amount_cents),0) FROM supplier_ledger WHERE supplier_id='{AP_SUPPLIER}'"
+        ))
+        .await,
+        4_940,
+        "the balance a shop carried in is preserved, duplicate and all"
+    );
+    // Both are still visible as the duplicate pair they are, which is what lets
+    // the shop reconcile them deliberately.
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM purchases WHERE supplier_reference_key = 'INV-1'").await,
+        2
+    );
+
+    // But the shop cannot add a THIRD.
+    db.exec(&format!(
+        "INSERT INTO purchases (
+           id, store_id, supplier_id, purchase_type, supplier_reference,
+           purchase_number, purchase_date, status
+         ) VALUES ('pur-4', '{STORE_ID}', '{AP_SUPPLIER}', 'normal', 'INV-1',
+                   98, '2026-03-01', 'draft')"
+    ))
+    .await;
+    let err = db
+        .try_exec("UPDATE purchases SET status='posted', posted_at='2026-03-01T09:00:00.000Z' WHERE id='pur-4'")
+        .await
+        .expect_err("the rule must bind writes from here on");
+    assert!(err.to_string().contains("already posted"), "got: {err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_010_leaves_a_historically_wrong_signed_ledger_row_alone() {
+    // A v9 ledger could hold a payment with a positive amount — the sign defect
+    // itself. The new trigger constrains INSERTs, so the historical row stands:
+    // it is a row the shop's accountant has to look at, not one a migration may
+    // silently flip, and flipping it would move a balance nobody asked us to.
+    let db = pre_wp05_database(&[("pur-1", "INV-1", 10_000)]).await;
+    db.exec(&format!(
+        "INSERT INTO supplier_ledger (
+           id, store_id, supplier_id, entry_type, amount_cents, entry_date, posted_at
+         ) VALUES ('led-bad', '{STORE_ID}', '{AP_SUPPLIER}', 'payment', 2_500,
+                   '2026-02-05', '2026-02-05T10:00:00.000Z')"
+    ))
+    .await;
+
+    db.migrate_again().await.expect("migration 010 must apply");
+
+    assert_eq!(
+        db.scalar_i64("SELECT amount_cents FROM supplier_ledger WHERE id='led-bad'").await,
+        2_500,
+        "history is not restated"
+    );
+    // And a new row like it is refused.
+    let err = db
+        .try_exec(&format!(
+            "INSERT INTO supplier_ledger (id, store_id, supplier_id, entry_type, amount_cents, entry_date)
+             VALUES ('led-bad-2', '{STORE_ID}', '{AP_SUPPLIER}', 'payment', 2500, '2026-03-01')"
+        ))
+        .await
+        .expect_err("the sign trigger must bind writes from here on");
+    assert!(err.to_string().contains("must be negative"), "got: {err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_010_is_idempotent_through_the_real_runner() {
+    let db = pre_wp05_database(&[("pur-1", "INV-1", 2_220)]).await;
+    db.migrate_again().await.expect("first run");
+    let before = db.count("SELECT COUNT(*) FROM _sqlx_migrations").await;
+
+    db.migrate_again().await.expect("second run must succeed");
+    db.migrate_again().await.expect("third run must succeed");
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM _sqlx_migrations").await, before);
+    assert_eq!(db.count("SELECT COUNT(*) FROM purchases").await, 1);
+    assert_eq!(db.count("SELECT COUNT(*) FROM supplier_ledger").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v9_upgrade_converges_on_the_same_schema_as_a_fresh_install() {
+    // Fresh install and upgrade must end up in the same place. A generated
+    // column, a partial index or a trigger that only ever appeared on one of
+    // the two paths would make the AP rules depend on how old the shop's
+    // database is.
+    let fresh = TempDb::new().await;
+    let upgraded = pre_wp05_database(&[("pur-1", "INV-1", 2_220), ("pur-2", "inv-1", 2_220)]).await;
+    upgraded.migrate_again().await.expect("migration 010 must apply");
+
+    let schema_sql = "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+                      (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        fresh.scalar_string(schema_sql).await,
+        upgraded.scalar_string(schema_sql).await,
+        "a fresh database and an upgraded one must carry identical schema"
+    );
+
+    for db in [&fresh, &upgraded] {
+        for (kind, name) in [
+            ("index", "idx_purchases_supplier_reference_key"),
+            ("trigger", "trg_purchases_no_duplicate_supplier_invoice_ins"),
+            ("trigger", "trg_purchases_no_duplicate_supplier_invoice_upd"),
+            ("trigger", "trg_supplier_ledger_sign_discipline"),
+        ] {
+            assert_eq!(
+                db.count(&format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='{kind}' AND name='{name}'"
+                ))
+                .await,
+                1,
+                "`{name}` must exist on both paths"
+            );
+        }
+        assert_eq!(
+            // `pragma_table_xinfo`, not `table_info`: a VIRTUAL generated
+            // column is a hidden column and `table_info` does not list it.
+            db.count("SELECT COUNT(*) FROM pragma_table_xinfo('purchases') WHERE name='supplier_reference_key'")
+                .await,
+            1,
+            "the normalized-reference column must exist on both paths"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_010_does_not_disturb_the_earlier_guards() {
+    // 010 adds triggers of its own and lifts none; every guard migrations 001
+    // through 009 put in place must still be in force.
+    let db = pre_wp05_database(&[("pur-1", "INV-1", 2_220)]).await;
+    db.migrate_again().await.expect("migration 010 must apply");
+
+    for trigger in [
+        "trg_sales_no_update_after_post",
+        "trg_inv_mov_no_update",
+        "trg_sale_items_no_update_after_post",
+        "trg_purchase_items_no_update_after_post",
+        "trg_purchases_no_update_after_post",
+        "trg_purchases_no_delete_after_post",
+        "trg_supplier_ledger_no_update",
+        "trg_supplier_ledger_no_delete",
+        "trg_shifts_no_update_after_close",
+    ] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='{trigger}'"
+            ))
+            .await,
+            1,
+            "`{trigger}` must be present after migration 010"
+        );
+    }
+
+    // And they still bite: a posted purchase cannot be edited, and a ledger row
+    // cannot be rewritten to change what the shop owes.
+    assert!(
+        db.try_exec("UPDATE purchases SET total_incl_vat_cents = 1 WHERE id='pur-1'")
+            .await
+            .is_err(),
+        "a posted purchase must stay immutable"
+    );
+    assert!(
+        db.try_exec("UPDATE supplier_ledger SET amount_cents = 1 WHERE id='led-1'")
+            .await
+            .is_err(),
+        "a supplier-ledger entry must stay immutable"
+    );
+    assert!(
+        db.try_exec("DELETE FROM supplier_ledger WHERE id='led-1'").await.is_err(),
+        "a supplier-ledger entry must stay undeletable"
+    );
 }

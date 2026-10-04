@@ -75,12 +75,29 @@ export const supplierLedgerRepo = {
     return rows[0]?.balance ?? 0;
   },
 
+  /**
+   * Post one supplier-ledger entry through the Rust transactional command.
+   *
+   * `amountCents` is stated SIGNED, as it always has been, and the sign still
+   * carries the direction for the two bidirectional entry types
+   * (`opening_balance`, `adjustment`). For `payment` and `credit_note` it does
+   * not: since WP-05 the backend derives those directions itself from
+   * `amountMagnitudeCents`, so a caller cannot increase the payable by sending
+   * a payment with the wrong sign.
+   *
+   * `ledgerEntryId` is the PAYMENT IDENTITY and the caller may supply it.
+   * `post_supplier_payment` is idempotent on it: replaying the same id with the
+   * same entry reconciles to the entry that already posted rather than paying
+   * the supplier a second time. A caller that retries after a lost answer must
+   * send the same id it sent the first time.
+   */
   async postEntry(args: {
     storeId: string;
     supplierId: string;
     entryType: SupplierLedgerEntryType;
     amountCents: number;
     entryDate: string;
+    ledgerEntryId?: string;
     paymentReference?: string | null;
     notes?: string | null;
     createdByUserId?: string | null;
@@ -90,7 +107,7 @@ export const supplierLedgerRepo = {
       throw new Error("Ledger entry amount must be a non-zero integer.");
     }
 
-    const ledgerEntryId = newId();
+    const ledgerEntryId = args.ledgerEntryId || newId();
 
     const result = await invoke<PostSupplierLedgerResult>("post_supplier_payment", {
       payload: {
@@ -98,6 +115,7 @@ export const supplierLedgerRepo = {
         storeId: args.storeId,
         supplierId: args.supplierId,
         entryType: args.entryType,
+        amountMagnitudeCents: Math.abs(args.amountCents),
         amountCents: args.amountCents,
         entryDate: args.entryDate,
         paymentReference: args.paymentReference?.trim() || null,

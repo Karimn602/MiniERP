@@ -1,4 +1,4 @@
-# Greaz POS test harness (WP-01, extended by WP-02, WP-03 and WP-04)
+# Greaz POS test harness (WP-01, extended by WP-02, WP-03, WP-04 and WP-05)
 
 A financial regression suite. Its job is to make the later hardening work
 packages safe: if a change breaks how money, stock, or VAT are recorded, one of
@@ -27,9 +27,9 @@ so cargo cannot build on a tree that has never been built.
 | Layer | Location | What it covers | Authority |
 |---|---|---|---|
 | **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, the fixed-point cost scale (`cost.test.ts`), sale/purchase line math, discount allocation; the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
-| **B. Rust units** | `src-tauri/src/tests/pure.rs`, `cost.rs` | The four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation; the whole `crate::cost` abstraction — scale, rounding, weighted average, overflow | Authoritative for pre-DB posting logic |
-| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, `open_shift`, `close_shift`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`), shift lifecycle and concurrency (`shifts.rs`), tender/change/rate authority (`tenders.rs`) | **Authoritative for the database and all posting behaviour** |
-| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation; the `invoke` wire format of the shift commands | Authoritative for read-model queries only |
+| **B. Rust units** | `src-tauri/src/tests/pure.rs`, `cost.rs` | The four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation, `prepare_purchase`'s derived line money, the purchase cost pair's VAT derivation, supplier-ledger sign authority; the whole `crate::cost` abstraction — scale, rounding, weighted average, overflow | Authoritative for pre-DB posting logic |
+| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, `open_shift`, `close_shift`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`), shift lifecycle and concurrency (`shifts.rs`), tender/change/rate authority (`tenders.rs`), purchase→AP reconciliation, duplicate invoices and purchase identity (`supplier_ap.rs`), supplier-payment sign/overpayment/identity (`supplier_payments.rs`) | **Authoritative for the database and all posting behaviour** |
+| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation, the supplier balance (`supplierLedger.test.ts`); the `invoke` wire format of the shift commands | Authoritative for read-model queries only |
 
 ### A note on what layer C2 is *not*
 
@@ -176,6 +176,79 @@ only makes the tests deterministic, it does not change the SQL.)
   only `cash_usd` / `cash_lbp` rows in BOTH terms — so a card can neither inflate
   nor reduce physical cash, including on rows an earlier release wrote. Variance
   is `counted − expected`: negative short, positive over.
+- **One authoritative unit price per purchase line** — a supplier invoice quotes
+  ONE price per unit. `vat_pricing_mode` names which side of the line's
+  excl/incl pair that is (the payload's, or `products.vat_pricing_mode` when the
+  payload is silent), and the counterpart is DERIVED with the application's own
+  VAT rounding — `posting.rs::add_vat` / `strip_vat`, mirroring `lib/vat.ts` in
+  integer arithmetic — then cross-checked, with a disagreement refused. At 0 bps
+  the two sides must be one figure. `add_vat` and `strip_vat` are not exact
+  inverses at cent precision, so the mode fixes the direction instead of the
+  backend guessing: at 11% the pair (50, 55) is a coherent gross-quoted invoice
+  and an impossible net-quoted one. The check is a pre-pass, so a malformed pair
+  leaves no document, goods, debt, cost blend or sequence advance behind — not
+  even transiently. Without it a line could declare "$20.00 net, $999.00 gross"
+  and stock inventory at a $20 cost basis while billing the shop $999.
+- **Purchase ↔ AP** — a posted purchase raises a payable of exactly its own
+  VAT-inclusive total, and that total is DERIVED from the per-UoM invoice cost
+  and the quantity in that UoM, the way `lib/purchaseMath.ts` derives it. The
+  client's declared line subtotal/VAT/total are a cross-check and a
+  disagreement is refused, so there is no second amount a caller can book debt
+  with. A normal purchase's supplier must belong to the purchase's store. The
+  purchase, its lines, its movements, its stock and cost updates and its
+  `supplier_ledger` row are one transaction: a failure leaves no document, no
+  goods, no debt, no cost blend, and does not consume a purchase number. An
+  `opening` batch raises nothing.
+- **One posted purchase per supplier invoice** — for a non-blank reference, the
+  same `(store, supplier, normalized reference)` may be POSTED once.
+  `purchases.supplier_reference_key` is the canonical normalized form — trim +
+  uppercase, the convention migration 002 already uses for
+  `product_barcodes.lookup_value` — and a blank or whitespace-only reference
+  normalizes to NULL and constrains nothing, so unnumbered receipts never
+  collide. `post_purchase` checks before a purchase number is consumed and
+  reports which purchase already holds the bill;
+  `trg_purchases_no_duplicate_supplier_invoice_{ins,upd}` is the backstop for
+  direct writers and for the interleaved case. Two suppliers may both number an
+  invoice "1001". A refused duplicate changes nothing — not stock, not the cost
+  pool, not the payable, not the sequence.
+- **AP retry identity** — `purchases.id` and `supplier_ledger.id` are document
+  identities. Replaying one with the same canonical content reconciles to the
+  row that already posted (one payable, one stock receipt, one cost blend, one
+  purchase number) and replaying it with materially different content is a
+  conflict. Technical retry idempotency is kept strictly apart from business
+  duplicate-invoice detection: two deliveries of the same goods under different
+  identities and different invoice numbers are two legitimate purchases, and two
+  separate payments of the same amount are two payments. Child row ids
+  (`purchase_item_id`) are request noise and are excluded from replay equality,
+  as are the derived per-base costs.
+- **Supplier-ledger sign** — positive means the shop owes more. `purchase` → +,
+  `payment` → −, `credit_note` → −; `opening_balance` and `adjustment` are
+  deliberately bidirectional and take the caller's sign. For the fixed-direction
+  types the backend applies the sign itself from a positive
+  `amountMagnitudeCents`, so a payment sent with the wrong sign still pays the
+  balance down instead of adding to it. The legacy signed `amountCents` stays on
+  the wire: its magnitude is honoured, its sign is not, and when both fields
+  arrive they must agree about how much money moved.
+  `trg_supplier_ledger_sign_discipline` enforces the same convention against
+  every other writer, plus that an entry is filed against the supplier's own
+  store. `post_supplier_payment` cannot write a `purchase` entry at all — only a
+  purchase document may raise a payable.
+- **No supplier advances** — a `payment` larger than the outstanding payable is
+  refused, and the payable it is measured against is read inside the posting
+  transaction, never taken from a displayed figure. Partial payment is
+  supplier-level (there is no invoice allocation model), works to the cent, and
+  lands exactly on zero. Two payments racing one balance cannot together
+  overpay. A negative balance stays reachable through the two explicitly-signed
+  instruments — a `credit_note` the supplier issued or a signed-off
+  `adjustment` — which is the "credit on file" state the Supplier screen already
+  displays.
+- **One supplier balance** — `supplierLedgerRepo.getBalance`, `listBalances`,
+  `decorateSuppliersWithBalances`, the `supplier_balances` view and
+  `posting.rs::current_supplier_balance` all compute `SUM(amount_cents)` over
+  the same rows, so the figure a buyer pays against is the figure the posting
+  command checks. Invoice liabilities reconcile to the posted purchase totals
+  that raised them; a supplier with no activity reads as zero rather than
+  missing; no read path reverses a sign.
 - **Immutability** — posted sales, sale items, payments, purchases, purchase
   items, inventory movements and supplier-ledger entries reject UPDATE and
   DELETE; the one carve-out (posted → voided) still refuses to rewrite money.
@@ -192,7 +265,14 @@ only makes the tests deterministic, it does not change the SQL.)
   shift alone, deterministically closes the older of several open shifts for one
   store without inventing a cash count for a drawer nobody counted, keeps closed
   and voided shifts unconstrained, preserves migration 008's restored triggers,
-  and converges on byte-identical schema with a fresh install.
+  and converges on byte-identical schema with a fresh install. Migration 010
+  likewise: it applies to a populated v9 database, needs no backfill because the
+  normalized reference is a generated column, upgrades a database that ALREADY
+  holds a duplicate invoice without deleting, rewriting or annotating either
+  financial document (the rule binds writes from then on), leaves a
+  historically wrong-signed ledger row alone while refusing a new one, is
+  idempotent through the real runner, disturbs none of the earlier guards, and
+  converges on byte-identical schema with a fresh install.
 
 ## Known-defect register
 
@@ -214,6 +294,131 @@ Cross-package note for WP-08: GP-A04's root cause is the post-discount
 persistence convention. WP-02 did **not** change it — `post_sale` still stores
 post-discount line values and the header discount alongside them; it only
 started *verifying* that the two agree. GP-A04's fixtures are unaffected.
+
+### Fixed by WP-05 — now enforced, must not regress
+
+| ID | Where the coverage lives | What is now enforced |
+|---|---|---|
+| **GZ-HI-05** | `supplier_ap.rs` (38 tests), `supplier_payments.rs` (25 tests), `migrations.rs` › "Migration 010" (6 tests), `pure.rs` › "Supplier-ledger sign authority", "Purchase line money" and "VAT arithmetic" (21 tests), `supplierLedger.test.ts` (13 tests) | One authoritative unit price per line, with the VAT counterpart derived and cross-checked; a purchase's payable is its own derived VAT-inclusive total, raised atomically with the goods; one supplier invoice reference posts once per supplier per store; both AP commands are idempotent on a document identity; the ledger sign is the backend's; a payment cannot exceed the outstanding payable; one balance arithmetic end to end. |
+
+#### Three rules that look alike and are not
+
+The hardest part of this package to keep straight, so it is worth stating
+plainly. There are three separate "is this the same thing twice?" questions, and
+collapsing any two of them breaks something real:
+
+1. **Technical retry idempotency** keys on the identity the caller minted —
+   `purchases.id`, `supplier_ledger.id`. It exists for the lost answer: the
+   transaction committed, the client never saw the reply, the user presses the
+   button again. The answer is "here is the document you already posted".
+2. **Business duplicate-invoice detection** keys on the supplier's own
+   reference. It exists for the paper on the counter: the same bill keyed twice,
+   under two identities, possibly by two people. The answer is "purchase #N
+   already holds that invoice".
+3. **Neither of them is content deduplication.** Two separate deliveries of the
+   same goods at the same price are two purchases. Two $40 payments to one
+   supplier in a week are two payments. A rule that collapsed those would leave
+   a shop still owing money it has already handed over — which is why
+   `two_deliveries_of_the_same_goods_under_different_identities_both_post` and
+   `two_separate_payments_of_the_same_amount_both_post` are tests and not
+   footnotes.
+
+#### Why the duplicate guard is a trigger and not a unique index
+
+A partial unique index would be the stronger, declarative mechanism, and WP-04
+used exactly that for `ux_shifts_one_open_per_store`. It is not available here,
+because a unique index is a statement about the rows that already exist as much
+as about the next one. Nothing before this release stopped a shop keying one
+supplier invoice twice, `CREATE UNIQUE INDEX` over that data fails, and this is
+a startup migration — so the failure mode is "the application will not open" for
+precisely the shop whose books are already wrong. The only ways around it are to
+rewrite or delete one of two real financial documents.
+
+WP-04 could repair its drift (close the older of two open shifts) because
+closing an uncounted shift and saying so in `notes` is a truthful record.
+Nothing equivalent is true of a supplier invoice: there is no honest way to
+restate which of two posted purchases the shop "really" received.
+
+So the rule is a BEFORE INSERT/UPDATE trigger, which constrains only the write
+in front of it. Historical duplicates stay visible, queryable and intact —
+`migration_010_upgrades_a_database_that_already_held_a_duplicate_invoice`
+asserts all three — and the shop cannot add a third.
+
+It is not a weaker guarantee against the concurrent case. SQLite permits one
+write transaction at a time, and the guard's `EXISTS` runs inside the
+transaction doing the writing: a rival either committed before this transaction
+took its read snapshot, in which case the `EXISTS` sees it, or it did not, in
+which case it cannot commit until this one ends.
+`two_concurrent_entries_of_one_invoice_cannot_both_commit` and
+`two_payments_racing_the_same_balance_cannot_together_overpay` race two real
+pools through `TempDb::rival_pool` and assert that at most one commits.
+
+Both races assert `winners <= 1` rather than `== 1`, which is a deliberate
+difference from the WP-04 shift races. "Neither" is a failure when opening a
+shift — it leaves a cashier unable to trade. It is not a failure for a refused
+bill or a refused payment: the buyer retries. Both tests go on to prove the
+path still works afterwards, so "always fails" cannot pass them.
+
+#### The normalized reference, defined twice
+
+`purchases.supplier_reference_key` is a VIRTUAL generated column, so the
+normalization has one definition, needs no backfill — which matters, because
+backfilling a column on `purchases` would mean lifting the posted-purchase
+immutability trigger over a shop's whole history — and cannot drift from what a
+writer remembers to compute.
+
+SQLite does not expose a VIRTUAL generated column through `NEW`, though: inside
+a trigger it reads as NULL. So each duplicate trigger recomputes the key inline
+from `NEW.supplier_reference`, with the identical expression. That is two copies
+of one rule, and
+`the_duplicate_guard_normalizes_exactly_as_the_stored_key_does` is what holds
+them in step — it compares the stored column against the trigger's expression
+row by row over a spread of awkward references.
+
+The expression is
+`NULLIF(TRIM(UPPER(x), char(9,10,13,32)), '')`. The explicit character set is
+load-bearing: SQLite's one-argument `TRIM` strips spaces only, so a reference
+pasted in with a trailing newline would not match the same reference typed by
+hand. char(9,10,13,32) is tab, newline, carriage return and space — the
+whitespace `String.prototype.trim()` strips on the JavaScript side of the same
+convention (`lib/barcode.ts::normalizeBarcode`). `UPPER` folds ASCII only, which
+is fine and symmetric: both sides of every comparison go through the same
+expression, and Arabic is caseless.
+
+#### What WP-05 deliberately left alone
+
+- **Supplier payments are still not drawer events, and that is a decision, not
+  an omission.** A `supplier_ledger` payment row records an amount in USD cents
+  and nothing else — no method, no currency, no shift. Nothing says whether a
+  given payment was lira out of this till, a bank transfer, or a cheque posted
+  last week. Subtracting every supplier payment from expected cash would make
+  the drawer look short by every payment that never touched it, and would
+  attribute payments to whichever shift happened to be open when somebody typed
+  them in. `close_shift` therefore still counts only `cash_usd`/`cash_lbp` sale
+  tender, exactly as WP-04 left it, and `drawer_cash_for_shift`'s doc comment
+  now says so in those terms. Giving supplier payments a tender model is a
+  product decision: it needs a method, a currency, a shift attribution and a UI,
+  and it is listed under *Remaining gaps*.
+- **No invoice-level allocation.** Payment is against the supplier's open
+  balance, which is the model the application already has — there is no
+  allocation table, no "apply to invoice" affordance, and no aging. Part F of
+  the brief explicitly permits the supplier-level model, and inventing an AP
+  aging subsystem for a single-store restaurant pilot would be the wrong trade.
+- **No "paid now" field on the Purchase screen.** The purchase posts the full
+  liability and payment is a separate transactional action from the Supplier
+  screen (MODEL 2 of the brief). Nothing in the UI labels a purchase as paid —
+  there is no payment status on the purchase at all — so the retained model is
+  already honest about what it knows. Adding an immediate-payment field is a UX
+  decision nobody has asked for.
+- **GP-A04** (report/shift discount double subtraction) is untouched and its two
+  tests stay skipped. It belongs to WP-08.
+- **Returns and credit memos** (GP-A08) remain WP-06. `credit_note` on the
+  supplier ledger is a *supplier* credit and is unrelated to a customer return.
+- **Purchase void.** `purchases.status` allows `'voided'` and migration 005's
+  trigger permits posted → voided, but no command does it, so nothing reverses a
+  payable. The duplicate rule is scoped to posted purchases, which means a
+  voided invoice releases its reference — the behaviour a void ought to have
+  when one is implemented. Recorded under *Remaining gaps*.
 
 ### Fixed by WP-04 — now enforced, must not regress
 
@@ -318,11 +523,13 @@ is WP-07.
   tests stay skipped. It belongs to WP-08.
 - `shiftsRepo.getSalesSummary` and `shiftSummaryRepo` keep their current
   semantics, including that defect.
-- Refunds and credit memos (WP-06), supplier payments out of the till (WP-05),
-  and petty cash / cash-in / cash-out are *not* in the expected-drawer
-  calculation, because no flow produces them yet.
+- Refunds and credit memos (WP-06) and petty cash / cash-in / cash-out are *not*
+  in the expected-drawer calculation, because no flow produces them yet.
   `posting.rs::drawer_cash_for_shift` names each one, so the package that adds a
-  flow knows where its drawer effect belongs.
+  flow knows where its drawer effect belongs. Supplier payments were examined by
+  WP-05 and deliberately left out too — see *What WP-05 deliberately left
+  alone* above: a payment row has no method, no currency and no shift, so there
+  is nothing to attribute to a drawer yet.
 - **Shift DELETE is not guarded.** Migration 009's
   `trg_shifts_no_update_after_close` blocks UPDATE on a closed shift but not
   DELETE. Not a WP-04 issue: there is no production delete path, and
@@ -604,11 +811,13 @@ Not covered by this harness, and worth knowing before relying on it:
   wired wrongly; only the disabled-button affordance is unverified.
 - **No end-to-end Tauri test.** Nothing exercises the real IPC boundary, the
   plugin's connection pool, or `App.tsx`'s three-stage boot.
-- **Concurrency is covered only at the shift boundary.** Most of the suite uses
-  `max_connections(1)`. Since WP-04, `shifts.rs` opens a second real pool via
-  `TempDb::rival_pool()` and races two opens, two closes, and a sale against a
-  close — see *Fixed by WP-04* above. Everything else still cannot detect races
-  between simultaneous posts. For checkout idempotency this leaves
+- **Concurrency is covered at the shift and AP boundaries only.** Most of the
+  suite uses `max_connections(1)`. Since WP-04, `shifts.rs` opens a second real
+  pool via `TempDb::rival_pool()` and races two opens, two closes, and a sale
+  against a close; since WP-05, `supplier_ap.rs` races two entries of one
+  supplier invoice and `supplier_payments.rs` races two payments against one
+  balance. Everything else still cannot detect races between simultaneous
+  posts. For checkout idempotency this leaves
   one case unproven: two *genuinely concurrent* posts of the same identity,
   where both transactions read "no such sale" before either inserts. Both
   cannot commit — the `sales.id` primary key makes a duplicate sale impossible,
@@ -644,4 +853,48 @@ Not covered by this harness, and worth knowing before relying on it:
   maintained, but nothing *prevents* a future query from costing off the mirror
   and silently reintroducing GP-A03. The mirrors are documented at every
   declaration; retiring them is a later package's call.
+- **Supplier payments have no tender model.** A `supplier_ledger` payment row is
+  an amount and a free-text reference: no method, no currency, no shift. So the
+  shop cannot record that a supplier was paid in lira out of the till, and
+  `close_shift` cannot attribute such a payment to a drawer. WP-05 examined this
+  and deliberately did not guess — see *What WP-05 deliberately left alone*. The
+  work is a product decision plus a schema change (method, currency,
+  `shift_id`), a UI, and the drawer term in `drawer_cash_for_shift`.
+- **No AP aging, and no invoice-level allocation.** Payment is against the
+  supplier's open balance. Nothing records which invoice a payment settled, so
+  nothing can report "what is 30 days overdue". Adequate and intentional for a
+  single-store pilot; it is the thing to revisit if the shop starts carrying
+  many open invoices per supplier.
+- **Nothing reverses a payable.** `purchases.status` allows `'voided'` and the
+  schema permits posted → voided, but no command performs it, so a purchase
+  entered in error can only be offset by a supplier `adjustment` — which records
+  the right balance but not the right story. The duplicate-invoice rule is
+  already scoped to posted purchases, so a void would correctly release its
+  reference for re-entry.
+- **The forms' identity reuse is not unit-tested.** `post_purchase` and
+  `post_supplier_payment` are idempotent on an identity the caller supplies, and
+  `Purchases.tsx` / `SupplierDetail.tsx` hold that identity in a `useRef` for the
+  life of the form so a retry reuses it. The backend half is covered thoroughly;
+  that the *page* mints the id once and not per attempt is unverified, for the
+  same reason the rest of the UI is — there is no component-test harness. A
+  regression there would reintroduce duplicate purchases only for retries that
+  the duplicate-invoice rule does not independently catch, i.e. bills with no
+  reference.
+- **The purchase pricing mode is not persisted.** `post_purchase` resolves it,
+  derives the cost pair with it and then writes only the pair — there is no
+  `purchase_items.vat_pricing_mode` column. Nothing is lost economically (the
+  pair IS the price, and a posted line's two figures reconcile under its own
+  snapshotted rate), and the canonical replay comparison already compares both
+  unit costs, so repricing the authoritative side conflicts. The one thing it
+  means is that a retry which restates the same pair under the other mode
+  reconciles as the same bill rather than conflicting — which is correct, since
+  it is the same money and the replay writes nothing. Adding the column would be
+  a migration for an audit nicety, not for an invariant.
+- **Non-ASCII invoice references fold case only on the ASCII part.** The
+  duplicate rule compares `UPPER()`-folded text, and SQLite's `UPPER` is
+  ASCII-only. "café-1" and "CAFÉ-1" are therefore treated as different invoice
+  references. Both sides of every comparison go through the same expression so
+  nothing is inconsistent, and Arabic — the other script a Lebanese supplier
+  invoice is numbered in — is caseless, so this is a theoretical gap rather than
+  a practical one.
 - **`sync_queue`** is scaffolding; untested by design.

@@ -6,7 +6,7 @@
 // against explicit expected numbers; the builders only remove boilerplate.
 
 use crate::posting::{
-    lbp_to_usd_cents, PostAdjustmentLine, PostAdjustmentPayload, PostPurchaseLine,
+    add_vat, lbp_to_usd_cents, PostAdjustmentLine, PostAdjustmentPayload, PostPurchaseLine,
     PostPurchasePayload, PostSaleLine, PostSalePayload, PostSalePayment,
     PostSupplierPaymentPayload,
 };
@@ -18,10 +18,16 @@ pub fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// net = round(gross * 10000 / (10000 + bps)) — the same decomposition
+/// net = round(gross x 10000 / (10000 + bps)) — the decomposition
 /// `lib/vat.ts::stripVat` performs.
+///
+/// Delegates to the PRODUCTION helper rather than reimplementing it in f64.
+/// Since the WP-05 correction the backend derives one side of every purchase
+/// line's cost pair with this exact rule and refuses a pair that disagrees, so
+/// a fixture rounding its own way would look like a crafted price rather than a
+/// legitimate invoice. `pure.rs` pins the rule itself to explicit figures.
 pub fn strip_vat(gross: i64, bps: i64) -> i64 {
-    ((gross * 10000) as f64 / (10000 + bps) as f64).round() as i64
+    crate::posting::strip_vat(gross, bps).expect("fixture amount must decompose")
 }
 
 // ============================================================================
@@ -507,6 +513,10 @@ impl PurchaseLineBuilder {
                 factor_den_snapshot: 1,
                 quantity_in_uom: 1,
                 quantity_base: 1,
+                // The fixtures state the NET invoice price (`unit_cost_excl`),
+                // so the default mode is the one that makes that figure the
+                // authoritative one.
+                vat_pricing_mode: Some("exclusive".to_string()),
                 unit_cost_excl_vat_in_uom_cents: 0,
                 unit_cost_incl_vat_in_uom_cents: 0,
                 unit_cost_excl_vat_base_cents: 0,
@@ -570,11 +580,17 @@ impl PurchaseLineBuilder {
         self
     }
 
-    /// Per-UoM cost excluding VAT. Base cost is derived exactly as
-    /// `lib/uom.ts::unitCostInUomToBase` does: round(cost × den ÷ num).
+    /// Per-UoM cost excluding VAT — i.e. an invoice that quotes the NET price,
+    /// which is what `vat_pricing_mode = "exclusive"` declares. The gross
+    /// counterpart is derived with the production `add_vat`, the same rule
+    /// `post_purchase` now derives and cross-checks it with.
+    ///
+    /// Base cost is derived exactly as `lib/uom.ts::unitCostInUomToBase` does:
+    /// round(cost × den ÷ num).
     pub fn unit_cost_excl(mut self, excl_per_uom: i64) -> Self {
         let bps = self.line.vat_rate_bps_snapshot;
-        let incl_per_uom = excl_per_uom + ((excl_per_uom * bps) as f64 / 10000.0).round() as i64;
+        let incl_per_uom = add_vat(excl_per_uom, bps).expect("fixture cost must take VAT");
+        self.line.vat_pricing_mode = Some("exclusive".to_string());
         self.line.unit_cost_excl_vat_in_uom_cents = excl_per_uom;
         self.line.unit_cost_incl_vat_in_uom_cents = incl_per_uom;
         let (num, den) = (self.line.factor_num_snapshot, self.line.factor_den_snapshot);
@@ -582,6 +598,46 @@ impl PurchaseLineBuilder {
             ((excl_per_uom * den) as f64 / num as f64).round() as i64;
         self.line.unit_cost_incl_vat_base_cents =
             ((incl_per_uom * den) as f64 / num as f64).round() as i64;
+        self
+    }
+
+    /// Per-UoM cost INCLUDING VAT — an invoice that quotes the gross price,
+    /// which is what `vat_pricing_mode = "inclusive"` declares. The net
+    /// counterpart is stripped with the production rule.
+    pub fn unit_cost_incl(mut self, incl_per_uom: i64) -> Self {
+        let bps = self.line.vat_rate_bps_snapshot;
+        let excl_per_uom = strip_vat(incl_per_uom, bps);
+        self.line.vat_pricing_mode = Some("inclusive".to_string());
+        self.line.unit_cost_incl_vat_in_uom_cents = incl_per_uom;
+        self.line.unit_cost_excl_vat_in_uom_cents = excl_per_uom;
+        let (num, den) = (self.line.factor_num_snapshot, self.line.factor_den_snapshot);
+        self.line.unit_cost_excl_vat_base_cents =
+            ((excl_per_uom * den) as f64 / num as f64).round() as i64;
+        self.line.unit_cost_incl_vat_base_cents =
+            ((incl_per_uom * den) as f64 / num as f64).round() as i64;
+        self
+    }
+
+    /// Declare a pricing mode that is not the one the cost was stated in, or
+    /// nothing at all (`None`, the pre-WP-05 wire shape, which makes
+    /// `post_purchase` fall back to the product's own mode). Used only by the
+    /// VAT-pair tests.
+    pub fn raw_pricing_mode(mut self, mode: Option<&str>) -> Self {
+        self.line.vat_pricing_mode = mode.map(|m| m.to_string());
+        self
+    }
+
+    /// Replace ONE side of the cost pair, leaving the other and the line totals
+    /// consistent with the REPLACED figure — i.e. a client that is internally
+    /// coherent about a price it invented. This is the crafted line the WP-05
+    /// release-gate review found: two unit costs that are not one price.
+    ///
+    /// `build()` extends whichever pair is in place, so the resulting line's
+    /// declared totals still reconcile against its own (incoherent) costs and
+    /// the only thing that can catch it is the VAT relationship.
+    pub fn raw_unit_costs(mut self, excl_per_uom: i64, incl_per_uom: i64) -> Self {
+        self.line.unit_cost_excl_vat_in_uom_cents = excl_per_uom;
+        self.line.unit_cost_incl_vat_in_uom_cents = incl_per_uom;
         self
     }
 
@@ -617,6 +673,65 @@ pub fn purchase_payload(
     }
 }
 
+/// `purchase_payload`, quoting a supplier invoice reference — the field the
+/// duplicate-invoice rule is scoped on.
+pub fn purchase_payload_with_reference(
+    purchase_type: &str,
+    supplier_id: Option<&str>,
+    reference: Option<&str>,
+    lines: Vec<PostPurchaseLine>,
+) -> PostPurchasePayload {
+    PostPurchasePayload {
+        supplier_reference: reference.map(|r| r.to_string()),
+        ..purchase_payload(purchase_type, supplier_id, lines)
+    }
+}
+
+/// A faithful replay of a purchase payload: the same document identity, the
+/// same lines, the same figures — but freshly minted `purchase_item_id`s,
+/// because that is what the Purchases page and `purchasesRepo.post` actually
+/// send on a retry. Idempotency must key on the purchase identity alone.
+pub fn replay_of_purchase(p: &PostPurchasePayload) -> PostPurchasePayload {
+    PostPurchasePayload {
+        purchase_id: p.purchase_id.clone(),
+        store_id: p.store_id.clone(),
+        supplier_id: p.supplier_id.clone(),
+        purchase_type: p.purchase_type.clone(),
+        supplier_reference: p.supplier_reference.clone(),
+        purchase_date: p.purchase_date.clone(),
+        created_by_user_id: p.created_by_user_id.clone(),
+        device_id: p.device_id.clone(),
+        notes: p.notes.clone(),
+        lines: p.lines.iter().map(clone_purchase_line).collect(),
+    }
+}
+
+pub fn clone_purchase_line(l: &PostPurchaseLine) -> PostPurchaseLine {
+    PostPurchaseLine {
+        // Fresh: a retry regenerates these.
+        purchase_item_id: uuid(),
+        product_id: l.product_id.clone(),
+        product_name_snapshot: l.product_name_snapshot.clone(),
+        product_sku_snapshot: l.product_sku_snapshot.clone(),
+        product_uom_id_snapshot: l.product_uom_id_snapshot.clone(),
+        uom_code_snapshot: l.uom_code_snapshot.clone(),
+        factor_num_snapshot: l.factor_num_snapshot,
+        factor_den_snapshot: l.factor_den_snapshot,
+        quantity_in_uom: l.quantity_in_uom,
+        quantity_base: l.quantity_base,
+        vat_pricing_mode: l.vat_pricing_mode.clone(),
+        unit_cost_excl_vat_in_uom_cents: l.unit_cost_excl_vat_in_uom_cents,
+        unit_cost_incl_vat_in_uom_cents: l.unit_cost_incl_vat_in_uom_cents,
+        unit_cost_excl_vat_base_cents: l.unit_cost_excl_vat_base_cents,
+        unit_cost_incl_vat_base_cents: l.unit_cost_incl_vat_base_cents,
+        vat_rate_id_snapshot: l.vat_rate_id_snapshot.clone(),
+        vat_rate_bps_snapshot: l.vat_rate_bps_snapshot,
+        line_subtotal_excl_vat_cents: l.line_subtotal_excl_vat_cents,
+        line_vat_cents: l.line_vat_cents,
+        line_total_incl_vat_cents: l.line_total_incl_vat_cents,
+    }
+}
+
 // ============================================================================
 // Adjustment / supplier payment
 // ============================================================================
@@ -643,6 +758,11 @@ pub fn adjustment_line(product_id: &str, delta_base: i64) -> PostAdjustmentLine 
     }
 }
 
+/// A supplier-ledger entry payload, assembled the way
+/// `db/repos/supplierLedger.ts::postEntry` assembles one: the positive
+/// magnitude in `amountMagnitudeCents` and the legacy signed figure alongside
+/// it. `amount_cents` is stated signed here because that is still the shape of
+/// the wire and of every call site that predates WP-05.
 pub fn supplier_payment_payload(
     supplier_id: &str,
     entry_type: &str,
@@ -653,11 +773,48 @@ pub fn supplier_payment_payload(
         store_id: STORE_ID.to_string(),
         supplier_id: supplier_id.to_string(),
         entry_type: entry_type.to_string(),
+        amount_magnitude_cents: if amount_cents == 0 {
+            None
+        } else {
+            Some(amount_cents.abs())
+        },
         amount_cents,
         entry_date: "2026-02-02".to_string(),
         payment_reference: None,
         notes: Some("test entry".to_string()),
         created_by_user_id: Some(USER_ID.to_string()),
         device_id: None,
+    }
+}
+
+/// The same entry, as a caller that only knows the OLD wire contract sends it:
+/// a signed `amountCents` and no magnitude field at all. This is what proves
+/// the compatibility path still works, and that its sign is not authoritative.
+pub fn legacy_supplier_payment_payload(
+    supplier_id: &str,
+    entry_type: &str,
+    signed_amount_cents: i64,
+) -> PostSupplierPaymentPayload {
+    PostSupplierPaymentPayload {
+        amount_magnitude_cents: None,
+        ..supplier_payment_payload(supplier_id, entry_type, signed_amount_cents)
+    }
+}
+
+/// A faithful replay of a supplier-ledger entry: the same payment identity,
+/// the same figures. What a retried payment sends after a lost answer.
+pub fn replay_of_ledger_entry(p: &PostSupplierPaymentPayload) -> PostSupplierPaymentPayload {
+    PostSupplierPaymentPayload {
+        ledger_entry_id: p.ledger_entry_id.clone(),
+        store_id: p.store_id.clone(),
+        supplier_id: p.supplier_id.clone(),
+        entry_type: p.entry_type.clone(),
+        amount_magnitude_cents: p.amount_magnitude_cents,
+        amount_cents: p.amount_cents,
+        entry_date: p.entry_date.clone(),
+        payment_reference: p.payment_reference.clone(),
+        notes: p.notes.clone(),
+        created_by_user_id: p.created_by_user_id.clone(),
+        device_id: p.device_id.clone(),
     }
 }

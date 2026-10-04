@@ -32,6 +32,17 @@
 // there is no behaviour to characterize. Recorded as a coverage gap in
 // tests/README.md only — no placeholder test.
 //
+// GZ-HI-05 (supplier / accounts-payable integrity) was fixed in WP-05 and, like
+// GP-A01, never had an ignored test here. Its invariants could not be stated
+// before the AP model had one sign convention, one derived payable and a
+// document identity to key a retry on, and the obvious shorthand — "the same
+// bill must not post twice" — would have licensed content-based deduplication,
+// silently swallowing a shop's second genuine delivery of the same goods. Its
+// coverage lives in `supplier_ap.rs` and `supplier_payments.rs`, each alongside
+// the control test that keeps the two apart
+// (`two_deliveries_of_the_same_goods_under_different_identities_both_post`,
+// `two_separate_payments_of_the_same_amount_both_post`).
+//
 // See tests/README.md for the full register.
 
 use crate::cost::{extended_cost_cents, COST_SCALE};

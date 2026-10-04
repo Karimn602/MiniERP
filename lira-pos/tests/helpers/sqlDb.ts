@@ -406,3 +406,117 @@ export function insertPurchaseItem(
   );
   return itemId;
 }
+
+// ----------------------------------------------------------------------------
+// Supplier / accounts-payable fixtures (WP-05)
+//
+// These insert rows in the SHAPE the Rust posting commands produce, which since
+// WP-05 means the sign convention `trg_supplier_ledger_sign_discipline`
+// enforces: a purchase liability is positive, a payment and a credit note are
+// negative. A fixture that got that wrong would be refused by the trigger here
+// exactly as it would be in production — which is the point.
+// ----------------------------------------------------------------------------
+
+export function seedSupplier(
+  db: DatabaseSync,
+  opts: { id: string; name: string; isActive?: boolean },
+): string {
+  db.prepare(
+    `INSERT INTO suppliers (id, store_id, name, is_active) VALUES (?, ?, ?, ?)`,
+  ).run(opts.id, STORE_ID, opts.name, opts.isActive === false ? 0 : 1);
+  return opts.id;
+}
+
+export type LedgerEntryTypeFixture =
+  | "purchase"
+  | "payment"
+  | "credit_note"
+  | "opening_balance"
+  | "adjustment";
+
+/**
+ * One supplier-ledger row. `amountSignedCents` is the signed amount as
+ * `post_supplier_payment` derives and persists it, not a magnitude.
+ */
+export function insertLedgerEntry(
+  db: DatabaseSync,
+  opts: {
+    supplierId: string;
+    entryType: LedgerEntryTypeFixture;
+    amountSignedCents: number;
+    entryDate: string;
+    postedAt?: string;
+    relatedPurchaseId?: string | null;
+    paymentReference?: string | null;
+    notes?: string | null;
+  },
+): string {
+  const entryId = id("ledger");
+  db.prepare(
+    `INSERT INTO supplier_ledger (
+       id, store_id, supplier_id, entry_type, amount_cents, entry_date,
+       related_purchase_id, payment_reference, notes, posted_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    entryId,
+    STORE_ID,
+    opts.supplierId,
+    opts.entryType,
+    opts.amountSignedCents,
+    opts.entryDate,
+    opts.relatedPurchaseId ?? null,
+    opts.paymentReference ?? null,
+    opts.notes ?? null,
+    opts.postedAt ?? `${opts.entryDate}T10:00:00.000Z`,
+  );
+  return entryId;
+}
+
+/**
+ * A posted supplier purchase plus the invoice liability it raised — the pair
+ * `post_purchase` writes in one transaction. The ledger amount IS the
+ * purchase's VAT-inclusive total, which is the invariant WP-05 enforces.
+ */
+export function insertSupplierPurchase(
+  db: DatabaseSync,
+  opts: {
+    supplierId: string;
+    purchaseDate: string;
+    subtotalExclVat: number;
+    vat: number;
+    supplierReference?: string | null;
+  },
+): { purchaseId: string; ledgerEntryId: string } {
+  const purchaseId = id("purchase");
+  const row = db.prepare("SELECT COALESCE(MAX(purchase_number), 0) AS n FROM purchases").get() as {
+    n: number;
+  };
+  const total = opts.subtotalExclVat + opts.vat;
+  db.prepare(
+    `INSERT INTO purchases (
+       id, store_id, supplier_id, purchase_type, supplier_reference,
+       purchase_number, purchase_date,
+       subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+       status, posted_at
+     ) VALUES (?, ?, ?, 'normal', ?, ?, ?, ?, ?, ?, 'posted', ?)`,
+  ).run(
+    purchaseId,
+    STORE_ID,
+    opts.supplierId,
+    opts.supplierReference ?? null,
+    row.n + 1,
+    opts.purchaseDate,
+    opts.subtotalExclVat,
+    opts.vat,
+    total,
+    `${opts.purchaseDate}T10:00:00.000Z`,
+  );
+  const ledgerEntryId = insertLedgerEntry(db, {
+    supplierId: opts.supplierId,
+    entryType: "purchase",
+    amountSignedCents: total,
+    entryDate: opts.purchaseDate,
+    relatedPurchaseId: purchaseId,
+  });
+  return { purchaseId, ledgerEntryId };
+}

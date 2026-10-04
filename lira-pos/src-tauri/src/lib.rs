@@ -71,6 +71,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/009_shift_integrity.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 10,
+            description: "supplier_ap_integrity",
+            sql: include_str!("../../src/db/migrations/010_supplier_ap_integrity.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 

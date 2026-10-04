@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { useActiveContext } from "../state/activeContext";
 import { suppliersRepo } from "../db/repos/suppliers";
@@ -9,6 +9,7 @@ import { Input } from "../components/ui/Input";
 import { Button } from "../components/ui/Button";
 import { EmptyState } from "../components/ui/EmptyState";
 import { formatUsd, parseUsdInput } from "../lib/money";
+import { newId } from "../lib/ids";
 import { todayLocalDate } from "../lib/dates";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
@@ -241,6 +242,15 @@ function RecordEntryForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The payment identity, minted once per form session and REUSED by every
+  // attempt. `post_supplier_payment` is idempotent on it (WP-05): if the first
+  // attempt reached the database but its answer was lost, pressing Post again
+  // reconciles to the entry that already posted instead of paying the supplier
+  // twice. The form unmounts on success, so the next entry gets a new identity.
+  const ledgerEntryIdRef = useRef<string | null>(null);
+
+  if (ledgerEntryIdRef.current === null) ledgerEntryIdRef.current = newId();
+
   async function handleSubmit() {
     setError(null);
 
@@ -288,6 +298,7 @@ function RecordEntryForm({
 
     try {
       await supplierLedgerRepo.postEntry({
+        ledgerEntryId: ledgerEntryIdRef.current ?? newId(),
         storeId,
         supplierId,
         entryType: kind,

@@ -1105,6 +1105,9 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
           factorDenSnapshot: uom.factor.den,
           quantityInUom: m.quantityInUom,
           quantityBase: m.quantityBase,
+          // Which of the two unit costs below is the one that was entered. The
+          // backend derives the other and refuses a pair that disagrees.
+          vatPricingMode: l.costMode,
           unitCostExclVatInUomCents: m.unitCostExclVatInUomCents,
           unitCostInclVatInUomCents: m.unitCostInclVatInUomCents,
           unitCostExclVatBaseCents: m.unitCostExclVatBaseCents,

@@ -126,8 +126,27 @@ pub struct PostPurchaseLine {
     pub quantity_in_uom: i64,
     pub quantity_base: i64,
 
-    // What the supplier invoice says, per purchasing UoM, in exact cents. This
-    // is the authoritative cost input: the user typed it to the cent.
+    // Which side of the cost pair below the supplier's invoice actually states
+    // — "inclusive" or "exclusive". The buyer sets it per line on the Purchases
+    // page (the Incl/Excl toggle), initialised from the product's own
+    // `vat_pricing_mode`, because whether a bill quotes net or gross is a fact
+    // about the bill. When the payload omits it, `post_purchase` falls back to
+    // `products.vat_pricing_mode`.
+    //
+    // This does NOT let a caller choose its own price: it names which ONE of
+    // the two figures below is the invoice's, and the other is then derived and
+    // cross-checked. See `derive_unit_cost_pair`.
+    #[serde(default)]
+    pub vat_pricing_mode: Option<String>,
+
+    // What the supplier invoice says, per purchasing UoM, in exact cents.
+    //
+    // Exactly ONE of these is authoritative — the one `vat_pricing_mode` names.
+    // The other is a cross-check: `post_purchase` derives it from the
+    // authoritative side with the application's own VAT rounding and refuses a
+    // line whose declared counterpart disagrees. Two independently chosen
+    // figures here are how a crafted request used to stock goods at one price
+    // and bill the shop at another.
     pub unit_cost_excl_vat_in_uom_cents: i64,
     pub unit_cost_incl_vat_in_uom_cents: i64,
 
@@ -199,12 +218,32 @@ pub struct PostAdjustmentResult {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostSupplierPaymentPayload {
+    /// The payment identity. Stable across retries: replaying it reconciles to
+    /// the entry it already created instead of paying the supplier twice.
     pub ledger_entry_id: String,
     pub store_id: String,
     pub supplier_id: String,
-    pub entry_type: String,        // 'payment' | 'credit_note' | 'opening_balance' | 'adjustment'
-    pub amount_cents: i64,         // SIGNED — caller decides the sign
-    pub entry_date: String,        // YYYY-MM-DD
+    pub entry_type: String, // 'payment' | 'credit_note' | 'opening_balance' | 'adjustment'
+
+    /// The money, as a POSITIVE magnitude. Authoritative when present.
+    ///
+    /// WP-05: how an entry type moves the payable is an accounting fact about
+    /// the type, not a choice the caller gets to make per request — see
+    /// `ledger_direction`. A caller states how much; the backend decides which
+    /// way. The one exception is the two deliberately bidirectional types
+    /// (`opening_balance`, `adjustment`), where the direction IS the
+    /// instruction and comes from `amount_cents`'s sign.
+    #[serde(default)]
+    pub amount_magnitude_cents: Option<i64>,
+
+    /// The legacy signed amount. Kept on the wire, and still the way the
+    /// bidirectional types carry their direction, but its sign is NOT
+    /// authoritative for `payment` or `credit_note`: a payment sent as `+5000`
+    /// pays $50 down, it does not add $50 to the payable. When
+    /// `amount_magnitude_cents` is also given the two must agree in magnitude.
+    pub amount_cents: i64,
+
+    pub entry_date: String, // YYYY-MM-DD
     pub payment_reference: Option<String>,
     pub notes: Option<String>,
     pub created_by_user_id: Option<String>,
@@ -216,6 +255,9 @@ pub struct PostSupplierPaymentPayload {
 pub struct PostSupplierPaymentResult {
     pub ledger_entry_id: String,
     pub posted_at: String,
+    /// The supplier's payable as it stands after this call. On a replay it is
+    /// the payable as it stands now, which is what the original call reported
+    /// when nothing else had posted in between.
     pub new_balance_cents: i64,
 }
 
@@ -245,6 +287,15 @@ async fn next_purchase_number(
     Ok(current)
 }
 
+/// The supplier's outstanding payable: `SUM(amount_cents)` over its whole
+/// ledger, positive meaning the shop owes money.
+///
+/// THE definition. `supplierLedgerRepo.getBalance`, `listBalances` and the
+/// `supplier_balances` view all compute the same sum over the same rows, which
+/// is what makes the figure on the Supplier screen the figure
+/// `post_supplier_payment` checks a payment against. Read inside the posting
+/// transaction, never taken from the caller: a balance the client last rendered
+/// is a balance from before whatever posted since.
 async fn current_supplier_balance(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     supplier_id: &str,
@@ -258,6 +309,151 @@ async fn current_supplier_balance(
     .map_err(|e| format!("read supplier balance: {e}"))?;
     let bal: i64 = row.try_get("bal").map_err(|e| format!("decode balance: {e}"))?;
     Ok(bal)
+}
+
+/// The store a supplier belongs to, or `None` if there is no such supplier.
+///
+/// A supplier row is owned by exactly one store (`suppliers.store_id`), so a
+/// document filed against a different store's books would be counted by
+/// `listBalances(storeId)` for one store and by the supplier's own balance for
+/// another. Both `post_purchase` and `post_supplier_payment` resolve this
+/// before writing; `trg_supplier_ledger_sign_discipline` is the backstop.
+async fn supplier_store_id(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    supplier_id: &str,
+) -> Result<Option<String>, String> {
+    let row = sqlx::query("SELECT store_id FROM suppliers WHERE id = ?")
+        .bind(supplier_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("read supplier {supplier_id}: {e}"))?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(
+            r.try_get("store_id").map_err(|e| format!("decode supplier store_id: {e}"))?,
+        )),
+    }
+}
+
+/// Prove that `supplier_id` is a supplier of `store_id`, or fail saying so.
+async fn assert_supplier_belongs_to_store(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    supplier_id: &str,
+    store_id: &str,
+) -> Result<(), String> {
+    match supplier_store_id(tx, supplier_id).await? {
+        None => Err(format!("Supplier {supplier_id} does not exist.")),
+        Some(owner) if owner == store_id => Ok(()),
+        Some(owner) => Err(format!(
+            "Supplier {supplier_id} belongs to store {owner}, not to store {store_id}."
+        )),
+    }
+}
+
+// ============================================================================
+// Supplier-ledger sign authority (WP-05, GZ-HI-05)
+// ============================================================================
+
+/// Which way an entry type moves the payable.
+///
+/// The supplier ledger is append-only, immutable and undeletable, and the
+/// balance every screen and report shows is `SUM(amount_cents)`. So the sign on
+/// a row is not a presentation detail that can be fixed later — it is the
+/// accounting meaning of the document, permanently. Migration 006 wrote the
+/// convention down in prose; this is that prose, as code, in the one place
+/// every writer goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LedgerDirection {
+    /// The payable goes up. `purchase` only: goods received on credit.
+    Increase,
+    /// The payable goes down. `payment` and `credit_note`.
+    Decrease,
+    /// Either way, and the caller says which. `opening_balance` carries in a
+    /// balance from elsewhere; `adjustment` is a manual write-up or write-down
+    /// and must explain itself in `notes`. Both are deliberately bidirectional
+    /// — the Supplier screen gives `adjustment` an explicit +/− toggle — so for
+    /// these two the caller's sign IS the instruction, not a guess at one.
+    Signed,
+}
+
+/// The direction of a `supplier_ledger.entry_type`, or `None` if the type is
+/// not one the schema allows.
+pub(crate) fn ledger_direction(entry_type: &str) -> Option<LedgerDirection> {
+    match entry_type {
+        "purchase" => Some(LedgerDirection::Increase),
+        "payment" | "credit_note" => Some(LedgerDirection::Decrease),
+        "opening_balance" | "adjustment" => Some(LedgerDirection::Signed),
+        _ => None,
+    }
+}
+
+/// The authoritative signed ledger amount for one entry.
+///
+/// This is the whole of Part A of WP-05 in one function: a caller states a
+/// magnitude, and for every type whose direction is fixed the backend applies
+/// the sign. A payment sent as `+5000` by a buggy client, a stale build or a
+/// hand-rolled integration pays $50 off the balance; it cannot add $50 to it.
+///
+/// `amount_magnitude_cents` is the authoritative input when given and must be
+/// strictly positive — a negative magnitude is a malformed request, not a
+/// direction, and zero records nothing. `amount_cents` stays on the wire for
+/// compatibility: when the magnitude is absent its absolute value supplies one,
+/// and when both are present they must agree about how much money moved (the
+/// same cross-check WP-03 applies to the UoM snapshots it no longer trusts).
+pub(crate) fn resolve_ledger_amount(
+    entry_type: &str,
+    amount_magnitude_cents: Option<i64>,
+    legacy_signed_amount_cents: i64,
+) -> Result<i64, String> {
+    let direction = ledger_direction(entry_type)
+        .ok_or_else(|| format!("Invalid entry_type: {entry_type}"))?;
+
+    let legacy_magnitude = legacy_signed_amount_cents
+        .checked_abs()
+        .ok_or_else(|| "Amount is too large to post.".to_string())?;
+
+    let magnitude = match amount_magnitude_cents {
+        Some(declared) => {
+            if declared <= 0 {
+                return Err(format!(
+                    "Amount must be a positive number of cents; got {declared}."
+                ));
+            }
+            if legacy_signed_amount_cents != 0 && legacy_magnitude != declared {
+                return Err(format!(
+                    "Amount disagrees with itself: magnitude {declared} cents against a signed \
+                     amount of {legacy_signed_amount_cents} cents."
+                ));
+            }
+            declared
+        }
+        None => {
+            if legacy_signed_amount_cents == 0 {
+                return Err("Amount must be non-zero.".into());
+            }
+            legacy_magnitude
+        }
+    };
+
+    match direction {
+        LedgerDirection::Increase => Ok(magnitude),
+        LedgerDirection::Decrease => Ok(-magnitude),
+        LedgerDirection::Signed => {
+            // The direction has to come from somewhere, and for these two types
+            // the caller is the only one who knows it.
+            if legacy_signed_amount_cents == 0 {
+                return Err(format!(
+                    "A '{entry_type}' entry is bidirectional and needs a signed amount_cents \
+                     saying which way it moves the balance."
+                ));
+            }
+            if legacy_signed_amount_cents < 0 {
+                Ok(-magnitude)
+            } else {
+                Ok(magnitude)
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -289,9 +485,619 @@ pub(crate) fn validate_purchase_payload(payload: &PostPurchasePayload) -> Result
         if line.uom_code_snapshot.trim().is_empty() {
             return Err(format!("Line {} does not name a unit of measure.", i + 1));
         }
+        // A pricing mode the payload names must be one the application has.
+        // The arithmetic it selects runs inside the transaction, where the
+        // product's own mode is available as the fallback — this is only the
+        // shape check, so a nonsense string fails before the pool is touched.
+        if let Some(mode) = line.vat_pricing_mode.as_deref() {
+            VatPricingMode::parse(mode).map_err(|e| format!("Line {}: {}", i + 1, e))?;
+        }
     }
     Ok(())
 }
+
+// ----------------------------------------------------------------------------
+// VAT arithmetic (mirrors lib/vat.ts)
+// ----------------------------------------------------------------------------
+
+/// Net → gross: `net + round(net × bps / 10000)`.
+///
+/// Mirrors `lib/vat.ts::addVat` exactly, but in integer arithmetic with no
+/// float step: the product is taken in i128 so a large amount cannot overflow
+/// on the way, and the half-up adjustment is exact rather than the result of an
+/// f64 division that happened to land near a boundary. `Math.round` in
+/// JavaScript rounds a positive half upward, which for the non-negative amounts
+/// this is ever called with is the same half-away-from-zero rule the rest of
+/// the money and cost code uses.
+///
+/// This is the ONLY net→gross rule in the backend. It is not a second VAT
+/// implementation: it is the existing one, restated in the language the posting
+/// commands are written in, and `pure.rs` pins the two together.
+pub(crate) fn add_vat(net_cents: i64, bps: i64) -> Result<i64, String> {
+    if net_cents < 0 {
+        return Err("a VAT-exclusive amount cannot be negative".into());
+    }
+    if bps < 0 {
+        return Err("a VAT rate cannot be negative".into());
+    }
+    let tax = (i128::from(net_cents) * i128::from(bps) + 5_000) / 10_000;
+    let gross = i128::from(net_cents) + tax;
+    i64::try_from(gross).map_err(|_| "amount overflows when VAT is added".to_string())
+}
+
+/// Gross → net: `round(gross × 10000 / (10000 + bps))`.
+///
+/// Mirrors `lib/vat.ts::stripVat` exactly, in integer arithmetic. Same
+/// provenance and same rounding rule as `add_vat`.
+///
+/// Note that `add_vat` and `strip_vat` are NOT exact inverses at cent
+/// precision — that is a property of rounding to whole cents, not a defect —
+/// which is precisely why the pricing mode decides which of the two runs. See
+/// `derive_unit_cost_pair`.
+pub(crate) fn strip_vat(gross_cents: i64, bps: i64) -> Result<i64, String> {
+    if gross_cents < 0 {
+        return Err("a VAT-inclusive amount cannot be negative".into());
+    }
+    if bps < 0 {
+        return Err("a VAT rate cannot be negative".into());
+    }
+    let denom = 10_000 + i128::from(bps);
+    let net = (i128::from(gross_cents) * 10_000 + denom / 2) / denom;
+    i64::try_from(net).map_err(|_| "amount overflows when VAT is stripped".to_string())
+}
+
+// ----------------------------------------------------------------------------
+// The authoritative unit cost of a purchase line (WP-05 correction)
+// ----------------------------------------------------------------------------
+
+/// Which side of a purchase line's VAT-exclusive/VAT-inclusive cost pair the
+/// supplier's invoice actually states.
+///
+/// This is not a presentation detail. A supplier bill quotes ONE price per unit,
+/// and whether that figure is net or gross is a fact about the bill that only
+/// the buyer reading it knows — which is why the Purchases page gives every
+/// line an Incl/Excl toggle, initialised from `products.vat_pricing_mode`.
+/// The other side of the pair is arithmetic, not information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VatPricingMode {
+    /// The invoice states the NET price. `unit_cost_excl_vat_in_uom_cents` is
+    /// authoritative and the inclusive figure is derived with `add_vat`.
+    Exclusive,
+    /// The invoice states the GROSS price. `unit_cost_incl_vat_in_uom_cents` is
+    /// authoritative and the exclusive figure is derived with `strip_vat`.
+    Inclusive,
+}
+
+impl VatPricingMode {
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "exclusive" => Ok(Self::Exclusive),
+            "inclusive" => Ok(Self::Inclusive),
+            other => Err(format!(
+                "Invalid VAT pricing mode \"{other}\" — expected \"inclusive\" or \"exclusive\"."
+            )),
+        }
+    }
+}
+
+/// A purchase line's per-UoM cost pair, as the backend derived it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnitCostPair {
+    pub excl_vat_in_uom_cents: i64,
+    pub incl_vat_in_uom_cents: i64,
+}
+
+/// Derive a line's full cost pair from the ONE price the invoice states, and
+/// refuse a payload whose other side disagrees.
+///
+/// WHY THIS EXISTS. Until this correction the backend accepted
+/// `unit_cost_excl_vat_in_uom_cents` and `unit_cost_incl_vat_in_uom_cents` as
+/// two independent client values, checking only that they were non-negative and
+/// ordered. Nothing proved they were the same price. So a crafted line could
+/// say "$20.00 net, $999.00 gross" at 11% and, if its declared totals matched
+/// the gross figure, post — stocking inventory at a $20 cost basis while
+/// raising $999 of supplier debt. One economic event, two prices, and the
+/// purchase immutable afterwards. That is the GZ-HI-05 invariant failing on the
+/// exact axis WP-05 set out to close.
+///
+/// There is now one authoritative economic unit price per line. The pricing
+/// mode names which side of the pair it is; the counterpart is computed with
+/// the application's own VAT rounding (`add_vat` / `strip_vat`, mirroring
+/// `lib/vat.ts`, which is what `lib/purchaseMath.ts::computeLineMath` already
+/// uses to build the pair on the client). The declared counterpart is a
+/// cross-check and a disagreement is REFUSED rather than overruled — the same
+/// treatment WP-03 gives the UoM factor and base quantity, and for the same
+/// reason: the buyer priced the goods against one figure, and quietly
+/// substituting another invents a cost or a debt nobody agreed to.
+///
+/// Rounding to whole cents means `add_vat` and `strip_vat` are not exact
+/// inverses, so the direction matters and the mode is what fixes it. An exempt
+/// (0 bps) line has no VAT to add or strip, and both sides must be the single
+/// price the invoice states.
+pub(crate) fn derive_unit_cost_pair(
+    index: usize,
+    line: &PostPurchaseLine,
+    mode: VatPricingMode,
+) -> Result<UnitCostPair, String> {
+    let n = index + 1;
+
+    if line.unit_cost_excl_vat_in_uom_cents < 0 || line.unit_cost_incl_vat_in_uom_cents < 0 {
+        return Err(format!("Line {n} has a negative unit cost."));
+    }
+    if line.vat_rate_bps_snapshot < 0 {
+        return Err(format!("Line {n} has a negative VAT rate."));
+    }
+
+    let bps = line.vat_rate_bps_snapshot;
+    let (excl, incl) = match mode {
+        VatPricingMode::Exclusive => {
+            let excl = line.unit_cost_excl_vat_in_uom_cents;
+            let incl = add_vat(excl, bps)
+                .map_err(|e| format!("Line {n}: {e}."))?;
+            (excl, incl)
+        }
+        VatPricingMode::Inclusive => {
+            let incl = line.unit_cost_incl_vat_in_uom_cents;
+            let excl = strip_vat(incl, bps)
+                .map_err(|e| format!("Line {n}: {e}."))?;
+            (excl, incl)
+        }
+    };
+
+    // The cross-check. Whichever side was derived must be the side the client
+    // declared; the authoritative side compares to itself and cannot fail.
+    if excl != line.unit_cost_excl_vat_in_uom_cents
+        || incl != line.unit_cost_incl_vat_in_uom_cents
+    {
+        let stated = match mode {
+            VatPricingMode::Exclusive => "excluding",
+            VatPricingMode::Inclusive => "including",
+        };
+        return Err(format!(
+            "Line {n}: the declared unit costs are not one price. The invoice states \
+             {} cents {stated} VAT, which at {} bps is {}/{} (excl/incl) — the line declares \
+             {}/{}. One of the two figures was not derived from the other.",
+            match mode {
+                VatPricingMode::Exclusive => line.unit_cost_excl_vat_in_uom_cents,
+                VatPricingMode::Inclusive => line.unit_cost_incl_vat_in_uom_cents,
+            },
+            bps,
+            excl,
+            incl,
+            line.unit_cost_excl_vat_in_uom_cents,
+            line.unit_cost_incl_vat_in_uom_cents,
+        ));
+    }
+
+    Ok(UnitCostPair {
+        excl_vat_in_uom_cents: excl,
+        incl_vat_in_uom_cents: incl,
+    })
+}
+
+/// One purchase line's money, derived from the inputs that are authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PurchaseLineAmounts {
+    pub subtotal_excl_vat_cents: i64,
+    pub vat_cents: i64,
+    pub total_incl_vat_cents: i64,
+}
+
+/// Everything `post_purchase` computes before it touches the database: the
+/// per-line amounts and the header totals they sum into.
+///
+/// The header total is the supplier's payable, so it cannot be a number the
+/// client chose (WP-05 Part C). It is derived here from the two inputs that
+/// genuinely are authoritative — the per-UoM invoice cost, which the buyer
+/// typed to the cent off the bill, and the quantity in that UoM — using the
+/// application's own convention from `lib/purchaseMath.ts::computeLineMath`.
+#[derive(Debug)]
+pub(crate) struct PreparedPurchase {
+    pub lines: Vec<PurchaseLineAmounts>,
+    pub subtotal_excl_vat_cents: i64,
+    pub vat_total_cents: i64,
+    pub total_incl_vat_cents: i64,
+}
+
+/// Derive one line's subtotal, VAT and total, and refuse a payload that
+/// declares different ones.
+///
+/// `lib/purchaseMath.ts` extends the per-UoM cost by the quantity in that UoM
+/// and takes VAT as the difference between the gross and net extensions. That
+/// is reproduced exactly here, so a line the Purchases page built passes
+/// unchanged — and a line that was assembled anywhere else does not get to name
+/// its own payable.
+///
+/// The relationship BETWEEN the two per-UoM costs is not settled here, because
+/// settling it needs the line's pricing mode and therefore possibly a look at
+/// the product row: `derive_unit_cost_pair` does it inside the transaction,
+/// before anything is written. What this function checks is that the pair is
+/// non-negative and ordered, that an exempt line carries no VAT, and — the
+/// part that matters for the payable — that the declared line totals really are
+/// that pair extended by the quantity. The two checks compose: the header is
+/// the extension of a pair that has been proved to be one price.
+pub(crate) fn derive_purchase_line_amounts(
+    index: usize,
+    line: &PostPurchaseLine,
+) -> Result<PurchaseLineAmounts, String> {
+    let n = index + 1;
+
+    if line.unit_cost_excl_vat_in_uom_cents < 0 || line.unit_cost_incl_vat_in_uom_cents < 0 {
+        return Err(format!("Line {n} has a negative unit cost."));
+    }
+    if line.vat_rate_bps_snapshot < 0 {
+        return Err(format!("Line {n} has a negative VAT rate."));
+    }
+    if line.unit_cost_incl_vat_in_uom_cents < line.unit_cost_excl_vat_in_uom_cents {
+        return Err(format!(
+            "Line {n} costs less with VAT ({} cents) than without it ({} cents).",
+            line.unit_cost_incl_vat_in_uom_cents, line.unit_cost_excl_vat_in_uom_cents
+        ));
+    }
+
+    let overflow = || format!("Line {n} overflows when its cost is extended by its quantity.");
+    let subtotal = line
+        .unit_cost_excl_vat_in_uom_cents
+        .checked_mul(line.quantity_in_uom)
+        .ok_or_else(overflow)?;
+    let total = line
+        .unit_cost_incl_vat_in_uom_cents
+        .checked_mul(line.quantity_in_uom)
+        .ok_or_else(overflow)?;
+    let vat = total - subtotal;
+
+    if line.vat_rate_bps_snapshot == 0 && vat != 0 {
+        return Err(format!(
+            "Line {n} does not reconcile: VAT of {vat} cents at an exempt (0 bps) rate."
+        ));
+    }
+
+    // The declared figures are a cross-check, exactly as WP-03 treats the
+    // declared base quantity and UoM factor: a client whose arithmetic
+    // disagrees with the invoice it is quoting is refused, not quietly
+    // overruled, because the difference IS the payable the shop would be left
+    // owing.
+    if line.line_subtotal_excl_vat_cents != subtotal
+        || line.line_vat_cents != vat
+        || line.line_total_incl_vat_cents != total
+    {
+        return Err(format!(
+            "Line {n} does not reconcile against its invoice cost: declared {}/{}/{} \
+             (subtotal/VAT/total) against {} {} x {} cents = {}/{}/{}.",
+            line.line_subtotal_excl_vat_cents,
+            line.line_vat_cents,
+            line.line_total_incl_vat_cents,
+            line.quantity_in_uom,
+            line.uom_code_snapshot,
+            line.unit_cost_excl_vat_in_uom_cents,
+            subtotal,
+            vat,
+            total
+        ));
+    }
+
+    Ok(PurchaseLineAmounts {
+        subtotal_excl_vat_cents: subtotal,
+        vat_cents: vat,
+        total_incl_vat_cents: total,
+    })
+}
+
+/// Validate a purchase payload and derive its authoritative money.
+pub(crate) fn prepare_purchase(
+    payload: &PostPurchasePayload,
+) -> Result<PreparedPurchase, String> {
+    validate_purchase_payload(payload)?;
+
+    let mut lines = Vec::with_capacity(payload.lines.len());
+    let mut subtotal: i64 = 0;
+    let mut vat_total: i64 = 0;
+    let mut total: i64 = 0;
+
+    for (i, line) in payload.lines.iter().enumerate() {
+        let amounts = derive_purchase_line_amounts(i, line)?;
+        let overflow = || "Purchase total is too large to post.".to_string();
+        subtotal = subtotal
+            .checked_add(amounts.subtotal_excl_vat_cents)
+            .ok_or_else(overflow)?;
+        vat_total = vat_total.checked_add(amounts.vat_cents).ok_or_else(overflow)?;
+        total = total
+            .checked_add(amounts.total_incl_vat_cents)
+            .ok_or_else(overflow)?;
+        lines.push(amounts);
+    }
+
+    Ok(PreparedPurchase {
+        lines,
+        subtotal_excl_vat_cents: subtotal,
+        vat_total_cents: vat_total,
+        total_incl_vat_cents: total,
+    })
+}
+
+// ----------------------------------------------------------------------------
+// Purchase identity (WP-05 Part I)
+// ----------------------------------------------------------------------------
+
+/// The canonical business content of a purchase: everything that decides WHICH
+/// supplier bill was entered, in a form that compares equal for a true retry
+/// and unequal for anything materially different.
+///
+/// Deliberately EXCLUDED, because comparing them would reject honest retries:
+///   - `purchase_item_id` — regenerated per request by `db/repos/purchases.ts`
+///     and by the Purchases page, so it is request noise, not business content.
+///   - the client's `quantity_base`, `factor_*_snapshot` and
+///     `product_uom_id_snapshot` — the backend derives all three from the
+///     product's own `product_uoms` row (WP-03), so the payload copies are
+///     non-authoritative. `quantity_in_uom` + `uom_code` are compared instead,
+///     and the authoritative base follows from them.
+///   - the per-base microcent costs — derived from the per-UoM cost and the
+///     resolved factor, so comparing them would compare a derivation twice.
+///   - `purchase_number` / `posted_at` — assigned by the first post.
+///
+/// `supplier_reference` IS compared, as typed: two bills quoting different
+/// references are different documents even when they cost the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalPurchase {
+    store_id: String,
+    supplier_id: Option<String>,
+    purchase_type: String,
+    supplier_reference: Option<String>,
+    purchase_date: String,
+    created_by_user_id: Option<String>,
+    device_id: Option<String>,
+    notes: Option<String>,
+    subtotal_excl_vat_cents: i64,
+    vat_total_cents: i64,
+    total_incl_vat_cents: i64,
+    /// Sorted, so a retry is not rejected merely because rows came back in a
+    /// different order.
+    lines: Vec<CanonicalPurchaseLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalPurchaseLine {
+    product_id: String,
+    uom_code: String,
+    quantity_in_uom: i64,
+    unit_cost_excl_vat_in_uom_cents: i64,
+    unit_cost_incl_vat_in_uom_cents: i64,
+    vat_rate_id: String,
+    vat_rate_bps: i64,
+    line_subtotal_excl_vat_cents: i64,
+    line_vat_cents: i64,
+    line_total_incl_vat_cents: i64,
+}
+
+impl CanonicalPurchase {
+    fn from_payload(payload: &PostPurchasePayload, prepared: &PreparedPurchase) -> Self {
+        let mut lines: Vec<CanonicalPurchaseLine> = payload
+            .lines
+            .iter()
+            .zip(&prepared.lines)
+            .map(|(l, a)| CanonicalPurchaseLine {
+                product_id: l.product_id.clone(),
+                uom_code: l.uom_code_snapshot.clone(),
+                quantity_in_uom: l.quantity_in_uom,
+                unit_cost_excl_vat_in_uom_cents: l.unit_cost_excl_vat_in_uom_cents,
+                unit_cost_incl_vat_in_uom_cents: l.unit_cost_incl_vat_in_uom_cents,
+                vat_rate_id: l.vat_rate_id_snapshot.clone(),
+                vat_rate_bps: l.vat_rate_bps_snapshot,
+                line_subtotal_excl_vat_cents: a.subtotal_excl_vat_cents,
+                line_vat_cents: a.vat_cents,
+                line_total_incl_vat_cents: a.total_incl_vat_cents,
+            })
+            .collect();
+        lines.sort();
+
+        Self {
+            store_id: payload.store_id.clone(),
+            supplier_id: payload.supplier_id.clone(),
+            purchase_type: payload.purchase_type.clone(),
+            supplier_reference: payload.supplier_reference.clone(),
+            purchase_date: payload.purchase_date.clone(),
+            created_by_user_id: payload.created_by_user_id.clone(),
+            device_id: payload.device_id.clone(),
+            notes: payload.notes.clone(),
+            subtotal_excl_vat_cents: prepared.subtotal_excl_vat_cents,
+            vat_total_cents: prepared.vat_total_cents,
+            total_incl_vat_cents: prepared.total_incl_vat_cents,
+            lines,
+        }
+    }
+}
+
+struct PostedPurchase {
+    purchase_number: i64,
+    posted_at: String,
+    status: String,
+    canonical: CanonicalPurchase,
+}
+
+/// Load the purchase already stored under this document identity, if any, in
+/// the same canonical form an incoming payload is reduced to.
+async fn load_purchase_by_identity(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    purchase_id: &str,
+) -> Result<Option<PostedPurchase>, String> {
+    let header = sqlx::query(
+        "SELECT store_id, supplier_id, purchase_type, supplier_reference,
+                purchase_number, purchase_date, created_by_user_id, device_id, notes,
+                subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+                status, posted_at
+           FROM purchases WHERE id = ?",
+    )
+    .bind(purchase_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("read purchase {purchase_id}: {e}"))?;
+
+    let Some(row) = header else { return Ok(None) };
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+
+    let mut lines: Vec<CanonicalPurchaseLine> = sqlx::query(
+        "SELECT product_id, uom_code_snapshot, quantity_in_uom,
+                unit_cost_excl_vat_in_uom_cents, unit_cost_incl_vat_in_uom_cents,
+                vat_rate_id_snapshot, vat_rate_bps_snapshot,
+                line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+           FROM purchase_items WHERE purchase_id = ?",
+    )
+    .bind(purchase_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| format!("read purchase_items for {purchase_id}: {e}"))?
+    .into_iter()
+    .map(|r| {
+        Ok(CanonicalPurchaseLine {
+            product_id: r.try_get("product_id").map_err(d("product_id"))?,
+            uom_code: r.try_get("uom_code_snapshot").map_err(d("uom_code"))?,
+            quantity_in_uom: r.try_get("quantity_in_uom").map_err(d("quantity_in_uom"))?,
+            unit_cost_excl_vat_in_uom_cents: r
+                .try_get("unit_cost_excl_vat_in_uom_cents")
+                .map_err(d("unit_cost_excl_in_uom"))?,
+            unit_cost_incl_vat_in_uom_cents: r
+                .try_get("unit_cost_incl_vat_in_uom_cents")
+                .map_err(d("unit_cost_incl_in_uom"))?,
+            vat_rate_id: r.try_get("vat_rate_id_snapshot").map_err(d("vat_rate_id"))?,
+            vat_rate_bps: r.try_get("vat_rate_bps_snapshot").map_err(d("vat_rate_bps"))?,
+            line_subtotal_excl_vat_cents: r
+                .try_get("line_subtotal_excl_vat_cents")
+                .map_err(d("line_subtotal"))?,
+            line_vat_cents: r.try_get("line_vat_cents").map_err(d("line_vat"))?,
+            line_total_incl_vat_cents: r
+                .try_get("line_total_incl_vat_cents")
+                .map_err(d("line_total"))?,
+        })
+    })
+    .collect::<Result<Vec<_>, String>>()?;
+    lines.sort();
+
+    Ok(Some(PostedPurchase {
+        purchase_number: row.try_get("purchase_number").map_err(d("purchase_number"))?,
+        posted_at: row
+            .try_get::<Option<String>, _>("posted_at")
+            .map_err(d("posted_at"))?
+            .unwrap_or_default(),
+        status: row.try_get("status").map_err(d("status"))?,
+        canonical: CanonicalPurchase {
+            store_id: row.try_get("store_id").map_err(d("store_id"))?,
+            supplier_id: row.try_get("supplier_id").map_err(d("supplier_id"))?,
+            purchase_type: row.try_get("purchase_type").map_err(d("purchase_type"))?,
+            supplier_reference: row
+                .try_get("supplier_reference")
+                .map_err(d("supplier_reference"))?,
+            purchase_date: row.try_get("purchase_date").map_err(d("purchase_date"))?,
+            created_by_user_id: row
+                .try_get("created_by_user_id")
+                .map_err(d("created_by_user_id"))?,
+            device_id: row.try_get("device_id").map_err(d("device_id"))?,
+            notes: row.try_get("notes").map_err(d("notes"))?,
+            subtotal_excl_vat_cents: row
+                .try_get("subtotal_excl_vat_cents")
+                .map_err(d("subtotal"))?,
+            vat_total_cents: row.try_get("vat_total_cents").map_err(d("vat_total"))?,
+            total_incl_vat_cents: row.try_get("total_incl_vat_cents").map_err(d("total"))?,
+            lines,
+        },
+    }))
+}
+
+/// Name the first material difference between a posted purchase and a replay of
+/// it, or `None` when the replay is the same document.
+fn purchase_replay_difference(
+    posted: &CanonicalPurchase,
+    replayed: &CanonicalPurchase,
+) -> Option<(&'static str, String, String)> {
+    macro_rules! compare {
+        ($what:literal, $field:ident) => {
+            if posted.$field != replayed.$field {
+                return Some((
+                    $what,
+                    format!("{:?}", posted.$field),
+                    format!("{:?}", replayed.$field),
+                ));
+            }
+        };
+    }
+    compare!("store", store_id);
+    compare!("supplier", supplier_id);
+    compare!("purchase type", purchase_type);
+    compare!("supplier reference", supplier_reference);
+    compare!("purchase date", purchase_date);
+    compare!("buyer", created_by_user_id);
+    compare!("device", device_id);
+    compare!("notes", notes);
+    compare!("subtotal", subtotal_excl_vat_cents);
+    compare!("VAT total", vat_total_cents);
+    compare!("total", total_incl_vat_cents);
+
+    if posted.lines != replayed.lines {
+        if posted.lines.len() != replayed.lines.len() {
+            return Some((
+                "line count",
+                format!("{} line(s)", posted.lines.len()),
+                format!("{} line(s)", replayed.lines.len()),
+            ));
+        }
+        for (a, b) in posted.lines.iter().zip(&replayed.lines) {
+            if a != b {
+                return Some(("purchase line", format!("{a:?}"), format!("{b:?}")));
+            }
+        }
+    }
+    None
+}
+
+/// Rebuild the original command result for an already-posted purchase, so a
+/// retry reconciles to the purchase that exists instead of creating a second
+/// one — with a second payable, a second stock receipt and a second cost blend.
+async fn result_for_posted_purchase(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    purchase_id: &str,
+    existing: &PostedPurchase,
+) -> Result<PostPurchaseResult, String> {
+    let movement_ids: Vec<String> = sqlx::query(
+        "SELECT id FROM inventory_movements WHERE related_purchase_id = ? ORDER BY rowid",
+    )
+    .bind(purchase_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| format!("read movements for {purchase_id}: {e}"))?
+    .into_iter()
+    .map(|r| r.try_get::<String, _>("id").map_err(|e| format!("decode movement id: {e}")))
+    .collect::<Result<Vec<_>, String>>()?;
+
+    let ledger_entry_id: Option<String> = sqlx::query(
+        "SELECT id FROM supplier_ledger
+          WHERE related_purchase_id = ? AND entry_type = 'purchase' ORDER BY rowid LIMIT 1",
+    )
+    .bind(purchase_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("read ledger entry for {purchase_id}: {e}"))?
+    .map(|r| r.try_get::<String, _>("id").map_err(|e| format!("decode ledger id: {e}")))
+    .transpose()?;
+
+    Ok(PostPurchaseResult {
+        purchase_id: purchase_id.to_string(),
+        purchase_number: existing.purchase_number,
+        posted_at: existing.posted_at.clone(),
+        movement_ids,
+        ledger_entry_id,
+    })
+}
+
+/// The canonical normalized form of a supplier invoice reference, as SQL.
+///
+/// ONE definition in SQL, applied to both sides of every duplicate comparison:
+/// the stored side is `purchases.supplier_reference_key`, a generated column
+/// that migration 010 defines with exactly this expression, and the incoming
+/// side is this text applied to the bound parameter. Normalizing in Rust
+/// instead would fold Unicode case where SQLite's `UPPER` folds only ASCII, and
+/// a probe that disagreed with the column it probes is how a duplicate slips
+/// past the friendly check and surfaces as a raw trigger abort.
+const SUPPLIER_REFERENCE_KEY_SQL: &str =
+    "NULLIF(TRIM(UPPER(?), char(9,10,13,32)), '')";
 
 #[tauri::command]
 pub async fn post_purchase(
@@ -299,10 +1105,10 @@ pub async fn post_purchase(
     state: State<'_, DbState>,
     payload: PostPurchasePayload,
 ) -> Result<PostPurchaseResult, String> {
-    validate_purchase_payload(&payload)?;
+    let prepared = prepare_purchase(&payload)?;
 
     let pool = pool(&app, &state).await?;
-    post_purchase_tx(&pool, payload).await
+    post_purchase_tx(&pool, payload, prepared).await
 }
 
 /// Validate-then-post against an already-resolved pool. Preserves the command's
@@ -312,25 +1118,188 @@ pub(crate) async fn post_purchase_with_pool(
     pool: &SqlitePool,
     payload: PostPurchasePayload,
 ) -> Result<PostPurchaseResult, String> {
-    validate_purchase_payload(&payload)?;
-    post_purchase_tx(pool, payload).await
+    let prepared = prepare_purchase(&payload)?;
+    post_purchase_tx(pool, payload, prepared).await
 }
 
-/// The transactional body of `post_purchase`, unchanged.
+/// The transactional body of `post_purchase`.
 pub(crate) async fn post_purchase_tx(
     pool: &SqlitePool,
     payload: PostPurchasePayload,
+    prepared: PreparedPurchase,
 ) -> Result<PostPurchaseResult, String> {
+    let subtotal = prepared.subtotal_excl_vat_cents;
+    let vat_total = prepared.vat_total_cents;
+    let total = prepared.total_incl_vat_cents;
+
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Idempotency: has this purchase identity already posted? (Part I) ----
+    //
+    // A duplicate purchase is a duplicate payable, a duplicate stock receipt
+    // and a second blend into the weighted average, so a lost answer that the
+    // client retries must land on the purchase it may already have created.
+    //
+    // Runs before anything is written, and in particular before a purchase
+    // number is consumed, so a replay costs the sequence nothing.
+    //
+    // This is TECHNICAL retry idempotency and nothing else. It keys on
+    // `purchases.id` — the document identity the caller minted once — never on
+    // what the purchase contains. Two genuinely separate deliveries of the same
+    // goods at the same price are two purchases; what stops the same BILL being
+    // entered twice is the supplier-reference rule below, which is a different
+    // question with a different answer.
+    if let Some(existing) = load_purchase_by_identity(&mut tx, &payload.purchase_id).await? {
+        if existing.status != "posted" {
+            return Err(format!(
+                "Purchase {} already exists with status '{}' and cannot be re-posted.",
+                payload.purchase_id, existing.status
+            ));
+        }
+        let replayed = CanonicalPurchase::from_payload(&payload, &prepared);
+        if let Some((what, was, now_)) =
+            purchase_replay_difference(&existing.canonical, &replayed)
+        {
+            return Err(format!(
+                "Purchase {} already exists (purchase #{}) with a different {}: posted {}, \
+                 replayed {}. Start a new purchase instead of reusing this one.",
+                payload.purchase_id, existing.purchase_number, what, was, now_
+            ));
+        }
+        let result = result_for_posted_purchase(&mut tx, &payload.purchase_id, &existing).await?;
+        // Nothing was written; end the transaction without a commit.
+        tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
+        return Ok(result);
+    }
+
+    // ---- The supplier is this store's supplier ----
+    //
+    // A normal purchase raises a payable, and which store's books it lands in
+    // decides whose payable it is. The foreign key only proves the supplier
+    // exists somewhere.
+    if let Some(supplier_id) = &payload.supplier_id {
+        assert_supplier_belongs_to_store(&mut tx, supplier_id, &payload.store_id).await?;
+    }
+
+    // ---- One posted purchase per supplier invoice reference (Part B) ----
+    //
+    // A supplier bill is a document, and entering it twice books the goods
+    // twice: two payables for one delivery, two stock receipts, two blends into
+    // the cost pool. The shop then owes double and nothing in the ledger says
+    // which half is real.
+    //
+    // Scoped to (store, supplier, normalized reference) and to POSTED
+    // purchases, because that is the scope in which a reference identifies a
+    // document: two suppliers may both number their invoices "1001", and a
+    // voided purchase has released its reference. A blank or whitespace-only
+    // reference normalizes to NULL and constrains nothing — a cash-and-carry
+    // receipt with no number to quote is not a duplicate of the next one.
+    //
+    // Checked HERE, before a purchase number is consumed and before any row,
+    // movement or ledger entry is written, so the common case fails with an
+    // error a buyer can act on. `trg_purchases_no_duplicate_supplier_invoice_*`
+    // is the backstop for the interleaved case and for every writer that does
+    // not come through this command.
+    if let (Some(supplier_id), Some(reference)) =
+        (payload.supplier_id.as_deref(), payload.supplier_reference.as_deref())
+    {
+        if !reference.trim().is_empty() {
+            let existing = sqlx::query(&format!(
+                "SELECT purchase_number, purchase_date FROM purchases
+                  WHERE store_id = ? AND supplier_id = ? AND status = 'posted'
+                    AND supplier_reference_key IS NOT NULL
+                    AND supplier_reference_key = {SUPPLIER_REFERENCE_KEY_SQL}
+                  ORDER BY purchase_number LIMIT 1"
+            ))
+            .bind(&payload.store_id)
+            .bind(supplier_id)
+            .bind(reference)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("check supplier reference {reference}: {e}"))?;
+
+            if let Some(row) = existing {
+                let number: i64 = row
+                    .try_get("purchase_number")
+                    .map_err(|e| format!("decode purchase_number: {e}"))?;
+                let date: String = row
+                    .try_get("purchase_date")
+                    .map_err(|e| format!("decode purchase_date: {e}"))?;
+                return Err(format!(
+                    "Supplier invoice \"{reference}\" is already posted for this supplier as \
+                     purchase #{number} of {date}. Open that purchase instead of entering the \
+                     bill a second time."
+                ));
+            }
+        }
+    }
+
+    // ---- One authoritative unit price per line (WP-05 correction) ----
+    //
+    // The invoice states ONE price per unit. `vat_pricing_mode` names which
+    // side of each line's excl/incl pair that is — the payload's, or the
+    // product's own `vat_pricing_mode` when the payload is silent — and
+    // `derive_unit_cost_pair` computes the counterpart and refuses a line whose
+    // declared counterpart disagrees.
+    //
+    // Without this, "net $20.00, gross $999.00 at 11%" was a payload the
+    // backend had no opinion about: the stock went in at a $20 cost basis while
+    // the supplier ledger took $999 of debt, from one delivery, on rows that
+    // can never be edited again.
+    //
+    // A PRE-PASS, deliberately. It runs before the purchase number is consumed
+    // and before the first `purchase_items` insert, so a malformed pair on
+    // line 2 cannot leave line 1's goods, cost blend or sequence advance behind
+    // even transiently — the rejection is clean rather than merely rolled back.
+    // Same placement, and same reasoning, as the duplicate-invoice check above.
+    for (i, line) in payload.lines.iter().enumerate() {
+        let mode = match line.vat_pricing_mode.as_deref() {
+            Some(declared) => VatPricingMode::parse(declared)
+                .map_err(|e| format!("Line {}: {}", i + 1, e))?,
+            None => {
+                // The product's own pricing mode is the fallback, which is what
+                // the Purchases page initialises its per-line toggle from. A
+                // caller that predates this field therefore keeps working, and
+                // keeps working the way the UI would have.
+                let stored: String = sqlx::query(
+                    "SELECT vat_pricing_mode FROM products WHERE id = ? AND store_id = ?",
+                )
+                .bind(&line.product_id)
+                .bind(&payload.store_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| format!("read pricing mode for {}: {e}", line.product_id))?
+                .ok_or_else(|| {
+                    // The same wording the line loop uses, so the error does not
+                    // depend on which stage noticed the product was missing.
+                    format!(
+                        "Product {} not found in store {}",
+                        line.product_id, payload.store_id
+                    )
+                })?
+                .try_get("vat_pricing_mode")
+                .map_err(|e| format!("decode vat_pricing_mode: {e}"))?;
+                VatPricingMode::parse(&stored).map_err(|e| {
+                    format!(
+                        "Product {} carries an unusable pricing mode: {}",
+                        line.product_id, e
+                    )
+                })?
+            }
+        };
+        // The derived pair is equal to the declared one by construction — that
+        // IS the check — so the value itself is nothing the caller needs. What
+        // matters is that a line which could not produce it never gets past
+        // here. The per-base microcent costs below are then derived from a pair
+        // that has been proved to be one price, which is what makes the stock's
+        // cost basis and the supplier's debt two views of the same money.
+        derive_unit_cost_pair(i, line, mode)?;
+    }
 
     let purchase_number = next_purchase_number(&mut tx, &payload.store_id).await?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
-
-    let subtotal: i64 = payload.lines.iter().map(|l| l.line_subtotal_excl_vat_cents).sum();
-    let vat_total: i64 = payload.lines.iter().map(|l| l.line_vat_cents).sum();
-    let total: i64 = payload.lines.iter().map(|l| l.line_total_incl_vat_cents).sum();
 
     sqlx::query(
     r#"INSERT INTO purchases (
@@ -359,7 +1328,7 @@ pub(crate) async fn post_purchase_tx(
 
     let mut movement_ids: Vec<String> = Vec::with_capacity(payload.lines.len());
 
-    for line in &payload.lines {
+    for (line, amounts) in payload.lines.iter().zip(&prepared.lines) {
         let purchase_item_id = if line.purchase_item_id.trim().is_empty() {
     uuid::Uuid::new_v4().to_string()
 } else {
@@ -548,9 +1517,13 @@ pub(crate) async fn post_purchase_tx(
         .bind(unit_cost_incl_base_mc)
         .bind(&line.vat_rate_id_snapshot)
         .bind(line.vat_rate_bps_snapshot)
-        .bind(line.line_subtotal_excl_vat_cents)
-        .bind(line.line_vat_cents)
-        .bind(line.line_total_incl_vat_cents)
+        // The DERIVED line money (Part C), not the payload's copy of it. The
+        // two were proved equal by `derive_purchase_line_amounts`; writing the
+        // derived one is what makes the header — and the payable that is summed
+        // from these rows — a figure the backend stands behind.
+        .bind(amounts.subtotal_excl_vat_cents)
+        .bind(amounts.vat_cents)
+        .bind(amounts.total_incl_vat_cents)
         .bind(Option::<String>::None)
         .execute(&mut *tx)
         .await
@@ -624,6 +1597,19 @@ pub(crate) async fn post_purchase_tx(
     }
 
     // --- Ledger entry: only for 'normal' purchases with a supplier. ---
+    //
+    // The payable raised is `total` — the purchase's own authoritative
+    // VAT-inclusive total, derived by `prepare_purchase` from the invoice costs
+    // and summed from the very rows written above. There is no second amount on
+    // the wire for a caller to put here instead, which is the whole of Part C:
+    // `SUM(supplier_ledger.amount_cents WHERE entry_type='purchase')` for a
+    // supplier can only ever equal the sum of its posted purchase totals.
+    //
+    // Written inside the same transaction as the purchase, its lines, its
+    // movements and its stock and cost updates, so there is no state in which a
+    // delivery was received without the debt for it, or the debt without the
+    // goods. An 'opening' batch raises nothing: opening stock is not something
+    // the shop owes anybody for.
     let ledger_entry_id: Option<String> = if payload.purchase_type == "normal" {
         if let Some(supplier_id) = &payload.supplier_id {
             let id = uuid::Uuid::new_v4().to_string();
@@ -827,24 +1813,128 @@ pub(crate) async fn post_adjustment_tx(
 // post_supplier_payment (Phase 2D.6)
 // ============================================================================
 
-/// Pure pre-DB validation for `post_supplier_payment`. Extracted verbatim (WP-01).
+/// Pure pre-DB validation for `post_supplier_payment`.
+///
+/// Returns the AUTHORITATIVE signed ledger amount, because deciding it is part
+/// of validating the request: the magnitude has to be positive and the
+/// direction has to be knowable before there is anything worth writing. The
+/// command runs this before acquiring the pool, as it always has.
 pub(crate) fn validate_supplier_payment_payload(
     payload: &PostSupplierPaymentPayload,
-) -> Result<(), String> {
+) -> Result<i64, String> {
+    // `purchase` is deliberately absent: only `post_purchase` may raise a
+    // payable, and it does so from the purchase document's own total. A caller
+    // able to book an arbitrary invoice liability through this command could
+    // invent debt with no goods, no lines and no paper behind it.
     let allowed = ["payment", "credit_note", "opening_balance", "adjustment"];
     if !allowed.contains(&payload.entry_type.as_str()) {
         return Err(format!("Invalid entry_type for this command: {}", payload.entry_type));
     }
-    if payload.amount_cents == 0 {
-        return Err("Amount must be non-zero.".into());
+    if payload.ledger_entry_id.trim().is_empty() {
+        return Err("A ledger entry id is required.".into());
     }
+    if payload.store_id.trim().is_empty() {
+        return Err("A store is required.".into());
+    }
+    if payload.supplier_id.trim().is_empty() {
+        return Err("A supplier is required.".into());
+    }
+    let amount_cents = resolve_ledger_amount(
+        &payload.entry_type,
+        payload.amount_magnitude_cents,
+        payload.amount_cents,
+    )?;
     if payload.entry_type == "adjustment" && payload.notes.as_deref().unwrap_or("").trim().is_empty() {
         return Err("Adjustment entries require a note explaining why.".into());
     }
     if payload.entry_date.trim().is_empty() {
         return Err("Entry date is required.".into());
     }
-    Ok(())
+    Ok(amount_cents)
+}
+
+/// The business content of a supplier-ledger entry, in a form that compares
+/// equal for a true retry and unequal for anything materially different.
+///
+/// `amount_cents` here is the DERIVED signed amount, not the payload's: a
+/// client that sent a payment as `+5000` on the first attempt and `−5000` on
+/// the retry sent the same payment twice, and must be told so rather than
+/// handed a conflict over a sign the backend was never going to honour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalLedgerEntry {
+    store_id: String,
+    supplier_id: String,
+    entry_type: String,
+    amount_cents: i64,
+    entry_date: String,
+    payment_reference: Option<String>,
+    notes: Option<String>,
+}
+
+struct PostedLedgerEntry {
+    posted_at: String,
+    canonical: CanonicalLedgerEntry,
+}
+
+/// Load the entry already stored under this payment identity, if any.
+async fn load_ledger_entry_by_identity(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    ledger_entry_id: &str,
+) -> Result<Option<PostedLedgerEntry>, String> {
+    let row = sqlx::query(
+        "SELECT store_id, supplier_id, entry_type, amount_cents, entry_date,
+                payment_reference, notes, posted_at
+           FROM supplier_ledger WHERE id = ?",
+    )
+    .bind(ledger_entry_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("read supplier_ledger entry {ledger_entry_id}: {e}"))?;
+
+    let Some(row) = row else { return Ok(None) };
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+
+    Ok(Some(PostedLedgerEntry {
+        posted_at: row.try_get("posted_at").map_err(d("posted_at"))?,
+        canonical: CanonicalLedgerEntry {
+            store_id: row.try_get("store_id").map_err(d("store_id"))?,
+            supplier_id: row.try_get("supplier_id").map_err(d("supplier_id"))?,
+            entry_type: row.try_get("entry_type").map_err(d("entry_type"))?,
+            amount_cents: row.try_get("amount_cents").map_err(d("amount_cents"))?,
+            entry_date: row.try_get("entry_date").map_err(d("entry_date"))?,
+            payment_reference: row
+                .try_get("payment_reference")
+                .map_err(d("payment_reference"))?,
+            notes: row.try_get("notes").map_err(d("notes"))?,
+        },
+    }))
+}
+
+/// Name the first material difference between a stored entry and a replay of
+/// it, or `None` when the replay is the same payment.
+fn ledger_replay_difference(
+    posted: &CanonicalLedgerEntry,
+    replayed: &CanonicalLedgerEntry,
+) -> Option<(&'static str, String, String)> {
+    macro_rules! compare {
+        ($what:literal, $field:ident) => {
+            if posted.$field != replayed.$field {
+                return Some((
+                    $what,
+                    format!("{:?}", posted.$field),
+                    format!("{:?}", replayed.$field),
+                ));
+            }
+        };
+    }
+    compare!("store", store_id);
+    compare!("supplier", supplier_id);
+    compare!("entry type", entry_type);
+    compare!("amount", amount_cents);
+    compare!("entry date", entry_date);
+    compare!("reference", payment_reference);
+    compare!("notes", notes);
+    None
 }
 
 #[tauri::command]
@@ -853,10 +1943,10 @@ pub async fn post_supplier_payment(
     state: State<'_, DbState>,
     payload: PostSupplierPaymentPayload,
 ) -> Result<PostSupplierPaymentResult, String> {
-    validate_supplier_payment_payload(&payload)?;
+    let amount_cents = validate_supplier_payment_payload(&payload)?;
 
     let pool = pool(&app, &state).await?;
-    post_supplier_payment_tx(&pool, payload).await
+    post_supplier_payment_tx(&pool, payload, amount_cents).await
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).
@@ -865,19 +1955,105 @@ pub(crate) async fn post_supplier_payment_with_pool(
     pool: &SqlitePool,
     payload: PostSupplierPaymentPayload,
 ) -> Result<PostSupplierPaymentResult, String> {
-    validate_supplier_payment_payload(&payload)?;
-    post_supplier_payment_tx(pool, payload).await
+    let amount_cents = validate_supplier_payment_payload(&payload)?;
+    post_supplier_payment_tx(pool, payload, amount_cents).await
 }
 
-/// The transactional body of `post_supplier_payment`, unchanged.
+/// The transactional body of `post_supplier_payment`.
+///
+/// `amount_cents` is the signed amount `validate_supplier_payment_payload`
+/// derived. The payload's own `amount_cents` is never written.
 pub(crate) async fn post_supplier_payment_tx(
     pool: &SqlitePool,
     payload: PostSupplierPaymentPayload,
+    amount_cents: i64,
 ) -> Result<PostSupplierPaymentResult, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
+
+    let replayed = CanonicalLedgerEntry {
+        store_id: payload.store_id.clone(),
+        supplier_id: payload.supplier_id.clone(),
+        entry_type: payload.entry_type.clone(),
+        amount_cents,
+        entry_date: payload.entry_date.clone(),
+        payment_reference: payload.payment_reference.clone(),
+        notes: payload.notes.clone(),
+    };
+
+    // ---- Idempotency: has this payment identity already posted? ----
+    //
+    // Before anything is written, and in particular before the overpayment
+    // check below — which a replay would fail, because the payable it would be
+    // tested against already includes this very payment. A retry after a lost
+    // answer is the case that matters: the money has left the shop, the ledger
+    // already says so, and the caller needs to be told which entry it was, not
+    // handed a second one or an error about a balance it already paid down.
+    if let Some(existing) = load_ledger_entry_by_identity(&mut tx, &payload.ledger_entry_id).await? {
+        if let Some((what, was, now_)) =
+            ledger_replay_difference(&existing.canonical, &replayed)
+        {
+            return Err(format!(
+                "Supplier ledger entry {} already exists with a different {}: posted {}, \
+                 replayed {}. Record a new entry instead of reusing this one.",
+                payload.ledger_entry_id, what, was, now_
+            ));
+        }
+        let new_balance = current_supplier_balance(&mut tx, &payload.supplier_id).await?;
+        // Nothing was written; end the transaction without a commit.
+        tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
+        return Ok(PostSupplierPaymentResult {
+            ledger_entry_id: payload.ledger_entry_id,
+            posted_at: existing.posted_at,
+            new_balance_cents: new_balance,
+        });
+    }
+
+    // ---- The supplier is this store's supplier ----
+    //
+    // The foreign key only proves the supplier exists somewhere. Which store's
+    // books the entry lands in decides which store's payable it reduces, so it
+    // is checked rather than assumed.
+    assert_supplier_belongs_to_store(&mut tx, &payload.supplier_id, &payload.store_id).await?;
+
+    // ---- A payment cannot exceed what is outstanding (Part E) ----
+    //
+    // Greaz models no supplier advance and no supplier receivable: there is no
+    // prepayment document, no advance account, and nothing that would ever draw
+    // such a balance back down. A payment that overshot would leave a negative
+    // payable that only looks like an asset, and since ledger rows are
+    // immutable it could never be unwound — only offset by a second entry that
+    // misstates something else.
+    //
+    // Negative balances remain reachable, deliberately, through the two
+    // explicitly-signed instruments: a `credit_note` the supplier actually
+    // issued, or an `adjustment` somebody signed off in writing. Those are
+    // decisions a human made about a real document. An overpayment is a typo.
+    //
+    // The balance is read HERE, inside the transaction that writes the payment,
+    // never from the caller. Two payments racing against one remaining balance
+    // cannot both commit: SQLite runs one write transaction at a time, so the
+    // second either sees the first's row in this sum, or cannot commit at all.
+    if payload.entry_type == "payment" {
+        let outstanding = current_supplier_balance(&mut tx, &payload.supplier_id).await?;
+        let paying = -amount_cents; // positive: `payment` is a Decrease
+        if outstanding <= 0 {
+            return Err(format!(
+                "There is nothing outstanding to pay: the supplier's balance is {} cents. \
+                 Record a credit note or an adjustment if the supplier owes the shop.",
+                outstanding
+            ));
+        }
+        if paying > outstanding {
+            return Err(format!(
+                "Payment of {} cents exceeds the {} cents outstanding. Pay the balance or less — \
+                 the shop does not carry supplier advances.",
+                paying, outstanding
+            ));
+        }
+    }
 
     sqlx::query(
         r#"INSERT INTO supplier_ledger (
@@ -890,7 +2066,7 @@ pub(crate) async fn post_supplier_payment_tx(
     .bind(&payload.store_id)
     .bind(&payload.supplier_id)
     .bind(&payload.entry_type)
-    .bind(payload.amount_cents)
+    .bind(amount_cents)
     .bind(&payload.entry_date)
     .bind(&payload.payment_reference)
     .bind(&payload.notes)
@@ -2594,10 +3770,21 @@ async fn assert_shift_is_open(
 /// that, and such a row must not go on quietly making the drawer look short.
 ///
 /// Events this deliberately does NOT model, because the application does not
-/// have them yet: refunds and credit memos (WP-06), supplier payments out of
-/// the till (WP-05), and petty cash / cash-in / cash-out. There is no flow that
-/// produces them, so there is nothing to include; each lands here when its own
-/// work package adds it.
+/// have them yet: refunds and credit memos (WP-06), and petty cash /
+/// cash-in / cash-out. There is no flow that produces them, so there is nothing
+/// to include; each lands here when its own work package adds it.
+///
+/// Supplier payments stay out too, and WP-05 left them out ON PURPOSE rather
+/// than by omission. A `supplier_ledger` payment row records an amount in USD
+/// cents and nothing else: no method, no currency, no shift. Nothing in the
+/// schema or the Supplier screen says whether a given payment was lira out of
+/// this drawer, a bank transfer, or a cheque posted last week. Subtracting
+/// every supplier payment from expected cash would therefore make the drawer
+/// look short by every payment that never touched it, and would attribute
+/// payments to whichever shift happened to be open when somebody typed them in.
+/// Giving supplier payments a tender model is a product decision, not a
+/// refactor; until it is made, the honest figure is the one that counts only
+/// what provably moved through the till.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DrawerCash {
     pub cash_usd_in_cents: i64,
