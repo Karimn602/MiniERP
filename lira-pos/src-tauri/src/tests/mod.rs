@@ -18,6 +18,7 @@ mod purchase_authority;
 mod purchases;
 mod pure;
 mod reconciliation;
+mod returns;
 mod sales;
 mod shifts;
 mod supplier_ap;

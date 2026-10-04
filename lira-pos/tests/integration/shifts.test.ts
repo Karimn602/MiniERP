@@ -400,11 +400,15 @@ describe("getDrawerExpectation", () => {
       ],
     });
 
+    // Since WP-06 the figure also carries the cash-refund terms, which are
+    // zero here because this shift has no credit memos.
     expect(await shiftsRepo.getDrawerExpectation(SHIFT_A, STORE_ID)).toEqual({
       cashUsdInCents: 0,
       cashLbpIn: 0,
       changeUsdOutCents: 0,
       changeLbpOut: 0,
+      refundUsdOutCents: 0,
+      refundLbpOut: 0,
     });
   });
 
@@ -415,6 +419,8 @@ describe("getDrawerExpectation", () => {
       cashLbpIn: 0,
       changeUsdOutCents: 0,
       changeLbpOut: 0,
+      refundUsdOutCents: 0,
+      refundLbpOut: 0,
     });
   });
 });

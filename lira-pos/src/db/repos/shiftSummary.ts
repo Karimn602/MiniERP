@@ -119,3 +119,67 @@ export const shiftSummaryRepo = {
     }));
   },
 };
+
+/**
+ * Refunds for one local day — the date-scoped twin of
+ * `shiftsRepo.getRefundSummary`.
+ *
+ * ADDITIVE, like every other returns read model: `salesSummary` above stays
+ * GROSS and keeps meaning exactly what it meant before WP-06, and a caller
+ * that wants net collection subtracts these with both figures on screen. In
+ * particular `netSalesExclVatCents` is untouched — it is GP-A04's defect and
+ * WP-08 owns it.
+ */
+export interface DayRefundSummary {
+  memoCount: number;
+  subtotalExclVatCents: number;
+  vatTotalCents: number;
+  totalInclVatCents: number;
+  cogsReversedCents: number;
+}
+
+export const refundSummaryRepo = {
+  async refundSummary(args: {
+    storeId: string;
+    date: string;
+  }): Promise<DayRefundSummary> {
+    interface Row {
+      memo_count: number;
+      subtotal_excl_vat_cents: number;
+      vat_total_cents: number;
+      total_incl_vat_cents: number;
+      cogs_reversed_cents: number;
+    }
+
+    const rows = await query<Row>(
+      `SELECT
+         COUNT(*) AS memo_count,
+         COALESCE(SUM(subtotal_excl_vat_cents), 0) AS subtotal_excl_vat_cents,
+         COALESCE(SUM(vat_total_cents), 0)         AS vat_total_cents,
+         COALESCE(SUM(total_incl_vat_cents), 0)    AS total_incl_vat_cents,
+         COALESCE(SUM(cogs_reversed_cents), 0)     AS cogs_reversed_cents
+       FROM sales_credit_memos
+       WHERE store_id = ?
+         AND status = 'posted'
+         AND posted_at >= ?
+         AND posted_at <= ?`,
+      [args.storeId, utcFrom(args.date), utcTo(args.date)],
+    );
+
+    const r = rows[0] ?? {
+      memo_count: 0,
+      subtotal_excl_vat_cents: 0,
+      vat_total_cents: 0,
+      total_incl_vat_cents: 0,
+      cogs_reversed_cents: 0,
+    };
+
+    return {
+      memoCount: r.memo_count,
+      subtotalExclVatCents: r.subtotal_excl_vat_cents,
+      vatTotalCents: r.vat_total_cents,
+      totalInclVatCents: r.total_incl_vat_cents,
+      cogsReversedCents: r.cogs_reversed_cents,
+    };
+  },
+};

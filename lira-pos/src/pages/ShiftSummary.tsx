@@ -5,6 +5,8 @@ import {
   type ShiftSalesSummary,
   type ShiftPaymentRow,
   type ShiftDrawerExpectation,
+  type ShiftRefundSummary,
+  type ShiftRefundRow,
 } from "../db/repos/shifts";
 import type { Shift } from "../db/types";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
@@ -117,6 +119,11 @@ export default function ShiftSummary() {
   const [salesSummary, setSalesSummary] = useState<ShiftSalesSummary | null>(null);
   const [payments, setPayments] = useState<ShiftPaymentRow[]>([]);
   const [drawerCash, setDrawerCash] = useState<ShiftDrawerExpectation | null>(null);
+  // Returns are kept as their OWN figures rather than folded into
+  // `salesSummary`: a refund is not a negative sale, so the sales numbers above
+  // stay gross and the net collection below is a visible subtraction.
+  const [refundSummary, setRefundSummary] = useState<ShiftRefundSummary | null>(null);
+  const [refunds, setRefunds] = useState<ShiftRefundRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -134,14 +141,18 @@ export default function ShiftSummary() {
 
   const loadShiftData = useCallback(async (shift: Shift) => {
     if (!storeId) return;
-    const [summary, breakdown, cash] = await Promise.all([
+    const [summary, breakdown, cash, refundTotals, refundRows] = await Promise.all([
       shiftsRepo.getSalesSummary(shift.id, storeId),
       shiftsRepo.getPaymentBreakdown(shift.id, storeId),
       shiftsRepo.getDrawerExpectation(shift.id, storeId),
+      shiftsRepo.getRefundSummary(shift.id, storeId),
+      shiftsRepo.getRefundBreakdown(shift.id, storeId),
     ]);
     setSalesSummary(summary);
     setPayments(breakdown);
     setDrawerCash(cash);
+    setRefundSummary(refundTotals);
+    setRefunds(refundRows);
   }, [storeId]);
 
   const loadShift = useCallback(async () => {
@@ -157,6 +168,8 @@ export default function ShiftSummary() {
         setSalesSummary(null);
         setPayments([]);
         setDrawerCash(null);
+        setRefundSummary(null);
+        setRefunds([]);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -182,22 +195,25 @@ export default function ShiftSummary() {
   // ---------- Drawer math ----------
 
   const drawer = useMemo(() => {
-    // Cash in and change out come from `getDrawerExpectation`, which runs the
-    // same SQL `close_shift` runs inside its transaction. This preview must not
-    // compute the drawer a second way in React: the figure the cashier counts
-    // against is the one that gets persisted (WP-04, parts E/K). In particular
-    // the change terms are cash-only there, so a card row can neither inflate
-    // nor reduce what the till is expected to hold.
+    // Cash in, change out and (since WP-06) cash refunded out all come from
+    // `getDrawerExpectation`, which runs the same SQL `close_shift` runs inside
+    // its transaction. This preview must not compute the drawer a second way in
+    // React: the figure the cashier counts against is the one that gets
+    // persisted (WP-04, parts E/K). In particular all three terms are cash-only
+    // there, so a card tender and a card refund alike can neither inflate nor
+    // reduce what the till is expected to hold.
     const cashUsdReceived = drawerCash?.cashUsdInCents ?? 0;
     const cashLbpReceived = drawerCash?.cashLbpIn ?? 0;
     const changeUsd = drawerCash?.changeUsdOutCents ?? 0;
     const changeLbp = drawerCash?.changeLbpOut ?? 0;
+    const refundUsd = drawerCash?.refundUsdOutCents ?? 0;
+    const refundLbp = drawerCash?.refundLbpOut ?? 0;
 
     const openingUsd = activeShift?.openingCashUsdCents ?? 0;
     const openingLbp = activeShift?.openingCashLbp ?? 0;
 
-    const expectedUsd = openingUsd + cashUsdReceived - changeUsd;
-    const expectedLbp = openingLbp + cashLbpReceived - changeLbp;
+    const expectedUsd = openingUsd + cashUsdReceived - changeUsd - refundUsd;
+    const expectedLbp = openingLbp + cashLbpReceived - changeLbp - refundLbp;
 
     // Live variance from closing inputs
     let closingUsd = 0;
@@ -224,6 +240,8 @@ export default function ShiftSummary() {
       cashLbpReceived,
       changeUsd,
       changeLbp,
+      refundUsd,
+      refundLbp,
       expectedUsd,
       expectedLbp,
       closingUsd,
@@ -259,7 +277,22 @@ export default function ShiftSummary() {
       setActiveShift(shift);
       setSalesSummary({ receiptCount: 0, totalInclVatCents: 0, subtotalExclVatCents: 0, discountCents: 0, vatTotalCents: 0, netSalesExclVatCents: 0 });
       setPayments([]);
-      setDrawerCash({ cashUsdInCents: 0, cashLbpIn: 0, changeUsdOutCents: 0, changeLbpOut: 0 });
+      setDrawerCash({
+        cashUsdInCents: 0,
+        cashLbpIn: 0,
+        changeUsdOutCents: 0,
+        changeLbpOut: 0,
+        refundUsdOutCents: 0,
+        refundLbpOut: 0,
+      });
+      setRefundSummary({
+        memoCount: 0,
+        subtotalExclVatCents: 0,
+        vatTotalCents: 0,
+        totalInclVatCents: 0,
+        cogsReversedCents: 0,
+      });
+      setRefunds([]);
       setOpeningUsdInput("");
       setOpeningLbpInput("");
       setClosingUsdInput("");
@@ -535,7 +568,86 @@ export default function ShiftSummary() {
             )}
           </Card>
 
-          {/* Section 3 — Cash Drawer + Close Shift */}
+          {/* Section 3 — Returns / Refunds (WP-06) */}
+          <div>
+            <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-700">
+              {t("shift.returnsTitle")}
+            </h3>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+              <StatCard
+                label={t("shift.returnsCount")}
+                value={refundSummary ? String(refundSummary.memoCount) : "—"}
+              />
+              <StatCard
+                label={t("shift.refundsInclVat")}
+                value={refundSummary ? formatUsd(refundSummary.totalInclVatCents) : "—"}
+                tone={refundSummary && refundSummary.totalInclVatCents > 0 ? "warn" : undefined}
+                sub={t("shift.refundsPaidOut")}
+              />
+              <StatCard
+                label={t("shift.vatReversed")}
+                value={refundSummary ? formatUsd(refundSummary.vatTotalCents) : "—"}
+                tone="muted"
+                sub={t("shift.vatReversedHint")}
+              />
+              <StatCard
+                label={t("shift.netCollection")}
+                value={
+                  salesSummary && refundSummary
+                    ? formatUsd(
+                        salesSummary.totalInclVatCents - refundSummary.totalInclVatCents,
+                      )
+                    : "—"
+                }
+                sub={t("shift.netCollectionHint")}
+              />
+            </div>
+
+            {refunds.length > 0 && (
+              <Card className="mt-3">
+                <CardHeader
+                  title={t("shift.refundBreakdownTitle")}
+                  subtitle={t("shift.refundBreakdownSubtitle")}
+                />
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-sm">
+                    <thead className="border-b border-slate-200 bg-slate-50/80 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">
+                      <tr>
+                        <th className="px-5 py-2">{t("shift.colMethod")}</th>
+                        <th className="px-5 py-2 text-end">{t("shift.colNativeAmount")}</th>
+                        <th className="px-5 py-2 text-end">{t("shift.colUsdEquivalent")}</th>
+                        <th className="px-5 py-2">{t("shift.colTouchesDrawer")}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {refunds.map((row) => (
+                        <tr key={`${row.method}-${row.currency}`} className="hover:bg-slate-50">
+                          <td className="px-5 py-2.5 font-medium text-slate-900">
+                            {t(`shift.paymentMethods.${row.method as PaymentMethod}`)}
+                          </td>
+                          <td className="px-5 py-2.5 text-end tabular-nums text-slate-700">
+                            {row.currency === "LBP"
+                              ? formatLbp(row.amountNativeLbp)
+                              : formatUsd(row.amountNativeUsdCents)}
+                          </td>
+                          <td className="px-5 py-2.5 text-end tabular-nums text-slate-700">
+                            {formatUsd(row.amountUsdCentsEquivalent)}
+                          </td>
+                          <td className="px-5 py-2.5 text-xs text-slate-500">
+                            {row.method === "cash_usd" || row.method === "cash_lbp"
+                              ? t("shift.drawerYes")
+                              : t("shift.drawerNo")}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+            )}
+          </div>
+
+          {/* Section 4 — Cash Drawer + Close Shift */}
           <Card>
             <CardHeader
               title={t("shift.cashDrawerTitle")}
@@ -562,6 +674,11 @@ export default function ShiftSummary() {
                       label={t("shift.changeGiven")}
                       value={drawer.changeUsd > 0 ? `− ${formatUsd(drawer.changeUsd)}` : "—"}
                       tone={drawer.changeUsd > 0 ? "warn" : undefined}
+                    />
+                    <DrawerRow
+                      label={t("shift.cashRefunded")}
+                      value={drawer.refundUsd > 0 ? `− ${formatUsd(drawer.refundUsd)}` : "—"}
+                      tone={drawer.refundUsd > 0 ? "warn" : undefined}
                     />
                     <DrawerRow
                       label={t("shift.expectedInDrawer")}
@@ -621,6 +738,11 @@ export default function ShiftSummary() {
                       label={t("shift.changeGiven")}
                       value={drawer.changeLbp > 0 ? `− ${formatLbp(drawer.changeLbp)}` : "—"}
                       tone={drawer.changeLbp > 0 ? "warn" : undefined}
+                    />
+                    <DrawerRow
+                      label={t("shift.cashRefunded")}
+                      value={drawer.refundLbp > 0 ? `− ${formatLbp(drawer.refundLbp)}` : "—"}
+                      tone={drawer.refundLbp > 0 ? "warn" : undefined}
                     />
                     <DrawerRow
                       label={t("shift.expectedInDrawer")}

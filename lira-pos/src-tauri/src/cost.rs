@@ -222,3 +222,62 @@ pub fn new_weighted_avg(
     let average = div_round_half_away(total_value, total_qty)?;
     to_i64(average, "weighted-average unit cost in microcents")
 }
+
+/// Weighted-average unit cost after RETURNED stock comes back, in microcents,
+/// or `None` when no average can honestly be formed.
+///
+/// A restock is a weighted average like any other — the returned units re-enter
+/// the pool at the rate they left it at, and `new_weighted_avg` does the
+/// arithmetic. What differs is the state it can meet. A purchase arrives into a
+/// pool the shop believes in; a return can arrive into one that is already
+/// NEGATIVE, because the POS allows selling below zero
+/// (`allow_negative_inventory`), and a negative pool is not a quantity an
+/// average can be taken over:
+///
+///   * the resulting quantity may still be zero or negative (sold 10 short,
+///     one unit comes back), and dividing a value by that is not a cost;
+///   * the resulting average may come out NEGATIVE (a negative pool valued at
+///     a high average, plus a few cheap units back), and
+///     `products.avg_cost_*_microcents` is `CHECK (>= 0)` — rightly, since no
+///     inventory pool costs less than nothing.
+///
+/// In both cases this returns `Ok(None)`, meaning: LEAVE THE EXISTING AVERAGE
+/// ALONE. The quantity still goes back on the shelf — the goods are physically
+/// there — but the cost pool keeps the only figure that is still meaningful,
+/// which is the rate the shop was already using for the next unit. Inventing an
+/// average over a non-positive pool, or clamping a negative one to zero, would
+/// both write a number nobody can defend.
+///
+/// `Ok(Some(avg))` is the ordinary case and is exactly `new_weighted_avg`.
+pub fn restock_weighted_avg(
+    old_qty: i64,
+    old_avg_microcents: i64,
+    returned_qty: i64,
+    returned_cost_microcents: i64,
+) -> Result<Option<i64>, String> {
+    if returned_qty <= 0 {
+        return Err("a restock must return a positive quantity".into());
+    }
+    if returned_cost_microcents < 0 {
+        return Err("a restock cost rate cannot be negative".into());
+    }
+    let total_qty = (old_qty as i128)
+        .checked_add(returned_qty as i128)
+        .ok_or_else(|| "restock quantity overflow".to_string())?;
+    if total_qty <= 0 {
+        // The pool is still short even after the return. No average exists.
+        return Ok(None);
+    }
+    let average = new_weighted_avg(
+        old_qty,
+        old_avg_microcents,
+        returned_qty,
+        returned_cost_microcents,
+    )?;
+    if average < 0 {
+        // Reachable only from a pre-existing negative pool. The column forbids
+        // it and so does arithmetic sense.
+        return Ok(None);
+    }
+    Ok(Some(average))
+}

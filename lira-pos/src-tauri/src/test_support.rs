@@ -104,6 +104,24 @@ pub fn app_migrator_through(max_version: i64) -> Migrator {
     }
 }
 
+/// The highest migration version the application ships, and how many there
+/// are, derived from the real list in `lib.rs`.
+///
+/// Every "this database is fully migrated" assertion goes through these rather
+/// than through a literal, so adding a migration means editing one list and not
+/// every test that happens to check the migrator reached the end.
+pub fn latest_migration_version() -> i64 {
+    crate::migrations()
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("the application ships at least one migration")
+}
+
+pub fn migration_count() -> i64 {
+    crate::migrations().len() as i64
+}
+
 /// A disposable SQLite database for one test.
 ///
 /// The pool is held in an `Option` so `Drop` can release it *before* deleting
@@ -652,4 +670,62 @@ pub async fn quantity_on_hand(db: &TempDb, product_id: &str) -> i64 {
         .expect("read qoh")
         .try_get::<i64, _>(0)
         .expect("decode i64")
+}
+
+// ============================================================================
+// Returns / credit memos (WP-06)
+// ============================================================================
+
+/// The `sale_items.id` of the line a sale posted for `product_id`.
+///
+/// `post_sale` mints the line ids itself (the repo does, and the builders do),
+/// so a return test has to read back the line it means to send back rather
+/// than assume an id.
+pub async fn sale_item_id(db: &TempDb, sale_id: &str, product_id: &str) -> String {
+    sqlx::query("SELECT id FROM sale_items WHERE sale_id = ? AND product_id = ? ORDER BY rowid")
+        .bind(sale_id)
+        .bind(product_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("read sale_item for {sale_id}/{product_id}: {e}"))
+        .try_get::<String, _>(0)
+        .expect("decode String")
+}
+
+/// A product's weighted-average cost, in microcents — the WP-03 accounting
+/// value, not its rounded cents mirror.
+pub async fn avg_cost_excl_microcents(db: &TempDb, product_id: &str) -> i64 {
+    sqlx::query("SELECT avg_cost_excl_vat_microcents FROM products WHERE id = ?")
+        .bind(product_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("read avg cost for {product_id}: {e}"))
+        .try_get::<i64, _>(0)
+        .expect("decode i64")
+}
+
+pub async fn avg_cost_incl_microcents(db: &TempDb, product_id: &str) -> i64 {
+    sqlx::query("SELECT avg_cost_incl_vat_microcents FROM products WHERE id = ?")
+        .bind(product_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("read avg cost for {product_id}: {e}"))
+        .try_get::<i64, _>(0)
+        .expect("decode i64")
+}
+
+/// Base units of one sale line that POSTED credit memos have sent back.
+pub async fn returned_quantity(db: &TempDb, sale_item_id: &str) -> i64 {
+    sqlx::query(
+        "SELECT COALESCE(SUM(l.quantity_base), 0)
+           FROM sales_credit_memo_lines l
+           JOIN sales_credit_memos m ON m.id = l.credit_memo_id
+          WHERE l.original_sale_item_id = ? AND m.status = 'posted'",
+    )
+    .bind(sale_item_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("read returned quantity")
+    .try_get::<i64, _>(0)
+    .expect("decode i64")
 }

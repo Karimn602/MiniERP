@@ -39,7 +39,7 @@ lira-pos/src/
     migrate.ts       — bootstrap: PRAGMAs + schema validation on startup
     types.ts         — all TypeScript domain interfaces
     repos/           — typed data accessors (products, sales, purchases, suppliers, ...)
-    migrations/      — 10 numbered SQL files; Rust registers them on app init
+    migrations/      — 11 numbered SQL files; Rust registers them on app init
     seed.ts          — demo data
   lib/
     money.ts         — USD ↔ LBP conversion; integer-only arithmetic
@@ -47,6 +47,7 @@ lira-pos/src/
     uom.ts           — Unit-of-Measure rational conversion (num/den)
     saleMath.ts      — sale line-item calculations
     purchaseMath.ts  — purchase line-item calculations
+    creditMemoMath.ts— returns: cumulative proration; mirrors posting.rs
     vat.ts           — VAT application
     ids.ts           — UUID v4 generation
   state/             — Zustand stores
@@ -54,7 +55,7 @@ lira-pos/src/
 src-tauri/src/
   lib.rs             — Tauri entry point; registers migrations and invoke handlers
   cost.rs            — fixed-point UNIT COST arithmetic: scale, rounding, WAC, overflow
-  posting.rs         — All transactional writes (purchase, sale, adjustment, payment)
+  posting.rs         — All transactional writes (purchase, sale, return, adjustment, payment)
 ```
 
 ### Critical Design Decisions
@@ -69,18 +70,19 @@ src-tauri/src/
 | `inventory_movements.unit_cost_*_vat_cents` | `inventory_movements.unit_cost_*_vat_microcents` |
 | `purchase_items.unit_cost_*_vat_base_cents` | `purchase_items.unit_cost_*_vat_base_microcents` |
 | `sale_items.unit_cogs_excl_vat_cents` | `sale_items.unit_cogs_excl_vat_microcents` |
+| `sales_credit_memo_lines.unit_cogs_excl_vat_cents` | `sales_credit_memo_lines.unit_cogs_excl_vat_microcents` |
 
 Rules: all cost arithmetic goes through `src-tauri/src/cost.rs` (or `src/lib/cost.ts`), never a hand-rolled multiply-and-divide. Rounding is half away from zero, in one helper. Cost becomes money exactly once, at `extended_cost_cents` — precise rate × base quantity, rounded once; never round the rate first. The `*_cents` columns are maintained by the posting commands as `round(rate)` for display and back-compatibility, and must never feed a calculation. The per-UoM invoice cost (`unit_cost_*_in_uom_cents`) stays in cents: it is what the supplier billed, exact to the cent.
 
 **UoM conversions use rational fractions.** Each `product_uom` row has `conversion_num` / `conversion_den` to preserve precision when converting between units (e.g., kg → g).
 
-**Transactions run in Rust, not JavaScript.** The six `invoke` handlers in `posting.rs` (`post_purchase`, `post_sale`, `post_adjustment`, `post_supplier_payment`, `open_shift`, `close_shift`) are the only place that mutates financial and inventory state. This avoids JS connection-pool race conditions. Frontend repos are read-only query helpers.
+**Transactions run in Rust, not JavaScript.** The seven `invoke` handlers in `posting.rs` (`post_purchase`, `post_sale`, `post_credit_memo`, `post_adjustment`, `post_supplier_payment`, `open_shift`, `close_shift`) are the only place that mutates financial and inventory state. This avoids JS connection-pool race conditions. Frontend repos are read-only query helpers.
 
 **The database decides the UoM conversion, not the payload.** `post_sale` and `post_purchase` both resolve the product's own active `product_uoms` row — looked up by `(product_id, store_id, uom_code, is_active)` — and derive `quantity_base` from *its* factor. That single resolved conversion drives the per-base cost, the persisted snapshots, the inventory movement, `quantity_on_hand`, the weighted average and the last-purchase rate. A payload that declares a different factor, base quantity or `product_uoms` row id is **refused**, not silently normalized: the buyer priced the goods against the conversion they believed in. Client-supplied `quantity_base` / `factor_*_snapshot` / `product_uom_id_snapshot` remain on the wire for compatibility and are cross-checks only.
 
 **One open shift per store, and the shift is checked when a sale posts.** The shift scope is the store — `getOpenShift(storeId)` queries `(store_id, status='open')`, `device_id` is never populated, and the cashier is recorded but not scoped on. `open_shift` decides uniqueness in a single `INSERT ... WHERE NOT EXISTS` statement, backed by the partial unique index `ux_shifts_one_open_per_store`; `close_shift` computes the cash reconciliation and writes it in the same transaction that marks the shift closed, and a closed shift is immutable (`trg_shifts_no_update_after_close`). **A new sale must name an open shift of its store** — `post_sale` refuses one that does not, inside its own transaction and before any receipt number or row is written. The check runs *after* the idempotency resolution, so retrying a sale that already posted still returns its original receipt, including a historical row whose `shift_id` is NULL. `sales.shift_id` stays nullable in the schema: the rule governs what may be written from now on, and history is not rewritten.
 
-**Tender is validated, never trusted; change is cash.** A payment row's `amount_usd_cents_equivalent` is *derived*: a USD tender's is itself, an LBP tender's is its lira at the rate locked on the sale, and that locked rate is matched against the `exchange_rates` row (scoped by store) before anything is written. Non-cash tender may never exceed the amount due, so a card overpayment is refused rather than written as drawer change, and the row absorbing an overpayment is always a cash row (USD cash preferred, else LBP cash, in that row's own currency). Expected drawer cash is `opening float + cash in − change out` per currency, counting only `cash_usd`/`cash_lbp` rows in both terms.
+**Tender is validated, never trusted; change is cash.** A payment row's `amount_usd_cents_equivalent` is *derived*: a USD tender's is itself, an LBP tender's is its lira at the rate locked on the sale, and that locked rate is matched against the `exchange_rates` row (scoped by store) before anything is written. Non-cash tender may never exceed the amount due, so a card overpayment is refused rather than written as drawer change, and the row absorbing an overpayment is always a cash row (USD cash preferred, else LBP cash, in that row's own currency). Expected drawer cash is `opening float + cash in − change out − cash refunds out` per currency (the refund term since WP-06), counting only `cash_usd`/`cash_lbp` rows in every term.
 
 **One authoritative unit price per purchase line.** A supplier invoice quotes ONE price per unit, and `vat_pricing_mode` on the line says which side of the excl/incl pair that is — the payload's value (the Purchases page's per-line Incl/Excl toggle), or the product's own `products.vat_pricing_mode` when the payload omits it. The counterpart is *derived* by `post_purchase` with the application's own VAT rounding (`posting.rs::add_vat` / `strip_vat`, mirroring `lib/vat.ts` in integer arithmetic), and a declared counterpart that disagrees is **refused**. Exclusive mode → `unit_cost_excl_vat_in_uom_cents` is authoritative; inclusive mode → `unit_cost_incl_vat_in_uom_cents` is. At 0 bps the two must be the same figure. Rounding to whole cents means `add_vat` and `strip_vat` are not exact inverses, so the mode is what fixes the direction rather than the backend guessing. Without this, a line could declare "$20.00 net, $999.00 gross" at 11% and stock inventory at a $20 cost basis while raising $999 of supplier debt.
 
@@ -96,9 +98,29 @@ A supplier invoice reference may be POSTED once per `(store, supplier)`. The can
 
 **Supplier payments are not drawer events.** A `supplier_ledger` payment records an amount and nothing else: no method, no currency, no shift. `close_shift` therefore counts only `cash_usd`/`cash_lbp` sale tender, and WP-05 left it that way deliberately. Giving supplier payments a tender model is an open product decision.
 
-**Snapshots at post time.** `sale_items` and `purchase_items` snapshot price, VAT, COGS, and UoM at the moment of posting. These values never change after posting.
+**A return is not a negative sale.** A customer return is a CREDIT MEMO — its own document in its own tables (`sales_credit_memos`, `sales_credit_memo_lines`, `sales_credit_memo_refunds`, migration 011) — and the sale it reverses stands exactly as posted. Nothing is written back onto it: "not returned / partially returned / fully returned" is **derived** by summing the memo lines that point at it, and `sales.sale_type` / `sales.original_sale_id` stay unused, as migration 001 left them. Negative `sales` rows were not an option: `sale_items.quantity` is `CHECK (> 0)`, every `sale_payments` amount is `CHECK (>= 0)`, and every report, shift summary and drawer query filters `status = 'posted'` WITHOUT filtering `sale_type` — so folding returns into `sales` would have changed the meaning of all of them, with the wrong sign, on the day it shipped. Returns are layered additively instead: `dailySales`, `productSales` and `getSalesSummary` are untouched and still GROSS, and the returns series (`dailyReturns`, `productReturns`, `getRefundSummary`, `getRefundBreakdown`) sits beside them, so net sales and net profit are visible subtractions rather than figures that quietly changed.
 
-**Posted rows are immutable.** Database triggers prevent UPDATE/DELETE on posted sales, purchases, and inventory movements. Corrections are made via reversal rows, never edits.
+**Every amount on a credit memo comes from the original posted snapshot.** The price, the VAT rate and amount, the discount allocation, the COGS rate, the tender the sale took and the exchange rate it locked are all read from `sales`, `sale_items`, `sale_payments` and the sale's own inventory movements. Nothing is recomputed from today's product price, today's VAT rate, today's cost pool or today's exchange rate: a refund settles a transaction that already happened, on the terms it happened on. Whether a line may be restocked is decided by whether the SALE produced an inventory movement, not by `products.is_service` as it reads now — a product reclassified since cannot make a service out of goods that left the shelf.
+
+**A memo's share of each COMPONENT is a difference of two cumulative figures.** Rounding each return independently makes the parts disagree with the whole: three returns of one unit from a 3-unit, $10.00 line each round $3.3333 to $3.33, and the customer is a cent short for ever, because a posted memo is immutable. So a memo's share is `cumulative(already returned + returning) − cumulative(already returned)`, where `cumulative(q) = round(original amount × q ÷ original quantity)` — `posting.rs::prorated_cumulative_cents`, mirrored for the register's preview by `lib/creditMemoMath.ts::returnedLineAmounts`.
+
+It is applied to the components the sale PERSISTED: the line's subtotal, its VAT and its discount allocation. **The total is derived as `subtotal slice + VAT slice`, and VAT is never a residual.** Taking VAT as `total − subtotal` was the original design and it is wrong: each of those series is monotone, but their difference is not, so the two roundings can move opposite ways on one step. An 11-cent, 3-unit line of 10 net + 1 VAT gives cumulative totals 4, 7, 11 against cumulative subtotals 3, 7, 10 — so the second unit's residual VAT is `3 − 4 = −1`, a credit note that ADDS output VAT, and the non-negative-VAT guard refused a return the customer was entitled to. Allocating the components separately fixes it at the root: both originals are non-negative, so both series are monotone and every slice is non-negative, and each lands exactly on its own original at full return, so their sum lands exactly on the line total. The one boundary left is money's own resolution — a line worth under a cent per unit has steps that credit nothing, so it is returnable in one go rather than unit by unit.
+
+COGS is prorated the same way but against the cumulative RESTOCKED quantity, so a line returned once as a write-off and once to the shelf reverses cost for the second unit only.
+
+**Returned stock comes back at the cost it left at, and the average is re-blended.** The restock movement carries the original sale's microcent COGS rate, and `cost::restock_weighted_avg` blends it into the pool at full precision. Leaving the average alone would put the units back in the quantity without putting their cost back in the value, so every subsequent average would be wrong by that much. Two states have no honest answer, both reachable only from a pre-existing negative pool (the POS permits selling below zero): a resulting quantity still ≤ 0, and a blend that would come out negative against the `CHECK (>= 0)` column. In both, the quantity still goes back and the existing rate stands. A write-off return (`return_to_stock = false`) moves no stock, writes no movement and reverses no cost — the margin on discarded goods is lost, which is the truth about them — and a service line can never restock at all.
+
+**A refund goes back the way it came, and only that far.** A credit memo may refund only a `(method, currency)` pair the original sale actually took, capped in THAT currency's own unit — USD cents for a USD leg, whole lira for a lira one — NET of any change the sale handed back, and cumulatively across every memo of that sale. So a card-only sale cannot be refunded in cash (which would empty the drawer against a payment that never filled it) and a cash-only sale cannot be credited to a card that was never charged. The split need not be proportional. `store_credit` is not a refund method at all: Greaz has no customer-credit ledger, so it would be a liability recorded nowhere. The refund legs must sum to the memo total EXACTLY — there is no unpaid-credit instrument and no change on a refund — and a lira leg's USD equivalent is derived at the SALE's locked rate, never taken from the client.
+
+**A cash refund is a drawer event; a card refund is not.** Expected drawer cash is now `opening float + cash in − change out − cash refunds out`, per currency, and `post_credit_memo` reads it inside its own transaction from the same `drawer_cash_for_shift` definition `close_shift` reconciles against. A cash refund that would drive the drawer below zero in its currency is refused, with no manager override: a refund the till cannot fund is a cash problem, not a permissions problem. A new credit memo must name an open shift of its store — checked after the idempotency resolution and again just before the commit, the WP-04 ordering — so a replay of a memo that already posted still resolves after its shift has been closed and counted.
+
+**A return is idempotent on its identity.** `sales_credit_memos.id` is the return identity the caller mints once. Replaying it reconciles to the memo that posted — one refund, one restock, one cost blend, no credit-memo number consumed — and replaying it with materially different content is a conflict. The canonical comparison is over the request's INPUTS (which sale, which lines, how much of each, restock or not, the refund legs), because every amount is derived from those plus the history at the time, and by replay time the memo's own lines are part of that history. Two genuinely separate partial returns are two memos under two identities, subject to the cumulative quantity and tender caps.
+
+**Snapshots at post time.** `sale_items`, `purchase_items` and `sales_credit_memo_lines` snapshot price, VAT, COGS, and UoM at the moment of posting. These values never change after posting.
+
+**Posted rows are immutable.** Database triggers prevent UPDATE/DELETE on posted sales, purchases, credit memos and inventory movements. Corrections are made via reversal rows, never edits.
+
+A posted CREDIT MEMO is sealed harder than a posted sale, and deliberately so. Migration 001 lets a posted sale become `'voided'` if a listed set of columns is unchanged; migration 011 allows no UPDATE at all, no DELETE, and no new line or refund leg. Two reasons. A posted memo has already moved stock, re-blended the cost pool and taken cash out of the drawer, and WP-06 ships no void command — so a bare status flip would hide the refund from every `status = 'posted'` read model while leaving all three effects in place, which is a hole that balances nowhere rather than a void. And a column list is a denylist worn as an allowlist: the copied one omitted the shift, the cashier, the locked rate and the reason, so the statement that voided a memo could also re-point it at another drawer. The `voided_*` columns stay RESERVED for a future workflow that relaxes the trigger and writes the compensating entries in the same migration. INSERT is guarded too, because adding a child to a settled document edits no existing row and so slips past an update guard — and the guard keys on the parent's `posted_at`, which is NULL throughout the command's draft construction phase.
 
 **Weighted-average COGS.** `products.avg_cost_*_microcents` is recalculated on every purchase post using `(existing_qty * old_cost + new_qty * new_cost) / total_qty`, accumulated in i128 at full microcent precision and divided once. No component is rounded to cents on the way.
 
@@ -116,12 +138,13 @@ A supplier invoice reference may be POSTED once per `(store, supplier)`. The can
 
 ### Database Schema Highlights
 
-23 tables across 10 migrations. Key groups:
+26 tables across 11 migrations. Key groups:
 
 | Group | Tables |
 |---|---|
 | Catalog | `products`, `product_barcodes`, `product_uoms`, `units_of_measure`, `vat_rates` |
 | Sales | `sales`, `sale_items`, `sale_payments` |
+| Returns | `sales_credit_memos`, `sales_credit_memo_lines`, `sales_credit_memo_refunds` |
 | Purchasing | `purchases`, `purchase_items`, `suppliers`, `supplier_ledger` |
 | Inventory | `inventory_movements` |
 | Finance | `exchange_rates`, `shifts` |

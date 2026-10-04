@@ -77,6 +77,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/010_supplier_ap_integrity.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 11,
+            description: "sales_credit_memos",
+            sql: include_str!("../../src/db/migrations/011_sales_credit_memos.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -96,6 +102,7 @@ pub fn run() {
             posting::post_adjustment,
             posting::post_supplier_payment,
             posting::post_sale,
+            posting::post_credit_memo,
             posting::open_shift,
             posting::close_shift,
         ])

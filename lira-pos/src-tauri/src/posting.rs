@@ -3769,10 +3769,17 @@ async fn assert_shift_is_open(
 /// row at all, but a database written by an earlier release can hold exactly
 /// that, and such a row must not go on quietly making the drawer look short.
 ///
-/// Events this deliberately does NOT model, because the application does not
-/// have them yet: refunds and credit memos (WP-06), and petty cash /
-/// cash-in / cash-out. There is no flow that produces them, so there is nothing
-/// to include; each lands here when its own work package adds it.
+/// Since WP-06 a CASH REFUND is a drawer event too, and the only new one: a
+/// `cash_usd` / `cash_lbp` leg of a posted credit memo attributed to this shift
+/// is physical money handed back out of the till, so it is subtracted in that
+/// currency's own unit. A card refund goes back down the card rail and touches
+/// no cash, exactly as a card tender does not fill the till. The refund terms
+/// are filtered by the SAME `is_cash_method` test as the tender terms, so the
+/// three cannot disagree about what counts as cash.
+///
+/// Events this STILL deliberately does not model, because the application does
+/// not have them: petty cash, cash-in / cash-out, and supplier payments. There
+/// is no flow that produces the first two, and the third is argued below.
 ///
 /// Supplier payments stay out too, and WP-05 left them out ON PURPOSE rather
 /// than by omission. A `supplier_ledger` payment row records an amount in USD
@@ -3791,6 +3798,31 @@ pub(crate) struct DrawerCash {
     pub cash_lbp_in: i64,
     pub change_usd_out_cents: i64,
     pub change_lbp_out: i64,
+    /// Cash handed back on posted credit memos of this shift, in USD cents.
+    pub refund_usd_out_cents: i64,
+    /// The same, in whole lira.
+    pub refund_lbp_out: i64,
+}
+
+impl DrawerCash {
+    /// Expected USD cash in the drawer: `opening float + cash in − change out
+    /// − cash refunds out`. Checked, because this is money.
+    pub(crate) fn expected_usd_cents(&self, opening_cash_usd_cents: i64) -> Result<i64, String> {
+        opening_cash_usd_cents
+            .checked_add(self.cash_usd_in_cents)
+            .and_then(|v| v.checked_sub(self.change_usd_out_cents))
+            .and_then(|v| v.checked_sub(self.refund_usd_out_cents))
+            .ok_or_else(|| "Expected USD drawer cash overflows.".to_string())
+    }
+
+    /// The same figure in whole lira.
+    pub(crate) fn expected_lbp(&self, opening_cash_lbp: i64) -> Result<i64, String> {
+        opening_cash_lbp
+            .checked_add(self.cash_lbp_in)
+            .and_then(|v| v.checked_sub(self.change_lbp_out))
+            .and_then(|v| v.checked_sub(self.refund_lbp_out))
+            .ok_or_else(|| "Expected LBP drawer cash overflows.".to_string())
+    }
 }
 
 async fn drawer_cash_for_shift(
@@ -3820,12 +3852,36 @@ async fn drawer_cash_for_shift(
     .await
     .map_err(|e| format!("aggregate drawer cash for shift {shift_id}: {e}"))?;
 
+    // Cash handed back on this shift's posted credit memos (WP-06). A separate
+    // statement rather than a join, because one sale can carry several tenders
+    // and one return several refund legs: joining the two would multiply each
+    // against the other. Both are plain sums over the same shift.
+    let refunds = sqlx::query(
+        "SELECT
+           COALESCE(SUM(CASE WHEN r.method = 'cash_usd'
+                             THEN r.amount_native_usd_cents ELSE 0 END), 0) AS refund_usd_out,
+           COALESCE(SUM(CASE WHEN r.method = 'cash_lbp'
+                             THEN r.amount_native_lbp ELSE 0 END), 0)       AS refund_lbp_out
+         FROM sales_credit_memo_refunds r
+         JOIN sales_credit_memos m ON m.id = r.credit_memo_id
+        WHERE m.store_id = ?
+          AND m.shift_id = ?
+          AND m.status = 'posted'",
+    )
+    .bind(store_id)
+    .bind(shift_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("aggregate drawer refunds for shift {shift_id}: {e}"))?;
+
     let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
     Ok(DrawerCash {
         cash_usd_in_cents: row.try_get("cash_usd_in").map_err(d("cash_usd_in"))?,
         cash_lbp_in: row.try_get("cash_lbp_in").map_err(d("cash_lbp_in"))?,
         change_usd_out_cents: row.try_get("change_usd_out").map_err(d("change_usd_out"))?,
         change_lbp_out: row.try_get("change_lbp_out").map_err(d("change_lbp_out"))?,
+        refund_usd_out_cents: refunds.try_get("refund_usd_out").map_err(d("refund_usd_out"))?,
+        refund_lbp_out: refunds.try_get("refund_lbp_out").map_err(d("refund_lbp_out"))?,
     })
 }
 
@@ -4040,18 +4096,13 @@ pub(crate) async fn close_shift_tx(
 
     let drawer = drawer_cash_for_shift(&mut tx, &payload.store_id, &payload.shift_id).await?;
 
-    // expected = opening float + cash in - change out, per currency. Card,
-    // transfer and wallet tenders appear in neither term: they never reach the
-    // till. Checked arithmetic because this is money and the alternative is a
-    // silent wrap.
-    let expected_usd = opening_usd
-        .checked_add(drawer.cash_usd_in_cents)
-        .and_then(|v| v.checked_sub(drawer.change_usd_out_cents))
-        .ok_or_else(|| "Expected USD drawer cash overflows.".to_string())?;
-    let expected_lbp = opening_lbp
-        .checked_add(drawer.cash_lbp_in)
-        .and_then(|v| v.checked_sub(drawer.change_lbp_out))
-        .ok_or_else(|| "Expected LBP drawer cash overflows.".to_string())?;
+    // expected = opening float + cash in - change out - cash refunds out, per
+    // currency. Card, transfer and wallet tenders appear in none of the terms:
+    // they never reach the till, whether money is coming in or going back out.
+    // One definition, shared with `post_credit_memo`'s drawer cap, so the
+    // figure a refund is checked against is the figure the close reconciles.
+    let expected_usd = drawer.expected_usd_cents(opening_usd)?;
+    let expected_lbp = drawer.expected_lbp(opening_lbp)?;
 
     // variance = counted - expected. Negative is SHORT, positive is OVER, in
     // both currencies, matching `shifts.variance_*`'s own documentation and the
@@ -4111,4 +4162,1614 @@ pub(crate) async fn close_shift_tx(
     let snapshot = load_shift_snapshot(&mut tx, &payload.shift_id).await?;
     tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
     Ok(snapshot)
+}
+
+// ============================================================================
+// Sales returns / credit memos (WP-06, GP-A08)
+// ============================================================================
+//
+// A RETURN IS NOT A NEGATIVE SALE. The original sale stands exactly as it was
+// posted — immutable by trigger since migration 001, idempotent on its own
+// identity since WP-02 — and a credit memo is a separate document that points
+// at it. "Not returned / partially returned / fully returned" is DERIVED by
+// summing credit-memo lines, never written back onto the sale.
+//
+// EVERYTHING ECONOMIC COMES FROM THE ORIGINAL POSTED SNAPSHOT. The price, the
+// VAT rate and amount, the discount allocation, the COGS rate, the tender that
+// was taken and the exchange rate it was locked at are all read from `sales`,
+// `sale_items`, `sale_payments` and the sale's own inventory movements. Nothing
+// is recomputed from today's product price, today's VAT rate, today's cost pool
+// or today's exchange rate: a refund settles a transaction that already
+// happened, at the terms it happened on.
+//
+// THE CLIENT DECIDES ALMOST NOTHING. It names which sale, which of its lines,
+// how much of each, whether each returns to the shelf, and how the money goes
+// back. Every amount below that is derived here and cross-checked against the
+// payload's copy, in the same way `post_sale` and `post_purchase` treat the
+// snapshots they no longer trust.
+
+/// The refund methods a credit memo may use.
+///
+/// `store_credit` is DELIBERATELY ABSENT, and migration 011's CHECK says the
+/// same thing in the engine. Greaz has no customer-credit ledger, so a
+/// store-credit refund would be a liability with no row recording it, no
+/// balance to spend it against and no way to reconcile it. A sale paid that way
+/// simply cannot be refunded through it.
+pub(crate) const REFUND_METHODS: [&str; 7] = [
+    "cash_usd",
+    "cash_lbp",
+    "card_usd",
+    "card_lbp",
+    "bank_transfer",
+    "wallet",
+    "other",
+];
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCreditMemoPayload {
+    /// The RETURN IDENTITY, minted once by the caller and reused for every
+    /// retry of the same return. `post_credit_memo` is idempotent on it:
+    /// replaying a posted identity returns that memo instead of refunding the
+    /// customer a second time.
+    pub credit_memo_id: String,
+    pub store_id: String,
+    pub original_sale_id: String,
+
+    /// REQUIRED for a new memo, despite the `Option`, exactly as
+    /// `PostSalePayload::shift_id` is (WP-04): a refund moves the drawer, so it
+    /// belongs to an open shift of its store. The type stays optional because
+    /// the replay path must still accept a memo whose shift has since closed.
+    pub shift_id: Option<String>,
+    pub cashier_user_id: Option<String>,
+    pub device_id: Option<String>,
+
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+
+    /// The exchange-rate context the CLIENT believes this refund carries.
+    /// Accepted for wire compatibility and never acted on: the memo is locked
+    /// to the ORIGINAL SALE's rate, read from `sales` inside the transaction.
+    /// A declared value that disagrees is refused rather than normalized.
+    #[serde(default)]
+    pub exchange_rate_id: Option<String>,
+    #[serde(default)]
+    pub exchange_rate_lbp_per_usd: Option<i64>,
+
+    pub lines: Vec<PostCreditMemoLine>,
+    pub refunds: Vec<PostCreditMemoRefund>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCreditMemoLine {
+    pub credit_memo_line_id: String,
+    /// Which line of the original receipt is coming back. The server resolves
+    /// it against the memo's own `original_sale_id`, so a line of a different
+    /// sale is unresolvable rather than merely implausible.
+    pub original_sale_item_id: String,
+
+    /// How much is coming back, in the ORIGINAL line's own unit of measure —
+    /// what the cashier reads off the receipt ("1 box", not "12"). The
+    /// authoritative input.
+    pub quantity_in_uom: i64,
+
+    /// The client's claim about the base-unit quantity that implies. Accepted
+    /// for wire compatibility and never acted on: the backend derives it from
+    /// the ORIGINAL line's own factor snapshot and refuses a payload that
+    /// contradicts it.
+    pub quantity_base: i64,
+
+    /// Whether these units go back on the shelf. False writes off the goods:
+    /// the customer is refunded, nothing is restocked, and the original cost
+    /// stays consumed.
+    pub return_to_stock: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCreditMemoRefund {
+    pub refund_id: String,
+    pub method: String,
+    pub currency: String,
+    pub amount_native_usd_cents: i64,
+    pub amount_native_lbp: i64,
+    /// Derived here from the native amount and the ORIGINAL SALE's locked rate.
+    /// The declared value is a cross-check and a disagreement is refused.
+    pub amount_usd_cents_equivalent: i64,
+    pub reference: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCreditMemoResult {
+    pub credit_memo_id: String,
+    pub credit_memo_number: i64,
+    pub posted_at: String,
+    pub movement_ids: Vec<String>,
+    pub subtotal_excl_vat_cents: i64,
+    pub vat_total_cents: i64,
+    pub discount_cents: i64,
+    pub total_incl_vat_cents: i64,
+    pub cogs_reversed_cents: i64,
+    pub refund_total_usd_cents: i64,
+}
+
+// ----------------------------------------------------------------------------
+// Cumulative proration — the rule that makes partial returns add up
+// ----------------------------------------------------------------------------
+
+/// The share of `original_amount` that belongs to `cumulative_qty` of
+/// `original_qty` units: `round(original_amount x cumulative_qty / original_qty)`,
+/// half away from zero, taken in i128 so the product cannot wrap.
+///
+/// WHY CUMULATIVE AND NOT PER-MEMO. Rounding each return independently makes
+/// the parts disagree with the whole. Three returns of one unit from a 3-unit,
+/// $1.00 line each round $0.3333 to $0.33, and the customer is 1 cent short of
+/// the line they paid for — permanently, because the memos are immutable. So a
+/// memo's share is the DIFFERENCE OF TWO CUMULATIVE FIGURES:
+///
+/// ```text
+/// this memo = cumulative(already returned + returning)
+///           - cumulative(already returned)
+/// ```
+///
+/// Each individual memo is still a whole number of cents, and returning every
+/// unit lands on `cumulative(original_qty) = original_amount` exactly — the
+/// line is reversed to the cent, however many memos it took and in whatever
+/// order the quantities came back.
+///
+/// WHICH COMPONENTS THIS IS APPLIED TO, AND WHY IT MATTERS.
+///
+/// The components the sale PERSISTED — the line's subtotal, its VAT and its
+/// discount allocation — each get their own cumulative series, and the returned
+/// TOTAL is the sum of the subtotal and VAT slices. The total is never prorated
+/// on its own.
+///
+/// The first implementation did the opposite: it prorated the total and the
+/// subtotal, and took VAT as the residual `total - subtotal`. Each of those two
+/// series is monotone, but their DIFFERENCE is not — the two roundings can move
+/// opposite ways on the same step. An 11-cent, 3-unit line of 10 net + 1 VAT:
+///
+/// ```text
+///          cumulative total    cumulative subtotal    residual VAT
+///   q = 1  round(11/3) = 4     round(10/3) = 3        4 - 3 =  1
+///   q = 2  round(22/3) = 7     round(20/3) = 7        3 - 4 = -1   <-- !
+///   q = 3              11                    10
+/// ```
+///
+/// Returning the second unit asked to credit MINUS a cent of VAT — a credit
+/// note that adds output VAT — so the non-negative-VAT check refused a return
+/// the customer was entitled to. Prorating subtotal and VAT separately fixes it
+/// at the root: both originals are non-negative, so both series are monotone and
+/// every slice is non-negative; each lands exactly on its own original at full
+/// return, so their sum lands exactly on the line total; and no ordering or
+/// partition of the quantity can make a valid return impossible.
+pub(crate) fn prorated_cumulative_cents(
+    original_amount: i64,
+    cumulative_qty: i64,
+    original_qty: i64,
+) -> Result<i64, String> {
+    if original_qty <= 0 {
+        return Err("the original line must have a positive quantity".into());
+    }
+    if cumulative_qty < 0 || cumulative_qty > original_qty {
+        return Err(format!(
+            "cumulative returned quantity {cumulative_qty} is outside 0..={original_qty}"
+        ));
+    }
+    if original_amount < 0 {
+        return Err("the original line amount cannot be negative".into());
+    }
+    let numerator = i128::from(original_amount)
+        .checked_mul(i128::from(cumulative_qty))
+        .ok_or_else(|| "prorated amount overflows".to_string())?;
+    let share = crate::cost::div_round_half_away(numerator, i128::from(original_qty))?;
+    i64::try_from(share).map_err(|_| "prorated amount is out of range".to_string())
+}
+
+/// Pure pre-DB validation for `post_credit_memo`. Shape only: everything with a
+/// monetary or quantitative meaning is resolved from the database.
+pub(crate) fn validate_credit_memo_payload(payload: &PostCreditMemoPayload) -> Result<(), String> {
+    if payload.credit_memo_id.trim().is_empty() {
+        return Err("A return needs an identifier.".into());
+    }
+    if payload.store_id.trim().is_empty() {
+        return Err("A return needs a store.".into());
+    }
+    if payload.original_sale_id.trim().is_empty() {
+        return Err("A return must name the sale it reverses.".into());
+    }
+    if payload.lines.is_empty() {
+        return Err("A return must have at least one line.".into());
+    }
+    if payload.refunds.is_empty() {
+        return Err("A return must refund the customer through at least one method.".into());
+    }
+    if let Some(rate) = payload.exchange_rate_lbp_per_usd {
+        if rate <= 0 {
+            return Err("Exchange rate must be positive.".into());
+        }
+    }
+
+    // ---- Lines ----
+    //
+    // One line per original sale item. Two lines naming the same receipt line
+    // would each be prorated against the SAME already-returned figure, so the
+    // pair would credit more than the cumulative rule intends and could walk
+    // past the remaining quantity between them. Merging them silently would
+    // change what the cashier asked for, so it is refused instead.
+    for (i, line) in payload.lines.iter().enumerate() {
+        let n = i + 1;
+        if line.original_sale_item_id.trim().is_empty() {
+            return Err(format!("Return line {n} does not name an original sale line."));
+        }
+        if line.quantity_in_uom <= 0 {
+            return Err(format!("Return line {n} must return a positive quantity."));
+        }
+        if line.quantity_base <= 0 {
+            return Err(format!("Return line {n} must return a positive quantity."));
+        }
+        if payload
+            .lines
+            .iter()
+            .take(i)
+            .any(|other| other.original_sale_item_id == line.original_sale_item_id)
+        {
+            return Err(format!(
+                "Return line {n} repeats sale line {}. List each returned line once, with the \
+                 total quantity coming back.",
+                line.original_sale_item_id
+            ));
+        }
+    }
+
+    // ---- Refunds ----
+    //
+    // The same tender matrix `prepare_sale` enforces, minus `store_credit`:
+    // `method` says how the money goes back and, for the four methods whose
+    // name names a currency, in which currency; the native amount must be the
+    // one that currency is denominated in.
+    for (i, r) in payload.refunds.iter().enumerate() {
+        let n = i + 1;
+        if !REFUND_METHODS.contains(&r.method.as_str()) {
+            if r.method == "store_credit" {
+                return Err(format!(
+                    "Refund {n}: Greaz has no customer store-credit ledger, so a refund cannot be \
+                     issued as store credit. Refund through a method the original sale used."
+                ));
+            }
+            return Err(format!("Refund {n} has invalid method: {}", r.method));
+        }
+        if r.currency != "USD" && r.currency != "LBP" {
+            return Err(format!("Refund {n} has invalid currency: {}", r.currency));
+        }
+        if let Some(required) = method_currency(&r.method) {
+            if r.currency != required {
+                return Err(format!(
+                    "Refund {n}: method \"{}\" is a {required} tender, but the row declares \
+                     currency {}.",
+                    r.method, r.currency
+                ));
+            }
+        }
+        let usd_ok =
+            r.amount_native_usd_cents > 0 && r.currency == "USD" && r.amount_native_lbp == 0;
+        let lbp_ok =
+            r.amount_native_lbp > 0 && r.currency == "LBP" && r.amount_native_usd_cents == 0;
+        if !(usd_ok || lbp_ok) {
+            return Err(format!("Refund {n}: native amounts inconsistent with currency."));
+        }
+        if r.amount_usd_cents_equivalent <= 0 {
+            return Err(format!("Refund {n} has non-positive amount."));
+        }
+    }
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Return idempotency (WP-06, mirroring GP-A01)
+// ----------------------------------------------------------------------------
+//
+// `sales_credit_memos.id` IS the return identity, and idempotency keys on it
+// ALONE. Nothing here looks at content to decide whether two requests are the
+// same return: content-based deduplication would swallow a second, genuinely
+// separate partial return of the same line for the same amount. Content is
+// compared only to catch the opposite mistake — one identity reused for a
+// materially different return.
+//
+// The canonical form is the request's INPUTS, not its outputs. Every amount a
+// memo carries is derived from those inputs plus the history that existed when
+// it posted, so two requests with equal inputs are necessarily the same memo —
+// and recomputing the amounts on the replay path would be wrong anyway, since
+// by then the memo's own lines are part of the already-returned figure.
+//
+// Deliberately EXCLUDED: `credit_memo_line_id` / `refund_id` (regenerated per
+// request by the repo, request noise rather than business content), the
+// client's `quantity_base` and `amount_usd_cents_equivalent` (both derived by
+// the backend from values that ARE compared), and `credit_memo_number` /
+// `posted_at` (assigned by the first post).
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalCreditMemo {
+    store_id: String,
+    original_sale_id: String,
+    shift_id: Option<String>,
+    cashier_user_id: Option<String>,
+    device_id: Option<String>,
+    reason: Option<String>,
+    notes: Option<String>,
+    /// Sorted, so a retry is not rejected merely because rows came back in a
+    /// different order.
+    lines: Vec<CanonicalCreditMemoLine>,
+    refunds: Vec<CanonicalCreditMemoRefund>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalCreditMemoLine {
+    original_sale_item_id: String,
+    quantity_in_uom: i64,
+    return_to_stock: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalCreditMemoRefund {
+    method: String,
+    currency: String,
+    amount_native_usd_cents: i64,
+    amount_native_lbp: i64,
+    reference: Option<String>,
+}
+
+impl CanonicalCreditMemo {
+    fn from_payload(payload: &PostCreditMemoPayload) -> Self {
+        let mut lines: Vec<CanonicalCreditMemoLine> = payload
+            .lines
+            .iter()
+            .map(|l| CanonicalCreditMemoLine {
+                original_sale_item_id: l.original_sale_item_id.clone(),
+                quantity_in_uom: l.quantity_in_uom,
+                return_to_stock: l.return_to_stock,
+            })
+            .collect();
+        lines.sort();
+
+        let mut refunds: Vec<CanonicalCreditMemoRefund> = payload
+            .refunds
+            .iter()
+            .map(|r| CanonicalCreditMemoRefund {
+                method: r.method.clone(),
+                currency: r.currency.clone(),
+                amount_native_usd_cents: r.amount_native_usd_cents,
+                amount_native_lbp: r.amount_native_lbp,
+                reference: r.reference.clone(),
+            })
+            .collect();
+        refunds.sort();
+
+        Self {
+            store_id: payload.store_id.clone(),
+            original_sale_id: payload.original_sale_id.clone(),
+            shift_id: payload.shift_id.clone(),
+            cashier_user_id: payload.cashier_user_id.clone(),
+            device_id: payload.device_id.clone(),
+            reason: payload.reason.clone(),
+            notes: payload.notes.clone(),
+            lines,
+            refunds,
+        }
+    }
+}
+
+struct PostedCreditMemo {
+    credit_memo_number: i64,
+    posted_at: String,
+    status: String,
+    subtotal_excl_vat_cents: i64,
+    vat_total_cents: i64,
+    discount_cents: i64,
+    total_incl_vat_cents: i64,
+    cogs_reversed_cents: i64,
+    refund_total_usd_cents: i64,
+    canonical: CanonicalCreditMemo,
+}
+
+/// Load the credit memo already stored under this return identity, if any, in
+/// the same canonical form an incoming payload is reduced to.
+async fn load_credit_memo_by_identity(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    credit_memo_id: &str,
+) -> Result<Option<PostedCreditMemo>, String> {
+    let header = sqlx::query(
+        "SELECT store_id, original_sale_id, credit_memo_number, shift_id,
+                cashier_user_id, device_id, reason, notes,
+                subtotal_excl_vat_cents, vat_total_cents, discount_cents,
+                total_incl_vat_cents, cogs_reversed_cents, refund_total_usd_cents,
+                status, posted_at
+           FROM sales_credit_memos WHERE id = ?",
+    )
+    .bind(credit_memo_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("read credit memo {credit_memo_id}: {e}"))?;
+
+    let Some(row) = header else { return Ok(None) };
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+
+    let mut lines: Vec<CanonicalCreditMemoLine> = sqlx::query(
+        "SELECT original_sale_item_id, quantity_in_uom, return_to_stock
+           FROM sales_credit_memo_lines WHERE credit_memo_id = ?",
+    )
+    .bind(credit_memo_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| format!("read credit memo lines for {credit_memo_id}: {e}"))?
+    .into_iter()
+    .map(|r| {
+        Ok(CanonicalCreditMemoLine {
+            original_sale_item_id: r
+                .try_get("original_sale_item_id")
+                .map_err(d("original_sale_item_id"))?,
+            quantity_in_uom: r.try_get("quantity_in_uom").map_err(d("quantity_in_uom"))?,
+            return_to_stock: r
+                .try_get::<i64, _>("return_to_stock")
+                .map_err(d("return_to_stock"))?
+                == 1,
+        })
+    })
+    .collect::<Result<Vec<_>, String>>()?;
+    lines.sort();
+
+    let mut refunds: Vec<CanonicalCreditMemoRefund> = sqlx::query(
+        "SELECT method, currency, amount_native_usd_cents, amount_native_lbp, reference
+           FROM sales_credit_memo_refunds WHERE credit_memo_id = ?",
+    )
+    .bind(credit_memo_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| format!("read credit memo refunds for {credit_memo_id}: {e}"))?
+    .into_iter()
+    .map(|r| {
+        Ok(CanonicalCreditMemoRefund {
+            method: r.try_get("method").map_err(d("method"))?,
+            currency: r.try_get("currency").map_err(d("currency"))?,
+            amount_native_usd_cents: r
+                .try_get("amount_native_usd_cents")
+                .map_err(d("amount_native_usd_cents"))?,
+            amount_native_lbp: r.try_get("amount_native_lbp").map_err(d("amount_native_lbp"))?,
+            reference: r.try_get("reference").map_err(d("reference"))?,
+        })
+    })
+    .collect::<Result<Vec<_>, String>>()?;
+    refunds.sort();
+
+    Ok(Some(PostedCreditMemo {
+        credit_memo_number: row
+            .try_get("credit_memo_number")
+            .map_err(d("credit_memo_number"))?,
+        posted_at: row
+            .try_get::<Option<String>, _>("posted_at")
+            .map_err(d("posted_at"))?
+            .unwrap_or_default(),
+        status: row.try_get("status").map_err(d("status"))?,
+        subtotal_excl_vat_cents: row
+            .try_get("subtotal_excl_vat_cents")
+            .map_err(d("subtotal_excl_vat_cents"))?,
+        vat_total_cents: row.try_get("vat_total_cents").map_err(d("vat_total_cents"))?,
+        discount_cents: row.try_get("discount_cents").map_err(d("discount_cents"))?,
+        total_incl_vat_cents: row
+            .try_get("total_incl_vat_cents")
+            .map_err(d("total_incl_vat_cents"))?,
+        cogs_reversed_cents: row
+            .try_get("cogs_reversed_cents")
+            .map_err(d("cogs_reversed_cents"))?,
+        refund_total_usd_cents: row
+            .try_get("refund_total_usd_cents")
+            .map_err(d("refund_total_usd_cents"))?,
+        canonical: CanonicalCreditMemo {
+            store_id: row.try_get("store_id").map_err(d("store_id"))?,
+            original_sale_id: row.try_get("original_sale_id").map_err(d("original_sale_id"))?,
+            shift_id: row.try_get("shift_id").map_err(d("shift_id"))?,
+            cashier_user_id: row.try_get("cashier_user_id").map_err(d("cashier_user_id"))?,
+            device_id: row.try_get("device_id").map_err(d("device_id"))?,
+            reason: row.try_get("reason").map_err(d("reason"))?,
+            notes: row.try_get("notes").map_err(d("notes"))?,
+            lines,
+            refunds,
+        },
+    }))
+}
+
+/// Name the first material difference between a posted credit memo and a replay
+/// of it, or `None` when the replay is the same return.
+fn credit_memo_replay_difference(
+    posted: &CanonicalCreditMemo,
+    replayed: &CanonicalCreditMemo,
+) -> Option<(&'static str, String, String)> {
+    macro_rules! compare {
+        ($what:literal, $field:ident) => {
+            if posted.$field != replayed.$field {
+                return Some((
+                    $what,
+                    format!("{:?}", posted.$field),
+                    format!("{:?}", replayed.$field),
+                ));
+            }
+        };
+    }
+    compare!("store", store_id);
+    compare!("original sale", original_sale_id);
+    compare!("shift", shift_id);
+    compare!("cashier", cashier_user_id);
+    compare!("device", device_id);
+    compare!("reason", reason);
+    compare!("notes", notes);
+
+    if posted.lines != replayed.lines {
+        if posted.lines.len() != replayed.lines.len() {
+            return Some((
+                "returned line count",
+                format!("{} line(s)", posted.lines.len()),
+                format!("{} line(s)", replayed.lines.len()),
+            ));
+        }
+        for (a, b) in posted.lines.iter().zip(&replayed.lines) {
+            if a != b {
+                return Some(("returned line", format!("{a:?}"), format!("{b:?}")));
+            }
+        }
+    }
+
+    if posted.refunds != replayed.refunds {
+        if posted.refunds.len() != replayed.refunds.len() {
+            return Some((
+                "refund count",
+                format!("{} row(s)", posted.refunds.len()),
+                format!("{} row(s)", replayed.refunds.len()),
+            ));
+        }
+        for (a, b) in posted.refunds.iter().zip(&replayed.refunds) {
+            if a != b {
+                return Some(("refund", format!("{a:?}"), format!("{b:?}")));
+            }
+        }
+    }
+
+    None
+}
+
+/// Rebuild the original command result for an already-posted credit memo, so a
+/// retry reconciles to the return that exists instead of creating a second one
+/// — a second refund, a second restock and a second blend into the cost pool.
+async fn result_for_posted_credit_memo(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    credit_memo_id: &str,
+    existing: &PostedCreditMemo,
+) -> Result<PostCreditMemoResult, String> {
+    let movement_ids: Vec<String> = sqlx::query(
+        "SELECT id FROM inventory_movements WHERE related_credit_memo_id = ? ORDER BY rowid",
+    )
+    .bind(credit_memo_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| format!("read movements for credit memo {credit_memo_id}: {e}"))?
+    .into_iter()
+    .map(|r| r.try_get::<String, _>("id").map_err(|e| format!("decode movement id: {e}")))
+    .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(PostCreditMemoResult {
+        credit_memo_id: credit_memo_id.to_string(),
+        credit_memo_number: existing.credit_memo_number,
+        posted_at: existing.posted_at.clone(),
+        movement_ids,
+        subtotal_excl_vat_cents: existing.subtotal_excl_vat_cents,
+        vat_total_cents: existing.vat_total_cents,
+        discount_cents: existing.discount_cents,
+        total_incl_vat_cents: existing.total_incl_vat_cents,
+        cogs_reversed_cents: existing.cogs_reversed_cents,
+        refund_total_usd_cents: existing.refund_total_usd_cents,
+    })
+}
+
+async fn next_credit_memo_number(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    _store_id: &str,
+) -> Result<i64, String> {
+    let row = sqlx::query("SELECT value FROM app_settings WHERE key = 'next_credit_memo_number'")
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("read next_credit_memo_number: {e}"))?;
+    let current: i64 = row
+        .ok_or_else(|| "next_credit_memo_number missing from app_settings".to_string())?
+        .try_get::<String, _>("value")
+        .map_err(|e| format!("decode next_credit_memo_number: {e}"))?
+        .parse()
+        .map_err(|e| format!("parse next_credit_memo_number: {e}"))?;
+    sqlx::query("UPDATE app_settings SET value = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE key = 'next_credit_memo_number'")
+        .bind((current + 1).to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("write next_credit_memo_number: {e}"))?;
+    Ok(current)
+}
+
+/// One return line after the database has had its say. Everything written for a
+/// line comes from here; nothing on it is a payload value.
+struct ResolvedReturnLine {
+    product_id: String,
+    product_name: String,
+    product_sku: Option<String>,
+    vat_rate_id: String,
+    vat_bps: i64,
+    uom_code: Option<String>,
+    factor_num: i64,
+    factor_den: i64,
+    quantity_base: i64,
+    quantity_in_uom: i64,
+    unit_price_excl_vat_cents: i64,
+    unit_price_incl_vat_cents: i64,
+    line_subtotal_excl_vat_cents: i64,
+    line_vat_cents: i64,
+    line_total_incl_vat_cents: i64,
+    line_discount_cents: i64,
+    /// The ORIGINAL sale's per-base COGS rates, in microcents.
+    unit_cogs_excl_mc: i64,
+    unit_cogs_incl_mc: i64,
+    /// The COGS this line reverses as money — zero when it does not restock.
+    line_cogs_cents: i64,
+    /// True when the original line moved no stock (a service or non-stock sale).
+    is_service: bool,
+    return_to_stock: bool,
+}
+
+#[tauri::command]
+pub async fn post_credit_memo(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: PostCreditMemoPayload,
+) -> Result<PostCreditMemoResult, String> {
+    validate_credit_memo_payload(&payload)?;
+    let pool = pool(&app, &state).await?;
+    post_credit_memo_tx(&pool, payload).await
+}
+
+/// Validate-then-post against an already-resolved pool (test seam).
+#[cfg(test)]
+pub(crate) async fn post_credit_memo_with_pool(
+    pool: &SqlitePool,
+    payload: PostCreditMemoPayload,
+) -> Result<PostCreditMemoResult, String> {
+    validate_credit_memo_payload(&payload)?;
+    post_credit_memo_tx(pool, payload).await
+}
+
+/// The transactional body of `post_credit_memo`.
+pub(crate) async fn post_credit_memo_tx(
+    pool: &SqlitePool,
+    payload: PostCreditMemoPayload,
+) -> Result<PostCreditMemoResult, String> {
+    let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Idempotency: has this return identity already posted? ----
+    //
+    // FIRST, before anything is read about the sale and in particular before a
+    // credit-memo number is consumed. The ordering is load bearing in both
+    // directions, exactly as it is in `post_sale_tx`:
+    //
+    //   * a replay of a memo that already posted writes nothing, so it must
+    //     keep reconciling to its original number even once its shift has been
+    //     closed and counted — and even though, by then, its OWN lines are part
+    //     of the already-returned quantity a fresh resolution would check
+    //     against. Re-deriving first would reject the retry of a return that
+    //     went through, telling the cashier a refund failed that the customer
+    //     has already been handed.
+    //   * nothing below this point is reached by a new memo that fails a check:
+    //     no number, no row, no movement, no refund, no stock change.
+    if let Some(existing) = load_credit_memo_by_identity(&mut tx, &payload.credit_memo_id).await? {
+        if existing.status != "posted" {
+            return Err(format!(
+                "Return {} already exists with status '{}' and cannot be re-posted.",
+                payload.credit_memo_id, existing.status
+            ));
+        }
+        let replayed = CanonicalCreditMemo::from_payload(&payload);
+        if let Some((what, was, now_)) =
+            credit_memo_replay_difference(&existing.canonical, &replayed)
+        {
+            return Err(format!(
+                "Return {} already exists (credit memo #{}) with a different {}: posted {}, \
+                 replayed {}. Start a new return instead of reusing this one.",
+                payload.credit_memo_id, existing.credit_memo_number, what, was, now_
+            ));
+        }
+        let result =
+            result_for_posted_credit_memo(&mut tx, &payload.credit_memo_id, &existing).await?;
+        // Nothing was written; end the transaction without a commit.
+        tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
+        return Ok(result);
+    }
+
+    // ---- The original sale: this store's, posted, and an actual sale ----
+    let sale_row = sqlx::query(
+        "SELECT sale_type, status, receipt_number,
+                exchange_rate_id, exchange_rate_lbp_per_usd
+           FROM sales WHERE id = ? AND store_id = ?",
+    )
+    .bind(&payload.original_sale_id)
+    .bind(&payload.store_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| format!("read original sale {}: {e}", payload.original_sale_id))?
+    .ok_or_else(|| {
+        format!(
+            "Sale {} is not a sale of store {}.",
+            payload.original_sale_id, payload.store_id
+        )
+    })?;
+
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+    let sale_type: String = sale_row.try_get("sale_type").map_err(d("sale_type"))?;
+    let sale_status: String = sale_row.try_get("status").map_err(d("status"))?;
+    let receipt_number: i64 = sale_row.try_get("receipt_number").map_err(d("receipt_number"))?;
+    let sale_rate_id: Option<String> =
+        sale_row.try_get("exchange_rate_id").map_err(d("exchange_rate_id"))?;
+    // NOT NULL and CHECK (> 0) since migration 001.
+    let locked_rate: i64 = sale_row
+        .try_get("exchange_rate_lbp_per_usd")
+        .map_err(d("exchange_rate_lbp_per_usd"))?;
+
+    if sale_status != "posted" {
+        return Err(format!(
+            "Only a posted sale can be returned; receipt #{receipt_number} is {sale_status}."
+        ));
+    }
+    if sale_type != "normal" {
+        return Err(format!(
+            "Only a normal sale can be returned; receipt #{receipt_number} is a {sale_type}."
+        ));
+    }
+
+    // ---- The exchange rate is the ORIGINAL SALE's, not the payload's ----
+    //
+    // Refund economics belong to the transaction being reversed. Today's rate
+    // would change the USD equivalent of a historical lira payment, which is
+    // how a refund stops reconciling against the tender it reverses. A declared
+    // rate that disagrees is refused rather than ignored: it means the screen
+    // the cashier is reading was priced against a different number.
+    if let Some(declared) = payload.exchange_rate_lbp_per_usd {
+        if declared != locked_rate {
+            return Err(format!(
+                "Exchange rate mismatch: receipt #{receipt_number} was locked at {locked_rate} \
+                 LBP/USD, but this return declares {declared} LBP/USD. A refund settles the sale \
+                 at the rate the sale was priced at."
+            ));
+        }
+    }
+    if let Some(declared_id) = payload.exchange_rate_id.as_deref() {
+        if !declared_id.is_empty() && Some(declared_id) != sale_rate_id.as_deref() {
+            return Err(format!(
+                "Exchange rate mismatch: receipt #{receipt_number} is locked to rate {}, but this \
+                 return declares rate {declared_id}.",
+                sale_rate_id.as_deref().unwrap_or("(none)")
+            ));
+        }
+    }
+
+    // ---- A NEW return belongs to an open shift of its store (WP-04 pattern) ----
+    //
+    // A refund moves the drawer, so it is a cash-control event exactly as a sale
+    // is. Checked INSIDE the transaction that writes it, so a shift closing
+    // between the cashier pressing Refund and this statement cannot acquire a
+    // return afterwards. See the second call, just before the commit.
+    let shift_id = payload
+        .shift_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "This return is not attached to a shift. Open a shift before refunding.".to_string()
+        })?;
+    assert_shift_is_open(&mut tx, shift_id, &payload.store_id).await?;
+
+    // ---- Resolve every line against the ORIGINAL sale ----
+    //
+    // A PRE-PASS: it reads, derives and refuses, and writes nothing. So a
+    // malformed or over-stated line 2 leaves no number consumed and no line 1
+    // behind, even transiently — the same placement, and the same reasoning, as
+    // `post_purchase`'s cost-pair check.
+    let mut resolved: Vec<ResolvedReturnLine> = Vec::with_capacity(payload.lines.len());
+    let mut header_subtotal: i64 = 0;
+    let mut header_vat: i64 = 0;
+    let mut header_total: i64 = 0;
+    let mut header_discount: i64 = 0;
+    let mut header_cogs_reversed: i64 = 0;
+
+    for (i, line) in payload.lines.iter().enumerate() {
+        let n = i + 1;
+
+        // The original line, scoped to the memo's OWN sale: a sale item of a
+        // different receipt is unresolvable here, not merely implausible.
+        let item = sqlx::query(
+            "SELECT product_id, product_name_snapshot, product_sku_snapshot,
+                    vat_rate_id_snapshot, vat_rate_bps_snapshot,
+                    quantity,
+                    uom_code_snapshot,
+                    COALESCE(factor_num_snapshot, 1)      AS factor_num_snapshot,
+                    COALESCE(factor_den_snapshot, 1)      AS factor_den_snapshot,
+                    unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+                    line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+                    line_discount_cents,
+                    unit_cogs_excl_vat_microcents
+               FROM sale_items
+              WHERE id = ? AND sale_id = ? AND store_id = ?",
+        )
+        .bind(&line.original_sale_item_id)
+        .bind(&payload.original_sale_id)
+        .bind(&payload.store_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read sale item {}: {e}", line.original_sale_item_id))?
+        .ok_or_else(|| {
+            format!(
+                "Return line {n}: sale line {} is not a line of receipt #{receipt_number}.",
+                line.original_sale_item_id
+            )
+        })?;
+
+        let orig_qty_base: i64 = item.try_get("quantity").map_err(d("quantity"))?;
+        let factor_num: i64 = item.try_get("factor_num_snapshot").map_err(d("factor_num"))?;
+        let factor_den: i64 = item.try_get("factor_den_snapshot").map_err(d("factor_den"))?;
+        let product_name: String = item
+            .try_get("product_name_snapshot")
+            .map_err(d("product_name_snapshot"))?;
+
+        // ---- How much has already come back, and how much of that restocked ----
+        //
+        // Two running totals, because they bound different things: the returned
+        // quantity bounds the return and prorates the money, while the restocked
+        // quantity is the basis the COGS reversal is prorated against. A line
+        // returned once as a write-off and once to the shelf must reverse cost
+        // for the second unit only.
+        let prior = sqlx::query(
+            "SELECT COALESCE(SUM(l.quantity_base), 0) AS returned,
+                    COALESCE(SUM(CASE WHEN l.return_to_stock = 1
+                                      THEN l.quantity_base ELSE 0 END), 0) AS restocked
+               FROM sales_credit_memo_lines l
+               JOIN sales_credit_memos m ON m.id = l.credit_memo_id
+              WHERE l.original_sale_item_id = ? AND m.status = 'posted'",
+        )
+        .bind(&line.original_sale_item_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("read already-returned quantity: {e}"))?;
+        let already_returned: i64 = prior.try_get("returned").map_err(d("returned"))?;
+        let already_restocked: i64 = prior.try_get("restocked").map_err(d("restocked"))?;
+
+        // ---- The base quantity is the ORIGINAL line's conversion, not the
+        //      payload's — the GP-A02 rule, applied in reverse ----
+        let quantity_base = derive_base_quantity(line.quantity_in_uom, factor_num, factor_den)
+            .map_err(|e| format!("Return line {n}: {e}."))?;
+        if line.quantity_base != quantity_base {
+            return Err(format!(
+                "Return line {n}: declared base quantity {} does not match the original line's \
+                 own conversion ({} x {}/{} = {}).",
+                line.quantity_base, line.quantity_in_uom, factor_num, factor_den, quantity_base
+            ));
+        }
+
+        let remaining = orig_qty_base
+            .checked_sub(already_returned)
+            .ok_or_else(|| format!("Return line {n}: returned quantity overflows."))?;
+        if remaining <= 0 {
+            return Err(format!(
+                "Return line {n}: \"{product_name}\" has already been returned in full \
+                 ({already_returned} of {orig_qty_base})."
+            ));
+        }
+        if quantity_base > remaining {
+            return Err(format!(
+                "Return line {n}: cannot return {quantity_base} of \"{product_name}\" — receipt \
+                 #{receipt_number} sold {orig_qty_base} and {already_returned} has already come \
+                 back, leaving {remaining}."
+            ));
+        }
+        let cumulative_returned = already_returned + quantity_base;
+
+        // ---- Did the original line move stock? ----
+        //
+        // Answered by the sale's OWN inventory movement, not by
+        // `products.is_service` as it reads today: whether these goods left the
+        // shelf is a fact about that sale, and a product reclassified since
+        // cannot retroactively make a service of something that was stocked —
+        // or stock of something that never was.
+        let sale_movement = sqlx::query(
+            "SELECT unit_cost_incl_vat_microcents
+               FROM inventory_movements
+              WHERE related_sale_item_id = ? AND store_id = ? AND movement_type = 'sale'
+              ORDER BY rowid LIMIT 1",
+        )
+        .bind(&line.original_sale_item_id)
+        .bind(&payload.store_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read original sale movement: {e}"))?;
+
+        let is_service = sale_movement.is_none();
+        let unit_cogs_incl_mc: i64 = match &sale_movement {
+            Some(m) => m
+                .try_get("unit_cost_incl_vat_microcents")
+                .map_err(d("unit_cost_incl_vat_microcents"))?,
+            None => 0,
+        };
+        // The excl-VAT rate is the SALE LINE's own snapshot, which is the
+        // column migration 008 made the accounting source of truth for COGS.
+        let unit_cogs_excl_mc: i64 = item
+            .try_get("unit_cogs_excl_vat_microcents")
+            .map_err(d("unit_cogs_excl_vat_microcents"))?;
+
+        if line.return_to_stock && is_service {
+            return Err(format!(
+                "Return line {n}: \"{product_name}\" moved no stock when it was sold — it is a \
+                 service or a non-stock item — so it cannot be put back into inventory. Refund it \
+                 without restocking."
+            ));
+        }
+        let return_to_stock = line.return_to_stock && !is_service;
+
+        // ---- The money, from the original snapshot ----
+        let orig_subtotal: i64 = item
+            .try_get("line_subtotal_excl_vat_cents")
+            .map_err(d("line_subtotal_excl_vat_cents"))?;
+        let orig_vat: i64 = item
+            .try_get("line_vat_cents")
+            .map_err(d("line_vat_cents"))?;
+        let orig_total: i64 = item
+            .try_get("line_total_incl_vat_cents")
+            .map_err(d("line_total_incl_vat_cents"))?;
+        let orig_discount: i64 = item
+            .try_get("line_discount_cents")
+            .map_err(d("line_discount_cents"))?;
+        let vat_bps: i64 = item
+            .try_get("vat_rate_bps_snapshot")
+            .map_err(d("vat_rate_bps_snapshot"))?;
+
+        // The sale's own parts must add up before anything is derived from
+        // them. `post_sale` enforces this at the boundary (WP-02, GP-A06), so
+        // this can only trip on a row written by something else — and it is
+        // what makes the returned total land exactly on the original one.
+        if orig_subtotal
+            .checked_add(orig_vat)
+            .ok_or_else(|| format!("Return line {n}: the original line overflows."))?
+            != orig_total
+        {
+            return Err(format!(
+                "Return line {n}: the original sale line does not reconcile (subtotal \
+                 {orig_subtotal} + VAT {orig_vat} != total {orig_total}), so it cannot be \
+                 prorated."
+            ));
+        }
+
+        // ---- The money, prorated CUMULATIVELY, COMPONENT BY COMPONENT ----
+        //
+        // Each of the three figures the sale persisted gets its own cumulative
+        // series, and the returned TOTAL is the sum of the subtotal and VAT
+        // slices. The total is NOT prorated on its own and VAT is NOT a
+        // residual: see `prorated_cumulative_cents` for the 11-cent line that
+        // made a residual VAT slice go negative and refused a legitimate
+        // return.
+        let slice = |amount: i64| -> Result<i64, String> {
+            let to = prorated_cumulative_cents(amount, cumulative_returned, orig_qty_base)
+                .map_err(|e| format!("Return line {n}: {e}."))?;
+            let from = prorated_cumulative_cents(amount, already_returned, orig_qty_base)
+                .map_err(|e| format!("Return line {n}: {e}."))?;
+            Ok(to - from)
+        };
+        let line_subtotal = slice(orig_subtotal)?;
+        let line_vat = slice(orig_vat)?;
+        let line_total = line_subtotal
+            .checked_add(line_vat)
+            .ok_or_else(|| format!("Return line {n}: the credited total overflows."))?;
+        // The ORIGINAL line's persisted discount allocation, by the same rule.
+        // Today's discount is never redistributed, and returning every unit
+        // gives back exactly `sale_items.line_discount_cents`.
+        let line_discount = slice(orig_discount)?;
+
+        // Each series is monotone in quantity because its original is
+        // non-negative, so no slice can be negative. Stated rather than
+        // assumed: these rows are immutable once written, and a negative VAT
+        // slice would be a credit note that ADDS output VAT.
+        if line_subtotal < 0 || line_vat < 0 || line_total < 0 || line_discount < 0 {
+            return Err(format!(
+                "Return line {n} does not reconcile: subtotal {line_subtotal}, VAT {line_vat}, \
+                 total {line_total}, discount {line_discount}."
+            ));
+        }
+        if line_subtotal + line_vat != line_total {
+            return Err(format!(
+                "Return line {n} does not reconcile: subtotal {line_subtotal} + VAT {line_vat} \
+                 != total {line_total}."
+            ));
+        }
+        if vat_bps == 0 && line_vat != 0 {
+            return Err(format!(
+                "Return line {n} does not reconcile: VAT of {line_vat} cents at an exempt (0 bps) \
+                 rate."
+            ));
+        }
+
+        // ---- COGS, prorated cumulatively against the RESTOCKED quantity ----
+        //
+        // Precise rate x quantity, rounded once — `cost::extended_cost_cents`,
+        // the single boundary where a cost becomes money — taken as the
+        // difference of two cumulative figures so that restocking every unit
+        // across several memos reverses exactly the COGS the sale booked.
+        let line_cogs_cents = if return_to_stock {
+            let cumulative_restocked = already_restocked + quantity_base;
+            let to = extended_cost_cents(unit_cogs_excl_mc, cumulative_restocked)
+                .map_err(|e| format!("Return line {n}: {e}."))?;
+            let from = extended_cost_cents(unit_cogs_excl_mc, already_restocked)
+                .map_err(|e| format!("Return line {n}: {e}."))?;
+            to - from
+        } else {
+            // Not restocked: the goods did not come back into inventory, so no
+            // cost comes back out of COGS. The margin on these units is lost,
+            // which is the truth about discarded stock.
+            0
+        };
+        if line_cogs_cents < 0 {
+            return Err(format!("Return line {n}: reversed cost cannot be negative."));
+        }
+
+        header_subtotal = header_subtotal
+            .checked_add(line_subtotal)
+            .ok_or_else(|| "Return subtotal overflows.".to_string())?;
+        header_vat = header_vat
+            .checked_add(line_vat)
+            .ok_or_else(|| "Return VAT overflows.".to_string())?;
+        header_total = header_total
+            .checked_add(line_total)
+            .ok_or_else(|| "Return total overflows.".to_string())?;
+        header_discount = header_discount
+            .checked_add(line_discount)
+            .ok_or_else(|| "Return discount overflows.".to_string())?;
+        header_cogs_reversed = header_cogs_reversed
+            .checked_add(line_cogs_cents)
+            .ok_or_else(|| "Reversed cost overflows.".to_string())?;
+
+        resolved.push(ResolvedReturnLine {
+            product_id: item.try_get("product_id").map_err(d("product_id"))?,
+            product_name,
+            product_sku: item
+                .try_get("product_sku_snapshot")
+                .map_err(d("product_sku_snapshot"))?,
+            vat_rate_id: item
+                .try_get("vat_rate_id_snapshot")
+                .map_err(d("vat_rate_id_snapshot"))?,
+            vat_bps,
+            uom_code: item.try_get("uom_code_snapshot").map_err(d("uom_code_snapshot"))?,
+            factor_num,
+            factor_den,
+            quantity_base,
+            quantity_in_uom: line.quantity_in_uom,
+            unit_price_excl_vat_cents: item
+                .try_get("unit_price_excl_vat_cents")
+                .map_err(d("unit_price_excl_vat_cents"))?,
+            unit_price_incl_vat_cents: item
+                .try_get("unit_price_incl_vat_cents")
+                .map_err(d("unit_price_incl_vat_cents"))?,
+            line_subtotal_excl_vat_cents: line_subtotal,
+            line_vat_cents: line_vat,
+            line_total_incl_vat_cents: line_total,
+            line_discount_cents: line_discount,
+            unit_cogs_excl_mc,
+            unit_cogs_incl_mc,
+            line_cogs_cents,
+            is_service,
+            return_to_stock,
+        });
+    }
+
+    if header_total <= 0 {
+        return Err("A return must credit a positive amount.".into());
+    }
+    if header_subtotal + header_vat != header_total {
+        return Err(format!(
+            "Return header does not reconcile: subtotal {header_subtotal} + VAT {header_vat} != \
+             total {header_total}."
+        ));
+    }
+
+    // ---- The refund: amount, currency, and which tenders it may use ----
+    //
+    // THE USD EQUIVALENT IS DERIVED. A USD leg's is itself; an LBP leg's is its
+    // lira at the ORIGINAL SALE's locked rate. The declared value is a
+    // cross-check, as it is for a sale tender since WP-04.
+    let mut refund_total: i64 = 0;
+    for (i, r) in payload.refunds.iter().enumerate() {
+        let n = i + 1;
+        let derived = if r.currency == "USD" {
+            r.amount_native_usd_cents
+        } else {
+            lbp_to_usd_cents(r.amount_native_lbp, locked_rate)
+                .map_err(|e| format!("Refund {n}: {e}."))?
+        };
+        if r.amount_usd_cents_equivalent != derived {
+            let native = if r.currency == "USD" {
+                r.amount_native_usd_cents
+            } else {
+                r.amount_native_lbp
+            };
+            return Err(format!(
+                "Refund {n}: declared USD equivalent of {} cents does not match {native} {} at \
+                 the sale's locked rate of {locked_rate} LBP/USD, which is {derived} cents.",
+                r.amount_usd_cents_equivalent, r.currency
+            ));
+        }
+        refund_total = refund_total
+            .checked_add(derived)
+            .ok_or_else(|| "Refund total overflows.".to_string())?;
+    }
+
+    // ---- The refund settles the memo exactly ----
+    //
+    // Not more and not less. Greaz has no unpaid-credit instrument and no
+    // customer balance, so a refund that fell short would leave money owed in
+    // no ledger, and one that overshot would hand out money no return earned.
+    // There is no "change given" on a refund either: the amount is agreed to
+    // the cent before anything leaves the drawer.
+    if refund_total != header_total {
+        return Err(format!(
+            "The refund must equal the return exactly: {refund_total} USD-cents refunded against \
+             a {header_total} USD-cent credit memo."
+        ));
+    }
+
+    // ---- A refund may only use tender the ORIGINAL SALE actually took ----
+    //
+    // Money goes back the way it came. Refunding a card sale in cash empties
+    // the drawer against a payment that never filled it, and refunding a cash
+    // sale to a card credits a card that was never charged; both are the
+    // classic till-skimming shape, and both are indistinguishable from an
+    // honest mistake after the fact.
+    //
+    // The cap is per (method, currency) and is stated in THAT currency's own
+    // unit — USD cents for a USD leg, whole lira for an LBP one — because that
+    // is the unit the money was actually received in; comparing USD equivalents
+    // would let a lira cap drift by the conversion's rounding. Availability is
+    // NET of change: a $100 cash tender that handed back $20 received $80,
+    // which is also exactly what `close_shift` counted into the drawer.
+    //
+    // Cumulative across every posted memo of this sale, so three refunds of $40
+    // against an $80 cash tender cannot each pass a per-memo check.
+    let mut refund_groups: Vec<(String, String, i64)> = Vec::new();
+    for r in &payload.refunds {
+        let native = if r.currency == "USD" {
+            r.amount_native_usd_cents
+        } else {
+            r.amount_native_lbp
+        };
+        match refund_groups
+            .iter_mut()
+            .find(|(m, c, _)| m == &r.method && c == &r.currency)
+        {
+            Some(entry) => {
+                entry.2 = entry
+                    .2
+                    .checked_add(native)
+                    .ok_or_else(|| "Refund amount overflows.".to_string())?;
+            }
+            None => refund_groups.push((r.method.clone(), r.currency.clone(), native)),
+        }
+    }
+
+    for (method, currency, requested_native) in &refund_groups {
+        let available: i64 = sqlx::query(
+            "SELECT COALESCE(SUM(CASE WHEN currency = 'USD'
+                                      THEN amount_native_usd_cents - change_given_usd_cents
+                                      ELSE amount_native_lbp - change_given_lbp END), 0) AS net
+               FROM sale_payments
+              WHERE sale_id = ? AND store_id = ? AND method = ? AND currency = ?",
+        )
+        .bind(&payload.original_sale_id)
+        .bind(&payload.store_id)
+        .bind(method)
+        .bind(currency)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("read original tender for {method}: {e}"))?
+        .try_get("net")
+        .map_err(d("net original tender"))?;
+
+        if available <= 0 {
+            return Err(format!(
+                "Receipt #{receipt_number} took no {method} ({currency}) payment, so it cannot be \
+                 refunded that way. A refund may only return money through a method the sale used."
+            ));
+        }
+
+        let already: i64 = sqlx::query(
+            "SELECT COALESCE(SUM(CASE WHEN r.currency = 'USD'
+                                      THEN r.amount_native_usd_cents
+                                      ELSE r.amount_native_lbp END), 0) AS refunded
+               FROM sales_credit_memo_refunds r
+               JOIN sales_credit_memos m ON m.id = r.credit_memo_id
+              WHERE m.original_sale_id = ? AND m.status = 'posted'
+                AND r.method = ? AND r.currency = ?",
+        )
+        .bind(&payload.original_sale_id)
+        .bind(method)
+        .bind(currency)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("read refunded-to-date for {method}: {e}"))?
+        .try_get("refunded")
+        .map_err(d("refunded to date"))?;
+
+        let cumulative = already
+            .checked_add(*requested_native)
+            .ok_or_else(|| "Refund amount overflows.".to_string())?;
+        if cumulative > available {
+            return Err(format!(
+                "Refund through {method} ({currency}) would total {cumulative} against the \
+                 {available} receipt #{receipt_number} took that way ({already} already \
+                 refunded). A method can give back only what it collected."
+            ));
+        }
+    }
+
+    // ---- A cash refund cannot drive the drawer negative ----
+    //
+    // Cash handed back is physical money leaving the till, so the till has to be
+    // holding it. Expected drawer cash is read HERE, inside the posting
+    // transaction, from the same `drawer_cash_for_shift` definition
+    // `close_shift` reconciles against — never from a figure the client last
+    // rendered, and never from one computed before this transaction's snapshot.
+    // Two refunds cannot therefore both spend the same drawer balance: SQLite
+    // admits one write transaction at a time, so the loser's read either already
+    // includes the winner or its own write cannot commit.
+    //
+    // Per currency, because a till holding dollars is not holding lira. Card
+    // refunds appear in neither figure: they go back down the card rail.
+    //
+    // There is no manager override. A refund the drawer cannot fund is a cash
+    // problem, not a permissions problem.
+    let shift_float = sqlx::query(
+        "SELECT opening_cash_usd_cents, opening_cash_lbp FROM shifts WHERE id = ? AND store_id = ?",
+    )
+    .bind(shift_id)
+    .bind(&payload.store_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| format!("read shift float for {shift_id}: {e}"))?;
+    let opening_usd: i64 = shift_float
+        .try_get("opening_cash_usd_cents")
+        .map_err(d("opening_cash_usd_cents"))?;
+    let opening_lbp: i64 = shift_float.try_get("opening_cash_lbp").map_err(d("opening_cash_lbp"))?;
+
+    let drawer = drawer_cash_for_shift(&mut tx, &payload.store_id, shift_id).await?;
+    let expected_usd = drawer.expected_usd_cents(opening_usd)?;
+    let expected_lbp = drawer.expected_lbp(opening_lbp)?;
+
+    let cash_out_usd: i64 = refund_groups
+        .iter()
+        .filter(|(m, _, _)| m == "cash_usd")
+        .map(|(_, _, native)| *native)
+        .sum();
+    let cash_out_lbp: i64 = refund_groups
+        .iter()
+        .filter(|(m, _, _)| m == "cash_lbp")
+        .map(|(_, _, native)| *native)
+        .sum();
+
+    if cash_out_usd > expected_usd {
+        return Err(format!(
+            "This refund would hand back {cash_out_usd} USD-cents of cash, but the drawer is only \
+             expected to hold {expected_usd}. Refund less in cash, or use another method the sale \
+             used that does not come out of the till."
+        ));
+    }
+    if cash_out_lbp > expected_lbp {
+        return Err(format!(
+            "This refund would hand back {cash_out_lbp} LBP of cash, but the drawer is only \
+             expected to hold {expected_lbp}. Refund less in cash, or use another method the sale \
+             used that does not come out of the till."
+        ));
+    }
+
+    // ========================================================================
+    // Everything above this line is a read. The writes begin here.
+    // ========================================================================
+
+    let credit_memo_number = next_credit_memo_number(&mut tx, &payload.store_id).await?;
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+
+    // The header goes in as a DRAFT and is promoted at the end, exactly as
+    // `post_purchase` does. The immutability triggers key on the parent memo's
+    // `posted_at`, so the lines have to be linkable to their movements before
+    // the document is sealed.
+    sqlx::query(
+        r#"INSERT INTO sales_credit_memos (
+             id, store_id, original_sale_id, credit_memo_number,
+             shift_id, device_id, cashier_user_id,
+             exchange_rate_lbp_per_usd, exchange_rate_id, reason,
+             subtotal_excl_vat_cents, vat_total_cents, discount_cents, total_incl_vat_cents,
+             cogs_reversed_cents, refund_total_usd_cents,
+             status, posted_at, notes
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', NULL, ?)"#,
+    )
+    .bind(&payload.credit_memo_id)
+    .bind(&payload.store_id)
+    .bind(&payload.original_sale_id)
+    .bind(credit_memo_number)
+    .bind(shift_id)
+    .bind(&payload.device_id)
+    .bind(&payload.cashier_user_id)
+    .bind(locked_rate)
+    .bind(&sale_rate_id)
+    .bind(&payload.reason)
+    .bind(header_subtotal)
+    .bind(header_vat)
+    .bind(header_discount)
+    .bind(header_total)
+    .bind(header_cogs_reversed)
+    .bind(refund_total)
+    .bind(&payload.notes)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert credit memo: {e}"))?;
+
+    let mut movement_ids: Vec<String> = Vec::new();
+
+    for (i, line) in payload.lines.iter().enumerate() {
+        let r = &resolved[i];
+        let unit_cogs_excl_cents = microcents_to_cents(r.unit_cogs_excl_mc)?;
+
+        sqlx::query(
+            r#"INSERT INTO sales_credit_memo_lines (
+                 id, credit_memo_id, store_id, original_sale_item_id, product_id,
+                 product_name_snapshot, product_sku_snapshot,
+                 vat_rate_id_snapshot, vat_rate_bps_snapshot,
+                 quantity_base, quantity_in_uom, uom_code_snapshot,
+                 factor_num_snapshot, factor_den_snapshot,
+                 unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+                 line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+                 line_discount_cents,
+                 unit_cogs_excl_vat_microcents, unit_cogs_excl_vat_cents,
+                 line_cogs_excl_vat_cents,
+                 is_service, return_to_stock, related_movement_id
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"#,
+        )
+        .bind(&line.credit_memo_line_id)
+        .bind(&payload.credit_memo_id)
+        .bind(&payload.store_id)
+        .bind(&line.original_sale_item_id)
+        .bind(&r.product_id)
+        .bind(&r.product_name)
+        .bind(&r.product_sku)
+        .bind(&r.vat_rate_id)
+        .bind(r.vat_bps)
+        .bind(r.quantity_base)
+        .bind(r.quantity_in_uom)
+        .bind(&r.uom_code)
+        .bind(r.factor_num)
+        .bind(r.factor_den)
+        .bind(r.unit_price_excl_vat_cents)
+        .bind(r.unit_price_incl_vat_cents)
+        .bind(r.line_subtotal_excl_vat_cents)
+        .bind(r.line_vat_cents)
+        .bind(r.line_total_incl_vat_cents)
+        .bind(r.line_discount_cents)
+        .bind(r.unit_cogs_excl_mc)
+        .bind(unit_cogs_excl_cents)
+        .bind(r.line_cogs_cents)
+        .bind(i64::from(r.is_service))
+        .bind(i64::from(r.return_to_stock))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert credit memo line: {e}"))?;
+
+        if !r.return_to_stock {
+            continue;
+        }
+
+        // ---- The goods go back on the shelf, at the cost they left at ----
+        let product = sqlx::query(
+            "SELECT quantity_on_hand,
+                    avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents
+               FROM products WHERE id = ? AND store_id = ?",
+        )
+        .bind(&r.product_id)
+        .bind(&payload.store_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read product {} for restock: {e}", r.product_id))?
+        .ok_or_else(|| {
+            format!(
+                "Product {} is no longer in store {}.",
+                r.product_id, payload.store_id
+            )
+        })?;
+        let old_qty: i64 = product.try_get("quantity_on_hand").map_err(d("quantity_on_hand"))?;
+        let old_avg_excl: i64 = product
+            .try_get("avg_cost_excl_vat_microcents")
+            .map_err(d("avg_cost_excl_vat_microcents"))?;
+        let old_avg_incl: i64 = product
+            .try_get("avg_cost_incl_vat_microcents")
+            .map_err(d("avg_cost_incl_vat_microcents"))?;
+
+        // The weighted average is RE-BLENDED, not left alone. Returning stock
+        // without touching the cost pool quietly restates its value: the units
+        // are back in the quantity but their cost is not back in the value, so
+        // every subsequent average is wrong by that much. The blend is the WP-03
+        // arithmetic at full microcent precision, against the rate the units
+        // actually left at — `cost::restock_weighted_avg`, which also decides
+        // the two states where no average exists (see its documentation).
+        let new_avg_excl = crate::cost::restock_weighted_avg(
+            old_qty,
+            old_avg_excl,
+            r.quantity_base,
+            r.unit_cogs_excl_mc,
+        )?;
+        let new_avg_incl = crate::cost::restock_weighted_avg(
+            old_qty,
+            old_avg_incl,
+            r.quantity_base,
+            r.unit_cogs_incl_mc,
+        )?;
+
+        let movement_id = uuid::Uuid::new_v4().to_string();
+        movement_ids.push(movement_id.clone());
+
+        sqlx::query(
+            r#"INSERT INTO inventory_movements (
+                 id, store_id, product_id, movement_type, quantity_delta,
+                 unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+                 unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents,
+                 related_credit_memo_id, related_credit_memo_line_id,
+                 notes, created_by_user_id, device_id, posted_at,
+                 quantity_in_uom, uom_code_snapshot,
+                 factor_num_snapshot, factor_den_snapshot
+               ) VALUES (?, ?, ?, 'return_in', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&movement_id)
+        .bind(&payload.store_id)
+        .bind(&r.product_id)
+        .bind(r.quantity_base) // a return is stock IN
+        .bind(unit_cogs_excl_cents)
+        .bind(microcents_to_cents(r.unit_cogs_incl_mc)?)
+        .bind(r.unit_cogs_excl_mc)
+        .bind(r.unit_cogs_incl_mc)
+        .bind(&payload.credit_memo_id)
+        .bind(&line.credit_memo_line_id)
+        .bind(format!(
+            "Return #{credit_memo_number} (receipt #{receipt_number})"
+        ))
+        .bind(&payload.cashier_user_id)
+        .bind(&payload.device_id)
+        .bind(&now)
+        .bind(r.quantity_in_uom)
+        .bind(&r.uom_code)
+        .bind(r.factor_num)
+        .bind(r.factor_den)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert return_in movement: {e}"))?;
+
+        sqlx::query("UPDATE sales_credit_memo_lines SET related_movement_id = ? WHERE id = ?")
+            .bind(&movement_id)
+            .bind(&line.credit_memo_line_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("link credit memo line to movement: {e}"))?;
+
+        // The quantity always goes back; the average moves only when one
+        // exists. Both averages move together or neither does — writing one
+        // side of the excl/incl pair and not the other would leave the product
+        // carrying two costs that are not the same cost.
+        match (new_avg_excl, new_avg_incl) {
+            (Some(avg_excl), Some(avg_incl)) => {
+                sqlx::query(
+                    r#"UPDATE products
+                          SET quantity_on_hand             = quantity_on_hand + ?,
+                              avg_cost_excl_vat_microcents = ?,
+                              avg_cost_incl_vat_microcents = ?,
+                              avg_cost_excl_vat_cents      = ?,
+                              avg_cost_incl_vat_cents      = ?
+                        WHERE id = ? AND store_id = ?"#,
+                )
+                .bind(r.quantity_base)
+                .bind(avg_excl)
+                .bind(avg_incl)
+                .bind(microcents_to_cents(avg_excl)?)
+                .bind(microcents_to_cents(avg_incl)?)
+                .bind(&r.product_id)
+                .bind(&payload.store_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("restock product stock/cost: {e}"))?;
+            }
+            _ => {
+                sqlx::query(
+                    "UPDATE products SET quantity_on_hand = quantity_on_hand + ?
+                      WHERE id = ? AND store_id = ?",
+                )
+                .bind(r.quantity_base)
+                .bind(&r.product_id)
+                .bind(&payload.store_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("restock product stock: {e}"))?;
+            }
+        }
+    }
+
+    // ---- The refund legs ----
+    for r in &payload.refunds {
+        sqlx::query(
+            r#"INSERT INTO sales_credit_memo_refunds (
+                 id, credit_memo_id, store_id,
+                 method, currency,
+                 amount_native_usd_cents, amount_native_lbp,
+                 amount_usd_cents_equivalent, reference
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&r.refund_id)
+        .bind(&payload.credit_memo_id)
+        .bind(&payload.store_id)
+        .bind(&r.method)
+        .bind(&r.currency)
+        .bind(r.amount_native_usd_cents)
+        .bind(r.amount_native_lbp)
+        // Derived above and proved equal to the declared value, so the stored
+        // equivalent is the backend's own conversion at the sale's locked rate.
+        .bind(if r.currency == "USD" {
+            r.amount_native_usd_cents
+        } else {
+            lbp_to_usd_cents(r.amount_native_lbp, locked_rate)?
+        })
+        .bind(&r.reference)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert credit memo refund: {e}"))?;
+    }
+
+    sqlx::query(
+        r#"UPDATE sales_credit_memos
+              SET status = 'posted', posted_at = ?
+            WHERE id = ? AND store_id = ? AND status = 'draft'"#,
+    )
+    .bind(&now)
+    .bind(&payload.credit_memo_id)
+    .bind(&payload.store_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("finalize credit memo posting: {e}"))?;
+
+    // ---- The shift is still open, now that the return is written ----
+    //
+    // Belt to the brace at the top, and the same argument `post_sale_tx` makes:
+    // a close is itself a write transaction, so it and this one cannot both
+    // commit, and re-reading here means "a refund never commits into a closed
+    // shift" holds on the transaction's own terms rather than on an argument
+    // about lock modes.
+    assert_shift_is_open(&mut tx, shift_id, &payload.store_id).await?;
+
+    tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+
+    Ok(PostCreditMemoResult {
+        credit_memo_id: payload.credit_memo_id,
+        credit_memo_number,
+        posted_at: now,
+        movement_ids,
+        subtotal_excl_vat_cents: header_subtotal,
+        vat_total_cents: header_vat,
+        discount_cents: header_discount,
+        total_incl_vat_cents: header_total,
+        cogs_reversed_cents: header_cogs_reversed,
+        refund_total_usd_cents: refund_total,
+    })
 }

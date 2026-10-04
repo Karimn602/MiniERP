@@ -3,7 +3,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
 import { salesRepo } from "../db/repos/sales";
-import type { Sale, SaleItem, SalePayment, SaleWithDetails } from "../db/types";
+import { creditMemosRepo } from "../db/repos/creditMemos";
+import { shiftsRepo } from "../db/repos/shifts";
+import type {
+  CreditMemo,
+  Sale,
+  SaleItem,
+  SalePayment,
+  SaleReturnStatus,
+  SaleWithDetails,
+} from "../db/types";
 import { query } from "../db/client";
 import { Card, CardBody, CardHeader } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -15,6 +24,7 @@ import { formatLbp, formatUsd, usdCentsToLbp } from "../lib/money";
 import { formatUnitCostUsd } from "../lib/cost";
 import { formatPrettyDate, relativeFromToday } from "../lib/dates";
 import { ReceiptPrint } from "../components/ReceiptPrint";
+import { CreateReturnModal } from "../components/CreateReturnModal";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
@@ -43,7 +53,7 @@ function profitMargin(s: Sale): string {
 }
 
 export default function SalesHistory() {
-  const { storeId, hydrated } = useActiveContext();
+  const { storeId, userId, hydrated } = useActiveContext();
   const { t } = useTranslation();
 
   const [storeName, setStoreName] = useState("Store");
@@ -55,6 +65,17 @@ export default function SalesHistory() {
   const [details, setDetails] = useState<SaleWithDetails | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState<string | null>(null);
+
+  // How much of each receipt has come back. DERIVED from credit-memo lines —
+  // the sale itself is never marked (see migration 011's preamble), so this map
+  // is the only thing that knows.
+  const [returnStatus, setReturnStatus] = useState<Map<string, SaleReturnStatus>>(
+    new Map(),
+  );
+  const [memosForSale, setMemosForSale] = useState<CreditMemo[]>([]);
+  const [hasOpenShift, setHasOpenShift] = useState(false);
+  const [returningSaleId, setReturningSaleId] = useState<string | null>(null);
+  const [returnNotice, setReturnNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!storeId || !hydrated) return;
@@ -70,8 +91,14 @@ export default function SalesHistory() {
     setLoadError(null);
 
     try {
-      const rows = await salesRepo.list({ storeId, limit: 200 });
+      const [rows, statuses, openShift] = await Promise.all([
+        salesRepo.list({ storeId, limit: 200 }),
+        creditMemosRepo.returnStatusForStore(storeId),
+        shiftsRepo.getOpenShift(storeId),
+      ]);
       setSales(rows);
+      setReturnStatus(statuses);
+      setHasOpenShift(openShift !== null);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -87,18 +114,24 @@ export default function SalesHistory() {
     if (selectedId === id && details) {
       setSelectedId(null);
       setDetails(null);
+      setMemosForSale([]);
       return;
     }
 
     setSelectedId(id);
     setDetails(null);
+    setMemosForSale([]);
     setDetailsError(null);
     setDetailsLoading(true);
 
     try {
-      const row = await salesRepo.findByIdWithDetails(id);
+      const [row, memos] = await Promise.all([
+        salesRepo.findByIdWithDetails(id),
+        creditMemosRepo.listForSale(id),
+      ]);
       if (!row) throw new Error("Sale not found.");
       setDetails(row);
+      setMemosForSale(memos);
     } catch (e) {
       setDetailsError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -174,6 +207,7 @@ export default function SalesHistory() {
                       <th className="px-5 py-2 text-end">{t("salesHistory.colTotalCost")}</th>
                       <th className="px-5 py-2 text-end">{t("salesHistory.colProfit")}</th>
                       <th className="px-5 py-2 text-end">{t("salesHistory.colMargin")}</th>
+                      <th className="px-5 py-2">{t("salesHistory.colReturn")}</th>
                       <th className="px-5 py-2">{t("salesHistory.colStatus")}</th>
                     </tr>
                   </thead>
@@ -239,6 +273,12 @@ export default function SalesHistory() {
                           </td>
 
                           <td className="px-5 py-2">
+                            <ReturnBadge
+                              status={returnStatus.get(s.id) ?? "none"}
+                            />
+                          </td>
+
+                          <td className="px-5 py-2">
                             <Badge
                               tone={
                                 s.status === "posted"
@@ -275,16 +315,53 @@ export default function SalesHistory() {
                 sale={details}
                 loading={detailsLoading}
                 error={detailsError}
+                memos={memosForSale}
+                returnStatus={
+                  details ? (returnStatus.get(details.id) ?? "none") : "none"
+                }
+                hasOpenShift={hasOpenShift}
+                onCreateReturn={() => details && setReturningSaleId(details.id)}
                 onPrint={() => window.print()}
                 onClose={() => {
                   setSelectedId(null);
                   setDetails(null);
+                  setMemosForSale([]);
                 }}
               />
             </div>
           </>
         )}
       </div>
+
+      {returnNotice && (
+        <div className="fixed bottom-6 end-6 z-[60] rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800 shadow-card print:hidden">
+          {returnNotice}
+        </div>
+      )}
+
+      {returningSaleId && storeId && details && (
+        <CreateReturnModal
+          storeId={storeId}
+          userId={userId}
+          saleId={returningSaleId}
+          receiptNumber={details.receiptNumber}
+          saleDateLabel={formatPrettyDate(
+            isoToLocalDate(details.postedAt ?? details.createdAt),
+          )}
+          onClose={() => setReturningSaleId(null)}
+          onPosted={async (creditMemoNumber) => {
+            setReturningSaleId(null);
+            setReturnNotice(
+              t("returns.detailTitle", { number: String(creditMemoNumber) }),
+            );
+            // Re-read rather than patch local state: the authoritative figures
+            // are whatever `post_credit_memo` committed.
+            const id = details.id;
+            await reload();
+            await openDetails(id);
+          }}
+        />
+      )}
 
       {/* Print-only receipt root — outside the drawer so fixed positioning escapes correctly */}
       {details && (
@@ -296,16 +373,43 @@ export default function SalesHistory() {
   );
 }
 
+/**
+ * The return-status pill. "None / part returned / returned" is derived by
+ * comparing sold quantity against what posted credit memos sent back; nothing
+ * is written onto the sale, so this is the only place the state exists.
+ */
+function ReturnBadge({ status }: { status: SaleReturnStatus }) {
+  const { t } = useTranslation();
+  if (status === "none") {
+    return <span className="text-xs text-slate-400">{t("salesHistory.returnStatusNone")}</span>;
+  }
+  return (
+    <Badge tone={status === "full" ? "bad" : "warn"}>
+      {status === "full"
+        ? t("salesHistory.returnStatusFull")
+        : t("salesHistory.returnStatusPartial")}
+    </Badge>
+  );
+}
+
 function SaleDetailCard({
   sale,
   loading,
   error,
+  memos,
+  returnStatus,
+  hasOpenShift,
+  onCreateReturn,
   onPrint,
   onClose,
 }: {
   sale: SaleWithDetails | null;
   loading: boolean;
   error: string | null;
+  memos: CreditMemo[];
+  returnStatus: SaleReturnStatus;
+  hasOpenShift: boolean;
+  onCreateReturn: () => void;
   onPrint: () => void;
   onClose: () => void;
 }) {
@@ -329,6 +433,14 @@ function SaleDetailCard({
         subtitle={subtitle}
         actions={
           <>
+            {sale && (
+              <CreateReturnButton
+                sale={sale}
+                returnStatus={returnStatus}
+                hasOpenShift={hasOpenShift}
+                onCreateReturn={onCreateReturn}
+              />
+            )}
             {sale && (
               <Button variant="ghost" size="sm" className="print:hidden" onClick={onPrint}>
                 {t("salesHistory.printReceipt")}
@@ -407,6 +519,7 @@ function SaleDetailCard({
 
             <LinesTable lines={sale.lines} />
             <PaymentsTable payments={sale.payments} />
+            <ReturnsOnThisSale memos={memos} />
 </>
         ) : null}
       </CardBody>
@@ -555,6 +668,110 @@ function PaymentsTable({ payments }: { payments: SalePayment[] }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/**
+ * Create return, or the reason it is unavailable.
+ *
+ * The button is hidden rather than merely disabled when there is nothing to
+ * return, because an action a cashier can never take is noise. When it is
+ * unavailable for a reason they CAN fix — no open shift — it says so.
+ *
+ * None of this is a guard. `post_credit_memo` refuses a voided sale, a
+ * fully-returned line and a missing shift on its own terms, inside the posting
+ * transaction; this is only the affordance.
+ */
+function CreateReturnButton({
+  sale,
+  returnStatus,
+  hasOpenShift,
+  onCreateReturn,
+}: {
+  sale: SaleWithDetails;
+  returnStatus: SaleReturnStatus;
+  hasOpenShift: boolean;
+  onCreateReturn: () => void;
+}) {
+  const { t } = useTranslation();
+
+  if (sale.status !== "posted") {
+    return (
+      <span className="text-xs text-slate-400 print:hidden">
+        {t("salesHistory.createReturnDisabledVoided")}
+      </span>
+    );
+  }
+  if (returnStatus === "full") {
+    return (
+      <span className="text-xs text-slate-400 print:hidden">
+        {t("salesHistory.createReturnDisabledFull")}
+      </span>
+    );
+  }
+  if (!hasOpenShift) {
+    return (
+      <span className="text-xs text-amber-600 print:hidden">
+        {t("salesHistory.createReturnDisabledNoShift")}
+      </span>
+    );
+  }
+  return (
+    <Button variant="primary" size="sm" className="print:hidden" onClick={onCreateReturn}>
+      {t("salesHistory.createReturn")}
+    </Button>
+  );
+}
+
+/** The credit memos already posted against this receipt. */
+function ReturnsOnThisSale({ memos }: { memos: CreditMemo[] }) {
+  const { t } = useTranslation();
+  return (
+    <div>
+      <div className="mb-2 text-sm font-medium text-slate-900">
+        {t("salesHistory.returnsOnThisSaleTitle")}
+      </div>
+      {memos.length === 0 ? (
+        <p className="text-xs text-slate-500">
+          {t("salesHistory.returnsOnThisSaleNone")}
+        </p>
+      ) : (
+        <div className="overflow-x-auto rounded-md border border-slate-200">
+          <table className="min-w-full text-sm">
+            <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-4 py-2">{t("salesHistory.returnsColMemo")}</th>
+                <th className="px-4 py-2">{t("salesHistory.returnsColDate")}</th>
+                <th className="px-4 py-2 text-end">
+                  {t("salesHistory.returnsColRefunded")}
+                </th>
+                <th className="px-4 py-2">{t("salesHistory.returnsColReason")}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {memos.map((m) => (
+                <tr key={m.id}>
+                  <td className="px-4 py-2 font-medium text-slate-900">
+                    #{m.creditMemoNumber}
+                  </td>
+                  <td className="px-4 py-2 text-slate-700">
+                    {m.postedAt
+                      ? formatPrettyDate(isoToLocalDate(m.postedAt))
+                      : "\u2014"}
+                  </td>
+                  <td className="px-4 py-2 text-end tabular-nums text-slate-900">
+                    {formatUsd(m.totalInclVatCents)}
+                  </td>
+                  <td className="px-4 py-2 text-xs text-slate-600">
+                    {m.reason ?? "\u2014"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

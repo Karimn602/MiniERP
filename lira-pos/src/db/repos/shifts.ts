@@ -1,7 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { query } from "../client";
 import { newId } from "../../lib/ids";
-import type { Shift, ShiftStatus, PaymentMethod, PaymentCurrency } from "../types";
+import type {
+  Shift,
+  ShiftStatus,
+  PaymentMethod,
+  PaymentCurrency,
+  RefundMethod,
+} from "../types";
 
 // ---------- DB row shape ----------
 
@@ -79,6 +85,34 @@ export interface ShiftDrawerExpectation {
   cashLbpIn: number;
   changeUsdOutCents: number;
   changeLbpOut: number;
+  /** Cash handed back on this shift's posted credit memos (WP-06). */
+  refundUsdOutCents: number;
+  refundLbpOut: number;
+}
+
+/**
+ * What one shift refunded, and how.
+ *
+ * Deliberately NOT folded into `ShiftSalesSummary`: a refund is not a negative
+ * sale, so `receiptCount` and the sales totals stay GROSS and the shift screen
+ * shows returns on a line of their own. Net collection is then a subtraction
+ * the page makes with both figures visible, rather than a number that quietly
+ * means something different than it did before.
+ */
+export interface ShiftRefundSummary {
+  memoCount: number;
+  subtotalExclVatCents: number;
+  vatTotalCents: number;
+  totalInclVatCents: number;
+  cogsReversedCents: number;
+}
+
+export interface ShiftRefundRow {
+  method: RefundMethod;
+  currency: PaymentCurrency;
+  amountNativeUsdCents: number;
+  amountNativeLbp: number;
+  amountUsdCentsEquivalent: number;
 }
 
 // ---------- Repo ----------
@@ -226,50 +260,155 @@ export const shiftsRepo = {
    * the figure that gets persisted.
    *
    * Only `cash_usd` and `cash_lbp` tenders move physical money, so only they
-   * appear — in both the money-in and the change-out term. Filtering the change
-   * term by method is the GZ-HI-04 correction: a card row that carries change
-   * (which `post_sale` now refuses to write, but an older release did) must not
-   * make the till look short.
+   * appear — in the money-in term, in the change-out term, and (since WP-06)
+   * in the refund-out term. Filtering the change term by method is the
+   * GZ-HI-04 correction: a card row that carries change (which `post_sale` now
+   * refuses to write, but an older release did) must not make the till look
+   * short. The refund term is filtered the same way, so a card refund cannot
+   * either.
    */
   async getDrawerExpectation(
     shiftId: string,
     storeId: string,
   ): Promise<ShiftDrawerExpectation> {
-    interface Row {
+    interface TenderRow {
       cash_usd_in: number;
       cash_lbp_in: number;
       change_usd_out: number;
       change_lbp_out: number;
     }
-    const rows = await query<Row>(
-      `SELECT
-         COALESCE(SUM(CASE WHEN sp.method = 'cash_usd'
-                           THEN sp.amount_native_usd_cents ELSE 0 END), 0) AS cash_usd_in,
-         COALESCE(SUM(CASE WHEN sp.method = 'cash_lbp'
-                           THEN sp.amount_native_lbp ELSE 0 END), 0)       AS cash_lbp_in,
-         COALESCE(SUM(CASE WHEN sp.method IN ('cash_usd','cash_lbp')
-                           THEN sp.change_given_usd_cents ELSE 0 END), 0)  AS change_usd_out,
-         COALESCE(SUM(CASE WHEN sp.method IN ('cash_usd','cash_lbp')
-                           THEN sp.change_given_lbp ELSE 0 END), 0)        AS change_lbp_out
-       FROM sale_payments sp
-       JOIN sales s ON s.id = sp.sale_id
-       WHERE s.store_id = ?
-         AND s.shift_id = ?
-         AND s.status = 'posted'`,
-      [storeId, shiftId],
-    );
-    const r = rows[0] ?? {
+    interface RefundRow {
+      refund_usd_out: number;
+      refund_lbp_out: number;
+    }
+
+    // Two statements, not a join: one sale can carry several tenders and one
+    // return several refund legs, so joining them would multiply each against
+    // the other. `posting.rs::drawer_cash_for_shift` is shaped the same way,
+    // and for the same reason.
+    const [tenderRows, refundRows] = await Promise.all([
+      query<TenderRow>(
+        `SELECT
+           COALESCE(SUM(CASE WHEN sp.method = 'cash_usd'
+                             THEN sp.amount_native_usd_cents ELSE 0 END), 0) AS cash_usd_in,
+           COALESCE(SUM(CASE WHEN sp.method = 'cash_lbp'
+                             THEN sp.amount_native_lbp ELSE 0 END), 0)       AS cash_lbp_in,
+           COALESCE(SUM(CASE WHEN sp.method IN ('cash_usd','cash_lbp')
+                             THEN sp.change_given_usd_cents ELSE 0 END), 0)  AS change_usd_out,
+           COALESCE(SUM(CASE WHEN sp.method IN ('cash_usd','cash_lbp')
+                             THEN sp.change_given_lbp ELSE 0 END), 0)        AS change_lbp_out
+         FROM sale_payments sp
+         JOIN sales s ON s.id = sp.sale_id
+         WHERE s.store_id = ?
+           AND s.shift_id = ?
+           AND s.status = 'posted'`,
+        [storeId, shiftId],
+      ),
+      query<RefundRow>(
+        `SELECT
+           COALESCE(SUM(CASE WHEN r.method = 'cash_usd'
+                             THEN r.amount_native_usd_cents ELSE 0 END), 0) AS refund_usd_out,
+           COALESCE(SUM(CASE WHEN r.method = 'cash_lbp'
+                             THEN r.amount_native_lbp ELSE 0 END), 0)       AS refund_lbp_out
+         FROM sales_credit_memo_refunds r
+         JOIN sales_credit_memos m ON m.id = r.credit_memo_id
+         WHERE m.store_id = ?
+           AND m.shift_id = ?
+           AND m.status = 'posted'`,
+        [storeId, shiftId],
+      ),
+    ]);
+
+    const t = tenderRows[0] ?? {
       cash_usd_in: 0,
       cash_lbp_in: 0,
       change_usd_out: 0,
       change_lbp_out: 0,
     };
+    const r = refundRows[0] ?? { refund_usd_out: 0, refund_lbp_out: 0 };
+
     return {
-      cashUsdInCents: r.cash_usd_in,
-      cashLbpIn: r.cash_lbp_in,
-      changeUsdOutCents: r.change_usd_out,
-      changeLbpOut: r.change_lbp_out,
+      cashUsdInCents: t.cash_usd_in,
+      cashLbpIn: t.cash_lbp_in,
+      changeUsdOutCents: t.change_usd_out,
+      changeLbpOut: t.change_lbp_out,
+      refundUsdOutCents: r.refund_usd_out,
+      refundLbpOut: r.refund_lbp_out,
     };
+  },
+
+  /** What this shift refunded, as its own figures. */
+  async getRefundSummary(
+    shiftId: string,
+    storeId: string,
+  ): Promise<ShiftRefundSummary> {
+    interface Row {
+      memo_count: number;
+      subtotal_excl_vat_cents: number;
+      vat_total_cents: number;
+      total_incl_vat_cents: number;
+      cogs_reversed_cents: number;
+    }
+    const rows = await query<Row>(
+      `SELECT
+         COUNT(*) AS memo_count,
+         COALESCE(SUM(subtotal_excl_vat_cents), 0) AS subtotal_excl_vat_cents,
+         COALESCE(SUM(vat_total_cents), 0)         AS vat_total_cents,
+         COALESCE(SUM(total_incl_vat_cents), 0)    AS total_incl_vat_cents,
+         COALESCE(SUM(cogs_reversed_cents), 0)     AS cogs_reversed_cents
+       FROM sales_credit_memos
+       WHERE store_id = ? AND shift_id = ? AND status = 'posted'`,
+      [storeId, shiftId],
+    );
+    const r = rows[0] ?? {
+      memo_count: 0,
+      subtotal_excl_vat_cents: 0,
+      vat_total_cents: 0,
+      total_incl_vat_cents: 0,
+      cogs_reversed_cents: 0,
+    };
+    return {
+      memoCount: r.memo_count,
+      subtotalExclVatCents: r.subtotal_excl_vat_cents,
+      vatTotalCents: r.vat_total_cents,
+      totalInclVatCents: r.total_incl_vat_cents,
+      cogsReversedCents: r.cogs_reversed_cents,
+    };
+  },
+
+  /** This shift's refunds, by the method the money went back on. */
+  async getRefundBreakdown(
+    shiftId: string,
+    storeId: string,
+  ): Promise<ShiftRefundRow[]> {
+    interface Row {
+      method: RefundMethod;
+      currency: PaymentCurrency;
+      amount_native_usd_cents: number;
+      amount_native_lbp: number;
+      amount_usd_cents_equivalent: number;
+    }
+    const rows = await query<Row>(
+      `SELECT
+         r.method,
+         r.currency,
+         COALESCE(SUM(r.amount_native_usd_cents), 0)     AS amount_native_usd_cents,
+         COALESCE(SUM(r.amount_native_lbp), 0)           AS amount_native_lbp,
+         COALESCE(SUM(r.amount_usd_cents_equivalent), 0) AS amount_usd_cents_equivalent
+       FROM sales_credit_memo_refunds r
+       JOIN sales_credit_memos m ON m.id = r.credit_memo_id
+       WHERE m.store_id = ? AND m.shift_id = ? AND m.status = 'posted'
+       GROUP BY r.method, r.currency
+       ORDER BY r.method, r.currency`,
+      [storeId, shiftId],
+    );
+    return rows.map((r) => ({
+      method: r.method,
+      currency: r.currency,
+      amountNativeUsdCents: r.amount_native_usd_cents,
+      amountNativeLbp: r.amount_native_lbp,
+      amountUsdCentsEquivalent: r.amount_usd_cents_equivalent,
+    }));
   },
 
   /**

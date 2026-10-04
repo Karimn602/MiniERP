@@ -3,11 +3,12 @@
 use crate::cost::new_weighted_avg;
 use crate::posting::{
     add_vat, derive_base_quantity, derive_purchase_line_amounts, derive_unit_cost_pair,
-    lbp_to_usd_cents, ledger_direction, prepare_purchase, prepare_sale, resolve_ledger_amount,
-    strip_vat as strip_vat_cents, usd_cents_to_lbp, validate_adjustment_payload,
-    validate_close_shift_payload,
-    validate_open_shift_payload, validate_purchase_payload, validate_supplier_payment_payload,
-    CloseShiftPayload, LedgerDirection, OpenShiftPayload, VatPricingMode,
+    lbp_to_usd_cents, ledger_direction, prepare_purchase, prepare_sale,
+    prorated_cumulative_cents, resolve_ledger_amount, strip_vat as strip_vat_cents,
+    usd_cents_to_lbp, validate_adjustment_payload, validate_close_shift_payload,
+    validate_credit_memo_payload, validate_open_shift_payload, validate_purchase_payload,
+    validate_supplier_payment_payload, CloseShiftPayload, LedgerDirection, OpenShiftPayload,
+    PostCreditMemoPayload, VatPricingMode,
 };
 use crate::test_support::{
     RATE_LBP_PER_USD, STORE_ID, USER_ID, VAT_EXEMPT_BPS, VAT_EXEMPT_ID, VAT_STD_BPS, VAT_STD_ID,
@@ -1038,4 +1039,244 @@ fn a_pricing_mode_the_application_does_not_have_is_refused() {
     // Omitting it is legal — `post_purchase` falls back to the product's mode.
     p.lines[0].vat_pricing_mode = None;
     assert!(validate_purchase_payload(&p).is_ok());
+}
+
+// ============================================================================
+// prorated_cumulative_cents — the rule that makes partial returns add up
+// ============================================================================
+
+/// The property the whole returns design rests on: however a quantity is
+/// broken into returns, and in whatever order, the memos sum to the original
+/// line exactly. Independent per-memo rounding does not have this property.
+fn sum_of_returns(original_amount: i64, original_qty: i64, chunks: &[i64]) -> i64 {
+    let mut returned = 0;
+    let mut total = 0;
+    for chunk in chunks {
+        let before = prorated_cumulative_cents(original_amount, returned, original_qty).unwrap();
+        returned += chunk;
+        let after = prorated_cumulative_cents(original_amount, returned, original_qty).unwrap();
+        total += after - before;
+    }
+    assert_eq!(returned, original_qty, "the chunks must add up to the quantity");
+    total
+}
+
+#[test]
+fn returning_a_whole_line_in_any_number_of_pieces_reverses_it_exactly() {
+    // $10.00 over three units: 333.33 a unit, which no single rounding can
+    // split into three whole cents adding to 1,000.
+    for chunks in [vec![3], vec![1, 1, 1], vec![2, 1], vec![1, 2]] {
+        assert_eq!(
+            sum_of_returns(1_000, 3, &chunks),
+            1_000,
+            "chunks {chunks:?} must reverse the line exactly"
+        );
+    }
+    // The awkward cases the POS actually meets: a 7-unit line, a 1-cent line,
+    // and a line whose amount is prime relative to its quantity.
+    assert_eq!(sum_of_returns(100, 7, &[1, 1, 1, 1, 1, 1, 1]), 100);
+    assert_eq!(sum_of_returns(1, 3, &[1, 1, 1]), 1);
+    assert_eq!(sum_of_returns(9_999, 7, &[4, 3]), 9_999);
+    assert_eq!(sum_of_returns(0, 5, &[2, 3]), 0, "a zero line reverses to zero");
+}
+
+#[test]
+fn independent_per_memo_rounding_would_lose_a_cent_where_the_cumulative_rule_does_not() {
+    // THE defect this rule exists to prevent, stated as arithmetic. Rounding
+    // each memo on its own: round(1000 x 1 / 3) three times.
+    let naive: i64 = (0..3).map(|_| (1_000 * 1 + 1) / 3).sum();
+    assert_eq!(naive, 999, "three independent roundings lose a cent");
+    assert_eq!(
+        sum_of_returns(1_000, 3, &[1, 1, 1]),
+        1_000,
+        "the cumulative rule does not"
+    );
+}
+
+#[test]
+fn a_cumulative_share_rounds_half_away_from_zero_like_every_other_boundary() {
+    // 1,000 over 3: 333.33 -> 333, 666.67 -> 667, 1000 -> 1000.
+    assert_eq!(prorated_cumulative_cents(1_000, 0, 3).unwrap(), 0);
+    assert_eq!(prorated_cumulative_cents(1_000, 1, 3).unwrap(), 333);
+    assert_eq!(prorated_cumulative_cents(1_000, 2, 3).unwrap(), 667);
+    assert_eq!(prorated_cumulative_cents(1_000, 3, 3).unwrap(), 1_000);
+    // An exact half goes away from zero, as `div_round_half_away` does
+    // everywhere else: 5 over 2 is 2.5 -> 3.
+    assert_eq!(prorated_cumulative_cents(5, 1, 2).unwrap(), 3);
+    // Returning everything is always the whole amount, by construction.
+    for (amount, qty) in [(1, 1), (7, 3), (123_456_789, 97)] {
+        assert_eq!(prorated_cumulative_cents(amount, qty, qty).unwrap(), amount);
+    }
+}
+
+#[test]
+fn a_cumulative_share_refuses_a_quantity_outside_the_line() {
+    assert!(prorated_cumulative_cents(1_000, 4, 3).is_err(), "more than was sold");
+    assert!(prorated_cumulative_cents(1_000, -1, 3).is_err(), "a negative quantity");
+    assert!(prorated_cumulative_cents(1_000, 0, 0).is_err(), "a line of nothing");
+    assert!(prorated_cumulative_cents(-1, 1, 3).is_err(), "a negative line amount");
+    // Overflow errors rather than wrapping.
+    assert!(prorated_cumulative_cents(i64::MAX, i64::MAX, i64::MAX).is_ok());
+    assert_eq!(
+        prorated_cumulative_cents(i64::MAX, i64::MAX, i64::MAX).unwrap(),
+        i64::MAX
+    );
+}
+
+// ============================================================================
+// validate_credit_memo_payload — the shape checks, before the pool is touched
+// ============================================================================
+
+fn memo_payload() -> PostCreditMemoPayload {
+    credit_memo_payload(
+        "sale-1",
+        vec![return_line("item-1").qty(1).build()],
+        vec![refund_cash_usd(500)],
+    )
+}
+
+#[test]
+fn a_well_formed_return_passes_the_shape_check() {
+    assert!(validate_credit_memo_payload(&memo_payload()).is_ok());
+}
+
+#[test]
+fn a_return_needs_an_identity_a_store_a_sale_a_line_and_a_refund() {
+    for (what, mutate) in [
+        ("identifier", (|p: &mut PostCreditMemoPayload| p.credit_memo_id = "  ".into())
+            as fn(&mut PostCreditMemoPayload)),
+        ("store", |p| p.store_id = String::new()),
+        ("name the sale", |p| p.original_sale_id = String::new()),
+        ("at least one line", |p| p.lines.clear()),
+        ("at least one method", |p| p.refunds.clear()),
+    ] {
+        let mut p = memo_payload();
+        mutate(&mut p);
+        let err = validate_credit_memo_payload(&p).unwrap_err();
+        assert!(err.contains(what), "expected {what:?}, got: {err}");
+    }
+}
+
+#[test]
+fn a_return_line_must_name_a_sale_line_and_a_positive_quantity() {
+    let mut p = memo_payload();
+    p.lines[0].original_sale_item_id = "   ".into();
+    assert!(validate_credit_memo_payload(&p)
+        .unwrap_err()
+        .contains("does not name an original sale line"));
+
+    for qty in [0, -3] {
+        let mut p = memo_payload();
+        p.lines[0].quantity_in_uom = qty;
+        p.lines[0].quantity_base = qty;
+        assert!(validate_credit_memo_payload(&p)
+            .unwrap_err()
+            .contains("positive quantity"));
+    }
+
+    // A base quantity of zero is refused even when the UoM quantity is sane:
+    // the cross-check is still a shape the payload has to have.
+    let mut p = memo_payload();
+    p.lines[0].quantity_base = 0;
+    assert!(validate_credit_memo_payload(&p)
+        .unwrap_err()
+        .contains("positive quantity"));
+}
+
+#[test]
+fn one_return_may_not_list_the_same_sale_line_twice() {
+    let mut p = memo_payload();
+    p.lines.push(return_line("item-1").qty(1).build());
+    let err = validate_credit_memo_payload(&p).unwrap_err();
+    assert!(err.contains("repeats sale line"), "got: {err}");
+
+    // Two DIFFERENT lines of the same sale are of course fine.
+    let mut p = memo_payload();
+    p.lines.push(return_line("item-2").qty(1).build());
+    assert!(validate_credit_memo_payload(&p).is_ok());
+}
+
+#[test]
+fn the_refund_tender_matrix_is_the_sale_matrix_minus_store_credit() {
+    // Every method a refund may use.
+    for method in ["cash_usd", "card_usd", "bank_transfer", "wallet", "other"] {
+        let mut p = memo_payload();
+        p.refunds[0].method = method.to_string();
+        assert!(
+            validate_credit_memo_payload(&p).is_ok(),
+            "{method} must be a legal refund method"
+        );
+    }
+    for method in ["cash_lbp", "card_lbp"] {
+        let mut p = memo_payload();
+        p.refunds[0] = refund_cash_lbp(895_000);
+        p.refunds[0].method = method.to_string();
+        assert!(validate_credit_memo_payload(&p).is_ok(), "{method}");
+    }
+
+    // Store credit is refused by NAME, with an explanation, because it is the
+    // one a cashier would reasonably reach for.
+    let mut p = memo_payload();
+    p.refunds[0].method = "store_credit".to_string();
+    let err = validate_credit_memo_payload(&p).unwrap_err();
+    assert!(err.contains("no customer store-credit ledger"), "got: {err}");
+
+    // Anything else is simply invalid.
+    let mut p = memo_payload();
+    p.refunds[0].method = "crypto".to_string();
+    assert!(validate_credit_memo_payload(&p)
+        .unwrap_err()
+        .contains("invalid method"));
+}
+
+#[test]
+fn a_refund_row_must_agree_with_itself_about_currency_and_amount() {
+    // A method whose name names a currency cannot be declared in the other.
+    let mut p = memo_payload();
+    p.refunds[0].currency = "LBP".to_string();
+    let err = validate_credit_memo_payload(&p).unwrap_err();
+    assert!(err.contains("is a USD tender"), "got: {err}");
+
+    // A currency the schema does not have.
+    let mut p = memo_payload();
+    p.refunds[0].currency = "EUR".to_string();
+    assert!(validate_credit_memo_payload(&p)
+        .unwrap_err()
+        .contains("invalid currency"));
+
+    // A USD row carrying a lira amount, and vice versa.
+    let mut p = memo_payload();
+    p.refunds[0].amount_native_lbp = 100;
+    assert!(validate_credit_memo_payload(&p)
+        .unwrap_err()
+        .contains("native amounts inconsistent"));
+
+    let mut p = memo_payload();
+    p.refunds[0].amount_native_usd_cents = 0;
+    assert!(validate_credit_memo_payload(&p)
+        .unwrap_err()
+        .contains("native amounts inconsistent"));
+
+    // A refund of nothing is not a refund.
+    let mut p = memo_payload();
+    p.refunds[0].amount_usd_cents_equivalent = 0;
+    assert!(validate_credit_memo_payload(&p)
+        .unwrap_err()
+        .contains("non-positive amount"));
+}
+
+#[test]
+fn a_declared_exchange_rate_must_at_least_be_a_rate() {
+    let mut p = memo_payload();
+    p.exchange_rate_lbp_per_usd = Some(0);
+    assert!(validate_credit_memo_payload(&p)
+        .unwrap_err()
+        .contains("Exchange rate must be positive"));
+
+    // Omitting it is the normal case: the backend locks the memo to the
+    // original sale's own rate.
+    let mut p = memo_payload();
+    p.exchange_rate_lbp_per_usd = None;
+    p.exchange_rate_id = None;
+    assert!(validate_credit_memo_payload(&p).is_ok());
 }

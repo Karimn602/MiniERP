@@ -13,7 +13,7 @@
 
 use crate::cost::{
     cents_to_microcents, div_round_half_away, extended_cost_cents, microcents_to_cents,
-    new_weighted_avg, unit_cost_in_uom_to_base_microcents, COST_SCALE,
+    new_weighted_avg, restock_weighted_avg, unit_cost_in_uom_to_base_microcents, COST_SCALE,
 };
 
 /// Factors used throughout: 1 kg = 1000 g, 1 box = 12 each, 1 L = 1000 ml.
@@ -272,4 +272,85 @@ fn an_inventory_value_that_cannot_be_represented_errors() {
 fn a_purchase_cannot_leave_an_empty_pool_to_average_over() {
     assert!(new_weighted_avg(0, 100, 0, 100).is_err());
     assert!(new_weighted_avg(10, 100, -10, 100).is_err());
+}
+
+// ============================================================================
+// restock_weighted_avg — the cost side of a sales return (WP-06)
+// ============================================================================
+//
+// Returned stock re-enters the pool at the rate it LEFT at, which is an
+// ordinary weighted average. What makes it its own function is the state it
+// can meet: the POS permits selling below zero, so a return can arrive into a
+// pool that is still short, and two of those states have no honest answer.
+
+#[test]
+fn a_restock_is_an_ordinary_weighted_average_when_the_pool_is_sound() {
+    // 98 units at $2.00, two coming back at the same $2.00 — nothing moves.
+    assert_eq!(
+        restock_weighted_avg(98, 200_000_000, 2, 200_000_000).unwrap(),
+        Some(200_000_000)
+    );
+    // Cheaper units coming back pull the average down, at full precision.
+    assert_eq!(
+        restock_weighted_avg(100, 220_000_000, 10, 200_000_000).unwrap(),
+        Some(218_181_818)
+    );
+    // And it agrees, value for value, with the purchase-side average: a
+    // restock is not a second costing rule.
+    assert_eq!(
+        restock_weighted_avg(100, 220_000_000, 10, 200_000_000).unwrap(),
+        Some(new_weighted_avg(100, 220_000_000, 10, 200_000_000).unwrap())
+    );
+}
+
+#[test]
+fn a_restock_into_an_empty_pool_takes_the_returned_cost() {
+    // Everything was sold; the units that come back are the whole pool.
+    assert_eq!(
+        restock_weighted_avg(0, 999_999_999, 5, 250_000).unwrap(),
+        Some(250_000)
+    );
+}
+
+#[test]
+fn a_restock_that_leaves_the_pool_still_short_forms_no_average() {
+    // 30 units short, 10 come back: still 20 short. Dividing a value by a
+    // non-positive quantity is not a cost, so there is no average to write —
+    // the caller adds the quantity and leaves the existing rate standing.
+    assert_eq!(restock_weighted_avg(-30, 200_000_000, 10, 200_000_000).unwrap(), None);
+    // Exactly zero is still not a pool.
+    assert_eq!(restock_weighted_avg(-10, 200_000_000, 10, 200_000_000).unwrap(), None);
+    // One more unit and it is.
+    assert_eq!(
+        restock_weighted_avg(-9, 200_000_000, 10, 200_000_000).unwrap(),
+        Some(200_000_000)
+    );
+}
+
+#[test]
+fn a_restock_that_would_value_the_pool_below_nothing_forms_no_average() {
+    // A short pool carrying a high average, plus a few cheap units back:
+    // (-5 x 1,000,000 + 10 x 1,000) / 5 is negative. `products.avg_cost_*` is
+    // CHECK (>= 0), rightly — no inventory costs less than nothing.
+    assert_eq!(restock_weighted_avg(-5, 1_000_000, 10, 1_000).unwrap(), None);
+    // Reachable ONLY from a negative pool: with a non-negative one both terms
+    // of the value are non-negative, so the average cannot be.
+    for old_qty in [0, 1, 100] {
+        assert!(
+            restock_weighted_avg(old_qty, 0, 1, 0).unwrap().is_some(),
+            "a sound pool always yields an average"
+        );
+    }
+}
+
+#[test]
+fn a_restock_refuses_a_nonsensical_request_rather_than_guessing() {
+    // A return of nothing, or of a negative quantity, is a programming error
+    // in the caller — not a state with an answer.
+    assert!(restock_weighted_avg(10, 100, 0, 100).is_err());
+    assert!(restock_weighted_avg(10, 100, -1, 100).is_err());
+    // A negative cost rate likewise.
+    assert!(restock_weighted_avg(10, 100, 1, -1).is_err());
+    // Overflow errors rather than wrapping, exactly as the purchase side does.
+    assert!(restock_weighted_avg(2, i64::MAX, 1, 1).is_err());
 }

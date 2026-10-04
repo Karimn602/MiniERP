@@ -12,6 +12,7 @@ import Suppliers from "./pages/Suppliers";
 import ExchangeRate from "./pages/ExchangeRate";
 import ShiftSummary from "./pages/ShiftSummary";
 import SalesHistory from "./pages/SalesHistory";
+import Returns from "./pages/Returns";
 import LocalReports from "./pages/LocalReports";
 import ManagerDashboard from "./pages/ManagerDashboard";
 import DevProbe from "./pages/_Dev";
@@ -66,6 +67,7 @@ export default function App() {
               <Route path="exchange-rate" element={<ExchangeRate />} />
               <Route path="shift" element={<ShiftSummary />} />
               <Route path="sales" element={<SalesHistory />} />
+              <Route path="returns" element={<Returns />} />
               <Route path="reports" element={<LocalReports />} />
               <Route path="manager" element={<ManagerDashboard />} />
 

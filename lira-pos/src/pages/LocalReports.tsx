@@ -3,7 +3,9 @@ import { useActiveContext } from "../state/activeContext";
 import {
   reportsRepo,
   type DailySalesRow,
+  type DailyReturnsRow,
   type ProductSalesRow,
+  type ProductReturnsRow,
   type DailyPurchasesRow,
 } from "../db/repos/reports";
 import { Card, CardHeader } from "../components/ui/Card";
@@ -41,7 +43,9 @@ export default function LocalReports() {
   const [appliedTo, setAppliedTo] = useState(todayLocalDate);
 
   const [dailySales, setDailySales] = useState<DailySalesRow[]>([]);
+  const [dailyReturns, setDailyReturns] = useState<DailyReturnsRow[]>([]);
   const [productSales, setProductSales] = useState<ProductSalesRow[]>([]);
+  const [productReturns, setProductReturns] = useState<ProductReturnsRow[]>([]);
   const [dailyPurchases, setDailyPurchases] = useState<DailyPurchasesRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -51,13 +55,17 @@ export default function LocalReports() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [ds, ps, dp] = await Promise.all([
+      const [ds, dr, ps, pr, dp] = await Promise.all([
         reportsRepo.dailySales({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
+        reportsRepo.dailyReturns({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.productSales({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
+        reportsRepo.productReturns({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.dailyPurchases({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
       ]);
       setDailySales(ds);
+      setDailyReturns(dr);
       setProductSales(ps);
+      setProductReturns(pr);
       setDailyPurchases(dp);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
@@ -75,13 +83,51 @@ export default function LocalReports() {
     setAppliedTo(dateTo);
   }
 
+  // Returns are kept as their OWN series and subtracted here, rather than
+  // folded into the sales aggregate. Three figures are then all visible and
+  // all mean exactly what they say — gross sales, returns, net sales — and the
+  // sales numbers keep the meaning they had before WP-06.
+  //
+  // PROFIT. Net gross profit reverses revenue for every return and reverses
+  // cost only for the goods that CAME BACK, which is what
+  // `cogs_reversed_cents` counts. A written-off return therefore loses its
+  // whole margin, which is the truth about discarded stock.
   const summary = useMemo(() => {
-    const revenue = dailySales.reduce((s, r) => s + r.totalInclVatCents, 0);
-    const net = dailySales.reduce((s, r) => s + r.subtotalExclVatCents, 0); // post-discount
-    const cogs = dailySales.reduce((s, r) => s + r.cogsTotalCents, 0);
+    const grossRevenue = dailySales.reduce((s, r) => s + r.totalInclVatCents, 0);
+    const grossNet = dailySales.reduce((s, r) => s + r.subtotalExclVatCents, 0); // post-discount
+    const grossCogs = dailySales.reduce((s, r) => s + r.cogsTotalCents, 0);
+
+    const returnedRevenue = dailyReturns.reduce((s, r) => s + r.totalInclVatCents, 0);
+    const returnedNet = dailyReturns.reduce((s, r) => s + r.subtotalExclVatCents, 0);
+    const reversedCogs = dailyReturns.reduce((s, r) => s + r.cogsReversedCents, 0);
+
     const purchases = dailyPurchases.reduce((s, r) => s + r.totalInclVatCents, 0);
-    return { revenue, net, cogs, profit: net - cogs, purchases };
-  }, [dailySales, dailyPurchases]);
+
+    const net = grossNet - returnedNet;
+    const cogs = grossCogs - reversedCogs;
+    return {
+      grossRevenue,
+      returnedRevenue,
+      revenue: grossRevenue - returnedRevenue,
+      net,
+      cogs,
+      profit: net - cogs,
+      purchases,
+    };
+  }, [dailySales, dailyReturns, dailyPurchases]);
+
+  /** Returns for one local date, or zeroes — the series are joined by date. */
+  const returnsByDate = useMemo(() => {
+    const map = new Map<string, DailyReturnsRow>();
+    for (const r of dailyReturns) map.set(r.localDate, r);
+    return map;
+  }, [dailyReturns]);
+
+  const returnsByProduct = useMemo(() => {
+    const map = new Map<string, ProductReturnsRow>();
+    for (const r of productReturns) map.set(r.productId, r);
+    return map;
+  }, [productReturns]);
 
   if (!hydrated) {
     return <div className="text-sm text-slate-500">{t("common.loading")}</div>;
@@ -142,14 +188,28 @@ export default function LocalReports() {
       )}
 
       {/* KPI cards */}
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <StatCard label={t("localReports.statRevenue")} value={formatUsd(summary.revenue)} />
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+        <StatCard
+          label={t("localReports.statRevenue")}
+          value={formatUsd(summary.grossRevenue)}
+        />
+        <StatCard
+          label={t("localReports.statReturns")}
+          value={formatUsd(summary.returnedRevenue)}
+          tone={summary.returnedRevenue > 0 ? "warn" : undefined}
+        />
+        <StatCard
+          label={t("localReports.statNetRevenue")}
+          value={formatUsd(summary.revenue)}
+        />
         <StatCard label={t("localReports.statNetSales")} value={formatUsd(summary.net)} />
         <StatCard
           label={t("localReports.statGrossProfit")}
           value={formatUsd(summary.profit)}
           tone={summary.profit > 0 ? "good" : summary.profit < 0 ? "bad" : undefined}
         />
+      </div>
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard label={t("localReports.statPurchases")} value={formatUsd(summary.purchases)} />
       </div>
 
@@ -168,7 +228,9 @@ export default function LocalReports() {
                 <tr>
                   <th className="px-5 py-2">{t("localReports.colDate")}</th>
                   <th className="px-5 py-2 text-end">{t("localReports.colSales")}</th>
-                  <th className="px-5 py-2 text-end">{t("localReports.colRevenue")}</th>
+                  <th className="px-5 py-2 text-end">{t("localReports.colGrossSales")}</th>
+                  <th className="px-5 py-2 text-end">{t("localReports.colLessReturns")}</th>
+                  <th className="px-5 py-2 text-end">{t("localReports.colNetSales")}</th>
                   <th className="px-5 py-2 text-end">{t("localReports.colVat")}</th>
                   <th className="px-5 py-2 text-end">{t("localReports.colCogs")}</th>
                   <th className="px-5 py-2 text-end">{t("localReports.colGrossProfit")}</th>
@@ -177,8 +239,14 @@ export default function LocalReports() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {dailySales.map((row) => {
-                  const net = row.subtotalExclVatCents; // post-discount
-                  const profit = calcGrossProfit(row.subtotalExclVatCents, row.cogsTotalCents);
+                  const ret = returnsByDate.get(row.localDate);
+                  const returnedRevenue = ret?.totalInclVatCents ?? 0;
+                  const returnedNet = ret?.subtotalExclVatCents ?? 0;
+                  const returnedVat = ret?.vatTotalCents ?? 0;
+                  const reversedCogs = ret?.cogsReversedCents ?? 0;
+                  // Post-discount, less what came back.
+                  const net = row.subtotalExclVatCents - returnedNet;
+                  const profit = calcGrossProfit(net, row.cogsTotalCents - reversedCogs);
                   return (
                     <tr key={row.localDate} className="hover:bg-slate-50">
                       <td className="px-5 py-2 text-slate-700">
@@ -187,14 +255,25 @@ export default function LocalReports() {
                       <td className="px-5 py-2 text-end tabular-nums text-slate-700">
                         {row.saleCount}
                       </td>
-                      <td className="px-5 py-2 text-end tabular-nums font-medium text-slate-900">
+                      <td className="px-5 py-2 text-end tabular-nums text-slate-700">
                         {formatUsd(row.totalInclVatCents)}
                       </td>
-                      <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.vatTotalCents)}
+                      <td
+                        className={clsx(
+                          "px-5 py-2 text-end tabular-nums",
+                          returnedRevenue > 0 ? "text-amber-700" : "text-slate-400",
+                        )}
+                      >
+                        {returnedRevenue > 0 ? `\u2212 ${formatUsd(returnedRevenue)}` : "\u2014"}
+                      </td>
+                      <td className="px-5 py-2 text-end tabular-nums font-medium text-slate-900">
+                        {formatUsd(row.totalInclVatCents - returnedRevenue)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.cogsTotalCents)}
+                        {formatUsd(row.vatTotalCents - returnedVat)}
+                      </td>
+                      <td className="px-5 py-2 text-end tabular-nums text-slate-600">
+                        {formatUsd(row.cogsTotalCents - reversedCogs)}
                       </td>
                       <td
                         className={clsx(
@@ -239,8 +318,10 @@ export default function LocalReports() {
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {productSales.map((row) => {
-                  const net = row.lineSubtotalExclVatCents; // post-discount
-                  const profit = calcGrossProfit(row.lineSubtotalExclVatCents, row.lineCogsCents);
+                  const ret = returnsByProduct.get(row.productId);
+                  // Post-discount, net of returns; cost net of what came back.
+                  const net = row.lineSubtotalExclVatCents - (ret?.lineSubtotalExclVatCents ?? 0);
+                  const profit = calcGrossProfit(net, row.lineCogsCents - (ret?.lineCogsCents ?? 0));
                   return (
                     <tr key={row.productId} className="hover:bg-slate-50">
                       <td className="px-5 py-2">
@@ -254,13 +335,20 @@ export default function LocalReports() {
                         )}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-700">
-                        {row.totalQty}
+                        {row.totalQty - (ret?.totalQty ?? 0)}
+                        {ret && ret.totalQty > 0 && (
+                          <div className="text-xs text-amber-700">
+                            {`\u2212${ret.totalQty}`}
+                          </div>
+                        )}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums font-medium text-slate-900">
-                        {formatUsd(row.lineTotalInclVatCents)}
+                        {formatUsd(
+                          row.lineTotalInclVatCents - (ret?.lineTotalInclVatCents ?? 0),
+                        )}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.lineCogsCents)}
+                        {formatUsd(row.lineCogsCents - (ret?.lineCogsCents ?? 0))}
                       </td>
                       <td
                         className={clsx(
@@ -279,6 +367,62 @@ export default function LocalReports() {
               </tbody>
             </table>
           </div>
+        )}
+      </Card>
+
+      {/* Returns — their own documents, listed as such */}
+      <Card>
+        <CardHeader
+          title={t("localReports.returnsTitle")}
+          subtitle={t(
+            dailyReturns.length === 1
+              ? "localReports.returnsSubtitleOne"
+              : "localReports.returnsSubtitleMany",
+            { count: String(dailyReturns.length) },
+          )}
+        />
+        {dailyReturns.length === 0 && !loading ? (
+          <EmptyState title={t("localReports.noReturnsInPeriod")} />
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead className="border-b border-slate-200 bg-slate-50/80 text-start text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  <tr>
+                    <th className="px-5 py-2">{t("localReports.colDate")}</th>
+                    <th className="px-5 py-2 text-end">{t("localReports.colMemos")}</th>
+                    <th className="px-5 py-2 text-end">{t("localReports.colRefunded")}</th>
+                    <th className="px-5 py-2 text-end">{t("localReports.colVatReversed")}</th>
+                    <th className="px-5 py-2 text-end">{t("localReports.colCogsReversed")}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {dailyReturns.map((row) => (
+                    <tr key={row.localDate} className="hover:bg-slate-50">
+                      <td className="px-5 py-2 text-slate-700">
+                        {formatPrettyDate(row.localDate)}
+                      </td>
+                      <td className="px-5 py-2 text-end tabular-nums text-slate-700">
+                        {row.memoCount}
+                      </td>
+                      <td className="px-5 py-2 text-end tabular-nums font-medium text-slate-900">
+                        {formatUsd(row.totalInclVatCents)}
+                      </td>
+                      <td className="px-5 py-2 text-end tabular-nums text-slate-600">
+                        {formatUsd(row.vatTotalCents)}
+                      </td>
+                      <td className="px-5 py-2 text-end tabular-nums text-slate-600">
+                        {formatUsd(row.cogsReversedCents)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="border-t border-slate-100 px-5 py-3 text-xs text-slate-500">
+              {t("localReports.netProfitNote")}
+            </p>
+          </>
         )}
       </Card>
 

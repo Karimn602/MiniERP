@@ -1,4 +1,4 @@
-# Greaz POS test harness (WP-01, extended by WP-02, WP-03, WP-04 and WP-05)
+# Greaz POS test harness (WP-01, extended by WP-02, WP-03, WP-04, WP-05 and WP-06)
 
 A financial regression suite. Its job is to make the later hardening work
 packages safe: if a change breaks how money, stock, or VAT are recorded, one of
@@ -26,10 +26,10 @@ so cargo cannot build on a tree that has never been built.
 
 | Layer | Location | What it covers | Authority |
 |---|---|---|---|
-| **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, the fixed-point cost scale (`cost.test.ts`), sale/purchase line math, discount allocation; the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
+| **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, the fixed-point cost scale (`cost.test.ts`), sale/purchase line math, discount allocation, the credit-memo cumulative proration (`creditMemoMath.test.ts`); the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
 | **B. Rust units** | `src-tauri/src/tests/pure.rs`, `cost.rs` | The four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation, `prepare_purchase`'s derived line money, the purchase cost pair's VAT derivation, supplier-ledger sign authority; the whole `crate::cost` abstraction — scale, rounding, weighted average, overflow | Authoritative for pre-DB posting logic |
-| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, `open_shift`, `close_shift`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`), shift lifecycle and concurrency (`shifts.rs`), tender/change/rate authority (`tenders.rs`), purchase→AP reconciliation, duplicate invoices and purchase identity (`supplier_ap.rs`), supplier-payment sign/overpayment/identity (`supplier_payments.rs`) | **Authoritative for the database and all posting behaviour** |
-| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation, the supplier balance (`supplierLedger.test.ts`); the `invoke` wire format of the shift commands | Authoritative for read-model queries only |
+| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, `post_credit_memo`, `open_shift`, `close_shift`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`), shift lifecycle and concurrency (`shifts.rs`), tender/change/rate authority (`tenders.rs`), purchase→AP reconciliation, duplicate invoices and purchase identity (`supplier_ap.rs`), supplier-payment sign/overpayment/identity (`supplier_payments.rs`), returns/credit memos end to end (`returns.rs`) | **Authoritative for the database and all posting behaviour** |
+| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation, the supplier balance (`supplierLedger.test.ts`), the returns read models — return status, returnable quantity, refundable tender, the returns series in reports and the shift's refunds (`returns.test.ts`); the `invoke` wire format of the shift commands | Authoritative for read-model queries only |
 
 ### A note on what layer C2 is *not*
 
@@ -249,10 +249,32 @@ only makes the tests deterministic, it does not change the SQL.)
   command checks. Invoice liabilities reconcile to the posted purchase totals
   that raised them; a supplier with no activity reads as zero rather than
   missing; no read path reverses a sign.
+- **A return reverses its own sale, exactly** — since WP-06. Everything a
+  credit memo credits comes from the ORIGINAL posted snapshot: the price, the
+  VAT rate and amount, the discount allocation, the COGS rate, the tender the
+  sale took and the rate it was locked at. Returnable quantity is sold minus
+  what posted memos sent back, resolved server-side. Each PERSISTED COMPONENT —
+  subtotal, VAT, discount, COGS — is allocated as the DIFFERENCE OF TWO
+  CUMULATIVE figures on its own series, and the returned total is the sum of the
+  subtotal and VAT slices; so every slice is non-negative, every memo
+  reconciles, and returning a line in any number of pieces, in any order,
+  reverses it to the cent. A restocked return
+  re-enters inventory at the rate the goods left at and re-blends both averages;
+  a write-off return refunds the money and leaves the cost consumed; a service
+  line can never restock. A refund may use only a (method, currency) the sale
+  actually took, capped in that currency's own unit, net of change and
+  cumulatively across every memo; it must equal the memo total exactly; a cash
+  leg cannot drive its shift's drawer below zero. `sales_credit_memos.id` is the
+  return identity and a replay reconciles to the memo that posted. A posted memo
+  is then SEALED: no UPDATE, no DELETE, no new line, no new refund leg, and no
+  reachable `voided` status while no command exists to write the compensating
+  entries a void would need. The sale itself is never touched — return status is
+  derived from the memo lines.
 - **Immutability** — posted sales, sale items, payments, purchases, purchase
-  items, inventory movements and supplier-ledger entries reject UPDATE and
-  DELETE; the one carve-out (posted → voided) still refuses to rewrite money.
-  Since WP-04, closed shifts too.
+  items, inventory movements, supplier-ledger entries and (since WP-06) posted
+  credit memos with their lines and refunds reject UPDATE and DELETE; the one
+  carve-out (posted → voided) still refuses to rewrite money. Since WP-04,
+  closed shifts too.
 - **Migrations** — every migration applies to a virgin database, re-running is a
   no-op, and two independent databases end up with identical schema and
   checksums. Since WP-03 the UPGRADE path is covered too: migration 008 applies
@@ -272,7 +294,17 @@ only makes the tests deterministic, it does not change the SQL.)
   financial document (the rule binds writes from then on), leaves a
   historically wrong-signed ledger row alone while refusing a new one, is
   idempotent through the real runner, disturbs none of the earlier guards, and
-  converges on byte-identical schema with a fresh install.
+  converges on byte-identical schema with a fresh install. Migration 011 adds
+  three tables and backfills nothing — there was never any returns data — so its
+  risk is DIVERGENCE rather than dirty data, and the tests are shaped
+  accordingly: it applies to a populated v10 database leaving every posted sale,
+  line, tender and movement byte for byte as it was; an upgraded database can
+  POST A REAL RETURN against history that predates the feature, valued at the
+  microcent cost snapshot that history already carried; re-running the real
+  runner is a no-op and in particular does not reset a credit-memo sequence a
+  shop has already used; every table, index and trigger exists on both the fresh
+  and the upgraded path, with byte-identical schema; and every guard from
+  migrations 001 through 010 is still present and still bites.
 
 ## Known-defect register
 
@@ -288,7 +320,8 @@ To enable one: delete its `#[ignore = ...]` line (Rust) or change `it.skip` to
 |---|---|---|---|
 | **GP-A04** | WP-08 | `shifts.test.ts` › `getSalesSummary` › `GP-A04 … does not subtract the discount twice` | `netSalesExclVatCents` must not subtract the discount a second time. Lines are persisted post-discount, so `subtotal − discount` understates net sales (observed: 711 where 811 is correct). |
 | **GP-A04** | WP-08 | `shifts.test.ts` › `shiftSummaryRepo` › `GP-A04 … does not subtract the discount twice` | The same defect in the date-scoped day summary. |
-| **GP-A08** | WP-06 | — (coverage gap, no test) | See below. |
+(GP-A08 — returns / credit memos — was a coverage gap in this table until
+WP-06. It is now implemented and covered; see *Fixed by WP-06* below.)
 
 Cross-package note for WP-08: GP-A04's root cause is the post-discount
 persistence convention. WP-02 did **not** change it — `post_sale` still stores
@@ -758,29 +791,183 @@ hardening item. The register's submission gate makes the interleaving
 unreachable from a single window, and the suite cannot reach it either: layer C
 uses `max_connections(1)` by design (see *Remaining gaps*).
 
-### GP-A08 — returns / credit memos (WP-06)
+### Fixed by WP-06 — now enforced, must not regress
 
-**There is nothing to characterize on this branch, and no test is registered
-for it.** `sales.sale_type` permits `'credit_memo'` and `inventory_movements`
-documents `'return_in'` / `'return_out'`, but no command writes either and no
-repository reads them. WP-01 was instructed not to import or implement returns.
+GP-A08 was a documented coverage gap: `sales.sale_type` permitted
+`'credit_memo'` and `inventory_movements` documented `'return_in'`, but no
+command wrote either and no repository read them. WP-06 implements returns and
+their coverage. Where it lives, and what it now pins:
 
-This is therefore a **documented coverage gap only** — no passing placeholder,
-no skipped assertion. (An earlier draft asserted that no credit-memo rows
-exist; that was dropped because an empty-table query keeps passing after
-returns are implemented, so it senses nothing.)
+| Area | Where the coverage lives | What is now enforced |
+|---|---|---|
+| Return quantity authority | `returns.rs` › over-return block | Returnable = sold base quantity − the sum over POSTED credit-memo lines, resolved server-side. Over-return, a second return beyond the remainder, a fully-returned line, a line of ANOTHER receipt, a zero or negative quantity, and one memo listing the same receipt line twice are all refused. `trg_credit_memo_lines_no_over_return` binds writers that bypass the command, counting the memo's own draft lines so two lines of one memo cannot over-return between them. |
+| Cumulative proration | `pure.rs` › `prorated_cumulative_cents`, `returns.rs` › `several_partial_returns_add_up_to_the_original_line_exactly`, `tests/unit/creditMemoMath.test.ts` | A memo's share of a COMPONENT is `cumulative(already + returning) − cumulative(already)`. Returning a line in any number of pieces, in any order, reverses it EXACTLY — subtotal, VAT, discount and COGS. Independent per-memo rounding loses a cent on a 3-unit, 1,000-cent line; the register's preview mirror is pinned to the same figures. |
+| VAT reversal | `returns.rs` › VAT block, `no_partition_of_any_small_line_can_produce_a_negative_slice` | Subtotal and VAT are each prorated on their OWN cumulative series and the total is their sum — see *Why VAT is not a residual* below. Every slice is non-negative, every memo reconciles on its own, and the three columns each land exactly on the original at full return. The snapshot is the SALE's: changing the standard rate and re-pointing the product does not change what a refund reverses. An exempt line reverses zero at every step. |
+| Discount reversal | `returns.rs` › the awkward-cent test | The returned share of `sale_items.line_discount_cents`, prorated by the same rule. Three one-unit returns of a 500-cent allocation give 167 + 166 + 167. Today's discount is never redistributed. |
+| COGS and restock | `returns.rs` › cost block, `cost.rs` › `restock_weighted_avg`, `tests/unit/cost.test.ts` | A restocked return re-enters inventory at the ORIGINAL sale's microcent rate, reverses exactly the COGS the sale booked (prorated against the cumulative RESTOCKED quantity), and re-blends both the excl- and incl-VAT averages as a pair. A purchase between the sale and the return does not move the basis. A write-off return moves no stock, writes no movement and reverses no cost. A service line cannot be restocked at all. |
+| Negative-stock WAC | `returns.rs` › `a_restock_into_a_still_negative_pool_…`, `cost.rs` | `restock_weighted_avg` returns `None` — leave the existing average alone, add the quantity — when the pool is still non-positive after the return, or when the blend would value it below nothing. Both are reachable only from a pre-existing negative pool. |
+| Refund amount | `returns.rs` › refund block | The refund legs sum to the credit-memo total EXACTLY. Under-refund and over-refund are both refused; there is no unpaid-credit model and no change on a refund. |
+| Original-tender restriction | `returns.rs` › tender block | A refund may use only a (method, currency) the sale actually took, capped in that currency's own unit, NET of the change the sale gave, and cumulatively across every memo of the sale. A card-only sale cannot be refunded in cash and a cash-only sale cannot be credited to a card. The split need not be proportional. `store_credit` is refused by name, and migration 011's CHECK says the same. |
+| Exchange rate | `returns.rs` › `a_refund_uses_the_sales_locked_rate_and_not_todays` | A memo is locked to the ORIGINAL SALE's rate. A lira refund's USD equivalent is derived at that rate, a declared equivalent that disagrees is refused, and a payload declaring today's rate is refused rather than ignored. |
+| Drawer | `returns.rs` › drawer block, `shifts.rs`, `returns.test.ts` | A cash refund reduces expected drawer cash per currency and cannot drive it below zero, checked inside the posting transaction against the same `drawer_cash_for_shift` definition `close_shift` reconciles with. A card refund touches neither figure. No manager override. |
+| Shift | `returns.rs` › shift block | A new memo must name an OPEN shift of its store, checked after the replay resolution and again just before the commit. A memo into a closed shift is refused; a REPLAY of one that already posted still resolves after its shift has closed and been counted. Return-versus-close races into valid outcomes only. |
+| Identity idempotency | `returns.rs` › idempotency block | `sales_credit_memos.id` is the return identity. A verbatim replay, and one with fresh child ids, both reconcile to the memo that posted — same number, same movements, no second refund, no number consumed. The same identity with a different quantity, restock decision or tender mix is a conflict. A second partial return under its OWN identity posts, because content is never used to deduplicate. |
+| Atomicity | `returns.rs` › `a_rejected_return_consumes_no_credit_memo_number`, `a_failure_on_the_second_line_rolls_the_whole_return_back` | Three different refusals leave the sequence at #1. A bad second line leaves no memo, no line, no refund, no movement and no stock change from the good first line. |
+| Posted-memo sealing | `returns.rs` › sealing block | A posted credit memo is sealed COMPLETELY: no UPDATE of any kind, no DELETE, no new line and no new refund leg. Proved with adversarial direct SQL — a smuggled line, a smuggled refund leg, every child UPDATE and DELETE, eleven header mutations (money, shift, sale, locked rate, cashier, reason, `posted_at`, the number) and a raw-SQL `posted → voided` flip. Draft construction is untouched: the command's own two-child-table, link-then-promote sequence still posts, and a hand-built draft still takes children and is sealed the instant it is promoted. |
+| Sale immutability | `returns.rs` › `a_return_does_not_touch_the_sale_it_reverses` | A verbatim fingerprint of the sale, its lines and its tender is identical before and after. `sale_type` stays `'normal'`, `original_sale_id` stays NULL, no row is ever written into `sales` as a credit memo, and a restock movement does not wear `related_sale_id` — so it cannot appear in the movement list WP-02 rebuilds for a replayed sale. |
+| Reports and shift summary | `returns.test.ts` | Returns are their own series. `dailySales` / `productSales` / `getSalesSummary` are untouched and still GROSS; `dailyReturns`, `productReturns`, `getRefundSummary`, `getRefundBreakdown` and `refundSummary` are additive, and net sales and net profit are visible subtractions. `cogs_reversed_cents` counts restocked lines only, which is what makes profit right for both policies at once. A voided memo counts nowhere. |
 
-WP-06 owns both the implementation and its regression coverage, and must add at
-least:
+#### Why VAT is not a residual
 
-- a credit-memo posting command with its own numbering,
-- restocking movements that keep the inventory reconciliation invariant,
-- COGS reversal at the **original** sale's snapshot cost, not today's,
-- refund tenders that net correctly in shift and daily reports,
-- a guard against returning more than the original receipt sold.
+The first implementation prorated the line TOTAL and the line SUBTOTAL
+cumulatively, and took VAT as the residual `total − subtotal`. Each of those two
+series is monotone on its own, but their DIFFERENCE is not: the two roundings
+can move in opposite directions on the same step. The smallest real case is a
+3-unit line of 11 cents — 10 net + 1 VAT:
 
-When that lands, add the tests against the real behaviour and move GP-A08 out
-of the gap table.
+```text
+         cumulative total      cumulative subtotal      residual VAT
+ q = 1   round(11/3) = 4       round(10/3) = 3          4 − 3 =  1
+ q = 2   round(22/3) = 7       round(20/3) = 7          3 − 4 = −1   <-- !
+ q = 3               11                      10
+```
+
+Returning the second unit asked to credit MINUS a cent of VAT. The non-negative
+check refused it, so a customer could not return goods they had bought — and the
+alternative, weakening the check, would have written a credit note that ADDS
+output VAT, which is worse than a refused refund.
+
+The fix prorates the components the sale actually PERSISTED — subtotal, VAT and
+the discount allocation — each on its own cumulative series, and derives the
+returned total as `subtotal slice + VAT slice`. The total is never prorated on
+its own. Because each original is non-negative, each series is monotone, so
+every slice is non-negative; and because each lands exactly on its own original
+at full return, their sum lands exactly on the line total.
+
+`no_partition_of_any_small_line_can_produce_a_negative_slice` states this as a
+property rather than a case: exhaustively over quantities 2–12, totals 1–40 and
+every VAT split of each, both cumulative series are non-decreasing and both
+converge exactly. Monotonicity is what makes it a statement about EVERY
+partition at once — it is the cumulative position that decides a slice, so if no
+step down exists, no chunk from any earlier position can be negative.
+`the_eleven_cent_three_unit_line_reverses_exactly_in_every_partition` then drives
+1+1+1, 2+1, 1+2 and 3 end to end through the real command, and
+`tests/unit/creditMemoMath.test.ts` pins the register's preview to the same
+numbers (including an explicit assertion that the OLD residual formula yields
+−1, so the regression cannot come back silently).
+
+**The one boundary that remains**, pinned by
+`a_line_worth_less_than_a_cent_per_unit_must_be_returned_in_one_go`: a cent is
+the smallest refundable amount, so a line worth less than about a cent per unit
+has steps on which nothing more is owed, and a memo that credits nothing is
+refused. The whole remainder always credits the whole remaining amount, so such
+a line is returnable in one go rather than unit by unit. It is a property of
+money's resolution, not of the allocation, and it is unreachable in practice —
+three items sold for under a cent each is not a transaction a till produces, and
+`post_sale` refuses a zero-total sale outright.
+
+#### Why a posted credit memo is sealed harder than a posted sale
+
+`trg_sales_no_update_after_post` (migration 001) carves out one transition: a
+posted sale may become `'voided'` provided a short list of columns is unchanged.
+The first draft of migration 011 copied that shape onto credit memos. It was
+wrong twice over.
+
+First, **WP-06 has no void command**, and a posted credit memo has already
+MOVED things: stock went back on the shelf, the weighted average was re-blended
+at the returned cost, and cash left the drawer. Every read model filters
+`status = 'posted'`, so flipping the status alone made the refund disappear from
+the reports, from the day's VAT and from the shift's expected cash — while the
+goods, the cost basis and the money stayed exactly where the memo put them. That
+is not a void; it is a hole that balances nowhere. Undoing a return needs
+COMPENSATING ENTRIES, and a workflow that writes them belongs in its own
+migration, which can relax the trigger in the same breath as it defines them.
+Until then `voided` is unreachable, and the `status` CHECK, the `voided_*`
+columns and the read models' `status = 'posted'` filters are RESERVED for it
+rather than half-wired.
+
+Second, **a column list is a denylist worn as an allowlist**. The copied list
+omitted `shift_id`, `cashier_user_id`, `exchange_rate_lbp_per_usd`,
+`exchange_rate_id`, `reason` and `notes` — so the same statement that voided a
+memo could re-point it at another shift's drawer, re-attribute it to another
+cashier, or restate the rate it settled at. Enumerating what may not change
+means every column added later is permitted by default.
+
+**INSERT also needed guarding, not just UPDATE and DELETE.** Adding a line to a
+settled document is not an edit to any row that already exists, so it slips past
+an update guard entirely: a smuggled line credits quantity against the original
+receipt, and a smuggled refund leg pays out money the memo does not owe, in both
+cases without changing a byte of what the command wrote.
+`trg_credit_memo_lines_no_insert_after_post` and
+`trg_credit_memo_refunds_no_insert_after_post` key on the PARENT's `posted_at`,
+which is NULL throughout `post_credit_memo`'s construction phase — it inserts a
+draft header, writes the children and the movements, links each line to its
+movement, and promotes the header last — so the seal closes exactly when the
+document becomes real and not a statement earlier.
+
+A note for a later package, deliberately NOT changed here: `sale_items` and
+`sale_payments` carry the same asymmetry — migration 001 guards their UPDATE and
+DELETE but not their INSERT, so a row can in principle be added to a posted
+sale. Migration 001 is shipped and WP-06 is not the package that owns it.
+
+#### Why `store_credit` is not a refund method
+
+`sale_payments` has allowed it since migration 001, so a sale could in
+principle carry one. A refund cannot. Greaz has no customer-credit or
+customer-wallet ledger, so a store-credit refund would be a liability with no
+row recording it, no balance to spend it against and no way to reconcile it —
+money the shop owes somebody, written down nowhere. The method is absent from
+`REFUND_METHODS`, absent from migration 011's CHECK, refused by name with an
+explanation (it is the one a cashier would reasonably reach for), and filtered
+out of `refundAvailability`. A sale paid that way simply cannot be refunded
+through it, which is the honest outcome until a customer ledger exists.
+
+#### What WP-06 deliberately left alone
+
+- **GP-A04 is untouched.** `netSalesExclVatCents` still computes
+  `subtotal − discount`, and its two skipped tests are still skipped. Every
+  returns figure is a NEW field on a NEW read model, so nothing WP-08 has to fix
+  changed meaning underneath it.
+- **Voiding a credit memo** has reserved schema (`status`, `voided_at`,
+  `voided_by_user_id`, `void_reason`) and NO command, and since the sealing
+  correction it is UNREACHABLE: the posted-memo trigger refuses every UPDATE,
+  including a status flip. That is deliberate — see *Why a posted credit memo is
+  sealed harder than a posted sale*. A future void workflow must arrive as a
+  migration that relaxes the trigger and a command that writes the compensating
+  movement, cost blend and drawer effect together.
+- **Returns to supplier** (`movement_type = 'return_out'`) are still unwritten.
+  WP-06 is about the customer side.
+- **Supplier payments still are not drawer events** — see *What WP-04
+  deliberately left alone*. WP-06 adds exactly one new drawer event, the cash
+  refund, and it has a method, a currency and a shift, which is what supplier
+  payments lack.
+- **Partial refunds are not invoice-allocated**, and a return is not allocated
+  to a particular tender leg. The caps are per method; which dollar came back
+  from which swipe is not modelled.
+
+#### The mutation checks WP-06 ran
+
+Each guard below was temporarily disabled, the suite was run, the named tests
+were confirmed to FAIL, and the code was restored. None of the mutations is in
+the working tree.
+
+| Guard disabled | Tests that failed |
+|---|---|
+| over-return (`remaining` checks) | `returning_more_than_the_receipt_sold_is_refused`, `a_second_return_cannot_exceed_what_is_left`, `a_fully_returned_line_cannot_be_returned_again` |
+| original-tender restriction (availability + cumulative cap) | `a_card_only_sale_cannot_be_refunded_in_cash`, `a_cash_only_sale_cannot_be_refunded_to_a_card`, `a_split_sale_may_be_refunded_through_either_of_its_own_methods_only`, `the_per_method_refund_cap_is_cumulative_across_every_return_of_a_sale`, `a_rejected_return_consumes_no_credit_memo_number` |
+| cash-drawer-negative protection | `a_usd_cash_refund_cannot_drive_the_usd_drawer_negative`, `an_lbp_cash_refund_cannot_drive_the_lbp_drawer_negative` |
+| return identity idempotency | `replaying_a_return_reconciles_to_the_memo_that_already_posted`, `the_same_return_identity_with_different_content_is_a_conflict`, `a_return_into_a_closed_shift_is_refused_but_a_replay_still_resolves` |
+| original-cost restock valuation (read today's average instead) | `a_purchase_after_the_sale_does_not_change_the_returns_cost_basis`, `a_restocked_return_blends_the_original_cost_into_the_average`, `a_lira_card_refund_reblends_both_averages_and_leaves_the_drawer_alone` |
+| cumulative proration (round each memo independently) | `several_partial_returns_add_up_to_the_original_line_exactly` |
+| the posted-child INSERT seal (`WHEN 0`) | `a_posted_credit_memo_rejects_a_new_line`, `a_posted_credit_memo_rejects_a_new_refund_leg`, `a_draft_memo_takes_children_and_is_sealed_the_moment_it_is_promoted` |
+| the header seal's completeness (a `posted → voided` carve-out restored) | `a_posted_credit_memo_cannot_be_voided_by_raw_sql` |
+| component-wise VAT allocation (the residual `total − subtotal` restored) | `the_eleven_cent_three_unit_line_reverses_exactly_in_every_partition`, `awkward_vat_amounts_reverse_exactly_across_several_quantities`, `a_mixed_vat_sale_allocates_each_line_against_its_own_components`, `a_line_worth_less_than_a_cent_per_unit_must_be_returned_in_one_go` |
+
+A harness note, because it cost a debugging round: cargo tracks `include_str!`
+dependencies by mtime, and two edits to a `.sql` file inside the same second can
+leave it running a stale test binary that still embeds the previous migration. A
+mutation on a migration must touch `src-tauri/src/lib.rs` as well, which the
+mutation scripts now do.
 
 ## Toolchain verified
 
@@ -801,7 +988,16 @@ Rust 1.7x/cargo (`rustc 1.95.0`). Two notes on the TypeScript layer:
 Not covered by this harness, and worth knowing before relying on it:
 
 - **No UI or component tests.** `PosRegister.tsx` cart state, scanning, and
-  multi-cart behaviour are untested. The pure pieces have been extracted and
+  multi-cart behaviour are untested, and so is `CreateReturnModal.tsx`. The
+  modal's figures are a preview of the backend's own arithmetic — it mirrors the
+  cumulative proration through `lib/creditMemoMath.ts` (unit-tested against the
+  same values as the Rust side) and the lira conversion through `lib/money.ts` —
+  and the backend re-derives every one of them inside the posting transaction,
+  so a stale screen produces a clear refusal rather than a wrong refund. What is
+  unverified is the wiring: that the return identity really reaches the payload
+  once per modal, and that the submit button is really disabled while a post is
+  in flight. The identity is held in a ref for the modal's lifetime, so the
+  idempotency guarantee holds even if the disabled-button affordance is wrong. The pure pieces have been extracted and
   are covered: the discount helpers (WP-01) and the checkout submission gate
   and identity registry (WP-02, `lib/checkout.ts`). Nothing tests that the page
   *wires* them correctly — that a second click really reaches the gate, that the

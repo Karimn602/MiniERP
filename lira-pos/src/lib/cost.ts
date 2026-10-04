@@ -203,6 +203,50 @@ export function newWeightedAvgMicrocents(args: {
   );
 }
 
+/**
+ * Weighted-average unit cost after RETURNED stock comes back, in microcents,
+ * or `null` when no average can honestly be formed.
+ *
+ * The mirror of `cost::restock_weighted_avg`. A restock is an ordinary
+ * weighted average — the returned units re-enter the pool at the rate they
+ * left it at — except that it can meet a pool that is already NEGATIVE,
+ * because the POS allows selling below zero. Two states then have no answer:
+ * a resulting quantity that is still zero or negative (nothing to average
+ * over), and a resulting average that comes out negative (no pool costs less
+ * than nothing, and the column is `CHECK (>= 0)`).
+ *
+ * `null` means LEAVE THE EXISTING AVERAGE ALONE. The quantity still goes back
+ * on the shelf; the cost pool keeps the only rate that is still meaningful.
+ */
+export function restockWeightedAvgMicrocents(args: {
+  oldQty: number;
+  oldAvgMicrocents: Microcents;
+  returnedQty: number;
+  returnedCostMicrocents: Microcents;
+}): Microcents | null {
+  const { oldQty, oldAvgMicrocents, returnedQty, returnedCostMicrocents } = args;
+  assertInt(oldQty, "oldQty");
+  assertInt(oldAvgMicrocents, "oldAvgMicrocents");
+  assertInt(returnedQty, "returnedQty");
+  assertInt(returnedCostMicrocents, "returnedCostMicrocents");
+
+  if (returnedQty <= 0) {
+    throw new Error("a restock must return a positive quantity");
+  }
+  if (returnedCostMicrocents < 0) {
+    throw new Error("a restock cost rate cannot be negative");
+  }
+  if (BigInt(oldQty) + BigInt(returnedQty) <= 0n) return null;
+
+  const average = newWeightedAvgMicrocents({
+    oldQty,
+    oldAvgMicrocents,
+    newQty: returnedQty,
+    newCostMicrocents: returnedCostMicrocents,
+  });
+  return average < 0 ? null : average;
+}
+
 // ---------- Display ----------
 
 /**

@@ -6,9 +6,9 @@
 // against explicit expected numbers; the builders only remove boilerplate.
 
 use crate::posting::{
-    add_vat, lbp_to_usd_cents, PostAdjustmentLine, PostAdjustmentPayload, PostPurchaseLine,
-    PostPurchasePayload, PostSaleLine, PostSalePayload, PostSalePayment,
-    PostSupplierPaymentPayload,
+    add_vat, lbp_to_usd_cents, PostAdjustmentLine, PostAdjustmentPayload, PostCreditMemoLine,
+    PostCreditMemoPayload, PostCreditMemoRefund, PostPurchaseLine, PostPurchasePayload,
+    PostSaleLine, PostSalePayload, PostSalePayment, PostSupplierPaymentPayload,
 };
 use crate::test_support::{
     TempDb, RATE_ID, RATE_LBP_PER_USD, SHIFT_ID, STORE_ID, USER_ID, VAT_STD_BPS, VAT_STD_ID,
@@ -816,5 +816,204 @@ pub fn replay_of_ledger_entry(p: &PostSupplierPaymentPayload) -> PostSupplierPay
         notes: p.notes.clone(),
         created_by_user_id: p.created_by_user_id.clone(),
         device_id: p.device_id.clone(),
+    }
+}
+
+// ============================================================================
+// Credit memo / sales return (WP-06)
+// ============================================================================
+
+/// One returned line. `quantity_in_uom` is the authoritative input, exactly as
+/// it is on the wire; `quantity_base` is the client's cross-check and is
+/// derived here with the same rounding the backend uses, so a legitimate line
+/// never looks like a mismatch merely because the harness rounded differently.
+pub struct ReturnLineBuilder {
+    line: PostCreditMemoLine,
+}
+
+impl ReturnLineBuilder {
+    /// Return one base unit of `sale_item_id`, back to the shelf.
+    pub fn new(sale_item_id: &str) -> Self {
+        Self {
+            line: PostCreditMemoLine {
+                credit_memo_line_id: uuid(),
+                original_sale_item_id: sale_item_id.to_string(),
+                quantity_in_uom: 1,
+                quantity_base: 1,
+                return_to_stock: true,
+            },
+        }
+    }
+
+    /// Quantity in the ORIGINAL line's unit of measure, with the base quantity
+    /// following a `num/den` conversion (1/1 unless `uom` says otherwise).
+    pub fn qty(mut self, qty_in_uom: i64) -> Self {
+        self.line.quantity_in_uom = qty_in_uom;
+        self.line.quantity_base = qty_in_uom;
+        self
+    }
+
+    /// The original line was sold in a non-base UoM: restate the cross-check
+    /// base quantity through that conversion.
+    pub fn uom(mut self, num: i64, den: i64) -> Self {
+        self.line.quantity_base = base_qty(self.line.quantity_in_uom, num, den);
+        self
+    }
+
+    pub fn restock(mut self, restock: bool) -> Self {
+        self.line.return_to_stock = restock;
+        self
+    }
+
+    /// Override the declared base quantity independently of the conversion.
+    /// Used only to prove the backend refuses a payload that contradicts the
+    /// original line's own factor.
+    pub fn raw_quantity_base(mut self, base: i64) -> Self {
+        self.line.quantity_base = base;
+        self
+    }
+
+    pub fn build(self) -> PostCreditMemoLine {
+        self.line
+    }
+}
+
+pub fn return_line(sale_item_id: &str) -> ReturnLineBuilder {
+    ReturnLineBuilder::new(sale_item_id)
+}
+
+pub fn refund_cash_usd(cents: i64) -> PostCreditMemoRefund {
+    PostCreditMemoRefund {
+        refund_id: uuid(),
+        method: "cash_usd".to_string(),
+        currency: "USD".to_string(),
+        amount_native_usd_cents: cents,
+        amount_native_lbp: 0,
+        amount_usd_cents_equivalent: cents,
+        reference: None,
+    }
+}
+
+pub fn refund_card_usd(cents: i64) -> PostCreditMemoRefund {
+    PostCreditMemoRefund {
+        refund_id: uuid(),
+        method: "card_usd".to_string(),
+        currency: "USD".to_string(),
+        amount_native_usd_cents: cents,
+        amount_native_lbp: 0,
+        amount_usd_cents_equivalent: cents,
+        reference: None,
+    }
+}
+
+/// A refund in lira. The USD equivalent uses the fixture's locked rate through
+/// the PRODUCTION helper, because the backend derives this value and refuses a
+/// payload that declares a different one.
+pub fn refund_cash_lbp(lbp: i64) -> PostCreditMemoRefund {
+    PostCreditMemoRefund {
+        refund_id: uuid(),
+        method: "cash_lbp".to_string(),
+        currency: "LBP".to_string(),
+        amount_native_usd_cents: 0,
+        amount_native_lbp: lbp,
+        amount_usd_cents_equivalent: lbp_to_usd_cents(lbp, RATE_LBP_PER_USD)
+            .expect("fixture LBP refund must convert"),
+        reference: None,
+    }
+}
+
+pub fn refund_card_lbp(lbp: i64) -> PostCreditMemoRefund {
+    PostCreditMemoRefund {
+        refund_id: uuid(),
+        method: "card_lbp".to_string(),
+        currency: "LBP".to_string(),
+        amount_native_usd_cents: 0,
+        amount_native_lbp: lbp,
+        amount_usd_cents_equivalent: lbp_to_usd_cents(lbp, RATE_LBP_PER_USD)
+            .expect("fixture LBP refund must convert"),
+        reference: None,
+    }
+}
+
+pub fn credit_memo_payload(
+    original_sale_id: &str,
+    lines: Vec<PostCreditMemoLine>,
+    refunds: Vec<PostCreditMemoRefund>,
+) -> PostCreditMemoPayload {
+    PostCreditMemoPayload {
+        credit_memo_id: uuid(),
+        store_id: STORE_ID.to_string(),
+        original_sale_id: original_sale_id.to_string(),
+        // A new return must belong to an open shift of its store (WP-06,
+        // following WP-04), so the default payload names the fixture shift. A
+        // test that wants the "no shift" case clears this field explicitly.
+        shift_id: Some(SHIFT_ID.to_string()),
+        cashier_user_id: Some(USER_ID.to_string()),
+        device_id: None,
+        reason: Some("Customer changed their mind".to_string()),
+        notes: None,
+        // Left unstated on purpose: the backend locks the memo to the ORIGINAL
+        // sale's rate. The tests that care send a declared value explicitly.
+        exchange_rate_id: None,
+        exchange_rate_lbp_per_usd: None,
+        lines,
+        refunds,
+    }
+}
+
+/// A faithful replay: the same return identity, the same child identifiers, the
+/// same figures. What a retried refund sends.
+pub fn replay_of_credit_memo(p: &PostCreditMemoPayload) -> PostCreditMemoPayload {
+    PostCreditMemoPayload {
+        credit_memo_id: p.credit_memo_id.clone(),
+        store_id: p.store_id.clone(),
+        original_sale_id: p.original_sale_id.clone(),
+        shift_id: p.shift_id.clone(),
+        cashier_user_id: p.cashier_user_id.clone(),
+        device_id: p.device_id.clone(),
+        reason: p.reason.clone(),
+        notes: p.notes.clone(),
+        exchange_rate_id: p.exchange_rate_id.clone(),
+        exchange_rate_lbp_per_usd: p.exchange_rate_lbp_per_usd,
+        lines: p.lines.iter().map(clone_credit_memo_line).collect(),
+        refunds: p.refunds.iter().map(clone_credit_memo_refund).collect(),
+    }
+}
+
+/// `replay_of_credit_memo`, with freshly minted line and refund ids: the same
+/// return identity carrying new child identifiers. Idempotency keys on the
+/// return identity alone, so this is still one return.
+pub fn replay_of_credit_memo_with_new_child_ids(
+    p: &PostCreditMemoPayload,
+) -> PostCreditMemoPayload {
+    let mut replay = replay_of_credit_memo(p);
+    for line in &mut replay.lines {
+        line.credit_memo_line_id = uuid();
+    }
+    for refund in &mut replay.refunds {
+        refund.refund_id = uuid();
+    }
+    replay
+}
+
+pub fn clone_credit_memo_line(l: &PostCreditMemoLine) -> PostCreditMemoLine {
+    PostCreditMemoLine {
+        credit_memo_line_id: l.credit_memo_line_id.clone(),
+        original_sale_item_id: l.original_sale_item_id.clone(),
+        quantity_in_uom: l.quantity_in_uom,
+        quantity_base: l.quantity_base,
+        return_to_stock: l.return_to_stock,
+    }
+}
+
+pub fn clone_credit_memo_refund(r: &PostCreditMemoRefund) -> PostCreditMemoRefund {
+    PostCreditMemoRefund {
+        refund_id: r.refund_id.clone(),
+        method: r.method.clone(),
+        currency: r.currency.clone(),
+        amount_native_usd_cents: r.amount_native_usd_cents,
+        amount_native_lbp: r.amount_native_lbp,
+        amount_usd_cents_equivalent: r.amount_usd_cents_equivalent,
+        reference: r.reference.clone(),
     }
 }

@@ -393,3 +393,153 @@ export interface Shift {
   status: ShiftStatus;
   notes: string | null;
 }
+// ---------- Sales returns / credit memos (WP-06) ----------
+
+export type CreditMemoStatus = "draft" | "posted" | "voided";
+
+/**
+ * A refund method. `store_credit` is absent on purpose: Greaz has no
+ * customer-credit ledger, so a store-credit refund would be a liability
+ * recorded nowhere. Migration 011's CHECK says the same thing in the engine.
+ */
+export type RefundMethod = Exclude<PaymentMethod, "store_credit">;
+
+/**
+ * The header of one return document.
+ *
+ * Every amount on it was derived by `post_credit_memo` from the ORIGINAL
+ * sale's snapshots — price, VAT, discount allocation, COGS rate and locked
+ * exchange rate — never from today's product, rate or cost pool.
+ */
+export interface CreditMemo {
+  id: string;
+  storeId: string;
+  originalSaleId: string;
+  creditMemoNumber: number;
+  shiftId: string | null;
+  deviceId: string | null;
+  cashierUserId: string | null;
+  /** The ORIGINAL sale's locked rate, copied at post time. */
+  exchangeRateLbpPerUsd: number;
+  exchangeRateId: string | null;
+  reason: string | null;
+  subtotalExclVatCents: UsdCents;
+  vatTotalCents: UsdCents;
+  discountCents: UsdCents;
+  totalInclVatCents: UsdCents;
+  /** COGS put back into inventory — restocked lines only. */
+  cogsReversedCents: UsdCents;
+  /** Equal to `totalInclVatCents` exactly; there is no unpaid-credit model. */
+  refundTotalUsdCents: UsdCents;
+  status: CreditMemoStatus;
+  createdAt: string;
+  postedAt: string | null;
+  notes: string | null;
+}
+
+export interface CreditMemoLine {
+  id: string;
+  creditMemoId: string;
+  storeId: string;
+  originalSaleItemId: string;
+  productId: string;
+  productNameSnapshot: string;
+  productSkuSnapshot: string | null;
+  vatRateIdSnapshot: string;
+  vatRateBpsSnapshot: number;
+  /** The canonical returned quantity, in base units. */
+  quantityBase: number;
+  /** The same quantity in the original line's own display unit. */
+  quantityInUom: number;
+  uomCodeSnapshot: string | null;
+  factorNumSnapshot: number | null;
+  factorDenSnapshot: number | null;
+  unitPriceExclVatCents: UsdCents;
+  unitPriceInclVatCents: UsdCents;
+  lineSubtotalExclVatCents: UsdCents;
+  lineVatCents: UsdCents;
+  lineTotalInclVatCents: UsdCents;
+  lineDiscountCents: UsdCents;
+  /** The ORIGINAL sale's COGS rate for this line. */
+  unitCogsExclVatMicrocents: Microcents;
+  /** Rounded mirror of the rate above. Display only. */
+  unitCogsExclVatCents: UsdCents;
+  /** The COGS actually reversed — zero when the line did not restock. */
+  lineCogsExclVatCents: UsdCents;
+  /** True when the original sale line moved no stock. */
+  isService: boolean;
+  returnToStock: boolean;
+  relatedMovementId: string | null;
+}
+
+export interface CreditMemoRefund {
+  id: string;
+  creditMemoId: string;
+  storeId: string;
+  method: RefundMethod;
+  currency: PaymentCurrency;
+  amountNativeUsdCents: UsdCents;
+  amountNativeLbp: number;
+  /** Derived at the ORIGINAL sale's locked rate. */
+  amountUsdCentsEquivalent: UsdCents;
+  reference: string | null;
+  createdAt: string;
+}
+
+export interface CreditMemoWithDetails extends CreditMemo {
+  lines: CreditMemoLine[];
+  refunds: CreditMemoRefund[];
+  /** The receipt number of the sale this memo reverses, for display. */
+  originalReceiptNumber: number | null;
+}
+
+/**
+ * How much of a sale has come back. DERIVED from credit-memo lines — the sale
+ * itself is never marked.
+ */
+export type SaleReturnStatus = "none" | "partial" | "full";
+
+/** One line of a sale, with what is still returnable on it. */
+export interface ReturnableLine {
+  saleItemId: string;
+  productId: string;
+  productNameSnapshot: string;
+  productSkuSnapshot: string | null;
+  uomCodeSnapshot: string | null;
+  factorNumSnapshot: number;
+  factorDenSnapshot: number;
+  /** Sold, in base units and in the line's own display unit. */
+  soldQuantityBase: number;
+  soldQuantityInUom: number;
+  /** Already returned by POSTED credit memos, in both units. */
+  returnedQuantityBase: number;
+  returnedQuantityInUom: number;
+  /** What is left, in both units. */
+  remainingQuantityBase: number;
+  remainingQuantityInUom: number;
+  unitPriceInclVatCents: UsdCents;
+  /**
+   * The ORIGINAL line's persisted components. All three are needed to preview
+   * what a return will credit, because each is prorated on its own series —
+   * see `lib/creditMemoMath.ts`.
+   */
+  lineSubtotalExclVatCents: UsdCents;
+  lineVatCents: UsdCents;
+  lineTotalInclVatCents: UsdCents;
+  lineDiscountCents: UsdCents;
+  vatRateBpsSnapshot: number;
+  /** True when the original line moved no stock, so it can never restock. */
+  isService: boolean;
+}
+
+/** How much a sale may still be refunded through one of its own tenders. */
+export interface RefundAvailability {
+  method: RefundMethod;
+  currency: PaymentCurrency;
+  /** Received through this method, NET of any change given, in native units. */
+  availableNative: number;
+  /** Already refunded through it by posted memos, in native units. */
+  refundedNative: number;
+  /** What is left, in native units. */
+  remainingNative: number;
+}

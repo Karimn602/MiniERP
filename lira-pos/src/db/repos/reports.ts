@@ -21,6 +21,31 @@ export interface ProductSalesRow {
   lineCogsCents: number;
 }
 
+/**
+ * Returns for one local day. ADDITIVE: the sales rows above stay GROSS, and
+ * net sales are gross less these — so a report can show all three figures and
+ * nothing that existed before this work package changed meaning.
+ */
+export interface DailyReturnsRow {
+  localDate: string;
+  memoCount: number;
+  subtotalExclVatCents: number;
+  vatTotalCents: number;
+  discountCents: number;
+  totalInclVatCents: number;
+  /** COGS put back into inventory — restocked lines only. */
+  cogsReversedCents: number;
+}
+
+export interface ProductReturnsRow {
+  productId: string;
+  totalQty: number;
+  lineSubtotalExclVatCents: number;
+  lineTotalInclVatCents: number;
+  /** Reversed COGS, which is zero for a line that was written off. */
+  lineCogsCents: number;
+}
+
 export interface DailyPurchasesRow {
   localDate: string;
   purchaseCount: number;
@@ -128,6 +153,109 @@ export const reportsRepo = {
       totalQty: r.total_qty,
       lineSubtotalExclVatCents: r.line_subtotal_excl_vat_cents,
       lineDiscountCents: r.line_discount_cents,
+      lineTotalInclVatCents: r.line_total_incl_vat_cents,
+      lineCogsCents: r.line_cogs_cents,
+    }));
+  },
+
+  /**
+   * Returns per local day, keyed the same way `dailySales` is so the two join
+   * on `localDate`.
+   *
+   * WHY THIS IS A SEPARATE QUERY, AND NOT A SIGN FLIP INSIDE `dailySales`.
+   * A credit memo is its own document (migration 011): it is not a negative
+   * sale and its lines are not in `sale_items`. Folding it into the sales
+   * aggregate would silently restate `saleCount`, and would lose the one
+   * distinction that matters for profit — whether the goods came back.
+   *
+   * `cogsReversedCents` counts only RESTOCKED lines, which is what makes the
+   * profit arithmetic correct for both policies at once:
+   *
+   *   restocked:     revenue reversed AND the returned cost reversed
+   *   not restocked: revenue reversed, the cost stays consumed
+   *
+   * so net profit = (gross net sales − returned net) − (gross COGS − reversed).
+   */
+  async dailyReturns(args: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+  }): Promise<DailyReturnsRow[]> {
+    interface Row {
+      local_date: string;
+      memo_count: number;
+      subtotal_excl_vat_cents: number;
+      vat_total_cents: number;
+      discount_cents: number;
+      total_incl_vat_cents: number;
+      cogs_reversed_cents: number;
+    }
+
+    const rows = await query<Row>(
+      `SELECT
+         date(posted_at, 'localtime') AS local_date,
+         COUNT(*) AS memo_count,
+         COALESCE(SUM(subtotal_excl_vat_cents), 0) AS subtotal_excl_vat_cents,
+         COALESCE(SUM(vat_total_cents), 0)         AS vat_total_cents,
+         COALESCE(SUM(discount_cents), 0)          AS discount_cents,
+         COALESCE(SUM(total_incl_vat_cents), 0)    AS total_incl_vat_cents,
+         COALESCE(SUM(cogs_reversed_cents), 0)     AS cogs_reversed_cents
+       FROM sales_credit_memos
+       WHERE store_id = ?
+         AND status = 'posted'
+         AND posted_at >= ?
+         AND posted_at <= ?
+       GROUP BY local_date
+       ORDER BY local_date ASC`,
+      [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+    );
+
+    return rows.map((r) => ({
+      localDate: r.local_date,
+      memoCount: r.memo_count,
+      subtotalExclVatCents: r.subtotal_excl_vat_cents,
+      vatTotalCents: r.vat_total_cents,
+      discountCents: r.discount_cents,
+      totalInclVatCents: r.total_incl_vat_cents,
+      cogsReversedCents: r.cogs_reversed_cents,
+    }));
+  },
+
+  /** Returns per product, to net off `productSales` row for row. */
+  async productReturns(args: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+  }): Promise<ProductReturnsRow[]> {
+    interface Row {
+      product_id: string;
+      total_qty: number;
+      line_subtotal_excl_vat_cents: number;
+      line_total_incl_vat_cents: number;
+      line_cogs_cents: number;
+    }
+
+    const rows = await query<Row>(
+      `SELECT
+         l.product_id,
+         SUM(l.quantity_base) AS total_qty,
+         SUM(l.line_subtotal_excl_vat_cents) AS line_subtotal_excl_vat_cents,
+         SUM(l.line_total_incl_vat_cents)    AS line_total_incl_vat_cents,
+         SUM(l.line_cogs_excl_vat_cents)     AS line_cogs_cents
+       FROM sales_credit_memo_lines l
+       JOIN sales_credit_memos m ON m.id = l.credit_memo_id
+       WHERE m.store_id = ?
+         AND m.status = 'posted'
+         AND m.posted_at >= ?
+         AND m.posted_at <= ?
+       GROUP BY l.product_id`,
+      [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+    );
+
+    return rows.map((r) => ({
+      productId: r.product_id,
+      totalQty: r.total_qty,
+      lineSubtotalExclVatCents: r.line_subtotal_excl_vat_cents,
       lineTotalInclVatCents: r.line_total_incl_vat_cents,
       lineCogsCents: r.line_cogs_cents,
     }));

@@ -2,7 +2,8 @@
 
 use crate::cost::{cents_to_microcents, COST_SCALE};
 use crate::test_support::{
-    app_migrator, assert_not_production_db, TempDb, RATE_ID, STORE_ID, USER_ID, VAT_STD_ID,
+    app_migrator, assert_not_production_db, latest_migration_version, migration_count, TempDb,
+    RATE_ID, STORE_ID, USER_ID, VAT_STD_ID,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -25,6 +26,7 @@ async fn all_migrations_apply_to_a_virgin_database() {
         "sync_queue", "app_settings", "accounts", "journal_entries", "journal_lines",
         "product_barcodes", "units_of_measure", "product_uoms", "suppliers",
         "purchases", "purchase_items", "supplier_ledger",
+        "sales_credit_memos", "sales_credit_memo_lines", "sales_credit_memo_refunds",
     ] {
         let n = db
             .count(&format!(
@@ -39,19 +41,23 @@ async fn all_migrations_apply_to_a_virgin_database() {
 async fn migration_versions_are_recorded_in_order() {
     let db = TempDb::new().await;
 
+    let expected = migration_count();
+    let latest = latest_migration_version();
+
     let applied = db
         .count("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
         .await;
-    assert_eq!(applied, 10, "all ten migrations must be recorded");
+    assert_eq!(applied, expected, "every shipped migration must be recorded");
 
     assert_eq!(db.scalar_i64("SELECT MIN(version) FROM _sqlx_migrations").await, 1);
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, latest);
 
-    // Versions are exactly 1..=10 with no gaps or duplicates.
+    // Versions are exactly 1..=latest with no gaps or duplicates.
     let distinct = db
         .count("SELECT COUNT(DISTINCT version) FROM _sqlx_migrations")
         .await;
-    assert_eq!(distinct, 10);
+    assert_eq!(distinct, expected);
+    assert_eq!(latest, expected, "migration versions must be contiguous from 1");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -299,7 +305,10 @@ async fn migration_008_applies_to_an_existing_pre_wp03_database() {
 
     // `migrate_again` runs the whole remaining list, so a v7 database lands on
     // the current head rather than stopping at 8.
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -521,7 +530,10 @@ async fn migration_009_applies_to_a_v8_database_with_one_open_shift() {
 
     db.migrate_again().await.expect("migration 009 must apply to a populated v8 database");
 
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
     assert_eq!(db.scalar_string(&format!("SELECT status FROM shifts WHERE id='{SHIFT_NEW}'")).await, "open");
     assert_eq!(
         db.count(&format!("SELECT COUNT(*) FROM shifts WHERE id='{SHIFT_NEW}' AND closed_at IS NULL")).await,
@@ -792,7 +804,10 @@ async fn migration_010_applies_to_a_populated_v9_database() {
         .await
         .expect("migration 010 must apply to a populated v9 database");
 
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
     assert_eq!(db.count("SELECT COUNT(*) FROM purchases WHERE status='posted'").await, 2);
     assert_eq!(db.count("SELECT COUNT(*) FROM supplier_ledger").await, 2);
     assert_eq!(
@@ -845,7 +860,10 @@ async fn migration_010_upgrades_a_database_that_already_held_a_duplicate_invoice
         .await
         .expect("migration 010 must upgrade a drifted database, not refuse to start");
 
-    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
 
     // Nothing deleted, nothing rewritten, nothing annotated.
     assert_eq!(db.count("SELECT COUNT(*) FROM purchases").await, 3);
@@ -1023,5 +1041,454 @@ async fn migration_010_does_not_disturb_the_earlier_guards() {
     assert!(
         db.try_exec("DELETE FROM supplier_ledger WHERE id='led-1'").await.is_err(),
         "a supplier-ledger entry must stay undeletable"
+    );
+}
+
+// ============================================================================
+// Migration 011 — sales returns / credit memos (GP-A08)
+// ============================================================================
+//
+// 011 adds three tables, two columns on `inventory_movements`, a sequence key
+// and a set of guards. Unlike 008 it backfills nothing — there is no prior
+// returns data anywhere, because no command and no repository ever wrote any —
+// so the risk is not dirty data but DIVERGENCE: a table, a trigger or a
+// sequence that appears on only one of the two paths into version 11 would make
+// whether a shop can process a return depend on how old its database is.
+//
+// These tests run migrations 1..=10, put a real posted sale in the database the
+// way an earlier release left one, and only then apply 011.
+
+const RET_PRODUCT: &str = "00000000-0000-0000-0000-00000000cb01";
+const RET_SALE: &str = "00000000-0000-0000-0000-00000000cb02";
+const RET_SALE_ITEM: &str = "00000000-0000-0000-0000-00000000cb03";
+
+/// A v10 database holding one posted sale of two units, paid in cash, with its
+/// stock movement — the shape every return in production starts from.
+async fn pre_wp06_database() -> TempDb {
+    let db = TempDb::at_schema_version(10).await;
+    db.exec(&format!(
+        "INSERT INTO exchange_rates (id, store_id, effective_date, rate_lbp_per_usd, source)
+         VALUES ('{RATE_ID}', '{STORE_ID}', '2026-01-01', 89500, 'manual')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents,
+           avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
+           avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
+           quantity_on_hand
+         ) VALUES ('{RET_PRODUCT}', '{STORE_ID}', 'SKU-D1', 'Coffee 250g', '{VAT_STD_ID}',
+                   'exclusive', 450, 500, 200, 222, 200000000, 222000000, 98)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opened_at,
+                             opening_cash_usd_cents, opening_cash_lbp, status)
+         VALUES ('shift-v10', '{STORE_ID}', '{USER_ID}', '2026-03-01T08:00:00.000Z', 0, 0, 'open')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, shift_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, exchange_rate_id,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+           discount_cents, cogs_total_cents, cogs_method,
+           sale_type, status, posted_at
+         ) VALUES ('{RET_SALE}', '{STORE_ID}', 'shift-v10', '{USER_ID}', 1,
+                   89500, '{RATE_ID}', 900, 100, 1000, 0, 400, 'weighted_average',
+                   'normal', 'posted', '2026-03-01T10:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_items (
+           id, sale_id, store_id, product_id, product_name_snapshot,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot, quantity,
+           unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+           line_discount_cents,
+           unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents, unit_cogs_excl_vat_microcents,
+           quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
+         ) VALUES ('{RET_SALE_ITEM}', '{RET_SALE}', '{STORE_ID}', '{RET_PRODUCT}', 'Coffee 250g',
+                   '{VAT_STD_ID}', 1100, 2, 450, 500, 900, 100, 1000, 0,
+                   200, 400, 200000000, 2, 'each', 1, 1)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_payments (
+           id, sale_id, store_id, method, currency,
+           amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent
+         ) VALUES ('pay-v10', '{RET_SALE}', '{STORE_ID}', 'cash_usd', 'USD', 1000, 0, 1000)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO inventory_movements (
+           id, store_id, product_id, movement_type, quantity_delta,
+           unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+           unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents,
+           related_sale_id, related_sale_item_id, posted_at
+         ) VALUES ('mov-v10', '{STORE_ID}', '{RET_PRODUCT}', 'sale', -2,
+                   200, 222, 200000000, 222000000,
+                   '{RET_SALE}', '{RET_SALE_ITEM}', '2026-03-01T10:00:00.000Z')"
+    ))
+    .await;
+    db
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_011_applies_to_a_populated_v10_database() {
+    let db = pre_wp06_database().await;
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 10);
+
+    db.migrate_again()
+        .await
+        .expect("migration 011 must apply to a populated v10 database");
+
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
+
+    // The three new tables exist and are empty — 011 backfills nothing, because
+    // there was never any returns data to carry forward.
+    for table in [
+        "sales_credit_memos",
+        "sales_credit_memo_lines",
+        "sales_credit_memo_refunds",
+    ] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+            ))
+            .await,
+            1,
+            "`{table}` is missing after migration 011"
+        );
+        assert_eq!(db.count(&format!("SELECT COUNT(*) FROM {table}")).await, 0);
+    }
+
+    // The sale, its line, its tender and its movement are byte for byte what
+    // they were. A shop's books are not ours to restate.
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales WHERE status='posted'").await, 1);
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT total_incl_vat_cents FROM sales WHERE id = '{RET_SALE}'"
+        ))
+        .await,
+        1_000
+    );
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT unit_cogs_excl_vat_microcents FROM sale_items WHERE id = '{RET_SALE_ITEM}'"
+        ))
+        .await,
+        200_000_000,
+        "the WP-03 cost snapshot a return will value its restock at"
+    );
+    assert_eq!(db.scalar_i64(&format!("SELECT quantity_on_hand FROM products WHERE id = '{RET_PRODUCT}'")).await,
+        98);
+
+    // The two new movement columns are present and NULL on history: a sale
+    // movement belongs to no credit memo.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM inventory_movements
+              WHERE related_credit_memo_id IS NULL AND related_credit_memo_line_id IS NULL"
+        )
+        .await,
+        1
+    );
+
+    // And the sequence is ready to issue #1.
+    assert_eq!(
+        db.scalar_string(
+            "SELECT value FROM app_settings WHERE key = 'next_credit_memo_number'"
+        )
+        .await,
+        "1"
+    );
+}
+
+/// The upgraded database must be able to take a real return, not merely hold
+/// the tables for one. This is the end-to-end proof that an upgrade and a fresh
+/// install behave the same, rather than only look the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgraded_database_can_post_a_return_against_its_own_history() {
+    let db = pre_wp06_database().await;
+    db.migrate_again().await.expect("migration 011 must apply");
+
+    let result = crate::posting::post_credit_memo_with_pool(
+        db.pool(),
+        crate::posting::PostCreditMemoPayload {
+            credit_memo_id: "memo-upgrade".to_string(),
+            store_id: STORE_ID.to_string(),
+            original_sale_id: RET_SALE.to_string(),
+            shift_id: Some("shift-v10".to_string()),
+            cashier_user_id: Some(USER_ID.to_string()),
+            device_id: None,
+            reason: Some("Upgrade smoke test".to_string()),
+            notes: None,
+            exchange_rate_id: None,
+            exchange_rate_lbp_per_usd: None,
+            lines: vec![crate::posting::PostCreditMemoLine {
+                credit_memo_line_id: "memo-upgrade-line".to_string(),
+                original_sale_item_id: RET_SALE_ITEM.to_string(),
+                quantity_in_uom: 2,
+                quantity_base: 2,
+                return_to_stock: true,
+            }],
+            refunds: vec![crate::posting::PostCreditMemoRefund {
+                refund_id: "memo-upgrade-refund".to_string(),
+                method: "cash_usd".to_string(),
+                currency: "USD".to_string(),
+                amount_native_usd_cents: 1_000,
+                amount_native_lbp: 0,
+                amount_usd_cents_equivalent: 1_000,
+                reference: None,
+            }],
+        },
+    )
+    .await
+    .expect("a return must post against history that predates the feature");
+
+    assert_eq!(result.credit_memo_number, 1);
+    assert_eq!(result.total_incl_vat_cents, 1_000);
+    assert_eq!(result.vat_total_cents, 100);
+    assert_eq!(
+        result.cogs_reversed_cents, 400,
+        "valued at the 200,000,000-microcent rate the pre-upgrade sale snapshotted"
+    );
+    assert_eq!(db.scalar_i64(&format!("SELECT quantity_on_hand FROM products WHERE id = '{RET_PRODUCT}'")).await,
+        100);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_011_is_idempotent_through_the_real_runner() {
+    let db = pre_wp06_database().await;
+    db.migrate_again().await.expect("first run");
+    let before = db.count("SELECT COUNT(*) FROM _sqlx_migrations").await;
+
+    db.migrate_again().await.expect("second run must succeed");
+    db.migrate_again().await.expect("third run must succeed");
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM _sqlx_migrations").await, before);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 1);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales_credit_memos").await, 0);
+    assert_eq!(
+        db.scalar_string("SELECT value FROM app_settings WHERE key = 'next_credit_memo_number'")
+            .await,
+        "1",
+        "re-running must not reset a sequence a shop has already used"
+    );
+}
+
+/// And re-running after a return has posted must not reset the sequence —
+/// `INSERT OR IGNORE` is what makes that true, and it is worth stating because
+/// an `INSERT OR REPLACE` here would silently renumber a shop's credit memos.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn re_running_migration_011_leaves_a_used_sequence_alone() {
+    let db = TempDb::new().await;
+    db.exec("UPDATE app_settings SET value = '47' WHERE key = 'next_credit_memo_number'")
+        .await;
+    db.migrate_again().await.expect("re-running must succeed");
+    assert_eq!(
+        db.scalar_string("SELECT value FROM app_settings WHERE key = 'next_credit_memo_number'")
+            .await,
+        "47"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v10_upgrade_converges_on_the_same_schema_as_a_fresh_install() {
+    let fresh = TempDb::new().await;
+    let upgraded = pre_wp06_database().await;
+    upgraded.migrate_again().await.expect("migration 011 must apply");
+
+    let schema_sql = "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+                      (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        fresh.scalar_string(schema_sql).await,
+        upgraded.scalar_string(schema_sql).await,
+        "a fresh database and an upgraded one must carry identical schema"
+    );
+
+    for db in [&fresh, &upgraded] {
+        for (kind, name) in [
+            ("table", "sales_credit_memos"),
+            ("table", "sales_credit_memo_lines"),
+            ("table", "sales_credit_memo_refunds"),
+            ("index", "idx_credit_memos_original"),
+            ("index", "idx_credit_memo_lines_orig_item"),
+            ("index", "idx_inv_mov_credit_memo"),
+            ("trigger", "trg_credit_memos_no_update_after_post"),
+            ("trigger", "trg_credit_memos_no_delete_after_post"),
+            ("trigger", "trg_credit_memo_lines_no_insert_after_post"),
+            ("trigger", "trg_credit_memo_refunds_no_insert_after_post"),
+            ("trigger", "trg_credit_memo_lines_no_update_after_post"),
+            ("trigger", "trg_credit_memo_lines_no_delete_after_post"),
+            ("trigger", "trg_credit_memo_refunds_no_update_after_post"),
+            ("trigger", "trg_credit_memo_refunds_no_delete_after_post"),
+            ("trigger", "trg_credit_memo_lines_no_over_return"),
+        ] {
+            assert_eq!(
+                db.count(&format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='{kind}' AND name='{name}'"
+                ))
+                .await,
+                1,
+                "`{name}` must exist on both paths"
+            );
+        }
+        for column in ["related_credit_memo_id", "related_credit_memo_line_id"] {
+            assert_eq!(
+                db.count(&format!(
+                    "SELECT COUNT(*) FROM pragma_table_info('inventory_movements')
+                      WHERE name='{column}'"
+                ))
+                .await,
+                1,
+                "`inventory_movements.{column}` must exist on both paths"
+            );
+        }
+        assert_eq!(
+            db.count(
+                "SELECT COUNT(*) FROM app_settings WHERE key = 'next_credit_memo_number'"
+            )
+            .await,
+            1,
+            "the credit-memo sequence must exist on both paths"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_011_does_not_disturb_the_earlier_guards() {
+    // 011 adds triggers of its own and lifts none — unlike 008, which had to
+    // drop and recreate three to backfill. Every guard migrations 001 through
+    // 010 put in place must still be in force, and must still bite.
+    let db = pre_wp06_database().await;
+    db.exec(&format!(
+        "INSERT INTO suppliers (id, store_id, name) VALUES ('sup-v10', '{STORE_ID}', 'Wholesale')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO purchases (
+           id, store_id, supplier_id, purchase_type, supplier_reference,
+           purchase_number, purchase_date, subtotal_excl_vat_cents, vat_total_cents,
+           total_incl_vat_cents, status, posted_at
+         ) VALUES ('pur-v10', '{STORE_ID}', 'sup-v10', 'normal', 'INV-7', 1, '2026-02-01',
+                   1000, 0, 1000, 'posted', '2026-02-01T10:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO supplier_ledger (
+           id, store_id, supplier_id, entry_type, amount_cents, entry_date,
+           related_purchase_id, posted_at
+         ) VALUES ('led-v10', '{STORE_ID}', 'sup-v10', 'purchase', 1000, '2026-02-01',
+                   'pur-v10', '2026-02-01T10:00:00.000Z')"
+    ))
+    .await;
+
+    db.migrate_again().await.expect("migration 011 must apply");
+
+    for trigger in [
+        // 001
+        "trg_sales_no_update_after_post",
+        "trg_sales_no_delete_after_post",
+        "trg_sale_items_no_update_after_post",
+        "trg_sale_payments_no_update_after_post",
+        "trg_inv_mov_no_update",
+        "trg_inv_mov_no_delete",
+        // 005 / 006
+        "trg_purchases_no_update_after_post",
+        "trg_purchase_items_no_update_after_post",
+        "trg_supplier_ledger_no_update",
+        "trg_supplier_ledger_no_delete",
+        // 009
+        "trg_shifts_no_update_after_close",
+        // 010
+        "trg_purchases_no_duplicate_supplier_invoice_ins",
+        "trg_purchases_no_duplicate_supplier_invoice_upd",
+        "trg_supplier_ledger_sign_discipline",
+    ] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='{trigger}'"
+            ))
+            .await,
+            1,
+            "`{trigger}` must be present after migration 011"
+        );
+    }
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+              AND name='ux_shifts_one_open_per_store'"
+        )
+        .await,
+        1,
+        "migration 009's partial unique index must survive"
+    );
+
+    // 001: a posted sale and its children stay immutable.
+    assert!(
+        db.try_exec(&format!(
+            "UPDATE sales SET total_incl_vat_cents = 1 WHERE id = '{RET_SALE}'"
+        ))
+        .await
+        .is_err(),
+        "a posted sale must stay immutable"
+    );
+    assert!(
+        db.try_exec("UPDATE inventory_movements SET quantity_delta = 1 WHERE id = 'mov-v10'")
+            .await
+            .is_err(),
+        "the movement ledger must stay append-only"
+    );
+    // 008: the backfilled cost columns and the triggers it restored still work.
+    assert!(
+        db.try_exec(&format!(
+            "UPDATE sale_items SET unit_cogs_excl_vat_microcents = 1 WHERE id = '{RET_SALE_ITEM}'"
+        ))
+        .await
+        .is_err(),
+        "a posted sale's cost snapshot must stay immutable"
+    );
+    // 009: a closed shift is final.
+    db.exec("UPDATE shifts SET status = 'closed', closed_at = '2026-03-01T18:00:00.000Z' WHERE id = 'shift-v10'")
+        .await;
+    assert!(
+        db.try_exec("UPDATE shifts SET closing_cash_usd_cents = 1 WHERE id = 'shift-v10'")
+            .await
+            .is_err(),
+        "a closed shift must stay immutable"
+    );
+    // 010: the duplicate-invoice rule and the ledger sign rule still bind.
+    assert!(
+        db.try_exec(&format!(
+            "INSERT INTO purchases (
+               id, store_id, supplier_id, purchase_type, supplier_reference,
+               purchase_number, purchase_date, status, posted_at
+             ) VALUES ('pur-dup', '{STORE_ID}', 'sup-v10', 'normal', ' inv-7 ',
+                       2, '2026-04-01', 'posted', '2026-04-01T10:00:00.000Z')"
+        ))
+        .await
+        .is_err(),
+        "one supplier invoice may still be posted only once"
+    );
+    assert!(
+        db.try_exec(&format!(
+            "INSERT INTO supplier_ledger (id, store_id, supplier_id, entry_type, amount_cents, entry_date)
+             VALUES ('led-bad', '{STORE_ID}', 'sup-v10', 'payment', 500, '2026-04-01')"
+        ))
+        .await
+        .is_err(),
+        "a payment must still be negative"
+    );
+    assert!(
+        db.try_exec("UPDATE supplier_ledger SET amount_cents = 1 WHERE id = 'led-v10'")
+            .await
+            .is_err(),
+        "a supplier-ledger entry must stay immutable"
     );
 }

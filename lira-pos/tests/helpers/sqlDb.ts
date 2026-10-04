@@ -520,3 +520,201 @@ export function insertSupplierPurchase(
   });
   return { purchaseId, ledgerEntryId };
 }
+
+// ============================================================================
+// Credit memos / sales returns (WP-06)
+// ============================================================================
+
+/**
+ * The `sale_items.id`s of one sale, in insertion order.
+ *
+ * `insertSale` mints them itself, exactly as `post_sale` does, so a return
+ * fixture has to read back the line it means to send back.
+ */
+export function saleItemIds(db: DatabaseSync, saleId: string): string[] {
+  const rows = db
+    .prepare("SELECT id FROM sale_items WHERE sale_id = ? ORDER BY rowid")
+    .all(saleId) as { id: string }[];
+  return rows.map((r) => r.id);
+}
+
+export interface CreditMemoLineFixture {
+  /** The `sale_items` row coming back. */
+  saleItemId: string;
+  productId: string;
+  productName?: string;
+  /** Base-unit quantity returned, as `quantity_base` stores it. */
+  quantityBase: number;
+  /** Prorated line figures, matching what `post_credit_memo` persists. */
+  subtotalExclVat: number;
+  vat: number;
+  totalInclVat: number;
+  lineDiscount?: number;
+  /** COGS actually reversed. Must be 0 when the line is not restocked. */
+  cogsReversed?: number;
+  /** Default true. False writes the goods off. */
+  returnToStock?: boolean;
+  /** True when the original sale line moved no stock. Forces no restock. */
+  isService?: boolean;
+  vatRateId?: string;
+  vatBps?: number;
+}
+
+export interface CreditMemoRefundFixture {
+  method: string;
+  currency: "USD" | "LBP";
+  nativeUsdCents?: number;
+  nativeLbp?: number;
+  usdEquivalent: number;
+}
+
+export interface CreditMemoFixture {
+  /** The sale this memo reverses. Its lines must belong to that sale. */
+  saleId: string;
+  postedAt: string;
+  shiftId?: string | null;
+  status?: "posted" | "voided";
+  reason?: string | null;
+  lines: CreditMemoLineFixture[];
+  refunds: CreditMemoRefundFixture[];
+}
+
+/**
+ * Insert a credit memo exactly as `post_credit_memo` would have persisted it.
+ *
+ * The header totals are SUMMED from the lines, and the refund total from the
+ * refunds, because that is what the command does — a fixture that stated them
+ * independently could hold a shape the real backend cannot produce.
+ *
+ * The memo is built as a DRAFT and promoted at the end, for the same reason the
+ * command does it that way: since migration 011 seals a posted memo completely,
+ * a posted header takes no child rows at all. A fixture that inserted a posted
+ * header first would be taking a shortcut the production code cannot take —
+ * which is exactly the shape of the defect the seal closes, so the harness is
+ * not allowed one either.
+ */
+export function insertCreditMemo(db: DatabaseSync, memo: CreditMemoFixture): string {
+  const memoId = id("memo");
+  const subtotal = memo.lines.reduce((s, l) => s + l.subtotalExclVat, 0);
+  const vat = memo.lines.reduce((s, l) => s + l.vat, 0);
+  const total = memo.lines.reduce((s, l) => s + l.totalInclVat, 0);
+  const discount = memo.lines.reduce((s, l) => s + (l.lineDiscount ?? 0), 0);
+  // Only RESTOCKED lines reverse cost, exactly as the command counts them: a
+  // written-off return gives the money back and leaves the cost consumed.
+  const cogsReversed = memo.lines.reduce((s, l) => {
+    const isService = l.isService ?? false;
+    const restock = isService ? false : (l.returnToStock ?? true);
+    return s + (restock ? (l.cogsReversed ?? 0) : 0);
+  }, 0);
+  const refundTotal = memo.refunds.reduce((s, r) => s + r.usdEquivalent, 0);
+
+  db.prepare(
+    `INSERT INTO sales_credit_memos (
+       id, store_id, original_sale_id, credit_memo_number,
+       shift_id, cashier_user_id,
+       exchange_rate_lbp_per_usd, exchange_rate_id, reason,
+       subtotal_excl_vat_cents, vat_total_cents, discount_cents, total_incl_vat_cents,
+       cogs_reversed_cents, refund_total_usd_cents,
+       status, posted_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    memoId,
+    STORE_ID,
+    memo.saleId,
+    nextCreditMemoNumber(db),
+    memo.shiftId ?? null,
+    USER_ID,
+    RATE_LBP_PER_USD,
+    RATE_ID,
+    memo.reason ?? null,
+    subtotal,
+    vat,
+    discount,
+    total,
+    cogsReversed,
+    refundTotal,
+    // Draft first: the children go in below, and the real status and
+    // `posted_at` are set once the document is complete.
+    "draft",
+    null,
+  );
+
+  for (const line of memo.lines) {
+    const isService = line.isService ?? false;
+    const restock = isService ? false : (line.returnToStock ?? true);
+    db.prepare(
+      `INSERT INTO sales_credit_memo_lines (
+         id, credit_memo_id, store_id, original_sale_item_id, product_id,
+         product_name_snapshot, vat_rate_id_snapshot, vat_rate_bps_snapshot,
+         quantity_base, quantity_in_uom, uom_code_snapshot,
+         factor_num_snapshot, factor_den_snapshot,
+         unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+         line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+         line_discount_cents,
+         unit_cogs_excl_vat_microcents, unit_cogs_excl_vat_cents,
+         line_cogs_excl_vat_cents,
+         is_service, return_to_stock
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id("memoline"),
+      memoId,
+      STORE_ID,
+      line.saleItemId,
+      line.productId,
+      line.productName ?? "Returned item",
+      line.vatRateId ?? VAT_STD_ID,
+      line.vatBps ?? VAT_STD_BPS,
+      line.quantityBase,
+      line.quantityBase,
+      Math.round(line.subtotalExclVat / line.quantityBase),
+      Math.round(line.totalInclVat / line.quantityBase),
+      line.subtotalExclVat,
+      line.vat,
+      line.totalInclVat,
+      line.lineDiscount ?? 0,
+      // Same pair the command maintains: a microcent RATE and its rounded
+      // cents mirror, derived from the line amount the test states.
+      Math.round(centsToMicrocents(line.cogsReversed ?? 0) / line.quantityBase),
+      microcentsToCents(
+        Math.round(centsToMicrocents(line.cogsReversed ?? 0) / line.quantityBase),
+      ),
+      restock ? (line.cogsReversed ?? 0) : 0,
+      isService ? 1 : 0,
+      restock ? 1 : 0,
+    );
+  }
+
+  for (const r of memo.refunds) {
+    db.prepare(
+      `INSERT INTO sales_credit_memo_refunds (
+         id, credit_memo_id, store_id, method, currency,
+         amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id("refund"),
+      memoId,
+      STORE_ID,
+      r.method,
+      r.currency,
+      r.nativeUsdCents ?? 0,
+      r.nativeLbp ?? 0,
+      r.usdEquivalent,
+    );
+  }
+
+  // Promote, exactly as the posting command's last statement does. From here
+  // the memo and its children are sealed.
+  db.prepare(
+    `UPDATE sales_credit_memos SET status = ?, posted_at = ?
+      WHERE id = ? AND status = 'draft'`,
+  ).run(memo.status ?? "posted", memo.postedAt, memoId);
+
+  return memoId;
+}
+
+function nextCreditMemoNumber(db: DatabaseSync): number {
+  const row = db
+    .prepare("SELECT COALESCE(MAX(credit_memo_number), 0) AS n FROM sales_credit_memos")
+    .get() as { n: number };
+  return row.n + 1;
+}

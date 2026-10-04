@@ -21,6 +21,7 @@ import {
   formatUnitCostUsd,
   microcentsToCents,
   newWeightedAvgMicrocents,
+  restockWeightedAvgMicrocents,
   unitCostInBaseToUomMicrocents,
   unitCostInUomToBaseMicrocents,
 } from "../../src/lib/cost";
@@ -316,5 +317,136 @@ describe("formatting a unit cost", () => {
 
   it("is presentation only and rejects a non-integer", () => {
     expect(() => formatUnitCostUsd(0.5)).toThrow();
+  });
+});
+
+// Mirrors `src-tauri/src/tests/cost.rs` › the `restock_weighted_avg` block.
+describe("restockWeightedAvgMicrocents (WP-06)", () => {
+  it("is an ordinary weighted average when the pool is sound", () => {
+    expect(
+      restockWeightedAvgMicrocents({
+        oldQty: 98,
+        oldAvgMicrocents: 200_000_000,
+        returnedQty: 2,
+        returnedCostMicrocents: 200_000_000,
+      }),
+    ).toBe(200_000_000);
+
+    expect(
+      restockWeightedAvgMicrocents({
+        oldQty: 100,
+        oldAvgMicrocents: 220_000_000,
+        returnedQty: 10,
+        returnedCostMicrocents: 200_000_000,
+      }),
+    ).toBe(218_181_818);
+
+    // It is not a second costing rule: the same inputs through the purchase
+    // side give the same answer.
+    expect(
+      restockWeightedAvgMicrocents({
+        oldQty: 100,
+        oldAvgMicrocents: 220_000_000,
+        returnedQty: 10,
+        returnedCostMicrocents: 200_000_000,
+      }),
+    ).toBe(
+      newWeightedAvgMicrocents({
+        oldQty: 100,
+        oldAvgMicrocents: 220_000_000,
+        newQty: 10,
+        newCostMicrocents: 200_000_000,
+      }),
+    );
+  });
+
+  it("takes the returned cost when everything had been sold", () => {
+    expect(
+      restockWeightedAvgMicrocents({
+        oldQty: 0,
+        oldAvgMicrocents: 999_999_999,
+        returnedQty: 5,
+        returnedCostMicrocents: 250_000,
+      }),
+    ).toBe(250_000);
+  });
+
+  it("forms no average when the pool is still short", () => {
+    // Dividing a value by a non-positive quantity is not a cost, so the caller
+    // adds the quantity and leaves the existing rate standing.
+    expect(
+      restockWeightedAvgMicrocents({
+        oldQty: -30,
+        oldAvgMicrocents: 200_000_000,
+        returnedQty: 10,
+        returnedCostMicrocents: 200_000_000,
+      }),
+    ).toBeNull();
+    expect(
+      restockWeightedAvgMicrocents({
+        oldQty: -10,
+        oldAvgMicrocents: 200_000_000,
+        returnedQty: 10,
+        returnedCostMicrocents: 200_000_000,
+      }),
+    ).toBeNull();
+    // One more unit and it is a pool again.
+    expect(
+      restockWeightedAvgMicrocents({
+        oldQty: -9,
+        oldAvgMicrocents: 200_000_000,
+        returnedQty: 10,
+        returnedCostMicrocents: 200_000_000,
+      }),
+    ).toBe(200_000_000);
+  });
+
+  it("forms no average that would value the pool below nothing", () => {
+    // Reachable only from a negative pool. `avg_cost_*` is CHECK (>= 0).
+    expect(
+      restockWeightedAvgMicrocents({
+        oldQty: -5,
+        oldAvgMicrocents: 1_000_000,
+        returnedQty: 10,
+        returnedCostMicrocents: 1_000,
+      }),
+    ).toBeNull();
+    for (const oldQty of [0, 1, 100]) {
+      expect(
+        restockWeightedAvgMicrocents({
+          oldQty,
+          oldAvgMicrocents: 0,
+          returnedQty: 1,
+          returnedCostMicrocents: 0,
+        }),
+      ).not.toBeNull();
+    }
+  });
+
+  it("refuses a nonsensical request rather than guessing", () => {
+    expect(() =>
+      restockWeightedAvgMicrocents({
+        oldQty: 10,
+        oldAvgMicrocents: 100,
+        returnedQty: 0,
+        returnedCostMicrocents: 100,
+      }),
+    ).toThrow();
+    expect(() =>
+      restockWeightedAvgMicrocents({
+        oldQty: 10,
+        oldAvgMicrocents: 100,
+        returnedQty: -1,
+        returnedCostMicrocents: 100,
+      }),
+    ).toThrow();
+    expect(() =>
+      restockWeightedAvgMicrocents({
+        oldQty: 10,
+        oldAvgMicrocents: 100,
+        returnedQty: 1,
+        returnedCostMicrocents: -1,
+      }),
+    ).toThrow();
   });
 });
