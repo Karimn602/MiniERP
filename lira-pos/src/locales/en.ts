@@ -106,7 +106,7 @@ const en = {
     postSale: "Post Sale",
     posting: "Posting…",
     noRateHint:
-      "No exchange rate is set for today. Set one in the Exchange Rate page to enable LBP payments.",
+      "No exchange rate is set. Set one in the Exchange Rate page before posting any sale.",
 
     printReceipt: "Print receipt",
     newSale: "New sale",
