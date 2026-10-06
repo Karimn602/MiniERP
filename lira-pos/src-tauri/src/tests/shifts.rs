@@ -322,19 +322,48 @@ async fn a_card_row_carrying_change_cannot_pull_the_drawer_down() {
     // EARLIER release can hold it, though, and such a row must not go on making
     // every close of that shift report a shortfall. The fixture inserts it
     // directly, exactly as the pre-WP-04 command would have.
+    // Built as a DRAFT and promoted, which is how such a row could actually
+    // have come to exist: the old command wrote the header and its payment rows
+    // in one transaction, so the legacy card row went in while the sale was
+    // still being constructed. Since migration 012 a posted sale takes no
+    // further payment rows, and that guard is not weakened for a fixture — the
+    // committed row state here is identical either way.
     let db = store_with_coffee().await;
     open_shift_with_pool(db.pool(), open_payload(SHIFT_A, 10_000, 0)).await.unwrap();
-    sell_for_cash_usd(&db, SHIFT_A, 2).await.unwrap(); // $10.00 cash in
 
-    let sale_id = db.scalar_string("SELECT id FROM sales LIMIT 1").await;
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, shift_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, exchange_rate_id,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+           discount_cents, cogs_total_cents, cogs_method, sale_type, status
+         ) VALUES ('legacy-sale', '{STORE_ID}', '{SHIFT_A}', '{USER_ID}', 1,
+                   {RATE_LBP_PER_USD}, '{RATE_ID}', 900, 100, 1000, 0, 0,
+                   'weighted_average', 'normal', 'draft')"
+    ))
+    .await;
     db.exec(&format!(
         "INSERT INTO sale_payments (
            id, sale_id, store_id, method, currency,
            amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent,
            change_given_usd_cents, change_given_lbp
-         ) VALUES ('legacy-card', '{sale_id}', '{STORE_ID}', 'card_usd', 'USD',
+         ) VALUES ('legacy-cash', 'legacy-sale', '{STORE_ID}', 'cash_usd', 'USD',
+                   1_000, 0, 1_000, 0, 0)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_payments (
+           id, sale_id, store_id, method, currency,
+           amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent,
+           change_given_usd_cents, change_given_lbp
+         ) VALUES ('legacy-card', 'legacy-sale', '{STORE_ID}', 'card_usd', 'USD',
                    5_000, 0, 5_000, 2_500, 0)"
     ))
+    .await;
+    db.exec(
+        "UPDATE sales SET status = 'posted', posted_at = '2026-03-01T10:00:00.000Z'
+          WHERE id = 'legacy-sale'",
+    )
     .await;
 
     let closed = close_shift_with_pool(db.pool(), close_payload(SHIFT_A, 11_000, 0))

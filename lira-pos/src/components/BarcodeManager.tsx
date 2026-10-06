@@ -77,7 +77,7 @@ export function BarcodeManager({
 
   async function handleRemove(barcodeId: string) {
     if (rows.length <= 1) return;
-    await barcodesRepo.remove(barcodeId);
+    await barcodesRepo.remove(productId, barcodeId);
     await reload();
     onChanged?.();
   }

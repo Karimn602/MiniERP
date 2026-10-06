@@ -115,7 +115,11 @@ export function ProductImportDialog({
           sku = await productsRepo.nextAutoSku(storeId);
         }
 
-        await productsRepo.create({
+        // One transaction per imported row: the product, its UoM rows and
+        // its barcode commit together, so a duplicate barcode half-way down a
+        // spreadsheet leaves no partially-created product behind (WP-07).
+        await productsRepo.save({
+          mode: "create",
           storeId,
           sku,
           name: row.name,
@@ -124,9 +128,6 @@ export function ProductImportDialog({
           vatPricingMode: "inclusive",
           priceExclVatCents: row.priceExclVatCents,
           priceInclVatCents: row.priceInclVatCents,
-          avgCostExclVatMicrocents: 0,
-          avgCostInclVatMicrocents: 0,
-          quantityOnHand: 0,
           reorderPoint: null,
           isService: row.isService,
           barcode: row.barcode ?? null,

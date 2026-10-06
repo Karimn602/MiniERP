@@ -2944,7 +2944,7 @@ async fn a_draft_line_cannot_be_reparented_into_a_posted_memo() {
         ))
         .await
         .expect_err("a posted memo must not grow a line by reparenting");
-    assert!(err.to_string().contains("posted credit memo"), "got: {err}");
+    assert!(err.to_string().contains("cannot be moved to another"), "got: {err}");
 
     assert_eq!(
         db.count(&format!(
@@ -2985,7 +2985,7 @@ async fn a_draft_refund_leg_cannot_be_reparented_into_a_posted_memo() {
         ))
         .await
         .expect_err("a posted memo must not grow a refund leg by reparenting");
-    assert!(err.to_string().contains("posted credit memo"), "got: {err}");
+    assert!(err.to_string().contains("cannot be moved to another"), "got: {err}");
 
     assert_eq!(
         db.scalar_i64(&format!(
@@ -3030,7 +3030,7 @@ async fn a_posted_memos_children_cannot_be_reparented_out_of_it() {
         ))
         .await
         .expect_err("a posted memo must not lose a line by reparenting");
-    assert!(err.to_string().contains("posted credit memo"), "got: {err}");
+    assert!(err.to_string().contains("cannot be moved to another"), "got: {err}");
 
     let err = db
         .try_exec(&format!(
@@ -3039,7 +3039,7 @@ async fn a_posted_memos_children_cannot_be_reparented_out_of_it() {
         ))
         .await
         .expect_err("a posted memo must not lose a refund leg by reparenting");
-    assert!(err.to_string().contains("posted credit memo"), "got: {err}");
+    assert!(err.to_string().contains("cannot be moved to another"), "got: {err}");
 
     // The posted document is untouched, and so is the draft.
     assert_eq!(
@@ -3066,74 +3066,85 @@ async fn a_posted_memos_children_cannot_be_reparented_out_of_it() {
     );
 }
 
-/// 5 and 6 — draft → draft stays allowed, deliberately.
+/// 5 and 6 — a child NEVER changes parent, draft or not.
 ///
-/// Nothing in production reparents anything; this is the behaviour the rule was
-/// scoped to LEAVE alone, so that `post_credit_memo`'s own draft construction —
-/// which UPDATEs each line to link its restock movement — is not disturbed. A
-/// draft is also unreadable by every report, every shift figure and every
-/// drawer calculation, all of which filter `status = 'posted'`, so nothing
-/// financial can observe one.
+/// WP-06 permitted draft → draft reparenting, on the argument that a draft is
+/// invisible to every read model. That argument was wrong, and this test is the
+/// inversion of the one that asserted it.
+///
+/// The two rules that give a memo line its meaning —
+/// `trg_credit_memo_lines_no_over_return` proving the line belongs to an item
+/// of the memo's OWN original sale, and that the quantity is still available —
+/// are checked on INSERT ONLY. So a line could be created under draft memo A,
+/// attached to the sale it really belongs to, and then moved under draft memo
+/// B, attached to a different sale entirely. Both inserts were valid; neither
+/// guard re-ran on the move. Promote B and it is a posted credit memo crediting
+/// a receipt that never sold the goods.
+///
+/// Production never reparents anything, so forbidding it outright gives nothing
+/// up and is cheaper than re-running those checks on UPDATE.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_draft_child_may_still_move_between_drafts() {
+async fn a_credit_memo_child_can_never_change_parent() {
     let db = shop().await;
-    let sale = sell_coffee_for_cash(&db, 4).await;
-    let item = sale_item_id(&db, &sale, P_COFFEE).await;
-    let (first, line, refund) = draft_memo_with_children(&db, "d", &sale, &item, 904).await;
-    let (second, _, _) = draft_memo_with_children(&db, "e", &sale, &item, 905).await;
+    let sale_a = sell_coffee_for_cash(&db, 4).await;
+    // A SECOND sale, so the move would smuggle the line onto a receipt that
+    // never sold the goods — the shape the INSERT-only guards cannot see.
+    let sale_b = sell_coffee_for_cash(&db, 4).await;
+    let item_a = sale_item_id(&db, &sale_a, P_COFFEE).await;
+    let item_b = sale_item_id(&db, &sale_b, P_COFFEE).await;
 
-    db.exec(&format!(
-        "UPDATE sales_credit_memo_lines SET credit_memo_id = '{second}' WHERE id = '{line}'"
-    ))
-    .await;
-    db.exec(&format!(
-        "UPDATE sales_credit_memo_refunds SET credit_memo_id = '{second}' WHERE id = '{refund}'"
-    ))
-    .await;
+    let (first, line, refund) = draft_memo_with_children(&db, "d", &sale_a, &item_a, 904).await;
+    let (second, _, _) = draft_memo_with_children(&db, "e", &sale_b, &item_b, 905).await;
 
-    assert_eq!(
-        db.count(&format!(
-            "SELECT COUNT(*) FROM sales_credit_memo_lines WHERE credit_memo_id = '{second}'"
+    let err = db
+        .try_exec(&format!(
+            "UPDATE sales_credit_memo_lines SET credit_memo_id = '{second}' WHERE id = '{line}'"
         ))
-        .await,
-        2
-    );
+        .await
+        .expect_err("a line cannot be moved to another memo, draft or not");
+    assert!(err.to_string().contains("cannot be moved to another"), "got: {err}");
+
+    let err = db
+        .try_exec(&format!(
+            "UPDATE sales_credit_memo_refunds SET credit_memo_id = '{second}' WHERE id = '{refund}'"
+        ))
+        .await
+        .expect_err("nor can a refund leg");
+    assert!(err.to_string().contains("cannot be moved to another"), "got: {err}");
+
+    // Both children are exactly where they were created.
     assert_eq!(
         db.count(&format!(
             "SELECT COUNT(*) FROM sales_credit_memo_lines WHERE credit_memo_id = '{first}'"
         ))
         .await,
-        0
+        1
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sales_credit_memo_lines WHERE credit_memo_id = '{second}'"
+        ))
+        .await,
+        1,
+        "the destination draft gained nothing"
     );
 
     // And the ordinary in-draft UPDATE the posting command itself performs —
-    // same parent, a different column — is untouched by the symmetric rule.
+    // SAME parent, a different column — is untouched by the rule.
     db.exec(&format!(
         "UPDATE sales_credit_memo_lines SET quantity_in_uom = 1 WHERE id = '{line}'"
     ))
     .await;
-
-    // Promote the destination; both are then sealed from either side.
     db.exec(&format!(
-        "UPDATE sales_credit_memos SET status = 'posted', posted_at = '2026-04-01T10:00:00.000Z'
-          WHERE id = '{second}'"
+        "UPDATE sales_credit_memo_lines SET related_movement_id = NULL WHERE id = '{line}'"
     ))
     .await;
-    assert!(
-        db.try_exec(&format!(
-            "UPDATE sales_credit_memo_lines SET credit_memo_id = '{first}' WHERE id = '{line}'"
-        ))
-        .await
-        .is_err(),
-        "once the destination posts, its children can no longer be moved out"
-    );
-    assert!(
-        db.try_exec(&format!(
-            "UPDATE sales_credit_memo_refunds SET credit_memo_id = '{first}' WHERE id = '{refund}'"
-        ))
-        .await
-        .is_err()
-    );
+    // Even restating the parent to its own current value is fine: the trigger
+    // fires on a CHANGE of parent, not on the column appearing in a SET list.
+    db.exec(&format!(
+        "UPDATE sales_credit_memo_lines SET credit_memo_id = '{first}' WHERE id = '{line}'"
+    ))
+    .await;
 }
 
 /// 7 — the one UPDATE production actually performs still works: the posting

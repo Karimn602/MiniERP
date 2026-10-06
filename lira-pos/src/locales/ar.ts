@@ -303,6 +303,9 @@ const ar: TranslationDict = {
     errReorderNegative: "نقطة إعادة الطلب لا يمكن أن تكون سالبة.",
     errUomFactor: "معامل وحدة القياس يجب أن يكون عدداً صحيحاً موجباً.",
     errSkuDuplicate: "رمز SKU موجود مسبقاً. استخدم رمزاً آخر أو اتركه فارغاً.",
+    errBarcodeDuplicate: "هذا الباركود مستخدم لمنتج آخر. لم يتم حفظ أي شيء.",
+    errStockedToService:
+      "لا يزال هذا المنتج يحتوي على {{qty}} في المخزون. قم بتسوية المخزون أولاً عبر تعديل المخزون، ثم حوّله إلى خدمة.",
     errMissingId: "معرّف المنتج مفقود.",
   },
   productImport: {

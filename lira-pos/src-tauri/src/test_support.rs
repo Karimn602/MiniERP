@@ -729,3 +729,24 @@ pub async fn returned_quantity(db: &TempDb, sale_item_id: &str) -> i64 {
     .try_get::<i64, _>(0)
     .expect("decode i64")
 }
+
+/// The application's migration list plus ONE extra migration appended after it.
+///
+/// For proving that a failing migration rolls back cleanly (WP-07). The real
+/// list is resolved exactly as `app_migrator` resolves it, so the extra one
+/// runs against a genuinely current database and through the same runner
+/// tauri-plugin-sql uses — `no_tx = false`, one transaction per migration.
+pub fn migrator_with_extra_migration(version: i64, description: &str, sql: &str) -> Migrator {
+    let mut list = to_sqlx_migrations(crate::migrations());
+    list.push(SqlxMigration::new(
+        version,
+        description.to_string().into(),
+        MigrationType::ReversibleUp,
+        sql.to_string().into(),
+        false,
+    ));
+    Migrator {
+        migrations: Cow::Owned(list),
+        ..Migrator::DEFAULT
+    }
+}

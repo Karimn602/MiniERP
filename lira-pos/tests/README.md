@@ -1,4 +1,4 @@
-# Greaz POS test harness (WP-01, extended by WP-02, WP-03, WP-04, WP-05 and WP-06)
+# Greaz POS test harness (WP-01, extended by WP-02 through WP-07)
 
 A financial regression suite. Its job is to make the later hardening work
 packages safe: if a change breaks how money, stock, or VAT are recorded, one of
@@ -28,7 +28,7 @@ so cargo cannot build on a tree that has never been built.
 |---|---|---|---|
 | **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, the fixed-point cost scale (`cost.test.ts`), sale/purchase line math, discount allocation, the credit-memo cumulative proration (`creditMemoMath.test.ts`); the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
 | **B. Rust units** | `src-tauri/src/tests/pure.rs`, `cost.rs` | The four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation, `prepare_purchase`'s derived line money, the purchase cost pair's VAT derivation, supplier-ledger sign authority; the whole `crate::cost` abstraction — scale, rounding, weighted average, overflow | Authoritative for pre-DB posting logic |
-| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, `post_credit_memo`, `open_shift`, `close_shift`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`), shift lifecycle and concurrency (`shifts.rs`), tender/change/rate authority (`tenders.rs`), purchase→AP reconciliation, duplicate invoices and purchase identity (`supplier_ap.rs`), supplier-payment sign/overpayment/identity (`supplier_payments.rs`), returns/credit memos end to end (`returns.rs`) | **Authoritative for the database and all posting behaviour** |
+| **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, `post_credit_memo`, `open_shift`, `close_shift`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`), shift lifecycle and concurrency (`shifts.rs`), tender/change/rate authority (`tenders.rs`), purchase→AP reconciliation, duplicate invoices and purchase identity (`supplier_ap.rs`), supplier-payment sign/overpayment/identity (`supplier_payments.rs`), returns/credit memos end to end (`returns.rs`), the inventory-adjustment trust boundary and posted-document sealing (`hardening.rs`), the transactional catalog seam (`catalog.rs`) | **Authoritative for the database and all posting behaviour** |
 | **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation, the supplier balance (`supplierLedger.test.ts`), the returns read models — return status, returnable quantity, refundable tender, the returns series in reports and the shift's refunds (`returns.test.ts`); the `invoke` wire format of the shift commands | Authoritative for read-model queries only |
 
 ### A note on what layer C2 is *not*
@@ -270,11 +270,26 @@ only makes the tests deterministic, it does not change the SQL.)
   reachable `voided` status while no command exists to write the compensating
   entries a void would need. The sale itself is never touched — return status is
   derived from the memo lines.
+- **An inventory adjustment is a UoM quantity the DATABASE converts** — since
+  WP-07. The product's own active `product_uoms` row is resolved by
+  `(product_id, store_id, uom_code, is_active)`, the base delta is derived from
+  ITS factor, the resolved factor is what the movement persists, and a payload
+  whose declared factor or base delta contradicts it is refused rather than
+  normalized. The negative-stock policy is measured on the derived delta, and
+  the movement is valued at the product's current microcent average without
+  moving it.
+- **A settled document takes no new children** — since WP-07 for sales and
+  purchases, WP-06 for credit memos. No child INSERT once the parent is posted,
+  no child UPDATE or DELETE, and no child reparented into or out of a posted
+  parent (the guards judge `OLD` and `NEW` parents alike). Every posting command
+  therefore builds a draft and promotes it last, which is the only shape in
+  which a parent-`posted_at` INSERT guard is expressible.
 - **Immutability** — posted sales, sale items, payments, purchases, purchase
   items, inventory movements, supplier-ledger entries and (since WP-06) posted
   credit memos with their lines and refunds reject UPDATE and DELETE; the one
   carve-out (posted → voided) still refuses to rewrite money. Since WP-04,
-  closed shifts too.
+  closed shifts too — and since WP-07 a closed shift cannot be DELETEd either,
+  which migration 009 left open.
 - **Migrations** — every migration applies to a virgin database, re-running is a
   no-op, and two independent databases end up with identical schema and
   checksums. Since WP-03 the UPGRADE path is covered too: migration 008 applies
@@ -790,6 +805,117 @@ That last point is a **UX gap, not a correctness gap**, and remains a later
 hardening item. The register's submission gate makes the interleaving
 unreachable from a single window, and the suite cannot reach it either: layer C
 uses `max_connections(1)` by design (see *Remaining gaps*).
+
+### Fixed by WP-07 — now enforced, must not regress
+
+| Area | Where the coverage lives | What is now enforced |
+|---|---|---|
+| Inventory-adjustment trust boundary | `hardening.rs` › adjustment block | `post_adjustment` resolves the product and its active `product_uoms` row server-side and derives the base delta from the DB factor. Refused: a declared base delta that contradicts the conversion (in either direction), a stale factor, another product's UoM, a retired UoM, an invented UoM, an unknown product, another store's product, a zero quantity in either field, and a line that disagrees with itself about direction. A bad second line rolls the whole adjustment back. The movement persists the RESOLVED factor and the product's current microcent average, which it does not move. |
+| Closed-shift deletion | `hardening.rs` › shift block | A closed shift cannot be deleted (`trg_shifts_no_delete_after_close`). An OPEN shift still can — it is not yet a financial record — and the open/close lifecycle is untouched. A shift with sales against it was already protected, by `ON DELETE RESTRICT` rather than by a trigger; both mechanisms are tested so they are not confused for one. |
+| Posted-sale sealing | `hardening.rs` › sales block | A posted sale cannot gain a line or a payment, and a child cannot be reparented into or out of one. Draft → draft stays allowed. `post_sale` now builds a draft and promotes it last, and that sequence is tested end to end — split tender with change, two lines, two movements, the shift — plus the fact that a FAILED sale leaves no draft and no consumed receipt number. |
+| Posted-purchase sealing | `hardening.rs` › purchases block | The same for `purchase_items`, including that the payable stays equal to the bill. `post_purchase` already built a draft, and its line→movement link UPDATE still runs. |
+| Supplier ledger | `hardening.rs` › `the_supplier_ledger_stays_append_only_and_still_takes_adjustments` | NO CHANGE was needed, and this says why: a liability can be neither modified, nor detached from its purchase, nor deleted, while signed `adjustment` and `opening_balance` entries still post because WP-05's sign discipline is a BEFORE INSERT trigger. |
+| Database identity | `hardening.rs` › `the_production_database_has_one_canonical_name` | One canonical name, asserted against `posting.rs::PRODUCTION_DB_FILENAME` and against `src/db/client.ts`'s own string, with `lira-pos.db` proved absent from production code. |
+| Migration atomicity | `hardening.rs` › `a_failing_migration_rolls_back_and_leaves_the_schema_untouched` | A migration whose second statement fails leaves the schema byte for byte as it was, does not record itself as applied, and leaves the database usable. "The app will not open" is a recoverable morning; "the app opens onto half a schema" is not. |
+| Adjustment net effect | `hardening.rs` › section 6 | The negative-stock policy is a decision about the DOCUMENT, applied once per product to its NET base delta. Two lines of −6 against 10 on hand are refused together although each passes alone; duplicate lines in different UoMs aggregate on their DERIVED base quantities; a positive and a negative line net out; products are judged independently of each other, and the refusal names the one at fault; a net that overflows `i64` is refused atomically. Each line still writes its own movement, so the trail records what was entered and still sums to the validated net. |
+| Credit-memo parent immutability | `returns.rs` › `a_credit_memo_child_can_never_change_parent` | A memo line or refund leg NEVER changes `credit_memo_id`, draft or not. WP-06 allowed draft → draft; that was wrong, because `trg_credit_memo_lines_no_over_return` checks on INSERT only — so a line created under a draft against its own sale could be moved under a draft against a DIFFERENT sale and promoted, crediting a receipt that never sold the goods. Same-parent UPDATEs, including restating the parent to its own value, still work. |
+| Catalog write atomicity | `catalog.rs` › sections 1–2 | A product, its UoM rows and its first barcode commit together or not at all (`catalog::save_product`). Proved by injecting a failure at each meaningful stage — duplicate SKU on the first statement, an unknown selling unit BETWEEN the two UoM inserts, a duplicate barcode on the last — and asserting the exact pre-operation state, including that the other product's primary barcode, demoted inside the transaction, comes back. An UPDATE's clear-then-set of the default sale UoM is one step, so a refusal cannot leave a product with no default sale UoM. The barcode commands are transactional for the same reason: demote-then-promote never leaves a product with barcodes and no primary, and removing a primary promotes the oldest survivor in the same transaction. |
+| Stock and cost are not metadata | `catalog.rs` › section 3 | A generic product edit writes NEITHER `quantity_on_hand` NOR the weighted average, in microcents or in the cents mirror — there is no field on the payload for either, so the authority is removed rather than merely unused. Turning a product holding stock into a service is REFUSED, reporting the quantity, and applies none of the edit; once the stock is written off through the adjustment flow, which records the movement, the same edit goes through. A service becoming stocked fabricates nothing. `SUM(quantity_delta)` still reconciles to `quantity_on_hand` across an edit. |
+| Migration 012 | `migrations.rs` › migration 012 block | Applies to a populated v11 database leaving every document untouched; idempotent through the real runner; converges on byte-identical schema with a fresh install — including the assertion that the three guards 012 DROPS and recreates carry the symmetric `NEW.`-aware form on both paths, which `CREATE TRIGGER IF NOT EXISTS` would otherwise have silently left one-sided on the upgrade path. |
+
+#### Why the catalog moved into Rust
+
+The same reason the posting commands did. A catalog save is a COMPOUND write —
+a `products` row, one or two `product_uoms` rows, sometimes a barcode, and on an
+update a clear-then-set of the default sale UoM — and it ran as separate
+`execute()` calls through tauri-plugin-sql, where there is no usable
+BEGIN/COMMIT across statements.
+
+What made it a correctness problem rather than an untidiness is that the
+half-states are UNLOADABLE. `productsRepo.enrich` refuses a product with no base
+UoM or no default sale UoM, and it refuses it while loading the LIST — so one
+product broken by a duplicate SKU takes the whole Products page down with it.
+The duplicate-barcode case was worse in practice: the product and its UoMs were
+already in, the operator saw "failed", retyped everything, and got a second
+product.
+
+`catalog.rs` is deliberately the smallest seam that fixes this: four commands
+(`save_product`, `add_product_barcode`, `set_primary_product_barcode`,
+`remove_product_barcode`), each one transaction. Reporting and read queries
+stayed in TypeScript, because a read has nothing to be atomic about.
+
+#### Why `post_sale` builds a draft now
+
+A parent-`posted_at` INSERT guard is only expressible if the parent is not yet
+posted while its children are written. `post_purchase` and `post_credit_memo`
+always inserted a draft header and promoted it last; `post_sale` wrote
+`status = 'posted'` in its first statement and then inserted lines, movements
+and payments — so the guard would have rejected every sale in the application.
+
+WP-07 changed the write ORDER inside the one transaction and nothing else. The
+draft exists only between two statements of a transaction no other connection
+can observe, the receipt number is still consumed exactly once before it, and a
+sale that fails still leaves nothing at all. The cost is that fixtures lose a
+shortcut production cannot take: `builders::seed_posted_sale_without_shift`,
+`sqlDb.ts::insertSale` and `sqlDb.ts::insertPurchase` all build drafts and
+promote them now, and `insertPurchase` takes its `lines` as an argument rather
+than having them attached afterwards. That is the same conclusion WP-06 reached
+for `insertCreditMemo`, and it is the right one: a harness that can reach a state
+the application cannot is a harness that stops testing the application.
+
+Two tests had to move rather than change:
+`the_sale_payment_currency_check_rejects_inconsistent_rows` now attaches its bad
+row to a DRAFT sale, because against a posted one the new trigger answers before
+the CHECK constraint and the test would be asserting the wrong guard; and
+`a_card_row_carrying_change_cannot_pull_the_drawer_down` builds its legacy
+card-with-change row inside a draft sale's construction, which is how a
+pre-WP-04 release would actually have left it.
+
+#### What WP-07 assessed and deliberately did not change
+
+- **SQLite runtime settings.** WAL is already on and persisted in the database
+  header (`ensureDbReady`). `foreign_keys` is ON for every connection on both
+  sides, not by luck: sqlx-sqlite sets it in its default pragma set, so the
+  explicit `PRAGMA` in `posting.rs::pool` is belt-and-braces rather than the
+  thing that makes it true. `busy_timeout`, `synchronous` and a startup
+  `integrity_check` were assessed and left at defaults — a single-terminal pilot
+  has no concurrent-writer contention to time out against, and SQLite's default
+  `synchronous = FULL` under WAL already survives a power cut.
+- **Integer range.** Every money, quantity, WAC and COGS calculation in the
+  posting commands already uses checked arithmetic or i128 intermediates, and
+  WP-07 added `checked_add` to the adjustment's resulting-stock figure while it
+  was rewriting it. The remaining theoretical boundary is migration 008's
+  `cents × 1,000,000` backfill, which would promote to REAL above roughly
+  `$92` billion per unit cost. That is economically absurd for a burger shop,
+  008 has already run on the pilot database, and detecting it would mean a
+  contrived constraint violation inside a migration. Documented as non-blocking
+  rather than engineered around.
+- **Interrupted operations.** All six write commands already open one
+  transaction and commit once, with their number sequences inside it, so
+  SQLite's rollback is the whole guarantee and no recovery machinery was
+  invented. Existing tests already pin it per command
+  (`a_rejected_return_consumes_no_credit_memo_number`,
+  `a_purchase_that_fails_mid_flight_leaves_no_debt_no_goods_and_no_number`,
+  `a_multi_line_adjustment_is_all_or_nothing`), and WP-07 added
+  `a_failed_sale_leaves_no_draft_and_no_receipt_number` for the one command
+  whose write order it changed.
+- **Automatic backup.** Assessed, not built. See `docs/BACKUP.md`.
+- **`sale_items` / `sale_payments` INSERT on migration 001.** The hole was
+  closed by migration 012 rather than by editing 001, which is shipped.
+
+#### The mutation checks WP-07 ran
+
+Each guard was temporarily removed, the suite was run, the named tests were
+confirmed to FAIL, and the code was restored. No mutation is in the tree.
+
+| Guard disabled | Tests that failed |
+|---|---|
+| the adjustment's base-delta authority (accept the client's figure) | `a_base_delta_that_contradicts_the_unit_quantity_is_refused`, `an_understated_base_delta_in_a_derived_uom_is_refused` |
+| `trg_shifts_no_delete_after_close` | `a_closed_shift_can_neither_be_rewritten_nor_deleted` |
+| the posted-sale child INSERT seals | `a_posted_sale_cannot_gain_a_line`, `a_posted_sale_cannot_gain_a_payment`, `migration_012_applies_to_a_populated_v11_database` |
+| the posted-purchase child INSERT seal | `a_posted_purchase_cannot_gain_or_lose_a_line`, `migration_012_applies_to_a_populated_v11_database` |
+| the sale children's reparenting symmetry (back to `OLD`-only) | `a_sale_child_cannot_be_reparented_into_or_out_of_a_posted_sale`, `a_v11_upgrade_converges_on_the_same_schema_as_a_fresh_install` |
+| the purchase children's reparenting symmetry | `a_purchase_line_cannot_be_reparented_into_or_out_of_a_posted_purchase` |
 
 ### Fixed by WP-06 — now enforced, must not regress
 

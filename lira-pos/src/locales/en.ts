@@ -298,6 +298,10 @@ const en = {
     errReorderNegative: "Reorder point cannot be negative.",
     errUomFactor: "UoM factor must be a positive whole number.",
     errSkuDuplicate: "SKU already exists. Use a different SKU or leave it blank.",
+    errBarcodeDuplicate:
+      "That barcode is already used by another product. Nothing was saved.",
+    errStockedToService:
+      "This product still has {{qty}} in stock. Write the stock off with an inventory adjustment first, then make it a service.",
     errMissingId: "Missing product id.",
   },
   productImport: {

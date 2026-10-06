@@ -20,7 +20,6 @@ import { setTestDb } from "../helpers/mockClient";
 import {
   createSqlTestDb,
   insertPurchase,
-  insertPurchaseItem,
   resetIds,
   seedProduct,
   seedProductCost,
@@ -92,29 +91,35 @@ describe("listForValuation", () => {
       quantityOnHand: 20_000,
       avgCostExclVatMicrocents: FLOUR_PER_GRAM,
     });
-    const older = insertPurchase(db, {
+    // Lines are passed to `insertPurchase` rather than attached afterwards:
+    // since migration 012 a posted purchase takes no further lines, so the
+    // fixture builds each document as a draft and promotes it, exactly as
+    // `post_purchase` does.
+    insertPurchase(db, {
       purchaseDate: "2026-03-01",
       subtotalExclVat: 5_000,
       vat: 550,
+      lines: [
+        {
+          productId: FLOUR,
+          productName: "Flour",
+          quantityBase: 20_000,
+          unitCostExclVatBaseMicrocents: FLOUR_PER_GRAM,
+        },
+      ],
     });
-    insertPurchaseItem(db, {
-      purchaseId: older,
-      productId: FLOUR,
-      productName: "Flour",
-      quantityBase: 20_000,
-      unitCostExclVatBaseMicrocents: FLOUR_PER_GRAM,
-    });
-    const newer = insertPurchase(db, {
+    insertPurchase(db, {
       purchaseDate: "2026-03-05",
       subtotalExclVat: 8_200,
       vat: 902,
-    });
-    insertPurchaseItem(db, {
-      purchaseId: newer,
-      productId: FLOUR,
-      productName: "Flour",
-      quantityBase: 20_000,
-      unitCostExclVatBaseMicrocents: 410_000, // $0.0041/g
+      lines: [
+        {
+          productId: FLOUR,
+          productName: "Flour",
+          quantityBase: 20_000,
+          unitCostExclVatBaseMicrocents: 410_000, // $0.0041/g
+        },
+      ],
     });
 
     const rows = await productsRepo.listForValuation(

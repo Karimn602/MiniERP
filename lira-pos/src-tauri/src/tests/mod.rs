@@ -9,8 +9,10 @@
 mod builders;
 
 mod adjustments;
+mod catalog;
 mod cost;
 mod cost_precision;
+mod hardening;
 mod immutability;
 mod known_defects;
 mod migrations;

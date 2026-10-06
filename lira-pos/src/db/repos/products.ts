@@ -1,4 +1,5 @@
-import { execute, query } from "../client";
+import { invoke } from "@tauri-apps/api/core";
+import { query } from "../client";
 import { newId } from "../../lib/ids";
 import { barcodesRepo } from "./barcodes";
 import type {
@@ -11,13 +12,50 @@ import type {
   BarcodeType,
 } from "../types";
 import type { Factor } from "../../lib/uom";
-import { microcentsToCents } from "../../lib/cost";
 
 export class DuplicateSkuError extends Error {
   constructor() {
     super("Duplicate SKU");
     this.name = "DuplicateSkuError";
   }
+}
+
+export class DuplicateBarcodeError extends Error {
+  constructor() {
+    super("Duplicate barcode");
+    this.name = "DuplicateBarcodeError";
+  }
+}
+
+/**
+ * Raised when a stocked product with stock on the shelf is being turned into a
+ * service. `quantityOnHand` is what the backend found.
+ *
+ * A metadata edit may not decide inventory (WP-07, GZ-HI-10): the operator
+ * writes the stock off through the inventory-adjustment flow, which records the
+ * movement, and only then reclassifies the product.
+ */
+export class StockedToServiceError extends Error {
+  readonly quantityOnHand: number;
+  constructor(quantityOnHand: number) {
+    super(`Product still holds ${quantityOnHand} in stock`);
+    this.name = "StockedToServiceError";
+    this.quantityOnHand = quantityOnHand;
+  }
+}
+
+/**
+ * Translate a `save_product` / barcode-command refusal into the typed errors
+ * the UI already branches on. The backend reports these by SENTINEL rather than
+ * by a driver message, so this never has to sniff SQLite error text.
+ */
+function translateCatalogError(e: unknown): never {
+  const message = e instanceof Error ? e.message : String(e);
+  if (message.includes("DUPLICATE_SKU")) throw new DuplicateSkuError();
+  if (message.includes("DUPLICATE_BARCODE")) throw new DuplicateBarcodeError();
+  const stocked = message.match(/STOCKED_TO_SERVICE_WITH_STOCK:(-?\d+)/);
+  if (stocked) throw new StockedToServiceError(Number(stocked[1]));
+  throw e instanceof Error ? e : new Error(message);
 }
 
 interface ProductRow {
@@ -72,66 +110,46 @@ type ProductListArgs = {
   limit?: number;
 };
 
-type ProductCreateArgs = {
+/**
+ * Everything a catalog save may write — and nothing else.
+ *
+ * NOTE WHAT IS ABSENT: `quantityOnHand` and the `avgCost*` fields. They used to
+ * be on both the create and the update DTO, and the generic `UPDATE products`
+ * wrote them, which is how ticking "service" on a product with ten units on the
+ * shelf destroyed ten units of stock with no `inventory_movements` row behind
+ * it (WP-07, GZ-HI-10). Stock and cost belong exclusively to the posting and
+ * adjustment commands, which always write a movement alongside them, so
+ * `SUM(inventory_movements.quantity_delta)` keeps reconciling to
+ * `products.quantity_on_hand`.
+ *
+ * The authority is REMOVED rather than merely unused: there is no field here to
+ * fill in, so no future caller can reintroduce it by accident.
+ */
+export type ProductSaveArgs = {
+  /** "create" mints a new product; "update" needs `productId`. */
+  mode: "create" | "update";
+  /** Required for an update. Ignored (a fresh id is minted) for a create. */
+  productId?: string;
   storeId: string;
   sku: string | null;
   name: string;
   description: string | null;
-  vatRateId: string;
+  vatRateId: VatPricingMode extends never ? never : string;
   vatPricingMode: VatPricingMode;
   priceExclVatCents: number;
   priceInclVatCents: number;
-  /**
-   * The product's weighted-average cost, as a rate in MICROCENTS. The repo
-   * derives the rounded `*_cents` mirror itself, so a caller cannot write an
-   * inconsistent pair or silently truncate a sub-cent cost (GP-A03).
-   */
-  avgCostExclVatMicrocents: number;
-  avgCostInclVatMicrocents: number;
-  quantityOnHand: number;
   reorderPoint: number | null;
   isService: boolean;
-  barcode?: string | null;
-  barcodeType?: BarcodeType | null;
+  /** Create defaults to active; an update states it. */
+  isActive?: boolean;
   baseUomCode: string;
   saleUomCode: string;
   saleFactor: Factor;
   salePriceExclVatCents: number | null;
   salePriceInclVatCents: number | null;
-};
-
-type ProductUpdateArgs = {
-  sku: string | null;
-  name: string;
-  description: string | null;
-  vatRateId: string;
-  vatPricingMode: VatPricingMode;
-  priceExclVatCents: number;
-  priceInclVatCents: number;
-  /** As in `ProductCreateArgs`: the rate in microcents, mirror derived here. */
-  avgCostExclVatMicrocents: number;
-  avgCostInclVatMicrocents: number;
-  quantityOnHand: number;
-  reorderPoint: number | null;
-  isService: boolean;
-  isActive: boolean;
-};
-
-type ProductAddUomArgs = {
-  productId: string;
-  uomCode: string;
-  factor: Factor;
-  isDefaultSale: boolean;
-  isDefaultPurchase: boolean;
-  salePriceExclVatCents: number | null;
-  salePriceInclVatCents: number | null;
-};
-
-type ProductUpdateUomArgs = {
-  factor: Factor;
-  isDefaultSale: boolean;
-  salePriceExclVatCents: number | null;
-  salePriceInclVatCents: number | null;
+  /** An optional first barcode. Create only. */
+  barcode?: string | null;
+  barcodeType?: BarcodeType | null;
 };
 
 function rowToProduct(r: ProductRow): Product {
@@ -182,14 +200,6 @@ function rowToVatRate(r: VatRateRow): VatRate {
     effectiveFrom: r.effective_from,
     effectiveTo: r.effective_to,
   };
-}
-
-function isDuplicateSkuError(e: unknown): boolean {
-  return (
-    e instanceof Error &&
-    e.message.includes("UNIQUE constraint failed") &&
-    e.message.includes("products")
-  );
 }
 
 async function enrich(p: Product): Promise<ProductWithUoms> {
@@ -367,247 +377,63 @@ export const productsRepo = {
     return `Item-${String(next).padStart(5, "0")}`;
   },
 
-  async create(args: ProductCreateArgs): Promise<ProductWithUoms> {
-    const productId = newId();
+  /**
+   * Create or edit a product, its unit-of-measure configuration and (on create)
+   * its first barcode — as ONE transaction.
+   *
+   * Transactional, in Rust (WP-07, GZ-HI-09). This used to be two to four
+   * separate `execute()` calls dispatched across tauri-plugin-sql's connection
+   * pool, where there is no usable BEGIN/COMMIT, so an ordinary duplicate SKU
+   * or duplicate barcode could leave a product with no base UoM or no default
+   * sale UoM — a catalog object `enrich` then REFUSES to load, which breaks the
+   * product list for everything else too. `save_product` commits all of it or
+   * none of it.
+   *
+   * Returns the saved product, read back after the commit, so the caller never
+   * has to reason about a partially-applied edit.
+   */
+  async save(args: ProductSaveArgs): Promise<ProductWithUoms> {
+    const productId =
+      args.mode === "create" ? newId() : (args.productId ?? "");
+    if (args.mode === "update" && !productId) {
+      throw new Error("An update needs a product id.");
+    }
 
     try {
-      await execute(
-        `INSERT INTO products (
-           id, store_id, sku, name, description,
-           vat_rate_id, vat_pricing_mode,
-           price_excl_vat_cents, price_incl_vat_cents,
-           avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
-           avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
-           quantity_on_hand, reorder_point,
-           is_active, is_service
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-        [
+      await invoke<{ productId: string }>("save_product", {
+        payload: {
           productId,
-          args.storeId,
-          args.sku,
-          args.name,
-          args.description,
-          args.vatRateId,
-          args.vatPricingMode,
-          args.priceExclVatCents,
-          args.priceInclVatCents,
-          args.avgCostExclVatMicrocents,
-          args.avgCostInclVatMicrocents,
-          microcentsToCents(args.avgCostExclVatMicrocents),
-          microcentsToCents(args.avgCostInclVatMicrocents),
-          args.quantityOnHand,
-          args.reorderPoint,
-          args.isService ? 1 : 0,
-        ],
-      );
-    } catch (e) {
-      if (isDuplicateSkuError(e)) throw new DuplicateSkuError();
-      throw e;
-    }
-
-    const baseUomId = newId();
-
-    if (args.baseUomCode === args.saleUomCode) {
-      await execute(
-        `INSERT INTO product_uoms (
-           id, store_id, product_id, uom_code, factor_num, factor_den,
-           is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
-           sale_price_excl_vat_cents, sale_price_incl_vat_cents
-         ) VALUES (?, ?, ?, ?, 1, 1, 1, 1, 1, 1, ?, ?)`,
-        [
-          baseUomId,
-          args.storeId,
-          productId,
-          args.baseUomCode,
-          args.salePriceExclVatCents,
-          args.salePriceInclVatCents,
-        ],
-      );
-    } else {
-      await execute(
-        `INSERT INTO product_uoms (
-           id, store_id, product_id, uom_code, factor_num, factor_den,
-           is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
-           sale_price_excl_vat_cents, sale_price_incl_vat_cents
-         ) VALUES (?, ?, ?, ?, 1, 1, 1, 0, 1, 1, NULL, NULL)`,
-        [baseUomId, args.storeId, productId, args.baseUomCode],
-      );
-
-      await execute(
-        `INSERT INTO product_uoms (
-           id, store_id, product_id, uom_code, factor_num, factor_den,
-           is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
-           sale_price_excl_vat_cents, sale_price_incl_vat_cents
-         ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, 0, 1, ?, ?)`,
-        [
-          newId(),
-          args.storeId,
-          productId,
-          args.saleUomCode,
-          args.saleFactor.num,
-          args.saleFactor.den,
-          args.salePriceExclVatCents,
-          args.salePriceInclVatCents,
-        ],
-      );
-    }
-
-    if (args.barcode) {
-      await barcodesRepo.addBarcode({
-        productId,
-        barcode: args.barcode,
-        barcodeType: args.barcodeType ?? undefined,
-        makePrimary: true,
+          storeId: args.storeId,
+          mode: args.mode,
+          sku: args.sku,
+          name: args.name,
+          description: args.description,
+          vatRateId: args.vatRateId,
+          vatPricingMode: args.vatPricingMode,
+          priceExclVatCents: args.priceExclVatCents,
+          priceInclVatCents: args.priceInclVatCents,
+          reorderPoint: args.reorderPoint,
+          isService: args.isService,
+          isActive: args.isActive ?? true,
+          baseUomCode: args.baseUomCode,
+          saleUomCode: args.saleUomCode,
+          saleFactorNum: args.saleFactor.num,
+          saleFactorDen: args.saleFactor.den,
+          salePriceExclVatCents: args.salePriceExclVatCents,
+          salePriceInclVatCents: args.salePriceInclVatCents,
+          barcode: args.mode === "create" ? (args.barcode ?? null) : null,
+          barcodeType: args.mode === "create" ? (args.barcodeType ?? null) : null,
+        },
       });
-    }
-
-    const created = await this.findByIdEnriched(productId);
-
-    if (!created) {
-      throw new Error("Product was created but could not be loaded.");
-    }
-
-    return created;
-  },
-
-  async update(id: string, args: ProductUpdateArgs): Promise<void> {
-    try {
-      await execute(
-        `UPDATE products
-            SET sku = ?,
-                name = ?,
-                description = ?,
-                vat_rate_id = ?,
-                vat_pricing_mode = ?,
-                price_excl_vat_cents = ?,
-                price_incl_vat_cents = ?,
-                avg_cost_excl_vat_microcents = ?,
-                avg_cost_incl_vat_microcents = ?,
-                avg_cost_excl_vat_cents = ?,
-                avg_cost_incl_vat_cents = ?,
-                quantity_on_hand = ?,
-                reorder_point = ?,
-                is_service = ?,
-                is_active = ?
-          WHERE id = ?`,
-        [
-          args.sku,
-          args.name,
-          args.description,
-          args.vatRateId,
-          args.vatPricingMode,
-          args.priceExclVatCents,
-          args.priceInclVatCents,
-          args.avgCostExclVatMicrocents,
-          args.avgCostInclVatMicrocents,
-          microcentsToCents(args.avgCostExclVatMicrocents),
-          microcentsToCents(args.avgCostInclVatMicrocents),
-          args.quantityOnHand,
-          args.reorderPoint,
-          args.isService ? 1 : 0,
-          args.isActive ? 1 : 0,
-          id,
-        ],
-      );
     } catch (e) {
-      if (isDuplicateSkuError(e)) throw new DuplicateSkuError();
-      throw e;
-    }
-  },
-
-  async addUom(args: ProductAddUomArgs): Promise<{ id: string }> {
-    const id = newId();
-
-    const productRows = await query<{ store_id: string }>(
-      `SELECT store_id FROM products WHERE id = ?`,
-      [args.productId],
-    );
-
-    const storeId = productRows[0]?.store_id;
-
-    if (!storeId) {
-      throw new Error("Product not found while adding UoM.");
+      translateCatalogError(e);
     }
 
-    if (args.isDefaultSale) {
-      await execute(
-        `UPDATE product_uoms
-         SET is_default_sale_uom = 0
-         WHERE product_id = ?`,
-        [args.productId],
-      );
+    const saved = await this.findByIdEnriched(productId);
+    if (!saved) {
+      throw new Error("Product was saved but could not be loaded.");
     }
-
-    if (args.isDefaultPurchase) {
-      await execute(
-        `UPDATE product_uoms
-         SET is_default_purchase_uom = 0
-         WHERE product_id = ?`,
-        [args.productId],
-      );
-    }
-
-    await execute(
-      `INSERT INTO product_uoms (
-         id, store_id, product_id, uom_code, factor_num, factor_den,
-         is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
-         sale_price_excl_vat_cents, sale_price_incl_vat_cents
-       ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 1, ?, ?)`,
-      [
-        id,
-        storeId,
-        args.productId,
-        args.uomCode,
-        args.factor.num,
-        args.factor.den,
-        args.isDefaultSale ? 1 : 0,
-        args.isDefaultPurchase ? 1 : 0,
-        args.salePriceExclVatCents,
-        args.salePriceInclVatCents,
-      ],
-    );
-
-    return { id };
-  },
-
-  async updateUom(id: string, args: ProductUpdateUomArgs): Promise<void> {
-    const rows = await query<{ product_id: string }>(
-      `SELECT product_id FROM product_uoms WHERE id = ?`,
-      [id],
-    );
-
-    const productId = rows[0]?.product_id;
-
-    if (!productId) {
-      throw new Error("Product UoM not found.");
-    }
-
-    if (args.isDefaultSale) {
-      await execute(
-        `UPDATE product_uoms
-         SET is_default_sale_uom = 0
-         WHERE product_id = ?`,
-        [productId],
-      );
-    }
-
-    await execute(
-      `UPDATE product_uoms
-          SET factor_num = ?,
-              factor_den = ?,
-              is_default_sale_uom = ?,
-              sale_price_excl_vat_cents = ?,
-              sale_price_incl_vat_cents = ?
-        WHERE id = ?`,
-      [
-        args.factor.num,
-        args.factor.den,
-        args.isDefaultSale ? 1 : 0,
-        args.salePriceExclVatCents,
-        args.salePriceInclVatCents,
-        id,
-      ],
-    );
+    return saved;
   },
 
   async listForValuation(storeId: string): Promise<InventoryValuationRow[]> {

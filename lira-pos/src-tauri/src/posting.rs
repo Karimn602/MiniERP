@@ -50,15 +50,39 @@ impl DbState {
     }
 }
 
+/// The file name of the one Greaz database. Named once, here, so the Rust pool
+/// and `src/db/client.ts`'s `sqlite:greaz-pos.db` cannot drift apart.
+pub(crate) const PRODUCTION_DB_FILENAME: &str = "greaz-pos.db";
+
+/// THE production database path — and it must be the SAME file the JavaScript
+/// side opens, which is the whole reason this function is not free to pick a
+/// directory it likes.
+///
+/// `src/db/client.ts` loads `sqlite:greaz-pos.db` through tauri-plugin-sql, and
+/// the plugin resolves a relative SQLite URL against `app_config_dir()`
+/// (`wrapper.rs::path_mapper`). This used to call `app_data_dir()` instead. On
+/// Windows those two resolve to the same folder — both are
+/// `%APPDATA%\<identifier>` — so the Greaz pilot has always opened one file and
+/// the mismatch never showed. On macOS and Linux they are DIFFERENT directories
+/// (`~/Library/Preferences` vs `~/Library/Application Support`;
+/// `~/.config` vs `~/.local/share`), and the app would have split in half: the
+/// migrations and every read would live in one database while every posting
+/// command wrote to another, so the UI would show an empty shop that
+/// nonetheless refused duplicate receipt numbers.
+///
+/// It is fixed here rather than left to luck. The plugin's choice is the one
+/// that has to be matched, because the plugin owns the migrations.
 fn resolve_db_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app
         .path()
-        .app_data_dir()
-        .map_err(|e| format!("cannot resolve app_data_dir: {e}"))?;
-    Ok(dir.join("greaz-pos.db"))
+        .app_config_dir()
+        .map_err(|e| format!("cannot resolve app_config_dir: {e}"))?;
+    Ok(dir.join(PRODUCTION_DB_FILENAME))
 }
 
-async fn pool(
+/// The one lazily-opened pool every transactional command shares — the posting
+/// commands here and the catalog commands in `crate::catalog`.
+pub(crate) async fn pool(
     app: &tauri::AppHandle,
     state: &State<'_, DbState>,
 ) -> Result<SqlitePool, String> {
@@ -1667,7 +1691,12 @@ pub(crate) async fn post_purchase_tx(
 // post_adjustment (unchanged from 2C)
 // ============================================================================
 
-/// Pure pre-DB validation for `post_adjustment`. Extracted verbatim (WP-01).
+/// Pure pre-DB validation for `post_adjustment`.
+///
+/// Shape only. Since WP-07 every quantity and every snapshot with a meaning is
+/// resolved from the database inside the transaction — see
+/// `post_adjustment_tx` — so what is left here is the checks that need no
+/// database at all, done before the pool is acquired.
 pub(crate) fn validate_adjustment_payload(payload: &PostAdjustmentPayload) -> Result<(), String> {
     if payload.lines.is_empty() {
         return Err("Adjustment must have at least one line.".into());
@@ -1676,11 +1705,31 @@ pub(crate) fn validate_adjustment_payload(payload: &PostAdjustmentPayload) -> Re
         return Err("Adjustment reason is required.".into());
     }
     for (i, line) in payload.lines.iter().enumerate() {
+        let n = i + 1;
         if line.quantity_base_signed == 0 {
-            return Err(format!("Line {} has zero delta — drop the line instead.", i + 1));
+            return Err(format!("Line {n} has zero delta — drop the line instead."));
+        }
+        // The quantity the manager actually typed, in the unit they chose. It
+        // is the authoritative input since WP-07, so a zero here is a line
+        // that adjusts nothing however large its declared base quantity is.
+        if line.quantity_in_uom_signed == 0 {
+            return Err(format!("Line {n} has zero quantity — drop the line instead."));
+        }
+        // The two must at least agree about which WAY the stock moves. A line
+        // reading "-3 boxes" alongside a +36 base delta is not a rounding
+        // disagreement the backend should resolve; it is a corrupt request.
+        if line.quantity_in_uom_signed.signum() != line.quantity_base_signed.signum() {
+            return Err(format!(
+                "Line {n} disagrees with itself about direction: {} in its unit of measure \
+                 against a base delta of {}.",
+                line.quantity_in_uom_signed, line.quantity_base_signed
+            ));
         }
         if line.factor_num_snapshot <= 0 || line.factor_den_snapshot <= 0 {
-            return Err(format!("Line {} has invalid UoM factor.", i + 1));
+            return Err(format!("Line {n} has invalid UoM factor."));
+        }
+        if line.uom_code_snapshot.trim().is_empty() {
+            return Err(format!("Line {n} does not name a unit of measure."));
         }
     }
     Ok(())
@@ -1708,7 +1757,58 @@ pub(crate) async fn post_adjustment_with_pool(
     post_adjustment_tx(pool, payload).await
 }
 
-/// The transactional body of `post_adjustment`, unchanged.
+/// One adjustment line after the database has had its say: the authoritative
+/// conversion, the authoritative base delta, and the cost it is valued at.
+struct ResolvedAdjustmentLine {
+    /// Carried so the second pass can aggregate by product without re-reading.
+    product_id: String,
+    /// `quantity_on_hand` as it stood BEFORE this document — the same value for
+    /// every line of the same product, which is the whole point.
+    opening_qoh: i64,
+    quantity_base_signed: i64,
+    factor_num: i64,
+    factor_den: i64,
+    avg_excl_mc: i64,
+    avg_incl_mc: i64,
+}
+
+/// The transactional body of `post_adjustment`.
+///
+/// THE DATABASE DECIDES THE CONVERSION, NOT THE PAYLOAD (WP-07).
+///
+/// The Inventory screen's adjustment is a UoM quantity, not a base-unit one: a
+/// manager picks a product, picks one of its `product_uoms` rows, types a whole
+/// number and a direction, and the page converts to base units with
+/// `lib/uom.ts::toBaseQty` (see `pages/Inventory.tsx::computeAdjLine`). So this
+/// command is the same shape as a sale line or a purchase line — and until
+/// WP-07 it was the one of the three that still believed the client.
+///
+/// It took `quantity_base_signed` straight from the payload and moved stock by
+/// it, and it persisted `uom_code_snapshot` and the factor pair verbatim with no
+/// check that the UoM existed, was active, or belonged to the product at all.
+/// Two consequences, both silent:
+///
+///   * A request could say "−1 each" and move 1,000 base units. The movement
+///     row then documents a correction nobody made, and `quantity_on_hand` is
+///     wrong in a way the audit trail actively denies — which is worse than
+///     being wrong, because reconciliation reports the trail as consistent.
+///   * A request could stamp a movement with a conversion that does not exist
+///     (another product's UoM, a retired one, a factor nobody sells in), so the
+///     stock delta and the cost metadata on one row described different
+///     transactions.
+///
+/// Now the product's own active `product_uoms` row is resolved by
+/// `(product_id, store_id, uom_code, is_active)` — `uom_code_snapshot` is the
+/// LOOKUP KEY and nothing more — the base delta is derived from ITS factor, and
+/// the resolved factor is what gets persisted. The client's `quantity_base_signed`
+/// and factor pair stay on the wire as cross-checks, and a payload that
+/// contradicts the product's own conversion is REFUSED rather than silently
+/// normalized: the manager counted stock against the unit they believed in, so
+/// posting a different quantity would record a correction they never made.
+///
+/// Everything is resolved for every line BEFORE the first write, so a malformed
+/// line 2 cannot leave line 1's stock movement behind — the same pre-pass shape
+/// `post_purchase` and `post_credit_memo` use.
 pub(crate) async fn post_adjustment_tx(
     pool: &SqlitePool,
     payload: PostAdjustmentPayload,
@@ -1718,46 +1818,182 @@ pub(crate) async fn post_adjustment_tx(
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
 
-    let mut movement_ids: Vec<String> = Vec::with_capacity(payload.lines.len());
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
 
-    for line in &payload.lines {
-        if line.quantity_base_signed < 0 {
-            let row = sqlx::query(
-                "SELECT quantity_on_hand FROM products WHERE id = ? AND store_id = ?",
-            )
-            .bind(&line.product_id)
-            .bind(&payload.store_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| format!("read product for adjustment: {e}"))?
-            .ok_or_else(|| format!("Product {} not found", line.product_id))?;
-            let qoh: i64 = row.try_get("quantity_on_hand").map_err(|e| format!("decode qoh: {e}"))?;
-            if qoh + line.quantity_base_signed < 0 {
-                return Err(format!(
-                    "Adjustment would drive stock negative for product {} (current {}, delta {}).",
-                    line.product_id, qoh, line.quantity_base_signed
-                ));
-            }
-        }
+    // ---- Resolve every line against the database before writing anything ----
+    let mut resolved: Vec<ResolvedAdjustmentLine> = Vec::with_capacity(payload.lines.len());
 
-        // An adjustment is valued at the product's CURRENT weighted-average
-        // cost, snapshotted at microcent precision so a sub-cent ingredient's
-        // write-off is not valued at zero.
-        let cost_row = sqlx::query(
-            "SELECT avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents
-             FROM products WHERE id = ? AND store_id = ?",
+    for (i, line) in payload.lines.iter().enumerate() {
+        let n = i + 1;
+
+        // The product, scoped to the store. Read once, for the stock guard and
+        // the cost snapshot together.
+        let product = sqlx::query(
+            "SELECT quantity_on_hand,
+                    avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents
+               FROM products WHERE id = ? AND store_id = ?",
         )
         .bind(&line.product_id)
         .bind(&payload.store_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| format!("read avg cost: {e}"))?;
-        let avg_excl_mc: i64 = cost_row
+        .map_err(|e| format!("read product {} for adjustment: {e}", line.product_id))?
+        .ok_or_else(|| {
+            format!(
+                "Line {n}: product {} not found in store {}.",
+                line.product_id, payload.store_id
+            )
+        })?;
+        let qoh: i64 = product.try_get("quantity_on_hand").map_err(d("quantity_on_hand"))?;
+        let avg_excl_mc: i64 = product
             .try_get("avg_cost_excl_vat_microcents")
-            .map_err(|e| format!("decode: {e}"))?;
-        let avg_incl_mc: i64 = cost_row
+            .map_err(d("avg_cost_excl_vat_microcents"))?;
+        let avg_incl_mc: i64 = product
             .try_get("avg_cost_incl_vat_microcents")
-            .map_err(|e| format!("decode: {e}"))?;
+            .map_err(d("avg_cost_incl_vat_microcents"))?;
+
+        // ---- The authoritative conversion (the GP-A02 rule, third command) ----
+        // Scoping by `product_id` is what makes another product's UoM
+        // unresolvable here, and `is_active = 1` is what makes a retired one
+        // unusable.
+        let uom_row = sqlx::query(
+            "SELECT factor_num, factor_den
+               FROM product_uoms
+              WHERE product_id = ? AND store_id = ? AND uom_code = ? AND is_active = 1",
+        )
+        .bind(&line.product_id)
+        .bind(&payload.store_id)
+        .bind(&line.uom_code_snapshot)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read product_uom for {}: {e}", line.product_id))?
+        .ok_or_else(|| {
+            format!(
+                "Line {n}: UoM \"{}\" is not an active unit of measure for product {}.",
+                line.uom_code_snapshot, line.product_id
+            )
+        })?;
+        let factor_num: i64 = uom_row.try_get("factor_num").map_err(d("factor_num"))?;
+        let factor_den: i64 = uom_row.try_get("factor_den").map_err(d("factor_den"))?;
+
+        if line.factor_num_snapshot != factor_num || line.factor_den_snapshot != factor_den {
+            return Err(format!(
+                "Line {n}: declared UoM factor {}/{} does not match the authoritative \
+                 conversion for \"{}\" ({}/{}).",
+                line.factor_num_snapshot,
+                line.factor_den_snapshot,
+                line.uom_code_snapshot,
+                factor_num,
+                factor_den
+            ));
+        }
+
+        // The magnitude converts; the direction is the manager's. Splitting them
+        // is what lets `derive_base_quantity` — the one conversion rule, shared
+        // with `post_sale` and `post_purchase` — be reused unchanged.
+        let magnitude = line
+            .quantity_in_uom_signed
+            .checked_abs()
+            .ok_or_else(|| format!("Line {n}: quantity is too large to post."))?;
+        let base_magnitude = derive_base_quantity(magnitude, factor_num, factor_den)
+            .map_err(|e| {
+                format!(
+                    "Line {n}: invalid quantity in UoM \"{}\" — {}.",
+                    line.uom_code_snapshot, e
+                )
+            })?;
+        let quantity_base_signed = if line.quantity_in_uom_signed < 0 {
+            -base_magnitude
+        } else {
+            base_magnitude
+        };
+
+        if line.quantity_base_signed != quantity_base_signed {
+            return Err(format!(
+                "Line {n}: declared base delta {} does not match the authoritative UoM \
+                 conversion ({} {} × {}/{} = {}).",
+                line.quantity_base_signed,
+                line.quantity_in_uom_signed,
+                line.uom_code_snapshot,
+                factor_num,
+                factor_den,
+                quantity_base_signed
+            ));
+        }
+
+        resolved.push(ResolvedAdjustmentLine {
+            product_id: line.product_id.clone(),
+            opening_qoh: qoh,
+            quantity_base_signed,
+            factor_num,
+            factor_den,
+            // An adjustment is valued at the product's CURRENT weighted-average
+            // cost, snapshotted at microcent precision so a sub-cent
+            // ingredient's write-off is not valued at zero. Read from the
+            // product row, never from the payload — the payload has no cost
+            // field at all, and this is what keeps it that way.
+            avg_excl_mc,
+            avg_incl_mc,
+        });
+    }
+
+    // ---- The negative-stock policy is a decision about the DOCUMENT ----
+    //
+    // It used to be taken per line, against `quantity_on_hand` as read for that
+    // line — and every line of the same product reads the SAME opening quantity,
+    // because nothing has been written yet. So two lines of −6 against an
+    // opening 10 each saw 10, each computed a resulting 4, and each passed; the
+    // document then committed a final quantity of −2 under a rule that forbids
+    // negative stock. The Inventory screen can produce duplicate product lines
+    // (it adds a line per pick, with no merge), so this was reachable by a
+    // manager counting the same item twice.
+    //
+    // The quantities are therefore aggregated BY PRODUCT first, and the policy
+    // is applied once per product to the document's NET effect. Each line still
+    // writes its own movement row — the audit trail records what the manager
+    // actually entered — and because the movements sum to the net delta that was
+    // validated, `SUM(quantity_delta)` still reconciles exactly to the resulting
+    // `quantity_on_hand`.
+    //
+    // A `Vec` rather than a map: an adjustment is a handful of lines typed by a
+    // human, and this matches how `post_credit_memo` groups its refund legs.
+    let mut net_by_product: Vec<(String, i64, i64)> = Vec::new();
+    for r in &resolved {
+        match net_by_product.iter_mut().find(|(id, _, _)| id == &r.product_id) {
+            Some(entry) => {
+                entry.2 = entry.2.checked_add(r.quantity_base_signed).ok_or_else(|| {
+                    format!("Adjustment totals overflow for product {}.", r.product_id)
+                })?;
+            }
+            None => net_by_product.push((
+                r.product_id.clone(),
+                r.opening_qoh,
+                r.quantity_base_signed,
+            )),
+        }
+    }
+
+    for (product_id, opening_qoh, net_delta) in &net_by_product {
+        // Checked, because the alternative is a silent wrap — and because
+        // SQLite turns an overflowed INTEGER into a REAL, which would make a
+        // quantity stop being a quantity.
+        let resulting = opening_qoh
+            .checked_add(*net_delta)
+            .ok_or_else(|| format!("Resulting stock is out of range for product {product_id}."))?;
+        if resulting < 0 {
+            return Err(format!(
+                "Adjustment would drive stock negative for product {product_id} \
+                 (current {opening_qoh}, net change {net_delta} across this document)."
+            ));
+        }
+    }
+
+    let mut movement_ids: Vec<String> = Vec::with_capacity(payload.lines.len());
+
+    for (i, line) in payload.lines.iter().enumerate() {
+        let r = &resolved[i];
+        let avg_excl_mc = r.avg_excl_mc;
+        let avg_incl_mc = r.avg_incl_mc;
 
         sqlx::query(
             r#"INSERT INTO inventory_movements (
@@ -1774,7 +2010,9 @@ pub(crate) async fn post_adjustment_tx(
         .bind(&line.movement_id)
         .bind(&payload.store_id)
         .bind(&line.product_id)
-        .bind(line.quantity_base_signed)
+        // The DERIVED delta, and the factor the DATABASE resolved. The movement
+        // row and the stock it moved therefore describe one conversion.
+        .bind(r.quantity_base_signed)
         .bind(microcents_to_cents(avg_excl_mc)?)
         .bind(microcents_to_cents(avg_incl_mc)?)
         .bind(avg_excl_mc)
@@ -1785,8 +2023,8 @@ pub(crate) async fn post_adjustment_tx(
         .bind(&now)
         .bind(line.quantity_in_uom_signed)
         .bind(&line.uom_code_snapshot)
-        .bind(line.factor_num_snapshot)
-        .bind(line.factor_den_snapshot)
+        .bind(r.factor_num)
+        .bind(r.factor_den)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert adjustment movement: {e}"))?;
@@ -1795,7 +2033,7 @@ pub(crate) async fn post_adjustment_tx(
             "UPDATE products SET quantity_on_hand = quantity_on_hand + ?
              WHERE id = ? AND store_id = ?",
         )
-        .bind(line.quantity_base_signed)
+        .bind(r.quantity_base_signed)
         .bind(&line.product_id)
         .bind(&payload.store_id)
         .execute(&mut *tx)
@@ -3409,7 +3647,7 @@ pub(crate) async fn post_sale_tx(
              subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
              discount_cents, cogs_total_cents, cogs_method,
              sale_type, status, posted_at, notes
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal', 'posted', ?, ?)"#,
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal', 'draft', NULL, ?)"#,
     )
     .bind(&payload.sale_id)
     .bind(&payload.store_id)
@@ -3425,7 +3663,6 @@ pub(crate) async fn post_sale_tx(
     .bind(payload.discount_cents)
     .bind(cogs_total)
     .bind(cogs_method)
-    .bind(&now)
     .bind(&payload.notes)
     .execute(&mut *tx)
     .await
@@ -3578,6 +3815,44 @@ pub(crate) async fn post_sale_tx(
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert sale_payment: {e}"))?;
+    }
+
+    // ---- Seal the sale: draft -> posted ----
+    //
+    // The header went in as a DRAFT and becomes posted only now, with every
+    // line, movement and payment already written. That ordering is what makes
+    // migration 012's `trg_sale_items_no_insert_after_post` and
+    // `trg_sale_payments_no_insert_after_post` expressible at all: they key on
+    // the parent's `posted_at`, so a posted sale can be refused another child
+    // precisely because its own children were written while it was still a
+    // draft. `post_purchase` and `post_credit_memo` have always been built this
+    // way; WP-07 brings `post_sale` into line with them.
+    //
+    // This changes write ORDER inside one transaction and nothing else. The
+    // draft exists only between two statements of a transaction no other
+    // connection can observe, the receipt number is still consumed exactly
+    // once above, `sales.status` has always allowed 'draft' (migration 001),
+    // and a sale that fails anywhere still leaves nothing behind.
+    //
+    // `AND status = 'draft'` makes the promotion idempotent-safe and keeps
+    // `trg_sales_no_update_after_post` out of it: that trigger fires only when
+    // `OLD.posted_at IS NOT NULL`, which a draft's never is.
+    let promoted = sqlx::query(
+        "UPDATE sales SET status = 'posted', posted_at = ?
+          WHERE id = ? AND store_id = ? AND status = 'draft'",
+    )
+    .bind(&now)
+    .bind(&payload.sale_id)
+    .bind(&payload.store_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("finalize sale posting: {e}"))?;
+    if promoted.rows_affected() != 1 {
+        return Err(format!(
+            "Sale {} could not be finalized — it is no longer the draft this \
+             transaction wrote.",
+            payload.sale_id
+        ));
     }
 
     // ---- The shift is still open, now that the sale is written (GZ-HI-03) ----

@@ -223,14 +223,30 @@ async fn the_supplier_ledger_is_append_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_sale_payment_currency_check_rejects_inconsistent_rows() {
     // Schema-level defence behind the command's own validation.
-    let (db, sale_id) = a_posted_sale().await;
+    //
+    // Attached to a DRAFT sale on purpose. Since migration 012 a POSTED sale
+    // refuses a new payment row outright, so against one of those the trigger
+    // would answer first and this test would be asserting the wrong guard. A
+    // draft is the only state in which the row gets far enough for the CHECK
+    // constraint to be what rejects it — which is the thing under test, and the
+    // state `post_sale` is in when it writes its real payment rows.
+    let (db, _) = a_posted_sale().await;
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, receipt_number, exchange_rate_lbp_per_usd,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+           cogs_method, sale_type, status
+         ) VALUES ('draft-sale', '{STORE_ID}', 9001, 89500, 0, 0, 0,
+                   'weighted_average', 'normal', 'draft')"
+    ))
+    .await;
 
     let err = db
         .try_exec(&format!(
             "INSERT INTO sale_payments
                (id, sale_id, store_id, method, currency,
                 amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent)
-             VALUES ('bad-1', '{sale_id}', '{STORE_ID}', 'cash_usd', 'USD', 0, 5000, 100)"
+             VALUES ('bad-1', 'draft-sale', '{STORE_ID}', 'cash_usd', 'USD', 0, 5000, 100)"
         ))
         .await
         .expect_err("a USD row carrying LBP must be rejected");

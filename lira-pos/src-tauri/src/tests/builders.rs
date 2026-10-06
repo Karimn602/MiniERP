@@ -338,6 +338,12 @@ pub fn clone_sale_payment(p: &PostSalePayment) -> PostSalePayment {
 /// COGS is left at zero: WP-02 deliberately excludes it from replay equality
 /// (it is re-read from product cost at post time), so it is not part of what
 /// this fixture has to reproduce.
+///
+/// It builds a DRAFT and promotes it at the end, because since migration 012 a
+/// posted sale takes no further children — so inserting a posted header and
+/// then its lines would be a shortcut the production command cannot take
+/// either. The committed row state is identical; only the order differs, which
+/// is exactly the order `post_sale` itself uses since WP-07.
 pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePayload) {
     let subtotal: i64 = payload.lines.iter().map(|l| l.line_subtotal_excl_vat_cents).sum();
     let vat_total: i64 = payload.lines.iter().map(|l| l.line_vat_cents).sum();
@@ -351,7 +357,7 @@ pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePaylo
            subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
            discount_cents, cogs_total_cents, cogs_method,
            sale_type, status, posted_at, notes
-         ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 'normal', 'posted', ?, ?)",
+         ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 'normal', 'draft', NULL, ?)",
     )
     .bind(&payload.sale_id)
     .bind(&payload.store_id)
@@ -364,7 +370,6 @@ pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePaylo
     .bind(total)
     .bind(payload.discount_cents)
     .bind(&payload.cogs_method)
-    .bind(posted_at)
     .bind(&payload.notes)
     .execute(db.pool())
     .await
@@ -475,6 +480,14 @@ pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePaylo
         .await
         .expect("seed historical sale payment");
     }
+
+    // Seal it, exactly as `post_sale`'s last statement does.
+    sqlx::query("UPDATE sales SET status = 'posted', posted_at = ? WHERE id = ?")
+        .bind(posted_at)
+        .bind(&payload.sale_id)
+        .execute(db.pool())
+        .await
+        .expect("promote the historical sale");
 
     // The sequence has been consumed by receipt #1, as it would have been.
     sqlx::query("UPDATE app_settings SET value = '2' WHERE key = 'next_receipt_number'")
@@ -1016,4 +1029,63 @@ pub fn clone_credit_memo_refund(r: &PostCreditMemoRefund) -> PostCreditMemoRefun
         amount_usd_cents_equivalent: r.amount_usd_cents_equivalent,
         reference: r.reference.clone(),
     }
+}
+
+// ============================================================================
+// Adjustment — UoM variants (WP-07)
+// ============================================================================
+
+/// An adjustment of `qty_in_uom_signed` in a NON-BASE unit of measure, with
+/// the base delta derived the way `pages/Inventory.tsx::computeAdjLine` derives
+/// it: `round(|qty| × num ÷ den)`, carrying the caller's sign.
+///
+/// Since WP-07 the backend resolves the product's own active `product_uoms`
+/// row and derives the base delta from ITS factor, so a fixture that rounded
+/// its own way would look like a crafted request rather than a legitimate
+/// stock correction.
+pub fn adjustment_line_in_uom(
+    product_id: &str,
+    uom_code: &str,
+    num: i64,
+    den: i64,
+    qty_in_uom_signed: i64,
+) -> PostAdjustmentLine {
+    let magnitude = qty_in_uom_signed.abs();
+    let base_magnitude = base_qty(magnitude, num, den);
+    PostAdjustmentLine {
+        movement_id: uuid(),
+        product_id: product_id.to_string(),
+        uom_code_snapshot: uom_code.to_string(),
+        factor_num_snapshot: num,
+        factor_den_snapshot: den,
+        quantity_in_uom_signed: qty_in_uom_signed,
+        quantity_base_signed: if qty_in_uom_signed < 0 {
+            -base_magnitude
+        } else {
+            base_magnitude
+        },
+    }
+}
+
+/// Override an adjustment line's declared factor, leaving everything else
+/// alone — a stale cart, an edited UoM, a hand-rolled integration.
+pub fn with_raw_factor(mut line: PostAdjustmentLine, num: i64, den: i64) -> PostAdjustmentLine {
+    line.factor_num_snapshot = num;
+    line.factor_den_snapshot = den;
+    line
+}
+
+/// Override an adjustment line's declared BASE delta independently of its
+/// unit-of-measure quantity. This is the crafted request WP-07 exists for:
+/// "−1 each" on the movement row, a far larger delta against the stock.
+pub fn with_raw_base(mut line: PostAdjustmentLine, base_signed: i64) -> PostAdjustmentLine {
+    line.quantity_base_signed = base_signed;
+    line
+}
+
+/// Override the UoM code an adjustment line names, so a test can borrow
+/// another product's unit or a retired one.
+pub fn with_raw_uom_code(mut line: PostAdjustmentLine, uom_code: &str) -> PostAdjustmentLine {
+    line.uom_code_snapshot = uom_code.to_string();
+    line
 }

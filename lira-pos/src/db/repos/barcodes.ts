@@ -1,8 +1,7 @@
-import { execute, query } from "../client";
-import { newId } from "../../lib/ids";
+import { invoke } from "@tauri-apps/api/core";
+import { query } from "../client";
 import {
   normalizeBarcode,
-  classifyBarcode,
   type BarcodeType,
 } from "../../lib/barcode";
 import type { ProductBarcode } from "../types";
@@ -78,173 +77,64 @@ export const barcodesRepo = {
     return rows[0] ? toDomain(rows[0]) : null;
   },
 
-  async add(args: {
-    storeId: string;
-    productId: string;
-    barcode: string;
-    barcodeType: BarcodeType;
-    isPrimary: boolean;
-    productUomId?: string | null;
-  }): Promise<{ id: string }> {
-    const id = newId();
-    const lookup = normalizeBarcode(args.barcode);
-
-    if (args.isPrimary) {
-      await execute(
-        `UPDATE product_barcodes
-         SET is_primary = 0
-         WHERE product_id = ?`,
-        [args.productId],
-      );
-    }
-
-    await execute(
-      `INSERT INTO product_barcodes
-         (id, store_id, product_id, barcode, lookup_value, barcode_type,
-          is_primary, is_active, product_uom_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-      [
-        id,
-        args.storeId,
-        args.productId,
-        args.barcode,
-        lookup,
-        args.barcodeType,
-        args.isPrimary ? 1 : 0,
-        args.productUomId ?? null,
-      ],
-    );
-
-    return { id };
-  },
-
+  /**
+   * Add a barcode to a product, promoting it to primary as one step.
+   *
+   * Transactional, in Rust (WP-07, GZ-HI-09). Promoting used to be "demote
+   * every current primary" followed by a separate INSERT, and the schema allows
+   * only one primary (`uq_product_barcodes_one_primary`) — so a duplicate
+   * barcode between those two statements left the product with barcodes and no
+   * primary, which means nothing to print on a label.
+   *
+   * `makePrimary` defaults to "yes if this is the product's first barcode",
+   * which is the rule this repo already had.
+   */
   async addBarcode(args: {
     productId: string;
     barcode: string;
     barcodeType?: BarcodeType | null;
     makePrimary?: boolean;
+    /** Accepted for call-site compatibility; the command does not set it. */
     productUomId?: string | null;
   }): Promise<{ id: string }> {
-    const productRows = await query<{ store_id: string }>(
-      `SELECT store_id FROM products WHERE id = ?`,
-      [args.productId],
-    );
-
-    const storeId = productRows[0]?.store_id;
-
-    if (!storeId) {
-      throw new Error(`Product not found: ${args.productId}`);
-    }
-
-    const activeRows = await query<{ n: number }>(
-      `SELECT COUNT(*) AS n
-       FROM product_barcodes
-       WHERE product_id = ? AND is_active = 1`,
-      [args.productId],
-    );
-
-    const isFirstBarcode = (activeRows[0]?.n ?? 0) === 0;
-    const shouldBePrimary = args.makePrimary ?? isFirstBarcode;
-
-    return this.add({
-      storeId,
-      productId: args.productId,
-      barcode: args.barcode,
-      barcodeType: args.barcodeType ?? classifyBarcode(args.barcode),
-      isPrimary: shouldBePrimary,
-      productUomId: args.productUomId ?? null,
+    return invoke<{ id: string }>("add_product_barcode", {
+      payload: {
+        productId: args.productId,
+        barcode: args.barcode,
+        barcodeType: args.barcodeType ?? null,
+        makePrimary: args.makePrimary ?? null,
+      },
     });
   },
 
+  /**
+   * Make one of a product's barcodes its primary.
+   *
+   * Transactional: demote-then-promote is one step, so a failure cannot leave
+   * the product with no primary at all.
+   */
   async setPrimary(productId: string, barcodeId: string): Promise<void> {
-    const rows = await query<{ id: string }>(
-      `SELECT id
-       FROM product_barcodes
-       WHERE id = ? AND product_id = ? AND is_active = 1`,
-      [barcodeId, productId],
-    );
-
-    if (!rows[0]) {
-      throw new Error("Barcode not found or inactive.");
-    }
-
-    await execute(
-      `UPDATE product_barcodes
-       SET is_primary = 0
-       WHERE product_id = ?`,
-      [productId],
-    );
-
-    await execute(
-      `UPDATE product_barcodes
-       SET is_primary = 1
-       WHERE id = ? AND product_id = ?`,
-      [barcodeId, productId],
-    );
+    return invoke("set_primary_product_barcode", {
+      payload: { productId, barcodeId },
+    });
   },
 
-  async remove(barcodeId: string): Promise<void> {
-    const rows = await query<{ product_id: string }>(
-      `SELECT product_id
-       FROM product_barcodes
-       WHERE id = ? AND is_active = 1`,
-      [barcodeId],
-    );
-
-    const productId = rows[0]?.product_id;
-
-    if (!productId) {
-      throw new Error("Barcode not found or already inactive.");
-    }
-
-    const countRows = await query<{ n: number }>(
-      `SELECT COUNT(*) AS n
-       FROM product_barcodes
-       WHERE product_id = ? AND is_active = 1`,
-      [productId],
-    );
-
-    if ((countRows[0]?.n ?? 0) <= 1) {
-      throw new Error("Cannot remove the last barcode.");
-    }
-
-    await execute(
-      `UPDATE product_barcodes
-       SET is_active = 0,
-           is_primary = 0
-       WHERE id = ?`,
-      [barcodeId],
-    );
-
-    const primaryRows = await query<{ n: number }>(
-      `SELECT COUNT(*) AS n
-       FROM product_barcodes
-       WHERE product_id = ? AND is_active = 1 AND is_primary = 1`,
-      [productId],
-    );
-
-    if ((primaryRows[0]?.n ?? 0) === 0) {
-      const nextRows = await query<{ id: string }>(
-        `SELECT id
-         FROM product_barcodes
-         WHERE product_id = ? AND is_active = 1
-         ORDER BY created_at ASC
-         LIMIT 1`,
-        [productId],
-      );
-
-      if (nextRows[0]) {
-        await execute(
-          `UPDATE product_barcodes
-           SET is_primary = 1
-           WHERE id = ?`,
-          [nextRows[0].id],
-        );
-      }
-    }
+  /**
+   * Deactivate a barcode and, if it was the primary, promote the oldest
+   * survivor — as one transaction, so a product never ends up with barcodes
+   * and no primary. The last barcode cannot be removed.
+   *
+   * Takes the product id as well as the barcode id because the command scopes
+   * every statement by both; the old signature derived the product with a
+   * separate read.
+   */
+  async remove(productId: string, barcodeId: string): Promise<void> {
+    return invoke("remove_product_barcode", {
+      payload: { productId, barcodeId },
+    });
   },
 
-  async deactivate(id: string): Promise<void> {
-    await this.remove(id);
+  async deactivate(productId: string, barcodeId: string): Promise<void> {
+    return this.remove(productId, barcodeId);
   },
 };

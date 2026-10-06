@@ -1492,3 +1492,319 @@ async fn migration_011_does_not_disturb_the_earlier_guards() {
         "a supplier-ledger entry must stay immutable"
     );
 }
+
+// ============================================================================
+// Migration 012 — database & inventory hardening (WP-07)
+// ============================================================================
+//
+// 012 adds one trigger and REPLACES three, which is the part worth testing:
+// `CREATE TRIGGER IF NOT EXISTS` would silently keep the weak one-sided
+// versions migrations 001/005/008 left behind, so 012 drops them first. A
+// convergence test is the only thing that proves the drop-and-recreate ran on
+// both paths into version 12.
+
+/// A v11 database holding a posted sale with a line and a tender, a posted
+/// purchase with a line and its supplier liability, and a closed shift — one of
+/// each thing 012 constrains, as an earlier release left them.
+async fn pre_wp07_database() -> TempDb {
+    let db = TempDb::at_schema_version(11).await;
+    db.exec(&format!(
+        "INSERT INTO exchange_rates (id, store_id, effective_date, rate_lbp_per_usd, source)
+         VALUES ('{RATE_ID}', '{STORE_ID}', '2026-01-01', 89500, 'manual')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents, quantity_on_hand
+         ) VALUES ('wp07-prod', '{STORE_ID}', 'SKU-W7', 'Burger', '{VAT_STD_ID}',
+                   'inclusive', 450, 500, 50)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO shifts (
+           id, store_id, opened_by_user_id, opened_at, closed_at, closed_by_user_id,
+           opening_cash_usd_cents, opening_cash_lbp,
+           closing_cash_usd_cents, expected_cash_usd_cents, variance_usd_cents, status
+         ) VALUES ('wp07-shift', '{STORE_ID}', '{USER_ID}', '2026-03-01T08:00:00.000Z',
+                   '2026-03-01T16:00:00.000Z', '{USER_ID}', 0, 0, 900, 1000, -100, 'closed')"
+    ))
+    .await;
+    // A posted sale, written the way a pre-WP-07 release wrote one: header
+    // posted outright, children after. That is precisely the shortcut 012
+    // closes, so the fixture has to take it BEFORE 012 applies.
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, shift_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, exchange_rate_id,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+           discount_cents, cogs_total_cents, cogs_method, sale_type, status, posted_at
+         ) VALUES ('wp07-sale', '{STORE_ID}', 'wp07-shift', '{USER_ID}', 1,
+                   89500, '{RATE_ID}', 450, 50, 500, 0, 0, 'weighted_average',
+                   'normal', 'posted', '2026-03-01T10:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_items (
+           id, sale_id, store_id, product_id, product_name_snapshot,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot, quantity,
+           unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+         ) VALUES ('wp07-item', 'wp07-sale', '{STORE_ID}', 'wp07-prod', 'Burger',
+                   '{VAT_STD_ID}', 1100, 1, 450, 500, 450, 50, 500)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_payments (
+           id, sale_id, store_id, method, currency,
+           amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent
+         ) VALUES ('wp07-pay', 'wp07-sale', '{STORE_ID}', 'cash_usd', 'USD', 500, 0, 500)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO suppliers (id, store_id, name)
+         VALUES ('wp07-sup', '{STORE_ID}', 'Wholesale')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO purchases (
+           id, store_id, supplier_id, purchase_type, purchase_number, purchase_date,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents, status, posted_at
+         ) VALUES ('wp07-pur', '{STORE_ID}', 'wp07-sup', 'normal', 1, '2026-02-01',
+                   1000, 110, 1110, 'posted', '2026-02-01T10:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO purchase_items (
+           id, purchase_id, store_id, product_id, product_name_snapshot,
+           uom_code_snapshot, factor_num_snapshot, factor_den_snapshot,
+           quantity_in_uom, quantity_base,
+           unit_cost_excl_vat_in_uom_cents, unit_cost_incl_vat_in_uom_cents,
+           unit_cost_excl_vat_base_cents, unit_cost_incl_vat_base_cents,
+           unit_cost_excl_vat_base_microcents, unit_cost_incl_vat_base_microcents,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+         ) VALUES ('wp07-pitem', 'wp07-pur', '{STORE_ID}', 'wp07-prod', 'Burger',
+                   'each', 1, 1, 5, 5, 200, 222, 200, 222, 200000000, 222000000,
+                   '{VAT_STD_ID}', 1100, 1000, 110, 1110)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO supplier_ledger (
+           id, store_id, supplier_id, entry_type, amount_cents, entry_date,
+           related_purchase_id, posted_at
+         ) VALUES ('wp07-led', '{STORE_ID}', 'wp07-sup', 'purchase', 1110, '2026-02-01',
+                   'wp07-pur', '2026-02-01T10:00:00.000Z')"
+    ))
+    .await;
+    db
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_012_applies_to_a_populated_v11_database() {
+    let db = pre_wp07_database().await;
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 11);
+
+    db.migrate_again()
+        .await
+        .expect("migration 012 must apply to a populated v11 database");
+
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
+
+    // Every document survives untouched — 012 backfills nothing and rewrites
+    // nothing; it constrains writes from here on.
+    assert_eq!(db.count("SELECT COUNT(*) FROM sale_items").await, 1);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sale_payments").await, 1);
+    assert_eq!(db.count("SELECT COUNT(*) FROM purchase_items").await, 1);
+    assert_eq!(db.scalar_i64("SELECT amount_cents FROM supplier_ledger").await, 1_110);
+    assert_eq!(
+        db.scalar_i64("SELECT variance_usd_cents FROM shifts WHERE id = 'wp07-shift'").await,
+        -100,
+        "the closed shift's reconciliation is exactly as it was counted"
+    );
+
+    // And the rules now bind. Every one of these was possible on v11.
+    assert!(
+        db.try_exec("DELETE FROM shifts WHERE id = 'wp07-shift'").await.is_err(),
+        "a closed shift can no longer be deleted"
+    );
+    assert!(
+        db.try_exec(&format!(
+            "INSERT INTO sale_items (
+               id, sale_id, store_id, product_id, product_name_snapshot,
+               vat_rate_id_snapshot, vat_rate_bps_snapshot, quantity,
+               unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+               line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+             ) VALUES ('late-item', 'wp07-sale', '{STORE_ID}', 'wp07-prod', 'Burger',
+                       '{VAT_STD_ID}', 1100, 1, 450, 500, 450, 50, 500)"
+        ))
+        .await
+        .is_err(),
+        "a posted sale can no longer gain a line"
+    );
+    assert!(
+        db.try_exec(&format!(
+            "INSERT INTO sale_payments (
+               id, sale_id, store_id, method, currency,
+               amount_native_usd_cents, amount_native_lbp, amount_usd_cents_equivalent
+             ) VALUES ('late-pay', 'wp07-sale', '{STORE_ID}', 'cash_usd', 'USD', 1, 0, 1)"
+        ))
+        .await
+        .is_err(),
+        "nor a payment"
+    );
+    assert!(
+        db.try_exec(&format!(
+            "INSERT INTO purchase_items (
+               id, purchase_id, store_id, product_id, product_name_snapshot,
+               uom_code_snapshot, factor_num_snapshot, factor_den_snapshot,
+               quantity_in_uom, quantity_base,
+               unit_cost_excl_vat_in_uom_cents, unit_cost_incl_vat_in_uom_cents,
+               unit_cost_excl_vat_base_cents, unit_cost_incl_vat_base_cents,
+               unit_cost_excl_vat_base_microcents, unit_cost_incl_vat_base_microcents,
+               vat_rate_id_snapshot, vat_rate_bps_snapshot,
+               line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+             ) VALUES ('late-pitem', 'wp07-pur', '{STORE_ID}', 'wp07-prod', 'Burger',
+                       'each', 1, 1, 1, 1, 200, 222, 200, 222, 200000000, 222000000,
+                       '{VAT_STD_ID}', 1100, 200, 22, 222)"
+        ))
+        .await
+        .is_err(),
+        "and a posted purchase can no longer gain a line"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_012_is_idempotent_through_the_real_runner() {
+    let db = pre_wp07_database().await;
+    db.migrate_again().await.expect("first run");
+    let before = db.count("SELECT COUNT(*) FROM _sqlx_migrations").await;
+
+    db.migrate_again().await.expect("second run must succeed");
+    db.migrate_again().await.expect("third run must succeed");
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM _sqlx_migrations").await, before);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sale_items").await, 1);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v11_upgrade_converges_on_the_same_schema_as_a_fresh_install() {
+    let fresh = TempDb::new().await;
+    let upgraded = pre_wp07_database().await;
+    upgraded.migrate_again().await.expect("migration 012 must apply");
+
+    let schema_sql = "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+                      (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        fresh.scalar_string(schema_sql).await,
+        upgraded.scalar_string(schema_sql).await,
+        "a fresh database and an upgraded one must carry identical schema"
+    );
+
+    for db in [&fresh, &upgraded] {
+        for trigger in [
+            "trg_shifts_no_delete_after_close",
+            "trg_sale_items_no_insert_after_post",
+            "trg_sale_payments_no_insert_after_post",
+            "trg_purchase_items_no_insert_after_post",
+        ] {
+            assert_eq!(
+                db.count(&format!(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='{trigger}'"
+                ))
+                .await,
+                1,
+                "`{trigger}` must exist on both paths"
+            );
+        }
+        // THE replacement check: the three guards 012 drops and recreates must
+        // carry the SYMMETRIC form on both paths. `CREATE TRIGGER IF NOT EXISTS`
+        // would have silently kept migration 001/005/008's one-sided version on
+        // the upgrade path, and only this assertion would notice.
+        for trigger in [
+            "trg_sale_items_no_update_after_post",
+            "trg_sale_payments_no_update_after_post",
+            "trg_purchase_items_no_update_after_post",
+        ] {
+            let sql = db
+                .scalar_string(&format!(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='{trigger}'"
+                ))
+                .await;
+            assert!(
+                sql.contains("NEW."),
+                "`{trigger}` must judge the NEW parent too, not just the old one: {sql}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_012_does_not_disturb_the_earlier_guards() {
+    let db = pre_wp07_database().await;
+    db.migrate_again().await.expect("migration 012 must apply");
+
+    for trigger in [
+        // 001
+        "trg_sales_no_update_after_post",
+        "trg_sales_no_delete_after_post",
+        "trg_sale_items_no_delete_after_post",
+        "trg_sale_payments_no_delete_after_post",
+        "trg_inv_mov_no_update",
+        "trg_inv_mov_no_delete",
+        // 005 / 006
+        "trg_purchases_no_update_after_post",
+        "trg_purchase_items_no_delete_after_post",
+        "trg_supplier_ledger_no_update",
+        "trg_supplier_ledger_no_delete",
+        // 009
+        "trg_shifts_no_update_after_close",
+        // 010
+        "trg_purchases_no_duplicate_supplier_invoice_ins",
+        "trg_supplier_ledger_sign_discipline",
+        // 011
+        "trg_credit_memos_no_update_after_post",
+        "trg_credit_memo_lines_no_insert_after_post",
+        "trg_credit_memo_lines_no_over_return",
+    ] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='{trigger}'"
+            ))
+            .await,
+            1,
+            "`{trigger}` must be present after migration 012"
+        );
+    }
+
+    // And they still bite.
+    assert!(
+        db.try_exec("UPDATE sales SET total_incl_vat_cents = 1 WHERE id = 'wp07-sale'")
+            .await
+            .is_err(),
+        "a posted sale must stay immutable"
+    );
+    assert!(
+        db.try_exec("UPDATE shifts SET closing_cash_usd_cents = 1 WHERE id = 'wp07-shift'")
+            .await
+            .is_err(),
+        "a closed shift must stay immutable"
+    );
+    assert!(
+        db.try_exec("DELETE FROM supplier_ledger WHERE id = 'wp07-led'").await.is_err(),
+        "the supplier ledger must stay undeletable"
+    );
+    assert!(
+        db.try_exec(&format!(
+            "INSERT INTO supplier_ledger (id, store_id, supplier_id, entry_type, amount_cents, entry_date)
+             VALUES ('bad', '{STORE_ID}', 'wp07-sup', 'payment', 500, '2026-04-01')"
+        ))
+        .await
+        .is_err(),
+        "a payment must still be negative"
+    );
+}

@@ -1,6 +1,7 @@
 // src-tauri/src/lib.rs
 use tauri_plugin_sql::{Migration, MigrationKind};
 
+mod catalog;
 mod cost;
 mod posting;
 use posting::DbState;
@@ -83,6 +84,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/011_sales_credit_memos.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 12,
+            description: "database_inventory_hardening",
+            sql: include_str!("../../src/db/migrations/012_database_inventory_hardening.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -105,6 +112,10 @@ pub fn run() {
             posting::post_credit_memo,
             posting::open_shift,
             posting::close_shift,
+            catalog::save_product,
+            catalog::add_product_barcode,
+            catalog::set_primary_product_barcode,
+            catalog::remove_product_barcode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

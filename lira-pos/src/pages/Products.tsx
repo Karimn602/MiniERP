@@ -1,7 +1,12 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import clsx from "clsx";
 import { useActiveContext } from "../state/activeContext";
-import { productsRepo, DuplicateSkuError } from "../db/repos/products";
+import {
+  productsRepo,
+  DuplicateSkuError,
+  DuplicateBarcodeError,
+  StockedToServiceError,
+} from "../db/repos/products";
 import { vatRatesRepo } from "../db/repos/vatRates";
 import { uomsRepo } from "../db/repos/uoms";
 import { ProductImportDialog } from "../components/ProductImportDialog";
@@ -321,15 +326,6 @@ export default function Products() {
       // mirror back and writing it would destroy a sub-cent cost (GP-A03) on
       // any unrelated edit, and the incl-VAT rate has to come from its own
       // field rather than be copied from the excl-VAT one.
-      const avgCostExclVatMicrocents =
-        form.mode === "edit" ? (selectedProduct?.avgCostExclVatMicrocents ?? 0) : 0;
-      const avgCostInclVatMicrocents =
-        form.mode === "edit" ? (selectedProduct?.avgCostInclVatMicrocents ?? 0) : 0;
-
-      const quantityOnHand = form.isService
-        ? 0
-        : (form.mode === "edit" ? (selectedProduct?.quantityOnHand ?? 0) : 0);
-
       const reorderPoint =
         form.reorderPointInput.trim() === ""
           ? null
@@ -361,8 +357,17 @@ export default function Products() {
               inclVatCents: salePriceOverrideIncl,
             };
 
+      // ONE call, ONE transaction. The product row, its unit-of-measure
+      // configuration and (on create) its first barcode commit together or not
+      // at all — previously this was two to four separate writes, and a
+      // duplicate SKU or barcode part-way through left a product the catalog
+      // could not load (WP-07, GZ-HI-09).
+      //
+      // Note what is no longer sent: stock and cost. A metadata edit may not
+      // write them (GZ-HI-10) and the payload has no field for them.
       if (form.mode === "new") {
-        await productsRepo.create({
+        await productsRepo.save({
+          mode: "create",
           storeId,
           sku,
           name,
@@ -371,9 +376,6 @@ export default function Products() {
           vatPricingMode: form.vatPricingMode,
           priceExclVatCents: price.exclVatCents,
           priceInclVatCents: price.inclVatCents,
-          avgCostExclVatMicrocents,
-          avgCostInclVatMicrocents,
-          quantityOnHand,
           reorderPoint,
           isService: form.isService,
           barcode: barcode || null,
@@ -389,7 +391,10 @@ export default function Products() {
       } else {
         if (!form.id) throw new Error(t("products.errMissingId"));
 
-        await productsRepo.update(form.id, {
+        await productsRepo.save({
+          mode: "update",
+          productId: form.id,
+          storeId,
           sku,
           name,
           description,
@@ -397,36 +402,15 @@ export default function Products() {
           vatPricingMode: form.vatPricingMode,
           priceExclVatCents: price.exclVatCents,
           priceInclVatCents: price.inclVatCents,
-          avgCostExclVatMicrocents,
-          avgCostInclVatMicrocents,
-          quantityOnHand,
           reorderPoint,
           isService: form.isService,
           isActive: form.isActive,
+          baseUomCode: form.baseUomCode,
+          saleUomCode: form.saleUomCode,
+          saleFactor: factor,
+          salePriceExclVatCents: salePriceOverride.exclVatCents,
+          salePriceInclVatCents: salePriceOverride.inclVatCents,
         });
-
-        const existingSaleUom = selectedProduct?.uoms.find(
-          (u) => u.uomCode === form.saleUomCode,
-        );
-
-        if (existingSaleUom) {
-          await productsRepo.updateUom(existingSaleUom.id, {
-            factor,
-            isDefaultSale: true,
-            salePriceExclVatCents: salePriceOverride.exclVatCents,
-            salePriceInclVatCents: salePriceOverride.inclVatCents,
-          });
-        } else {
-          await productsRepo.addUom({
-            productId: form.id,
-            uomCode: form.saleUomCode,
-            factor,
-            isDefaultSale: true,
-            isDefaultPurchase: false,
-            salePriceExclVatCents: salePriceOverride.exclVatCents,
-            salePriceInclVatCents: salePriceOverride.inclVatCents,
-          });
-        }
 
         setSaveOk(t("products.updatedOk"));
       }
@@ -437,6 +421,21 @@ export default function Products() {
         resetForm();
       }
     } catch (e) {
+      if (e instanceof StockedToServiceError) {
+        // Not a validation slip: the operator has stock to account for, and the
+        // inventory-adjustment flow is where that happens so a movement is
+        // recorded against it.
+        setSaveError(
+          t("products.errStockedToService", {
+            qty: String(e.quantityOnHand),
+          }),
+        );
+        return;
+      }
+      if (e instanceof DuplicateBarcodeError) {
+        setSaveError(t("products.errBarcodeDuplicate"));
+        return;
+      }
       if (e instanceof DuplicateSkuError) {
         setSaveError(t("products.errSkuDuplicate"));
       } else {

@@ -190,7 +190,15 @@ export interface SaleFixture {
   payments: PaymentFixture[];
 }
 
-/** Insert a sale exactly as `post_sale` would have persisted it. */
+/**
+ * Insert a sale exactly as `post_sale` would have persisted it.
+ *
+ * Built as a DRAFT and promoted at the end, because since migration 012 a
+ * POSTED sale takes no further children — so inserting a posted header and
+ * then its lines would be a shortcut the production command cannot take
+ * either. The committed row state is identical; only the order differs, which
+ * is exactly the order `post_sale` uses since WP-07.
+ */
 export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
   const saleId = id("sale");
   const subtotal = sale.lines.reduce((s, l) => s + l.subtotalExclVat, 0);
@@ -205,7 +213,7 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
        subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
        discount_cents, cogs_total_cents, cogs_method,
        sale_type, status, posted_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'weighted_average', 'normal', ?, ?)`,
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'weighted_average', 'normal', 'draft', NULL)`,
   ).run(
     saleId,
     STORE_ID,
@@ -219,8 +227,6 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
     total,
     sale.discountCents ?? 0,
     cogs,
-    sale.status ?? "posted",
-    sale.postedAt,
   );
 
   for (const line of sale.lines) {
@@ -281,6 +287,11 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
     );
   }
 
+  // Seal it, exactly as `post_sale`'s last statement does.
+  db.prepare(
+    `UPDATE sales SET status = ?, posted_at = ? WHERE id = ? AND status = 'draft'`,
+  ).run(sale.status ?? "posted", sale.postedAt, saleId);
+
   return saleId;
 }
 
@@ -291,6 +302,22 @@ function nextReceiptNumber(db: DatabaseSync): number {
   return row.n + 1;
 }
 
+export interface PurchaseItemFixture {
+  productId: string;
+  productName: string;
+  quantityBase: number;
+  unitCostExclVatBaseMicrocents: number;
+}
+
+/**
+ * Insert a purchase as `post_purchase` would have persisted it.
+ *
+ * Built as a DRAFT, its `lines` written, and promoted at the end — the order
+ * `post_purchase` itself uses, and the only order migration 012 permits: a
+ * POSTED purchase takes no further lines, so a fixture cannot insert a posted
+ * header and then add to it. Lines must therefore be passed in rather than
+ * attached afterwards.
+ */
 export function insertPurchase(
   db: DatabaseSync,
   opts: {
@@ -298,6 +325,7 @@ export function insertPurchase(
     subtotalExclVat: number;
     vat: number;
     status?: "posted" | "draft";
+    lines?: PurchaseItemFixture[];
   },
 ): string {
   const purchaseId = id("purchase");
@@ -318,8 +346,21 @@ export function insertPurchase(
     opts.subtotalExclVat,
     opts.vat,
     opts.subtotalExclVat + opts.vat,
+    "draft",
+    null,
+  );
+
+  for (const line of opts.lines ?? []) {
+    insertPurchaseItem(db, { purchaseId, ...line });
+  }
+
+  // Seal it, exactly as `post_purchase`'s last statement does.
+  db.prepare(
+    `UPDATE purchases SET status = ?, posted_at = ? WHERE id = ? AND status = 'draft'`,
+  ).run(
     opts.status ?? "posted",
     `${opts.purchaseDate}T10:00:00.000Z`,
+    purchaseId,
   );
   return purchaseId;
 }
