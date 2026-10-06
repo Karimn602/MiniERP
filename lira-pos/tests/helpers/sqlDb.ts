@@ -157,7 +157,15 @@ export function seedShift(
 
 export interface SaleLineFixture {
   productId: string;
+  /**
+   * The name and SKU as the RECEIPT recorded them, which is what
+   * `sale_items.product_*_snapshot` holds. A fixture may vary them between
+   * sales of one product to reproduce a rename or a re-SKU — the case that
+   * makes `reportsRepo.productSales` legitimately return several rows for one
+   * `product_id`.
+   */
   productName: string;
+  productSku?: string | null;
   /** Base-unit quantity, as `sale_items.quantity` stores it. */
   quantity: number;
   /** POST-discount line figures, matching what post_sale persists. */
@@ -233,20 +241,22 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
     db.prepare(
       `INSERT INTO sale_items (
          id, sale_id, store_id, product_id,
-         product_name_snapshot, vat_rate_id_snapshot, vat_rate_bps_snapshot,
+         product_name_snapshot, product_sku_snapshot,
+         vat_rate_id_snapshot, vat_rate_bps_snapshot,
          quantity, unit_price_excl_vat_cents, unit_price_incl_vat_cents,
          line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
          line_discount_cents,
          unit_cogs_excl_vat_cents, unit_cogs_excl_vat_microcents,
          line_cogs_excl_vat_cents,
          quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1)`,
     ).run(
       id("item"),
       saleId,
       STORE_ID,
       line.productId,
       line.productName,
+      line.productSku ?? null,
       line.vatRateId ?? VAT_STD_ID,
       line.vatBps ?? VAT_STD_BPS,
       line.quantity,
@@ -583,7 +593,9 @@ export interface CreditMemoLineFixture {
   /** The `sale_items` row coming back. */
   saleItemId: string;
   productId: string;
+  /** The memo line's own snapshots, which may differ from a later sale's. */
   productName?: string;
+  productSku?: string | null;
   /** Base-unit quantity returned, as `quantity_base` stores it. */
   quantityBase: number;
   /** Prorated line figures, matching what `post_credit_memo` persists. */
@@ -686,7 +698,8 @@ export function insertCreditMemo(db: DatabaseSync, memo: CreditMemoFixture): str
     db.prepare(
       `INSERT INTO sales_credit_memo_lines (
          id, credit_memo_id, store_id, original_sale_item_id, product_id,
-         product_name_snapshot, vat_rate_id_snapshot, vat_rate_bps_snapshot,
+         product_name_snapshot, product_sku_snapshot,
+         vat_rate_id_snapshot, vat_rate_bps_snapshot,
          quantity_base, quantity_in_uom, uom_code_snapshot,
          factor_num_snapshot, factor_den_snapshot,
          unit_price_excl_vat_cents, unit_price_incl_vat_cents,
@@ -695,7 +708,7 @@ export function insertCreditMemo(db: DatabaseSync, memo: CreditMemoFixture): str
          unit_cogs_excl_vat_microcents, unit_cogs_excl_vat_cents,
          line_cogs_excl_vat_cents,
          is_service, return_to_stock
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id("memoline"),
       memoId,
@@ -703,6 +716,7 @@ export function insertCreditMemo(db: DatabaseSync, memo: CreditMemoFixture): str
       line.saleItemId,
       line.productId,
       line.productName ?? "Returned item",
+      line.productSku ?? null,
       line.vatRateId ?? VAT_STD_ID,
       line.vatBps ?? VAT_STD_BPS,
       line.quantityBase,

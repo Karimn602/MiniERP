@@ -145,21 +145,21 @@ describe("getSalesSummary", () => {
   });
 
   // -------------------------------------------------------------------
-  // GP-A04 — report / shift discount double subtraction.  Owner: WP-08
+  // GP-A04 — report / shift discount double subtraction.  FIXED in WP-08.
   //
   // PosRegister sends POST-discount line values (see PosRegister.tsx, which
   // calls postDiscountLineTotals before building the payload), so
   // `sales.subtotal_excl_vat_cents` is ALREADY net of the discount.
   //
-  // shifts.ts:getSalesSummary and shiftSummary.ts:salesSummary both compute
+  // shifts.ts:getSalesSummary and shiftSummary.ts:salesSummary both computed
   //     netSalesExclVatCents = subtotal_excl_vat_cents - discount_cents
-  // which subtracts the same discount a second time. Net sales — and any
-  // margin derived from it — are understated by the discount amount.
+  // which subtracted the same discount a second time. Net sales — and any
+  // margin derived from it — were understated by the discount amount.
   //
-  // WP-08 owns the fix (either stop subtracting, or persist pre-discount
-  // line values). Enable both skipped tests then.
+  // Both now return the persisted subtotal unmodified. Restoring either
+  // subtraction must fail this test and its twin below.
   // -------------------------------------------------------------------
-  it.skip("GP-A04 (WP-08): does not subtract the discount twice", async () => {
+  it("GP-A04: does not subtract the discount twice", async () => {
     seedShift(db, { id: SHIFT_A });
     // A $10.00 cart discounted by $1.00: lines are persisted at $9.00.
     insertSale(db, {
@@ -183,9 +183,12 @@ describe("getSalesSummary", () => {
 
     const s = await shiftsRepo.getSalesSummary(SHIFT_A, STORE_ID);
     expect(s.subtotalExclVatCents).toBe(811);
-    expect(s.netSalesExclVatCents).toBe(
-      811, // today this returns 711 — the discount is removed twice
-    );
+    // 811, not 811 − 100 = 711. The discount is already out of the subtotal.
+    expect(s.netSalesExclVatCents).toBe(811);
+    // And it is still reportable on its own.
+    expect(s.discountCents).toBe(100);
+    // The header invariant the whole vocabulary rests on.
+    expect(s.subtotalExclVatCents + s.vatTotalCents).toBe(s.totalInclVatCents);
   });
 });
 
@@ -465,9 +468,9 @@ describe("shiftSummaryRepo (date-scoped day summary)", () => {
     expect(payments[0].amountUsdCentsEquivalent).toBe(2000);
   });
 
-  // GP-A04 (WP-08) — same defect as above, via the date-scoped summary.
-  // See the comment on the shiftsRepo test for the full explanation.
-  it.skip("GP-A04 (WP-08): does not subtract the discount twice", async () => {
+  // GP-A04 — same defect as above, via the date-scoped summary. FIXED in
+  // WP-08. See the comment on the shiftsRepo test for the full explanation.
+  it("GP-A04: does not subtract the discount twice", async () => {
     insertSale(db, {
       postedAt: "2026-03-01T09:00:00.000Z",
       discountCents: 100,
@@ -487,7 +490,13 @@ describe("shiftSummaryRepo (date-scoped day summary)", () => {
     });
 
     const summary = await shiftSummaryRepo.salesSummary({ storeId: STORE_ID, date: "2026-03-01" });
-    expect(summary.netSalesExclVatCents).toBe(811); // today: 711
+    expect(summary.subtotalExclVatCents).toBe(811);
+    // 811, not 811 − 100 = 711.
+    expect(summary.netSalesExclVatCents).toBe(811);
+    expect(summary.discountCents).toBe(100);
+    expect(summary.subtotalExclVatCents + summary.vatTotalCents).toBe(
+      summary.totalInclVatCents,
+    );
   });
 });
 

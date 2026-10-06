@@ -55,12 +55,33 @@ function toShift(r: ShiftRow): Shift {
 
 // ---------- Shift summary shapes ----------
 
+/**
+ * One shift's posted SALES, stated in the canonical reporting vocabulary
+ * (tests/README.md › "Canonical reporting vocabulary").
+ *
+ * Every figure here is POST-DISCOUNT and BEFORE RETURNS, because that is what
+ * `sales` persists: `post_sale` sums the lines PosRegister already discounted
+ * (`lib/discount.ts::postDiscountLineTotals`), so the header satisfies
+ * `subtotal + VAT == total` with the discount already taken out. Returns are
+ * their own documents and come from `getRefundSummary`, which the page
+ * subtracts with both figures on screen.
+ *
+ * `netSalesExclVatCents` is therefore net OF THE DISCOUNT, not of returns —
+ * and it is exactly `subtotalExclVatCents`. It used to be
+ * `subtotal − discount`, which removed the same discount a second time
+ * (GP-A04): an $8.11-net sale discounted by $1.00 reported $7.11 of net sales
+ * and a margin short by the whole discount. `discountCents` stays as its own
+ * INFORMATIONAL figure — what the shop gave away — and is never subtracted
+ * from a sales total again.
+ */
 export interface ShiftSalesSummary {
   receiptCount: number;
   totalInclVatCents: number;
   subtotalExclVatCents: number;
+  /** Informational: already deducted from every other figure here. */
   discountCents: number;
   vatTotalCents: number;
+  /** Post-discount revenue excl. VAT, before returns. */
   netSalesExclVatCents: number;
 }
 
@@ -202,7 +223,9 @@ export const shiftsRepo = {
       subtotalExclVatCents: r.subtotal_excl_vat_cents,
       discountCents: r.discount_cents,
       vatTotalCents: r.vat_total_cents,
-      netSalesExclVatCents: r.subtotal_excl_vat_cents - r.discount_cents,
+      // The persisted subtotal IS the post-discount figure (GP-A04). Do not
+      // subtract `discount_cents` here: it is already out of this number.
+      netSalesExclVatCents: r.subtotal_excl_vat_cents,
     };
   },
 

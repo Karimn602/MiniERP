@@ -24,16 +24,12 @@ import { StatCard } from "../components/ui/StatCard";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Badge } from "../components/ui/Badge";
 import { formatLbp, formatUsd } from "../lib/money";
-import { formatPrettyDate, relativeFromToday } from "../lib/dates";
+import { formatPrettyDate, isoToLocalDate, relativeFromToday } from "../lib/dates";
 import { CreditMemoPrint } from "../components/CreditMemoPrint";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 type CreditMemoRow = CreditMemo & { originalReceiptNumber: number | null };
-
-function isoToLocalDate(iso: string): string {
-  return iso.slice(0, 10);
-}
 
 function isoToTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });

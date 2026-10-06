@@ -148,7 +148,9 @@ const en = {
     receipts: "Receipts",
     salesInclVat: "Sales incl. VAT",
     grossCollected: "gross collected",
-    netExclVat: "Net excl. VAT",
+    // Before returns; the shift's returns and net collection are their own
+    // cards further down. "after discounts" is the sub-label.
+    netExclVat: "Sales excl. VAT",
     afterDiscounts: "after discounts",
     outputVat: "Output VAT",
     owedToAuthority: "owed to authority",
@@ -190,6 +192,8 @@ const en = {
     vatReversedHint: "deducted from output VAT",
     netCollection: "Net collection",
     netCollectionHint: "sales less refunds",
+    netSalesExclVat: "Net sales (excl. VAT)",
+    netSalesExclVatHint: "after discounts and returns",
     refundBreakdownTitle: "Refund Method Breakdown",
     refundBreakdownSubtitle: "How the money went back in this shift",
     colTouchesDrawer: "Cash drawer",
@@ -622,7 +626,10 @@ const en = {
     statInclVat: "Sales (incl. VAT)",
     statTotalCost: "Total cost",
     statGrossProfit: "Gross profit",
-    statNetSales: "Net sales (excl. VAT)",
+    // NOT "net sales": this page lists posted RECEIPTS, so the figure is
+    // before returns. "Net sales" is reserved for the after-returns figure in
+    // Local Reports. Both are post-discount; see reports.ts.
+    statNetSales: "Sales (excl. VAT)",
     cardTitle: "Sales",
     countOne: "{{count}} record",
     countMany: "{{count}} records",
@@ -737,9 +744,9 @@ const en = {
     colRefunded: "Refunded (incl. VAT)",
     colVatReversed: "VAT reversed",
     colCogsReversed: "Cost reversed",
-    colGrossSales: "Gross sales",
+    colGrossSales: "Sales before returns (incl. VAT)",
     colLessReturns: "Less returns",
-    colNetSales: "Net sales",
+    colNetSales: "Net sales (incl. VAT)",
     netProfitNote:
       "Net gross profit reverses revenue for every return, and reverses cost only for the goods that came back — a written-off return keeps its cost consumed.",
   },

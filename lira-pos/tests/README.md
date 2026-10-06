@@ -1,4 +1,4 @@
-# Greaz POS test harness (WP-01, extended by WP-02 through WP-07)
+# Greaz POS test harness (WP-01, extended by WP-02 through WP-08)
 
 A financial regression suite. Its job is to make the later hardening work
 packages safe: if a change breaks how money, stock, or VAT are recorded, one of
@@ -26,10 +26,10 @@ so cargo cannot build on a tree that has never been built.
 
 | Layer | Location | What it covers | Authority |
 |---|---|---|---|
-| **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, the fixed-point cost scale (`cost.test.ts`), sale/purchase line math, discount allocation, the credit-memo cumulative proration (`creditMemoMath.test.ts`); the register's checkout submission gate and identity registry | Authoritative for `src/lib/` |
+| **A. TypeScript units** | `tests/unit/` | Pure financial helpers: money, VAT, UoM, the fixed-point cost scale (`cost.test.ts`), sale/purchase line math, discount allocation, the credit-memo cumulative proration (`creditMemoMath.test.ts`); the register's checkout submission gate and identity registry. `src/lib/reportMath.ts` is exercised through layer C2 against real query output rather than re-stated here | Authoritative for `src/lib/` |
 | **B. Rust units** | `src-tauri/src/tests/pure.rs`, `cost.rs` | The four commands' pure validators, `prepare_sale` totals, change routing, line/discount reconciliation, base-quantity derivation, `prepare_purchase`'s derived line money, the purchase cost pair's VAT derivation, supplier-ledger sign authority; the whole `crate::cost` abstraction — scale, rounding, weighted average, overflow | Authoritative for pre-DB posting logic |
 | **C. Rust posting integration** | `src-tauri/src/tests/` | Migrations, `post_sale`, `post_purchase`, `post_adjustment`, `post_supplier_payment`, `post_credit_memo`, `open_shift`, `close_shift`, whole-ledger reconciliation, immutability triggers, the cost lifecycle (`cost_precision.rs`), purchase UoM authority (`purchase_authority.rs`), shift lifecycle and concurrency (`shifts.rs`), tender/change/rate authority (`tenders.rs`), purchase→AP reconciliation, duplicate invoices and purchase identity (`supplier_ap.rs`), supplier-payment sign/overpayment/identity (`supplier_payments.rs`), returns/credit memos end to end (`returns.rs`), the inventory-adjustment trust boundary and posted-document sealing (`hardening.rs`), the transactional catalog seam (`catalog.rs`) | **Authoritative for the database and all posting behaviour** |
-| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation, the supplier balance (`supplierLedger.test.ts`), the returns read models — return status, returnable quantity, refundable tender, the returns series in reports and the shift's refunds (`returns.test.ts`); the `invoke` wire format of the shift commands | Authoritative for read-model queries only |
+| **C2. TypeScript SQL / read-model** | `tests/integration/` | Repository SQL for reports, shift summaries, drawer reconciliation, inventory valuation, the supplier balance (`supplierLedger.test.ts`), the returns read models — return status, returnable quantity, refundable tender, the returns series in reports and the shift's refunds (`returns.test.ts`); cross-report reconciliation over one realistic trading day (`reportingReconciliation.test.ts`) and the SQL/JS local-date agreement (`reportDates.test.ts`); the `invoke` wire format of the shift commands | Authoritative for read-model queries only |
 
 ### A note on what layer C2 is *not*
 
@@ -115,6 +115,16 @@ only makes the tests deterministic, it does not change the SQL.)
   line moves stock. None of it can be overridden by the payload.
 - **Discount reconciliation** — `SUM(sale_items.line_discount_cents)` equals
   `sales.discount_cents`, enforced at the boundary.
+- **Discounted once** — a discount is deducted from a sales total exactly once,
+  in the register, before the sale is persisted; `sales.discount_cents` is
+  informational and no report subtracts it again (GP-A04, WP-08). See *Canonical
+  reporting vocabulary*.
+- **Report reconciliation** — one day's economics are the same figures however
+  they are sliced: the daily rows, the per-product rows, the shift summary, the
+  date-scoped day summary and the listed receipts all reconcile to one headline,
+  with returns reversing revenue always and cost only for restocked goods, and
+  with drafts and voided documents excluded from every figure including the
+  drawer.
 - **Inventory reconciliation** — `SUM(inventory_movements.quantity_delta)`
   equals `products.quantity_on_hand` across opening stock, purchases, sales and
   adjustments; one movement per stocked sale line, none for services.
@@ -331,17 +341,32 @@ is dormant by accident.
 To enable one: delete its `#[ignore = ...]` line (Rust) or change `it.skip` to
 `it` (TypeScript) as part of the owning package.
 
-| ID | Owner | Test | Invariant it will enforce |
-|---|---|---|---|
-| **GP-A04** | WP-08 | `shifts.test.ts` › `getSalesSummary` › `GP-A04 … does not subtract the discount twice` | `netSalesExclVatCents` must not subtract the discount a second time. Lines are persisted post-discount, so `subtotal − discount` understates net sales (observed: 711 where 811 is correct). |
-| **GP-A04** | WP-08 | `shifts.test.ts` › `shiftSummaryRepo` › `GP-A04 … does not subtract the discount twice` | The same defect in the date-scoped day summary. |
-(GP-A08 — returns / credit memos — was a coverage gap in this table until
-WP-06. It is now implemented and covered; see *Fixed by WP-06* below.)
+**The register is EMPTY.** Every entry that was ever in it has been fixed and
+its test enabled:
 
-Cross-package note for WP-08: GP-A04's root cause is the post-discount
-persistence convention. WP-02 did **not** change it — `post_sale` still stores
-post-discount line values and the header discount alongside them; it only
-started *verifying* that the two agree. GP-A04's fixtures are unaffected.
+| ID | Closed by | Where the coverage lives now |
+|---|---|---|
+| GP-A01 checkout idempotency | WP-02 | `sales.rs` › "Checkout idempotency" |
+| GP-A02 UoM base-quantity authority | WP-02 | `known_defects.rs` |
+| GP-A03 fractional base-unit cost precision | WP-03 | `known_defects.rs`, `cost_precision.rs` |
+| **GP-A04 report / shift discount double subtraction** | **WP-08** | `shifts.test.ts` › the two `GP-A04` tests, now `it(...)`; `reportingReconciliation.test.ts` |
+| GP-A05 stale `is_service` vs stock movement | WP-02 | `known_defects.rs` |
+| GP-A06 backend line reconciliation | WP-02 | `known_defects.rs` |
+| GP-A07 line vs header discount reconciliation | WP-02 | `known_defects.rs` |
+| GP-A08 returns / credit memos | WP-06 | `returns.rs`, `returns.test.ts` |
+| GZ-HI-03 shift lifecycle | WP-04 | `shifts.rs`, `tenders.rs` |
+| GZ-HI-05 supplier / AP integrity | WP-05 | `supplier_ap.rs`, `supplier_payments.rs` |
+
+So the suite has **zero skipped and zero `#[ignore]`d tests**. A new `.skip` or
+`#[ignore]` is now a regression in itself: there is no longer a category of
+"known defect we are living with", and anything added here must come with an
+owner and an entry in this table.
+
+Cross-package note, kept because it explains GP-A04's root cause: the
+post-discount persistence convention is WP-02's and WP-08 did **not** change
+it. `post_sale` stores post-discount line values and the header discount
+alongside them, and verifies that the two agree (GP-A07). What WP-08 corrected
+is the *reading* of them.
 
 ### Fixed by WP-05 — now enforced, must not regress
 
@@ -467,6 +492,52 @@ expression, and Arabic is caseless.
   payable. The duplicate rule is scoped to posted purchases, which means a
   voided invoice releases its reference — the behaviour a void ought to have
   when one is implemented. Recorded under *Remaining gaps*.
+
+### Fixed by WP-08 — now enforced, must not regress
+
+| ID | Where the coverage lives | What is now enforced |
+|---|---|---|
+| **GP-A04** | `shifts.test.ts` › the two `GP-A04` tests, `reportingReconciliation.test.ts` (42 tests), `reportDates.test.ts` (5 tests) | The header discount is deducted from a sales total exactly ONCE — in the register, before the sale is persisted. No report subtracts it again. Every reporting surface derives sales, returns, VAT, COGS and profit from one set of equations, and the daily, per-product, shift and receipt views of one day reconcile to the same figures. One interpretation of a stored timestamp across SQL and JS. |
+
+#### The mutation checks WP-08 ran
+
+Each erroneous formula was temporarily restored, the suite run, and the code
+restored:
+
+| Mutation | Result |
+|---|---|
+| `netSalesExclVatCents = subtotal − discount` in `shifts.ts` and `shiftSummary.ts` | both `GP-A04` tests fail — `expected 711 to be 811`, the historical figure exactly |
+| `periodTotals` subtracts `discountCents` from net sales | 8 reconciliation tests fail across the headline, the daily table, the product table, the shift agreement and the population check |
+| `mergeDailyRows` / `mergeProductRows` keyed on the sales rows only | 2 tests fail — the return posted outside its sale's period disappears from the table while the headline still counts it |
+| per-line profit `subtotal − lineDiscount − cogs` (Sales History's formula, as the test states it) | 1 test fails — `expected 753 to be 953`, short by exactly the 200-cent discount |
+| `status = 'posted'` dropped from `salesRepo.listPostedForReporting` | 3 tests fail — the draft case, the voided case, and the all-three-states case |
+| `mergeProductRows` reverted to the last-row-wins `Map` | 8 tests fail — every rename, SKU-change, returns-only, no-multiplication and header-reconciliation case |
+
+#### What WP-08 deliberately did not change
+
+- **No migration.** GP-A04 was a reading error, not a schema defect. The
+  persisted columns were already coherent and already carried everything a
+  correct report needs; migration count stays at **12**.
+- **No posting or accounting semantics.** Not one Rust file changed. The posted
+  records WP-02 through WP-07 produce are the authority, and WP-08 only
+  interprets them — which is why the Rust suite is unchanged at 463 passing.
+- **The additive returns architecture stands.** `dailySales`, `productSales`
+  and `getSalesSummary` are still GROSS and still mean what they meant before
+  WP-06; returns remain their own series, subtracted where a figure says "net"
+  and shown on their own line. Folding returns into the sales aggregates would
+  have restated `saleCount` and lost the restock distinction that profit
+  depends on.
+- **`netSalesExclVatCents` keeps its name** on both shift read models, although
+  "net" there means net of the DISCOUNT and not of returns. Renaming it would
+  have meant editing the two GP-A04 tests whose assertions are the proof the
+  defect is closed, so the field is documented instead and the returns
+  subtraction is composed by the caller, as it is everywhere else.
+- **Supplier/AP reporting is WP-05's.** `dailyPurchases` reads posted purchases
+  only and is untouched by the sales formula work; its figures are asserted
+  separately so a future sales change cannot drift it.
+- **No new dashboards, charts or exports.** One StatCard was added (the shift's
+  net sales) and two labels were corrected. Everything else is formula and
+  documentation.
 
 ### Fixed by WP-04 — now enforced, must not regress
 
@@ -1050,10 +1121,11 @@ through it, which is the honest outcome until a customer ledger exists.
 
 #### What WP-06 deliberately left alone
 
-- **GP-A04 is untouched.** `netSalesExclVatCents` still computes
-  `subtotal − discount`, and its two skipped tests are still skipped. Every
-  returns figure is a NEW field on a NEW read model, so nothing WP-08 has to fix
-  changed meaning underneath it.
+- **GP-A04 was untouched** (fixed later, in WP-08). `netSalesExclVatCents` still
+  computed `subtotal − discount` and its two tests were still skipped. Every
+  returns figure WP-06 added is a NEW field on a NEW read model, so nothing
+  WP-08 had to fix changed meaning underneath it — which is why WP-08 needed no
+  change to any returns query.
 - **Voiding a credit memo** has reserved schema (`status`, `voided_at`,
   `voided_by_user_id`, `void_reason`) and NO command, and since the sealing
   correction it is UNREACHABLE: the posted-memo trigger refuses every UPDATE,
@@ -1095,6 +1167,211 @@ leave it running a stale test binary that still embeds the previous migration. A
 mutation on a migration must touch `src-tauri/src/lib.rs` as well, which the
 mutation scripts now do.
 
+## Canonical reporting vocabulary
+
+The definitions every Greaz report uses. `src/lib/reportMath.ts` implements
+them, `src/db/repos/reports.ts` carries the schema reasoning, and
+`reportingReconciliation.test.ts` proves the surfaces agree.
+
+### What the persisted sale header means
+
+`post_sale` sums line values the register has ALREADY discounted
+(`lib/discount.ts::postDiscountLineTotals`, called by `PosRegister.tsx` before
+the payload is built). So, on `sales`:
+
+| Column | Meaning |
+|---|---|
+| `subtotal_excl_vat_cents` | post-discount revenue excl. VAT |
+| `vat_total_cents` | post-discount output VAT |
+| `total_incl_vat_cents` | what the customer owed — **== subtotal + VAT**, checked by `prepare_sale` |
+| `discount_cents` | **INFORMATIONAL.** Already out of all three above |
+| `cogs_total_cents` | cost of the goods that left, at the cost snapshot |
+
+`sale_items` carries the same five per line, and the header is the sum of the
+lines — which is why product-level reporting reconciles to header-level
+reporting at all. `line_discount_cents` sums to `discount_cents` (GP-A07).
+
+**There is no pre-discount figure persisted anywhere.** That is the single fact
+the whole vocabulary turns on, and it is why "gross" below cannot mean "before
+discounts".
+
+### The two words
+
+| Word | Means |
+|---|---|
+| **GROSS** | posted, post-discount, **before returns** |
+| **NET** | the same, **less posted credit memos** |
+
+### The equations
+
+```
+grossRevenueInclVat = Σ sales.total_incl_vat_cents
+grossSalesExclVat   = Σ sales.subtotal_excl_vat_cents
+grossVat            = Σ sales.vat_total_cents
+grossCogs           = Σ sales.cogs_total_cents
+discounts           = Σ sales.discount_cents          (reported, never deducted)
+
+returnedRevenueInclVat = Σ sales_credit_memos.total_incl_vat_cents
+returnedSalesExclVat   = Σ sales_credit_memos.subtotal_excl_vat_cents
+returnedVat            = Σ sales_credit_memos.vat_total_cents
+reversedCogs           = Σ sales_credit_memos.cogs_reversed_cents  (restocked only)
+
+netRevenueInclVat = grossRevenueInclVat − returnedRevenueInclVat
+netSalesExclVat   = grossSalesExclVat   − returnedSalesExclVat
+netVat            = grossVat            − returnedVat
+netCogs           = grossCogs           − reversedCogs
+grossProfit       = netSalesExclVat     − netCogs
+```
+
+And the invariants the suite asserts:
+
+```
+sale:    subtotal + VAT == total          (per line, per sale, per day)
+memo:    subtotal + VAT == total          (VAT is never a residual — WP-06)
+period:  netSalesExclVat + netVat == netRevenueInclVat
+tables:  Σ daily rows == period totals == Σ product rows
+```
+
+**NOT** `netSales = revenue − discount − returns`. That was GP-A04.
+
+### COGS and the two return policies
+
+`cogs_reversed_cents` counts **restocked** lines only, which makes one profit
+formula correct for both:
+
+| Return | Revenue | COGS |
+|---|---|---|
+| restocked | reverses | reverses — the goods are back in the pool at the rate they left at |
+| written off | reverses | **does not reverse** — the cost stays consumed |
+
+A write-off therefore loses its whole margin, which is the truth about
+discarded food. Nothing is recomputed from today's product master: every memo
+figure comes from the original posted snapshot (WP-06).
+
+### Which label means which, on screen
+
+Two screens used the same words for different things, which is how GP-A04 hid
+in plain sight. The words are now allocated:
+
+| Label | Surface | Formula |
+|---|---|---|
+| "Revenue (incl. VAT)" / "Sales before returns (incl. VAT)" | Local Reports | `grossRevenueInclVat` |
+| "Returns (incl. VAT)" | Local Reports | `returnedRevenueInclVat` |
+| "Net revenue (incl. VAT)" / "Net sales (incl. VAT)" column | Local Reports | `netRevenueInclVat` |
+| "Net sales (excl. VAT)" | Local Reports KPI, Shift Summary returns section | `netSalesExclVat` |
+| "Sales (excl. VAT)" | **Sales History**, **Shift Summary** sales section | `grossSalesExclVat` — before returns |
+| "Sales incl. VAT" | Shift Summary | `grossRevenueInclVat` |
+| "Discounts" | Shift Summary, Sales History detail | `discounts`, on its own |
+| "Net collection" | Shift Summary | `netRevenueInclVat` for that shift |
+
+Sales History and the Shift Summary sales cards were both labelled "Net sales
+(excl. VAT)" while computing a BEFORE-returns figure, next to a Local Reports
+card with the same label computing an AFTER-returns one. They now say "Sales",
+and "net" is reserved for after returns everywhere.
+
+The Daily Sales table's first money column said "Gross sales", which an
+operator reads as *before discounts*. It is not: there is no pre-discount
+figure in the database, and the number is post-discount sales before RETURNS.
+It now says so — "Sales before returns (incl. VAT)" — and its net twin states
+the same VAT basis. Neither formula changed, and no pre-discount metric was
+invented to rescue the old word.
+
+### Product rows: product id is the aggregation identity
+
+`productSales` and `productReturns` group by the snapshot triple
+`(product_id, product_name_snapshot, product_sku_snapshot)`, because the
+snapshot is what the receipt said. So **a product that has been renamed or
+re-SKU'd legitimately comes back as several rows for one `product_id`**, each
+correct for the label it carries.
+
+Collapsing them is `lib/reportMath.ts::mergeProductRows`'s job, and it must SUM
+them. It originally built `new Map(rows.map(r => [r.productId, r]))` on each
+side, which does not sum but **overwrite**: the last row for a product id
+replaced every earlier one, and the rest of that product's quantity, revenue and
+COGS vanished from the table while the headline still counted them. Two sales of
+one burger renamed between them — 100 + 200 of net sales, 40 + 80 of cost —
+reported 100 and 40, a third of the money, with no error anywhere. It survived
+the first reconciliation pass only because no fixture renamed a product.
+
+Every row is now added into an accumulator keyed on `product_id` alone, each
+series folded independently (so no row of one can multiply a row of the other),
+and the net fields derived once at the end.
+
+**The display-label rule: the most recent snapshot wins.** Of all the historical
+labels a product sold or came back under in the period, the row shows the one
+from the latest posted document — `MAX(posted_at)` per snapshot group, carried
+on the row as `latestPostedAt` — breaking a tie on the same timestamp by name
+then SKU ascending, so the result is fully deterministic and independent of SQL
+row order (which is revenue-ordered, and a rename makes that meaningless). It is
+a snapshot rather than `products.name` as it reads today, consistent with every
+other figure on a product report and needing no join.
+
+It is only a LABEL. The economics are summed before it is consulted, and
+`reportingReconciliation.test.ts` asserts that relabelling every raw row to one
+arbitrary name leaves all the figures identical.
+
+### Revenue is not cash
+
+The Shift Summary shows both and they are different concepts. A Greaz day paid
+partly in lira has USD cash in the drawer that is nothing like its revenue, and
+a card sale never reaches the till at all. The drawer formula is WP-04's,
+unchanged by WP-08:
+
+```
+expected cash (per currency) = opening float + cash in − change out − cash refunds out
+```
+
+counting only `cash_usd` / `cash_lbp` rows in every term. Tender stated in USD
+equivalent *does* reconcile to gross revenue, and that is asserted; native cash
+deliberately does not.
+
+### Population
+
+`status = 'posted'`, on sales, credit memos and purchases alike. That excludes
+voided documents and the **drafts** every posting command now passes through
+since WP-07's draft-then-promote architecture — so a draft is a state a real
+transaction briefly occupies, not a shape only a test can build, and
+`reportingReconciliation.test.ts` seeds one of each with absurd amounts to prove
+none leaks into any figure, including the drawer.
+
+**Sales History had been the exception.** It called `salesRepo.list({ storeId,
+limit })` with no status and fed every row it got straight into its revenue,
+VAT, COGS and profit cards, so a stranded draft or a sale voided after posting
+counted as trade on the one screen an operator reads per receipt. The fix is a
+named accessor, `salesRepo.listPostedForReporting`, which carries the predicate
+in the SQL — the population is an accounting decision, not a caller's option,
+and it now lives in one place a test can pin rather than in an argument each
+screen has to remember. `salesRepo.list` remains as the ADMINISTRATIVE accessor
+and may return any state; nothing financial may use it. The earlier coverage
+missed this because the tests passed `status: "posted"` explicitly while the
+page did not — they asserted a population nobody had asked for. They now read
+through the same accessor the page calls.
+
+### Dates
+
+One interpretation: a shop event belongs to the **local calendar day** it
+happened on, which is what `lib/dates.ts` has always said. Two layers implement
+it and `reportDates.test.ts` pins them to each other:
+
+- SQL — `date(posted_at, 'localtime')` in `reports.ts` and `shiftSummary.ts`,
+  with the window bounds converted from local midnight.
+- JS — `lib/dates.ts::isoToLocalDate` in Sales History, Returns and Purchases.
+
+Sales History and Returns previously used `iso.slice(0, 10)`, which is the
+**UTC** date. Lebanon is UTC+2/+3, so local is always ahead: a receipt posted
+00:30 Beirut was listed under the previous day, beside a time column rendered in
+local time — and Local Reports put the same receipt on the correct day. The test
+compares the JS helper against SQLite's own `date(x,'localtime')` across every
+hour of a day plus month, year, DST and leap-day edges, so it is meaningful in
+any host timezone rather than only where the bug shows.
+
+### Money stays integer
+
+Every aggregation is integer cents, summed in SQL or by integer addition in
+`reportMath`. The only division is `formatMargin`, which produces a label
+string that nothing else consumes, and currency formatting at the presentation
+boundary.
+
 ## Toolchain verified
 
 WP-01 was developed and verified against **Node 24.15.0**, npm 12.0.2, and
@@ -1113,6 +1390,19 @@ Rust 1.7x/cargo (`rustc 1.95.0`). Two notes on the TypeScript layer:
 
 Not covered by this harness, and worth knowing before relying on it:
 
+- **The report PAGES are not rendered.** WP-08 moved every reporting equation
+  into `src/lib/reportMath.ts`, and the population decision into
+  `salesRepo.listPostedForReporting`, precisely so both could be tested — the
+  pages now call them rather than carrying arithmetic or a filter of their own.
+  What is still unverified, like the rest of the UI, is that the JSX passes the
+  right field to the right StatCard. Two formulas remain inline on Sales
+  History: the per-line profit (`lineSubtotalExclVatCents −
+  lineCogsExclVatCents`) and the summary reduction over the loaded rows. Both
+  are guarded indirectly — `reportingReconciliation.test.ts` asserts that a
+  discounted sale's line profits sum to the receipt's own gross profit (which
+  only holds if neither subtracts the line discount again), and that the same
+  reduction over the posted-only accessor equals the daily report's figures for
+  that day.
 - **No UI or component tests.** `PosRegister.tsx` cart state, scanning, and
   multi-cart behaviour are untested, and so is `CreateReturnModal.tsx`. The
   modal's figures are a preview of the backend's own arithmetic — it mirrors the

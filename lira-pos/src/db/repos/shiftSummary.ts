@@ -9,12 +9,23 @@ function utcTo(localDate: string): string {
   return new Date(`${localDate}T23:59:59.999`).toISOString();
 }
 
+/**
+ * Every posted sale on one local date, across shifts — the date-scoped twin of
+ * `shiftsRepo.getSalesSummary`, and the same vocabulary.
+ *
+ * POST-DISCOUNT and BEFORE RETURNS, for the reason given there: `sales` stores
+ * line values the register already discounted, so the header discount is
+ * informational and must never be subtracted again. Returns come from
+ * `refundSummaryRepo.refundSummary` below.
+ */
 export interface ShiftSalesSummary {
   receiptCount: number;
   totalInclVatCents: number;
   subtotalExclVatCents: number;
+  /** Informational: already deducted from every other figure here. */
   discountCents: number;
   vatTotalCents: number;
+  /** Post-discount revenue excl. VAT, before returns. */
   netSalesExclVatCents: number;
 }
 
@@ -70,7 +81,8 @@ export const shiftSummaryRepo = {
       subtotalExclVatCents: r.subtotal_excl_vat_cents,
       discountCents: r.discount_cents,
       vatTotalCents: r.vat_total_cents,
-      netSalesExclVatCents: r.subtotal_excl_vat_cents - r.discount_cents,
+      // GP-A04: the persisted subtotal is ALREADY net of the discount.
+      netSalesExclVatCents: r.subtotal_excl_vat_cents,
     };
   },
 
@@ -125,10 +137,10 @@ export const shiftSummaryRepo = {
  * `shiftsRepo.getRefundSummary`.
  *
  * ADDITIVE, like every other returns read model: `salesSummary` above stays
- * GROSS and keeps meaning exactly what it meant before WP-06, and a caller
- * that wants net collection subtracts these with both figures on screen. In
- * particular `netSalesExclVatCents` is untouched — it is GP-A04's defect and
- * WP-08 owns it.
+ * BEFORE RETURNS and keeps meaning exactly what it meant before WP-06, and a
+ * caller that wants net collection subtracts these with both figures on
+ * screen. `netSalesExclVatCents` is net of the DISCOUNT only; WP-08 corrected
+ * that formula (GP-A04) and deliberately did not fold returns into it.
  */
 export interface DayRefundSummary {
   memoCount: number;

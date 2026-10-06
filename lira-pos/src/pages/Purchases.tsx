@@ -13,7 +13,7 @@ import type {
 import { formatUsd, parseUsdInput } from "../lib/money";
 import { formatUnitCostUsd } from "../lib/cost";
 import { formatBps } from "../lib/vat";
-import { todayLocalDate, formatPrettyDate, relativeFromToday } from "../lib/dates";
+import { todayLocalDate, formatPrettyDate, isoToLocalDate, relativeFromToday } from "../lib/dates";
 import { computeLineMath, type PurchaseLineMath } from "../lib/purchaseMath";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Input } from "../components/ui/Input";
@@ -749,7 +749,7 @@ function PurchaseDetailCard({
         subtitle={
           purchase?.postedAt
             ? t("purchases.detailPostedAt", {
-                date: formatPrettyDate(purchase.postedAt.slice(0, 10)),
+                date: formatPrettyDate(isoToLocalDate(purchase.postedAt)),
               })
             : undefined
         }

@@ -22,15 +22,11 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { Badge } from "../components/ui/Badge";
 import { formatLbp, formatUsd, usdCentsToLbp } from "../lib/money";
 import { formatUnitCostUsd } from "../lib/cost";
-import { formatPrettyDate, relativeFromToday } from "../lib/dates";
+import { formatPrettyDate, isoToLocalDate, relativeFromToday } from "../lib/dates";
 import { ReceiptPrint } from "../components/ReceiptPrint";
 import { CreateReturnModal } from "../components/CreateReturnModal";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
-
-function isoToLocalDate(iso: string): string {
-  return iso.slice(0, 10);
-}
 
 function isoToTime(iso: string): string {
   const d = new Date(iso);
@@ -91,8 +87,12 @@ export default function SalesHistory() {
     setLoadError(null);
 
     try {
+      // POSTED ONLY. This page is a financial screen — the stat cards above the
+      // table sum revenue, VAT, cost and profit straight off these rows — so
+      // the population decision belongs at the query, not in one summary
+      // afterwards. See `salesRepo.listPostedForReporting`.
       const [rows, statuses, openShift] = await Promise.all([
-        salesRepo.list({ storeId, limit: 200 }),
+        salesRepo.listPostedForReporting({ storeId, limit: 200 }),
         creditMemosRepo.returnStatusForStore(storeId),
         shiftsRepo.getOpenShift(storeId),
       ]);
@@ -558,10 +558,14 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
 
         <tbody className="divide-y divide-slate-100">
           {lines.map((line) => {
+            // `line_subtotal_excl_vat_cents` is persisted POST-discount
+            // (`lib/discount.ts::postDiscountLineTotals`), so
+            // `lineDiscountCents` must not come off it again — the same
+            // GP-A04 mistake, at line level. Subtracting it understated every
+            // discounted line's profit and stopped the line profits summing to
+            // the receipt's gross profit shown just above this table.
             const profit =
-              line.lineSubtotalExclVatCents -
-              line.lineDiscountCents -
-              line.lineCogsExclVatCents;
+              line.lineSubtotalExclVatCents - line.lineCogsExclVatCents;
 
             return (
               <tr key={line.id}>

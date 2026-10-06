@@ -263,6 +263,45 @@ export const salesRepo = {
     };
   },
 
+  /**
+   * The sales a FINANCIAL screen may report on: posted documents only.
+   *
+   * This exists as its own named accessor because the population is an
+   * accounting decision, not a caller's option. Sales History used to call
+   * `list({ storeId, limit })` with no status and then aggregate every row it
+   * got back into revenue, VAT, COGS and profit — so a stranded draft, or a
+   * sale voided after posting, was counted as trade. Drafts are not
+   * hypothetical: since WP-07 every posting command builds one and promotes it
+   * last, so an interrupted post can leave one behind.
+   *
+   * Putting the filter here rather than at the call site means the rule lives
+   * in production code that a test can pin, and there is one place to get it
+   * wrong instead of one per screen. Every other financial read model already
+   * filters `status = 'posted'`; this makes Sales History agree with them.
+   *
+   * `list` below is the unfiltered administrative accessor and keeps its
+   * behaviour — nothing financial may use it.
+   */
+  async listPostedForReporting(args: {
+    storeId: string;
+    limit?: number;
+  }): Promise<Sale[]> {
+    const rows = await query<SaleRow>(
+      `SELECT * FROM sales
+       WHERE store_id = ? AND status = 'posted'
+       ORDER BY COALESCE(posted_at, created_at) DESC
+       LIMIT ?`,
+      [args.storeId, args.limit ?? 100],
+    );
+    return rows.map(toSale);
+  },
+
+  /**
+   * Every sale in whatever state, or one state if asked — an ADMINISTRATIVE
+   * accessor. It can return drafts and voided documents, so no financial
+   * figure may be computed from its result. Use `listPostedForReporting` for
+   * anything that adds money up.
+   */
   async list(args: {
     storeId: string;
     status?: SaleStatus;

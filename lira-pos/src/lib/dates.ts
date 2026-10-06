@@ -18,6 +18,30 @@ export function todayLocalDate(): string {
   return `${y}-${m}-${day}`;
 }
 
+/**
+ * The LOCAL calendar date of a stored UTC ISO timestamp, as YYYY-MM-DD.
+ *
+ * This is the one correct way to turn a `posted_at` into a report date, and it
+ * is not `iso.slice(0, 10)` — that is the UTC date, which is a DIFFERENT DAY
+ * for part of every day in Lebanon (UTC+2/+3, so local is always ahead). Sales
+ * History and the Returns list both sliced, while `reports.ts` and
+ * `shiftSummary.ts` group by `date(posted_at, 'localtime')`: a receipt posted
+ * 00:30 Beirut landed on the previous day in the document lists and on the
+ * correct day in Local Reports, with the time column beside it — rendered with
+ * `toLocaleTimeString` — reading 00:30 next to yesterday's date.
+ *
+ * One interpretation, stated once: a shop event belongs to the local calendar
+ * day it happened on, which is what the module header has always claimed.
+ */
+export function isoToLocalDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 /** Days between two YYYY-MM-DD strings. Positive if `b` is after `a`. */
 export function daysBetween(a: string, b: string): number {
   const da = new Date(`${a}T00:00:00`);

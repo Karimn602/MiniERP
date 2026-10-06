@@ -15,22 +15,18 @@ import { StatCard } from "../components/ui/StatCard";
 import { EmptyState } from "../components/ui/EmptyState";
 import { formatUsd } from "../lib/money";
 import { todayLocalDate, formatPrettyDate } from "../lib/dates";
+import {
+  formatMargin,
+  mergeDailyRows,
+  mergeProductRows,
+  periodTotals,
+} from "../lib/reportMath";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 function firstDayOfMonth(): string {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
-}
-
-function calcGrossProfit(subtotal: number, cogs: number): number {
-  // subtotal is stored post-discount; discountCents is not subtracted again.
-  return subtotal - cogs;
-}
-
-function calcMargin(profit: number, netSales: number): string {
-  if (netSales <= 0) return "—";
-  return `${Math.round((profit / netSales) * 1000) / 10}%`;
 }
 
 export default function LocalReports() {
@@ -83,64 +79,43 @@ export default function LocalReports() {
     setAppliedTo(dateTo);
   }
 
-  // Returns are kept as their OWN series and subtracted here, rather than
-  // folded into the sales aggregate. Three figures are then all visible and
-  // all mean exactly what they say — gross sales, returns, net sales — and the
-  // sales numbers keep the meaning they had before WP-06.
-  //
-  // PROFIT. Net gross profit reverses revenue for every return and reverses
-  // cost only for the goods that CAME BACK, which is what
-  // `cogs_reversed_cents` counts. A written-off return therefore loses its
-  // whole margin, which is the truth about discarded stock.
-  const summary = useMemo(() => {
-    const grossRevenue = dailySales.reduce((s, r) => s + r.totalInclVatCents, 0);
-    const grossNet = dailySales.reduce((s, r) => s + r.subtotalExclVatCents, 0); // post-discount
-    const grossCogs = dailySales.reduce((s, r) => s + r.cogsTotalCents, 0);
+  // Every figure on this page comes from `lib/reportMath`, so the KPI cards and
+  // the two tables below them are derived by the SAME code and cannot disagree.
+  // Returns stay their own series and are subtracted there — gross sales,
+  // returns and net sales are then three visible figures that each mean what
+  // they say, and the sales numbers keep the meaning they had before WP-06.
+  const summary = useMemo(() => periodTotals(dailySales, dailyReturns), [
+    dailySales,
+    dailyReturns,
+  ]);
 
-    const returnedRevenue = dailyReturns.reduce((s, r) => s + r.totalInclVatCents, 0);
-    const returnedNet = dailyReturns.reduce((s, r) => s + r.subtotalExclVatCents, 0);
-    const reversedCogs = dailyReturns.reduce((s, r) => s + r.cogsReversedCents, 0);
+  const purchasesTotal = useMemo(
+    () => dailyPurchases.reduce((s, r) => s + r.totalInclVatCents, 0),
+    [dailyPurchases],
+  );
 
-    const purchases = dailyPurchases.reduce((s, r) => s + r.totalInclVatCents, 0);
+  const dailyRows = useMemo(
+    () => mergeDailyRows(dailySales, dailyReturns),
+    [dailySales, dailyReturns],
+  );
 
-    const net = grossNet - returnedNet;
-    const cogs = grossCogs - reversedCogs;
-    return {
-      grossRevenue,
-      returnedRevenue,
-      revenue: grossRevenue - returnedRevenue,
-      net,
-      cogs,
-      profit: net - cogs,
-      purchases,
-    };
-  }, [dailySales, dailyReturns, dailyPurchases]);
-
-  /** Returns for one local date, or zeroes — the series are joined by date. */
-  const returnsByDate = useMemo(() => {
-    const map = new Map<string, DailyReturnsRow>();
-    for (const r of dailyReturns) map.set(r.localDate, r);
-    return map;
-  }, [dailyReturns]);
-
-  const returnsByProduct = useMemo(() => {
-    const map = new Map<string, ProductReturnsRow>();
-    for (const r of productReturns) map.set(r.productId, r);
-    return map;
-  }, [productReturns]);
+  const productRows = useMemo(
+    () => mergeProductRows(productSales, productReturns),
+    [productSales, productReturns],
+  );
 
   if (!hydrated) {
     return <div className="text-sm text-slate-500">{t("common.loading")}</div>;
   }
 
   const dailySalesSubtitle = t(
-    dailySales.length === 1 ? "localReports.dailySalesSubtitleOne" : "localReports.dailySalesSubtitleMany",
-    { from: appliedFrom, to: appliedTo, count: String(dailySales.length) },
+    dailyRows.length === 1 ? "localReports.dailySalesSubtitleOne" : "localReports.dailySalesSubtitleMany",
+    { from: appliedFrom, to: appliedTo, count: String(dailyRows.length) },
   );
 
   const productSalesSubtitle = t(
-    productSales.length === 1 ? "localReports.productSalesSubtitleOne" : "localReports.productSalesSubtitleMany",
-    { count: String(productSales.length) },
+    productRows.length === 1 ? "localReports.productSalesSubtitleOne" : "localReports.productSalesSubtitleMany",
+    { count: String(productRows.length) },
   );
 
   const purchasesSubtitle = t(
@@ -191,26 +166,35 @@ export default function LocalReports() {
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard
           label={t("localReports.statRevenue")}
-          value={formatUsd(summary.grossRevenue)}
+          value={formatUsd(summary.grossRevenueInclVatCents)}
         />
         <StatCard
           label={t("localReports.statReturns")}
-          value={formatUsd(summary.returnedRevenue)}
-          tone={summary.returnedRevenue > 0 ? "warn" : undefined}
+          value={formatUsd(summary.returnedRevenueInclVatCents)}
+          tone={summary.returnedRevenueInclVatCents > 0 ? "warn" : undefined}
         />
         <StatCard
           label={t("localReports.statNetRevenue")}
-          value={formatUsd(summary.revenue)}
+          value={formatUsd(summary.netRevenueInclVatCents)}
         />
-        <StatCard label={t("localReports.statNetSales")} value={formatUsd(summary.net)} />
+        <StatCard
+          label={t("localReports.statNetSales")}
+          value={formatUsd(summary.netSalesExclVatCents)}
+        />
         <StatCard
           label={t("localReports.statGrossProfit")}
-          value={formatUsd(summary.profit)}
-          tone={summary.profit > 0 ? "good" : summary.profit < 0 ? "bad" : undefined}
+          value={formatUsd(summary.grossProfitCents)}
+          tone={
+            summary.grossProfitCents > 0
+              ? "good"
+              : summary.grossProfitCents < 0
+                ? "bad"
+                : undefined
+          }
         />
       </div>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-        <StatCard label={t("localReports.statPurchases")} value={formatUsd(summary.purchases)} />
+        <StatCard label={t("localReports.statPurchases")} value={formatUsd(purchasesTotal)} />
       </div>
 
       {/* Daily Sales */}
@@ -219,7 +203,7 @@ export default function LocalReports() {
           title={t("localReports.dailySalesTitle")}
           subtitle={dailySalesSubtitle}
         />
-        {dailySales.length === 0 && !loading ? (
+        {dailyRows.length === 0 && !loading ? (
           <EmptyState title={t("localReports.noSalesInPeriod")} />
         ) : (
           <div className="overflow-x-auto">
@@ -238,15 +222,9 @@ export default function LocalReports() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {dailySales.map((row) => {
-                  const ret = returnsByDate.get(row.localDate);
-                  const returnedRevenue = ret?.totalInclVatCents ?? 0;
-                  const returnedNet = ret?.subtotalExclVatCents ?? 0;
-                  const returnedVat = ret?.vatTotalCents ?? 0;
-                  const reversedCogs = ret?.cogsReversedCents ?? 0;
-                  // Post-discount, less what came back.
-                  const net = row.subtotalExclVatCents - returnedNet;
-                  const profit = calcGrossProfit(net, row.cogsTotalCents - reversedCogs);
+                {dailyRows.map((row) => {
+                  const returnedRevenue = row.returnedRevenueInclVatCents;
+                  const profit = row.grossProfitCents;
                   return (
                     <tr key={row.localDate} className="hover:bg-slate-50">
                       <td className="px-5 py-2 text-slate-700">
@@ -256,7 +234,7 @@ export default function LocalReports() {
                         {row.saleCount}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-700">
-                        {formatUsd(row.totalInclVatCents)}
+                        {formatUsd(row.grossRevenueInclVatCents)}
                       </td>
                       <td
                         className={clsx(
@@ -267,13 +245,13 @@ export default function LocalReports() {
                         {returnedRevenue > 0 ? `\u2212 ${formatUsd(returnedRevenue)}` : "\u2014"}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums font-medium text-slate-900">
-                        {formatUsd(row.totalInclVatCents - returnedRevenue)}
+                        {formatUsd(row.netRevenueInclVatCents)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.vatTotalCents - returnedVat)}
+                        {formatUsd(row.netVatCents)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.cogsTotalCents - reversedCogs)}
+                        {formatUsd(row.netCogsCents)}
                       </td>
                       <td
                         className={clsx(
@@ -284,7 +262,7 @@ export default function LocalReports() {
                         {formatUsd(profit)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {calcMargin(profit, net)}
+                        {formatMargin(profit, row.netSalesExclVatCents)}
                       </td>
                     </tr>
                   );
@@ -301,7 +279,7 @@ export default function LocalReports() {
           title={t("localReports.productSalesTitle")}
           subtitle={productSalesSubtitle}
         />
-        {productSales.length === 0 && !loading ? (
+        {productRows.length === 0 && !loading ? (
           <EmptyState title={t("localReports.noProductSales")} />
         ) : (
           <div className="overflow-x-auto">
@@ -317,11 +295,8 @@ export default function LocalReports() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {productSales.map((row) => {
-                  const ret = returnsByProduct.get(row.productId);
-                  // Post-discount, net of returns; cost net of what came back.
-                  const net = row.lineSubtotalExclVatCents - (ret?.lineSubtotalExclVatCents ?? 0);
-                  const profit = calcGrossProfit(net, row.lineCogsCents - (ret?.lineCogsCents ?? 0));
+                {productRows.map((row) => {
+                  const profit = row.grossProfitCents;
                   return (
                     <tr key={row.productId} className="hover:bg-slate-50">
                       <td className="px-5 py-2">
@@ -335,20 +310,18 @@ export default function LocalReports() {
                         )}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-700">
-                        {row.totalQty - (ret?.totalQty ?? 0)}
-                        {ret && ret.totalQty > 0 && (
+                        {row.netQty}
+                        {row.returnedQty > 0 && (
                           <div className="text-xs text-amber-700">
-                            {`\u2212${ret.totalQty}`}
+                            {`\u2212${row.returnedQty}`}
                           </div>
                         )}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums font-medium text-slate-900">
-                        {formatUsd(
-                          row.lineTotalInclVatCents - (ret?.lineTotalInclVatCents ?? 0),
-                        )}
+                        {formatUsd(row.netRevenueInclVatCents)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {formatUsd(row.lineCogsCents - (ret?.lineCogsCents ?? 0))}
+                        {formatUsd(row.netCogsCents)}
                       </td>
                       <td
                         className={clsx(
@@ -359,7 +332,7 @@ export default function LocalReports() {
                         {formatUsd(profit)}
                       </td>
                       <td className="px-5 py-2 text-end tabular-nums text-slate-600">
-                        {calcMargin(profit, net)}
+                        {formatMargin(profit, row.netSalesExclVatCents)}
                       </td>
                     </tr>
                   );

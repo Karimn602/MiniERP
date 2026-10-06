@@ -573,7 +573,7 @@ export default function ShiftSummary() {
             <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-700">
               {t("shift.returnsTitle")}
             </h3>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
               <StatCard
                 label={t("shift.returnsCount")}
                 value={refundSummary ? String(refundSummary.memoCount) : "—"}
@@ -600,6 +600,27 @@ export default function ShiftSummary() {
                     : "—"
                 }
                 sub={t("shift.netCollectionHint")}
+              />
+              {/*
+                The shift's NET SALES, on exactly the definition Local Reports
+                uses: post-discount revenue excl. VAT less the revenue posted
+                credit memos reversed. Stated here rather than in the sales
+                section above, because that section is deliberately before
+                returns — and net sales is the figure the shift's gross profit
+                would be built on, so the two screens must not mean different
+                things by it. Cash is a separate concept and lives below.
+              */}
+              <StatCard
+                label={t("shift.netSalesExclVat")}
+                value={
+                  salesSummary && refundSummary
+                    ? formatUsd(
+                        salesSummary.netSalesExclVatCents -
+                          refundSummary.subtotalExclVatCents,
+                      )
+                    : "—"
+                }
+                sub={t("shift.netSalesExclVatHint")}
               />
             </div>
 
