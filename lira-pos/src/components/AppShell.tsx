@@ -3,6 +3,8 @@ import type { ReactNode } from "react";
 import { NavLink } from "./NavLink";
 import { NetworkBadge } from "./NetworkBadge";
 import { LanguageSwitcher } from "./LanguageSwitcher";
+import { SandboxBanner } from "./SandboxBanner";
+import { IS_SANDBOX } from "../lib/appMode";
 import { useOnline } from "../lib/network";
 import { useLowStockCount } from "../state/lowStockBadge";
 import { useTranslation } from "../lib/i18n";
@@ -66,10 +68,16 @@ export function AppShell() {
           </span>
           <div className="flex min-w-0 flex-col leading-none">
             <span className="text-[15px] font-bold tracking-tight text-slate-900">
-              Lira <span className="text-brand">POS</span>
+              Greaz <span className="text-brand">POS</span>
             </span>
-            <span className="mt-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-              Retail Point of Sale
+            <span
+              className={
+                IS_SANDBOX
+                  ? "mt-1.5 text-[10px] font-bold uppercase tracking-[0.18em] text-amber-600"
+                  : "mt-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400"
+              }
+            >
+              {IS_SANDBOX ? "Sandbox · Training" : "Retail Point of Sale"}
             </span>
           </div>
         </div>
@@ -113,6 +121,9 @@ export function AppShell() {
       </aside>
 
       <div className="flex flex-1 flex-col overflow-hidden">
+        {/* Sandbox warning strip — above the header, so it sits on every
+            routed screen. Renders null (and is compiled out) in production. */}
+        <SandboxBanner />
         <header className="flex items-center justify-between border-b border-slate-200 bg-white/80 px-6 py-3 backdrop-blur">
           <h1 className="text-sm font-semibold tracking-tight text-slate-700">{t("common.workspace")}</h1>
           <NetworkBadge />

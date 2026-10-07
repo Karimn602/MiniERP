@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Greaz POS SANDBOX",
+  "identifier": "com.greazlb.pos.sandbox",
+  "build": {
+    "beforeDevCommand": "npm run dev:sandbox",
+    "beforeBuildCommand": "npm run build:sandbox"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Greaz POS — SANDBOX — DATA IS NOT REAL",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true
+      }
+    ]
+  }
+}

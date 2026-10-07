@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
+import { SandboxBanner } from "./components/SandboxBanner";
+import { IS_SANDBOX } from "./lib/appMode";
 import { ensureDbReady } from "./db/migrate";
 import { hydrateActiveContext } from "./state/activeContext";
 import { I18nProvider } from "./lib/i18n";
@@ -20,9 +22,18 @@ import SupplierDetail from "./pages/SupplierDetail";
 
 type BootStage = "db" | "context" | "ready" | "error";
 
+/** Window title for the training build. Kept in step with the `app.windows[0].title`
+ *  in `src-tauri/tauri.sandbox.conf.json`; this one also covers `npm run dev:sandbox`
+ *  in a plain browser tab, where no Tauri window title exists. */
+const SANDBOX_WINDOW_TITLE = "Greaz POS — SANDBOX — DATA IS NOT REAL";
+
 export default function App() {
   const [stage, setStage] = useState<BootStage>("db");
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (IS_SANDBOX) document.title = SANDBOX_WINDOW_TITLE;
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -41,15 +52,21 @@ export default function App() {
   return (
     <I18nProvider>
       {stage === "error" ? (
-        <div className="flex h-screen items-center justify-center bg-red-50 p-8">
-          <div className="max-w-lg space-y-2 rounded-lg border border-red-200 bg-white p-6 shadow-sm">
-            <h2 className="text-lg font-semibold text-red-800">Startup failed</h2>
-            <pre className="whitespace-pre-wrap text-xs text-red-900">{error}</pre>
+        <div className="flex h-screen flex-col">
+          <SandboxBanner />
+          <div className="flex flex-1 items-center justify-center bg-red-50 p-8">
+            <div className="max-w-lg space-y-2 rounded-lg border border-red-200 bg-white p-6 shadow-sm">
+              <h2 className="text-lg font-semibold text-red-800">Startup failed</h2>
+              <pre className="whitespace-pre-wrap text-xs text-red-900">{error}</pre>
+            </div>
           </div>
         </div>
       ) : stage !== "ready" ? (
-        <div className="flex h-screen items-center justify-center text-slate-500">
-          {stage === "db" ? "Initializing database…" : "Loading workspace…"}
+        <div className="flex h-screen flex-col">
+          <SandboxBanner />
+          <div className="flex flex-1 items-center justify-center text-slate-500">
+            {stage === "db" ? "Initializing database…" : "Loading workspace…"}
+          </div>
         </div>
       ) : (
         <BrowserRouter>

@@ -482,7 +482,7 @@ const en = {
 
     openingTitle: "Opening stock",
     openingSubtitle:
-      "Record the stock you already had when you started using Lira POS. Creates a purchase document marked 'opening' — no supplier required.",
+      "Record the stock you already had when you started using Greaz POS. Creates a purchase document marked 'opening' — no supplier required.",
     openingDate: "Opening date *",
     openingNotes: "Notes (optional)",
     openingNotesPlaceholder: "e.g. Initial count Jan 2025",

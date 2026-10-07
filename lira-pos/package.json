@@ -5,9 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:sandbox": "vite --mode sandbox",
     "build": "tsc && vite build",
+    "build:sandbox": "tsc && vite build --mode sandbox",
     "preview": "vite preview",
     "tauri": "tauri",
+    "tauri:dev:sandbox": "tauri dev --config src-tauri/tauri.sandbox.conf.json",
+    "tauri:build:sandbox": "tauri build --config src-tauri/tauri.sandbox.conf.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:types": "tsc -p tsconfig.test.json --noEmit",
