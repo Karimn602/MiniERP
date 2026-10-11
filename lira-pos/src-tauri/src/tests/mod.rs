@@ -15,6 +15,7 @@ mod cost_precision;
 mod hardening;
 mod immutability;
 mod known_defects;
+mod lifecycle;
 mod migrations;
 mod purchase_authority;
 mod purchases;

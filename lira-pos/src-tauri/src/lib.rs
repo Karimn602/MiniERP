@@ -93,6 +93,40 @@ pub(crate) fn migrations() -> Vec<Migration> {
     ]
 }
 
+/// Close Greaz's own SQLite pool, in order, as the application exits.
+///
+/// Greaz holds TWO pools against the one database file: tauri-plugin-sql's,
+/// which the plugin closes itself on `RunEvent::Exit`, and the `DbState` pool in
+/// `posting.rs` that every transactional command uses. Nothing closed the second
+/// one — it was simply abandoned when the process ended.
+///
+/// That matters because of how WAL works. SQLite checkpoints the write-ahead log
+/// into the main database and unlinks `-wal` / `-shm` when the LAST connection to
+/// the file closes. With the posting pool still open, the plugin closing its own
+/// achieved nothing, so a cleanly-closed Greaz left its WAL on disk — and
+/// `docs/BACKUP.md` reads exactly that as the signature of a crash, while a
+/// single-file copy taken in that state silently omits the sales still sitting in
+/// the WAL (`tests/lifecycle.rs`).
+///
+/// It only ever looked intermittent. The pool's idle connections are reaped after
+/// roughly ten minutes, so a shop that closed the till long after the last sale
+/// checkpointed correctly, and one that closed it straight after a sale did not.
+///
+/// This changes no durability setting: WAL, `synchronous`, foreign keys and every
+/// posting guard are untouched. It closes a resource that was already finished
+/// with, at the one moment it is safe to close it.
+fn close_db_pool_on_exit(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let state = app.state::<DbState>();
+    tauri::async_runtime::block_on(async move {
+        let mut guard = state.pool.lock().await;
+        if let Some(pool) = guard.take() {
+            pool.close().await;
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = migrations();
@@ -117,6 +151,11 @@ pub fn run() {
             catalog::set_primary_product_barcode,
             catalog::remove_product_barcode,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                close_db_pool_on_exit(app_handle);
+            }
+        });
 }
