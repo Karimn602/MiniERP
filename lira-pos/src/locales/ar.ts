@@ -13,6 +13,17 @@ const ar: TranslationDict = {
     returns: "المرتجعات",
     localReports: "التقارير المحلية",
     managerDashboard: "لوحة المدير",
+    groupFrontOfHouse: "الصالة",
+    groupMenuAndStock: "القائمة والمخزون",
+    groupBackOffice: "الإدارة",
+  },
+  theme: {
+    label: "المظهر",
+    group: "مظهر الكاشير",
+    classic: "كلاسيك",
+    midnight: "ليلي",
+    switchToClassic: "التبديل إلى المظهر الفاتح كلاسيك",
+    switchToMidnight: "التبديل إلى المظهر الداكن الليلي",
   },
   common: {
     workspace: "مساحة العمل",
@@ -29,14 +40,33 @@ const ar: TranslationDict = {
     total: "المجموع",
   },
   pos: {
+    shiftOpenChip: "الوردية مفتوحة",
     title: "نقطة البيع",
-    subtitle: "امسح أو ابحث لإضافة المنتجات، ثم استلم الدفعة.",
+    subtitle: "انقر على المنتجات لبناء الطلب، ثم استلم النقد.",
     loadingRegister: "جارٍ تحميل سجل المبيعات…",
-    rateLocked: "سعر الصرف:",
-    noExchangeRate: "لا يوجد سعر صرف — الدفع بالليرة معطّل",
+    rateLocked: "سعر الصرف",
+    noExchangeRate: "لا يوجد سعر صرف — لا يمكن تسجيل المبيعات",
     noOpenShiftBold: "لا توجد وردية مفتوحة.",
     goTo: "اذهب إلى",
     toOpenShift: "لفتح وردية قبل تسجيل المبيعات.",
+    openShiftAction: "انتقل إلى ملخص الوردية",
+    noRateTitle: "لا يوجد سعر صرف لليوم.",
+    noRateBody:
+      "يجب تحديد سعر الصرف قبل تسجيل أي عملية بيع — بما في ذلك البيع المدفوع بالدولار بالكامل.",
+    goToExchangeRate: "انتقل إلى سعر الصرف",
+
+    menuTitle: "القائمة",
+    eyebrow: "غريز · الصالة",
+    groupAll: "الكل",
+    groupOutOfStock: "غير متوفر",
+    menuSubtitle: "انقر على المنتج لإضافته. انقر مرة أخرى لزيادة الكمية.",
+    menuFilterPlaceholder: "تصفية القائمة…",
+    menuLoading: "جارٍ تحميل القائمة…",
+    menuEmpty: "لا توجد منتجات نشطة بعد. أضفها من صفحة المنتجات.",
+    menuNoMatches: "لا يوجد في القائمة ما يطابق «{{term}}».",
+    menuOutOfStock: "غير متوفر",
+    scanLabel: "مسح",
+    moreWaysToAdd: "امسح باركود أو ابحث في كامل الكتالوج",
 
     addItemTitle: "إضافة منتج",
     addItemSubtitle: "امسح باركود أو ابحث في الكتالوج.",
@@ -46,7 +76,7 @@ const ar: TranslationDict = {
 
     cartTitle: "السلة",
     cartEmpty: "فارغة",
-    cartEmptyMessage: "امسح أو ابحث لإضافة المنتج الأول.",
+    cartEmptyMessage: "انقر على منتج من القائمة لبدء الطلب.",
     cartLinesCount: "{{count}} سطر",
     clearCart: "تفريغ السلة",
 
@@ -71,6 +101,7 @@ const ar: TranslationDict = {
     discountSectionTitle: "خصم",
     discountPct: "نسبة الخصم %",
     discountAmt: "مبلغ الخصم دولار",
+    discountClear: "إلغاء الخصم",
     subtotalBeforeDiscount: "المجموع (قبل الخصم)",
     vat: "ضريبة القيمة المضافة",
     totalInclVat: "المجموع (شامل الضريبة)",
@@ -95,11 +126,13 @@ const ar: TranslationDict = {
       "السماح بالبيع حتى عند عدم توفر كمية كافية. قد يصبح المخزون أقل من صفر.",
 
     paymentTitle: "الدفع",
-    paymentSubtitle: "يمكن الدمج بين الدولار والليرة اللبنانية.",
+    paymentSubtitle: "نقداً بالدولار أو بالليرة أو بكليهما.",
     cashUsdReceived: "نقد بالدولار مستلم",
     cashLbpReceived: "نقد بالليرة مستلم",
     cashLbpNoRate: "نقد بالليرة مستلم (لا يوجد سعر صرف)",
     cardUsdReceived: "بطاقة دولار مستلمة",
+    cardLegacyNotice:
+      "منقول من سلة محفوظة. غريز تعمل بالنقد — احذفه للدفع نقداً.",
     totalPaidUsdEquiv: "إجمالي المدفوع (ما يعادل دولار)",
     remaining: "المتبقي",
     lbpRemaining: "= المتبقي بالليرة",
@@ -215,7 +248,8 @@ const ar: TranslationDict = {
     },
   },
   products: {
-    title: "المنتجات",
+    eyebrow: "القائمة والمخزون",
+    title: "أصناف القائمة",
     subtitle: "أنشئ المنتجات، خصّص الباركودات، حدّد أسعار الضريبة، وأدر وحدات القياس.",
     loadingPage: "جارٍ تحميل المنتجات…",
 
@@ -387,6 +421,7 @@ const ar: TranslationDict = {
     done: "تم",
   },
   inventory: {
+    eyebrow: "القائمة والمخزون",
     title: "المخزون",
     subtitle:
       "مستويات المخزون الحالية، سجل الحركات، التسويات اليدوية، والمخزون الافتتاحي.",

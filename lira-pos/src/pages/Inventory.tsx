@@ -18,6 +18,7 @@ import { computeLineMath, type PurchaseLineMath } from "../lib/purchaseMath";
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
+import { PageHeader } from "../components/ui/PageHeader";
 import { ProductPicker } from "../components/ProductPicker";
 import { newId } from "../lib/ids";
 import { useSearchParams } from "react-router-dom";
@@ -59,12 +60,15 @@ export default function Inventory() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight text-slate-900">{t("inventory.title")}</h2>
-          <p className="mt-1 text-sm text-slate-500">{t("inventory.subtitle")}</p>
-        </div>
-        <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1 shadow-soft">
+      {/* Was a hand-rolled header duplicating PageHeader's markup. Moved onto the
+          shared component so this screen picks up the Greaz heading treatment
+          and the eyebrow with every other back-office page. */}
+      <PageHeader
+        eyebrow={t("inventory.eyebrow")}
+        title={t("inventory.title")}
+        subtitle={t("inventory.subtitle")}
+        actions={
+        <div className="inline-flex rounded-xl border border-slate-200 bg-slate-100 p-1 shadow-soft">
           {(["stock", "movements", "adjust", "opening"] as const).map((v) => (
             <button
               key={v}
@@ -84,7 +88,8 @@ export default function Inventory() {
             </button>
           ))}
         </div>
-      </div>
+        }
+      />
 
       {view === "stock" && (
         <StockView
@@ -238,23 +243,23 @@ function StockView({
             <CardBody className="space-y-1">
               <p className="text-xs font-medium text-slate-500">{t("inventory.valCardAvgTitle")}</p>
               <p className="text-2xl font-bold tabular-nums tracking-tight text-slate-900">{formatUsd(summary.totalAvgCostValue)}</p>
-              <p className="text-xs text-slate-400">{t("inventory.valCardExclVat")}</p>
+              <p className="text-xs text-fg-muted">{t("inventory.valCardExclVat")}</p>
             </CardBody>
           </Card>
           <Card>
             <CardBody className="space-y-1">
               <p className="text-xs font-medium text-slate-500">{t("inventory.valCardLastTitle")}</p>
               <p className="text-2xl font-bold tabular-nums tracking-tight text-slate-900">{formatUsd(summary.totalLastPurchValue)}</p>
-              <p className="text-xs text-slate-400">{t("inventory.valCardExclVat")}</p>
+              <p className="text-xs text-fg-muted">{t("inventory.valCardExclVat")}</p>
             </CardBody>
           </Card>
           <Card>
             <CardBody className="space-y-1">
               <p className="text-xs font-medium text-slate-500">{t("inventory.valCardDiffTitle")}</p>
-              <p className={clsx("text-2xl font-bold tabular-nums tracking-tight", summary.totalDifference >= 0 ? "text-emerald-600" : "text-red-600")}>
+              <p className={clsx("text-2xl font-bold tabular-nums tracking-tight", summary.totalDifference >= 0 ? "text-good-fg" : "text-danger-fg")}>
                 {summary.totalDifference >= 0 ? "+" : ""}{formatUsd(summary.totalDifference)}
               </p>
-              <p className="text-xs text-slate-400">
+              <p className="text-xs text-fg-muted">
                 {t("inventory.valCardDiffSub", { n: String(summary.coveredCount), total: String(summary.totalWithQty) })}
               </p>
             </CardBody>
@@ -263,9 +268,9 @@ function StockView({
             <CardBody className="space-y-1">
               <p className="text-xs font-medium text-slate-500">{t("inventory.valCardMissingTitle")}</p>
               {summary.missingCount === 0 ? (
-                <p className="text-sm text-emerald-700">{t("inventory.valCardMissingNone")}</p>
+                <p className="text-sm text-good-fg">{t("inventory.valCardMissingNone")}</p>
               ) : (
-                <p className="text-2xl font-bold tabular-nums tracking-tight text-amber-600">
+                <p className="text-2xl font-bold tabular-nums tracking-tight text-warn-fg">
                   {t("inventory.valCardMissingCount", { count: String(summary.missingCount) })}
                 </p>
               )}
@@ -333,7 +338,7 @@ function StockView({
                       key={p.id}
                       className={clsx(
                         "transition-colors hover:bg-slate-50",
-                        low && "bg-amber-50/40",
+                        low && "bg-warn-bg/40",
                       )}
                     >
                       <td className="px-5 py-2">
@@ -352,9 +357,9 @@ function StockView({
                       </td>
                       <td className="px-5 py-2 text-right">
                         {p.isService ? (
-                          <span className="text-xs text-slate-400">n/a</span>
+                          <span className="text-xs text-fg-muted">n/a</span>
                         ) : (
-                          <span className={clsx("font-medium", low ? "text-amber-700" : "text-slate-900")}>
+                          <span className={clsx("font-medium", low ? "text-warn-fg" : "text-slate-900")}>
                             {p.quantityOnHand} {p.baseUom.uomCode}
                           </span>
                         )}
@@ -364,7 +369,7 @@ function StockView({
                       </td>
                       <td className="px-5 py-2 text-right text-slate-700">
                         {p.isService ? (
-                          <span className="text-xs text-slate-400">—</span>
+                          <span className="text-xs text-fg-muted">—</span>
                         ) : (
                           formatUnitCostUsd(p.avgCostExclVatMicrocents)
                         )}
@@ -373,23 +378,23 @@ function StockView({
                         {avgCostValue !== null ? (
                           formatUsd(avgCostValue)
                         ) : (
-                          <span className="text-xs text-slate-400">—</span>
+                          <span className="text-xs text-fg-muted">—</span>
                         )}
                       </td>
                       <td className="px-5 py-2 text-right text-slate-700">
                         {p.isService ? (
-                          <span className="text-xs text-slate-400">—</span>
+                          <span className="text-xs text-fg-muted">—</span>
                         ) : vRow?.lastPurchaseCostExclVatMicrocents != null ? (
                           formatUnitCostUsd(vRow.lastPurchaseCostExclVatMicrocents)
                         ) : (
-                          <span className="text-xs text-amber-600">{t("inventory.noPurchaseCost")}</span>
+                          <span className="text-xs text-warn-fg">{t("inventory.noPurchaseCost")}</span>
                         )}
                       </td>
                       <td className="px-5 py-2 text-right font-medium text-slate-900">
                         {lastPurchValue !== null ? (
                           formatUsd(lastPurchValue)
                         ) : (
-                          <span className="text-xs text-slate-400">—</span>
+                          <span className="text-xs text-fg-muted">—</span>
                         )}
                       </td>
                       <td className="px-5 py-2 text-right">
@@ -397,13 +402,13 @@ function StockView({
                           <span
                             className={clsx(
                               "font-medium",
-                              rowDiff > 0 ? "text-emerald-700" : rowDiff < 0 ? "text-red-700" : "text-slate-600",
+                              rowDiff > 0 ? "text-good-fg" : rowDiff < 0 ? "text-danger-fg" : "text-slate-600",
                             )}
                           >
                             {rowDiff > 0 ? "+" : ""}{formatUsd(rowDiff)}
                           </span>
                         ) : (
-                          <span className="text-xs text-slate-400">—</span>
+                          <span className="text-xs text-fg-muted">—</span>
                         )}
                       </td>
                       <td className="px-5 py-2 text-end">
@@ -465,8 +470,8 @@ function MovementsDrawer({
   }, [product.id]);
 
   return (
-    <div className="fixed inset-0 z-30 flex justify-end bg-slate-900/40" onClick={onClose}>
-      <div onClick={(e) => e.stopPropagation()} className="flex h-full w-full max-w-2xl flex-col bg-white shadow-xl">
+    <div className="fixed inset-0 z-30 flex justify-end bg-scrim/40" onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} className="flex h-full w-full max-w-2xl flex-col bg-surface shadow-xl">
         <div className="flex items-start justify-between border-b border-slate-200 px-5 py-3">
           <div>
             <h3 className="text-base font-semibold text-slate-900">
@@ -508,7 +513,7 @@ function MovementsDrawer({
                       <MovementBadge type={m.movementType} delta={m.quantityDelta} />
                     </td>
                     <td className="px-4 py-2 text-right font-medium">
-                      <span className={clsx(m.quantityDelta > 0 ? "text-emerald-700" : "text-red-700")}>
+                      <span className={clsx(m.quantityDelta > 0 ? "text-good-fg" : "text-danger-fg")}>
                         {m.quantityDelta > 0 ? "+" : ""}{m.quantityDelta} {product.baseUom.uomCode}
                       </span>
                       {m.quantityInUom !== null &&
@@ -560,7 +565,7 @@ function MovementBadge({ type, delta }: { type: MovementType; delta: number }) {
       <span
         className={clsx(
           "rounded px-2 py-0.5 text-xs font-medium",
-          positive ? "bg-emerald-100 text-emerald-800" : "bg-red-100 text-red-800",
+          positive ? "bg-good-bg text-good-fg" : "bg-danger-bg text-danger-fg",
         )}
       >
         {label}
@@ -632,7 +637,7 @@ function MovementsView({ storeId }: { storeId: string }) {
           <select
             value={filter}
             onChange={(e) => setFilter(e.target.value as MovementType | "all")}
-            className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
+            className="rounded-md border border-slate-300 bg-surface px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
           >
             <option value="all">{t("inventory.filterAll")}</option>
             <option value="purchase">{t("inventory.filterPurchase")}</option>
@@ -681,7 +686,7 @@ function MovementsView({ storeId }: { storeId: string }) {
                       {p && <div className="text-[10px] text-slate-500">{p.sku ?? "—"}</div>}
                     </td>
                     <td className="px-5 py-2 text-right font-medium">
-                      <span className={clsx(m.quantityDelta > 0 ? "text-emerald-700" : "text-red-700")}>
+                      <span className={clsx(m.quantityDelta > 0 ? "text-good-fg" : "text-danger-fg")}>
                         {m.quantityDelta > 0 ? "+" : ""}{m.quantityDelta} {p?.baseUom.uomCode ?? ""}
                       </span>
                     </td>
@@ -871,7 +876,7 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
                     ? l.product.quantityOnHand + l.quantityBaseSigned
                     : null;
                   return (
-                    <tr key={l.draftId} className={clsx(l.error && "bg-red-50/40")}>
+                    <tr key={l.draftId} className={clsx(l.error && "bg-danger-bg/40")}>
                       <td className="px-3 py-2 align-top">
                         <div className="font-medium text-slate-900">{l.product.name}</div>
                         <div className="text-xs text-slate-500">
@@ -885,7 +890,7 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
                         <select
                           value={l.selectedUomId}
                           onChange={(e) => updateLine(l.draftId, { selectedUomId: e.target.value })}
-                          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
+                          className="rounded-md border border-slate-300 bg-surface px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
                         >
                           {l.product.uoms.map((u) => (
                             <option key={u.id} value={u.id}>{u.uomCode}</option>
@@ -893,13 +898,15 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
                         </select>
                       </td>
                       <td className="px-3 py-2 align-top">
-                        <div className="inline-flex rounded-md border border-slate-300 bg-white text-xs shadow-sm">
+                        <div className="inline-flex rounded-md border border-slate-300 bg-surface text-xs shadow-sm">
                           <button
                             type="button"
                             onClick={() => updateLine(l.draftId, { direction: "+" })}
                             className={clsx(
                               "px-2 py-1",
-                              l.direction === "+" ? "bg-emerald-600 text-white" : "text-slate-600 hover:bg-slate-50",
+                              l.direction === "+"
+                                ? "bg-good-solid text-good-solid-fg"
+                                : "text-fg-muted hover:bg-paper",
                             )}
                           >+</button>
                           <button
@@ -907,7 +914,9 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
                             onClick={() => updateLine(l.draftId, { direction: "-" })}
                             className={clsx(
                               "px-2 py-1",
-                              l.direction === "-" ? "bg-red-600 text-white" : "text-slate-600 hover:bg-slate-50",
+                              l.direction === "-"
+                                ? "bg-danger-solid text-danger-solid-fg"
+                                : "text-fg-muted hover:bg-paper",
                             )}
                           >−</button>
                         </div>
@@ -923,16 +932,16 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
                       </td>
                       <td className="px-3 py-2 text-right align-top">
                         {l.quantityBaseSigned !== null ? (
-                          <span className={clsx("font-medium", l.quantityBaseSigned > 0 ? "text-emerald-700" : "text-red-700")}>
+                          <span className={clsx("font-medium", l.quantityBaseSigned > 0 ? "text-good-fg" : "text-danger-fg")}>
                             {l.quantityBaseSigned > 0 ? "+" : ""}{l.quantityBaseSigned} {l.product.baseUom.uomCode}
                           </span>
-                        ) : (<span className="text-xs text-slate-400">—</span>)}
+                        ) : (<span className="text-xs text-fg-muted">—</span>)}
                       </td>
                       <td className="px-3 py-2 text-right align-top">
                         {after !== null ? (
                           <span className="text-slate-700">{after} {l.product.baseUom.uomCode}</span>
-                        ) : (<span className="text-xs text-slate-400">—</span>)}
-                        {l.error && (<div className="mt-0.5 text-[10px] text-red-600">{l.error}</div>)}
+                        ) : (<span className="text-xs text-fg-muted">—</span>)}
+                        {l.error && (<div className="mt-0.5 text-[10px] text-danger-fg">{l.error}</div>)}
                       </td>
                       <td className="px-3 py-2 align-top">
                         <Button variant="ghost" size="sm" onClick={() => removeLine(l.draftId)}>✕</Button>
@@ -946,7 +955,7 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
         )}
 
         {submitError && (
-          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          <div className="rounded-md border border-danger-line bg-danger-bg p-3 text-sm text-danger-fg">
             {submitError}
           </div>
         )}
@@ -960,7 +969,7 @@ function AdjustView({ storeId, userId }: { storeId: string; userId: string | nul
             {submitting ? t("inventory.adjPosting") : t("inventory.adjPost")}
           </Button>
           {justSaved && (
-            <span className="text-sm text-emerald-700">{t("inventory.adjSuccess")}</span>
+            <span className="text-sm text-good-fg">{t("inventory.adjSuccess")}</span>
           )}
           <p className="ml-auto text-xs text-slate-500">
             {t("inventory.adjNote")}
@@ -1193,7 +1202,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
                 {lines.map((l) => {
                   const uom = l.product.uoms.find((u) => u.id === l.selectedUomId);
                   return (
-                    <tr key={l.draftId} className={clsx(l.error && "bg-red-50/40")}>
+                    <tr key={l.draftId} className={clsx(l.error && "bg-danger-bg/40")}>
                       <td className="px-3 py-2 align-top">
                         <div className="font-medium text-slate-900">{l.product.name}</div>
                         <div className="text-xs text-slate-500">
@@ -1207,7 +1216,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
                         <select
                           value={l.selectedUomId}
                           onChange={(e) => updateLine(l.draftId, { selectedUomId: e.target.value })}
-                          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
+                          className="rounded-md border border-slate-300 bg-surface px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
                         >
                           {l.product.uoms.map((u) => (
                             <option key={u.id} value={u.id}>{u.uomCode}</option>
@@ -1242,7 +1251,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
                         </div>
                       </td>
                       <td className="px-3 py-2 align-top">
-                        <div className="inline-flex rounded-md border border-slate-300 bg-white text-xs shadow-sm">
+                        <div className="inline-flex rounded-md border border-slate-300 bg-surface text-xs shadow-sm">
                           <button
                             type="button"
                             onClick={() => updateLine(l.draftId, { costMode: "inclusive" })}
@@ -1264,7 +1273,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
                       <td className="px-3 py-2 text-right align-top font-medium text-slate-900">
                         {l.math ? formatUsd(l.math.lineTotalInclVatCents) : "—"}
                         {l.error && (
-                          <div className="mt-0.5 text-[10px] font-normal text-red-600">{l.error}</div>
+                          <div className="mt-0.5 text-[10px] font-normal text-danger-fg">{l.error}</div>
                         )}
                       </td>
                       <td className="px-3 py-2 align-top">
@@ -1279,7 +1288,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
                   <td className="px-3 py-2 text-right font-medium text-slate-700" colSpan={5}>
                     {t("inventory.openTotalValue")}
                   </td>
-                  <td className="px-3 py-2 text-right font-semibold text-emerald-900">
+                  <td className="px-3 py-2 text-right font-semibold text-good-fg">
                     {formatUsd(totals.total)}
                   </td>
                   <td></td>
@@ -1290,7 +1299,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
         )}
 
         {submitError && (
-          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          <div className="rounded-md border border-danger-line bg-danger-bg p-3 text-sm text-danger-fg">
             {submitError}
           </div>
         )}
@@ -1304,7 +1313,7 @@ function OpeningStockView({ storeId, userId }: { storeId: string; userId: string
             {submitting ? t("inventory.openPosting") : t("inventory.openPost")}
           </Button>
           {justSaved && (
-            <span className="text-sm text-emerald-700">
+            <span className="text-sm text-good-fg">
               {t("inventory.openSuccess", { number: String(justSaved.number) })}
             </span>
           )}

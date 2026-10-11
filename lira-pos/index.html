@@ -1,10 +1,34 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="classic">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Greaz POS</title>
+    <script>
+      // Appearance, applied before the first paint.
+      //
+      // The bundle cannot do this: by the time React mounts, the window has
+      // already painted Classic's warm white, so a cashier who chose Midnight
+      // would get a white flash on every launch. `<html>` therefore ships with
+      // data-theme="classic" (the documented default, correct with JavaScript
+      // disabled) and this runs synchronously to correct it.
+      //
+      // Deliberately duplicates `resolveTheme` and the storage key from
+      // src/lib/theme.ts in four lines rather than importing them, because a
+      // module import is exactly the deferral this is here to avoid. The
+      // duplication is pinned by a test on THEME_STORAGE_KEY's shape.
+      //
+      // Anything that is not the exact string "midnight" — unset, stale,
+      // corrupt, or a storage accessor that throws — leaves Classic in place.
+      try {
+        var mode = "__VITE_APP_MODE__";
+        var saved = localStorage.getItem("greaz.ui.appearance.v1." + mode);
+        if (saved === "midnight") document.documentElement.dataset.theme = "midnight";
+      } catch (e) {
+        /* private mode / blocked site data — Classic stands */
+      }
+    </script>
   </head>
 
   <body>

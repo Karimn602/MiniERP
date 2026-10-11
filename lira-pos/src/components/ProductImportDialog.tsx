@@ -36,9 +36,9 @@ function StatusBadge({ status }: { status: RowStatus }) {
     <span
       className={clsx(
         "inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium",
-        status === "valid" && "bg-emerald-100 text-emerald-800",
-        status === "warning" && "bg-amber-100 text-amber-800",
-        status === "error" && "bg-red-100 text-red-800",
+        status === "valid" && "bg-good-bg text-good-fg",
+        status === "warning" && "bg-warn-bg text-warn-fg",
+        status === "error" && "bg-danger-bg text-danger-fg",
       )}
     >
       {status === "valid" && t("productImport.statusReady")}
@@ -160,13 +160,13 @@ export function ProductImportDialog({
   return (
     // Backdrop
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-scrim/50 p-4 backdrop-blur-sm"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       {/* Panel */}
-      <div className="flex max-h-[90vh] w-full max-w-4xl animate-scale-in flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
+      <div className="flex max-h-[90vh] w-full max-w-4xl animate-scale-in flex-col overflow-hidden rounded-2xl border border-slate-200 bg-surface shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
           <div>
@@ -179,7 +179,7 @@ export function ProductImportDialog({
           </div>
           <button
             onClick={onClose}
-            className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+            className="rounded p-1 text-fg-muted hover:bg-slate-100 hover:text-slate-700"
           >
             ✕
           </button>
@@ -200,7 +200,7 @@ export function ProductImportDialog({
                 </p>
                 <button
                   onClick={downloadTemplate}
-                  className="mt-2 text-xs font-medium text-teal-700 underline hover:text-teal-900"
+                  className="mt-2 text-xs font-medium text-brand-700 underline hover:text-brand-900"
                 >
                   {t("productImport.downloadTemplate")}
                 </button>
@@ -224,7 +224,7 @@ export function ProductImportDialog({
               </div>
 
               {/* Opening stock note */}
-              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+              <div className="rounded-lg border border-warn-line bg-warn-bg px-4 py-3 text-xs text-warn-fg">
                 <span className="font-semibold">{t("productImport.noteLabel")}</span>{" "}
                 {t("productImport.openingStockNote")}{" "}
                 <span className="font-medium">{t("productImport.inventoryAdjLink")}</span>{" "}
@@ -255,7 +255,7 @@ export function ProductImportDialog({
               </div>
 
               {parseError && (
-                <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700">
+                <div className="rounded-md border border-danger-line bg-danger-bg px-4 py-3 text-xs text-danger-fg">
                   {parseError}
                 </div>
               )}
@@ -267,23 +267,23 @@ export function ProductImportDialog({
             <div className="space-y-4">
               {/* Summary bar */}
               <div className="flex flex-wrap gap-3 text-sm">
-                <span className="rounded-full bg-emerald-100 px-3 py-1 text-emerald-800">
+                <span className="rounded-full bg-good-bg px-3 py-1 text-good-fg">
                   {t("productImport.readyToImport", { count: String(validRows.length) })}
                 </span>
                 {warnRows.length > 0 && (
-                  <span className="rounded-full bg-amber-100 px-3 py-1 text-amber-800">
+                  <span className="rounded-full bg-warn-bg px-3 py-1 text-warn-fg">
                     {t("productImport.willBeSkipped", { count: String(warnRows.length) })}
                   </span>
                 )}
                 {errorRows.length > 0 && (
-                  <span className="rounded-full bg-red-100 px-3 py-1 text-red-800">
+                  <span className="rounded-full bg-danger-bg px-3 py-1 text-danger-fg">
                     {t("productImport.haveErrors", { count: String(errorRows.length) })}
                   </span>
                 )}
               </div>
 
               {/* Opening stock note */}
-              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800">
+              <div className="rounded-lg border border-warn-line bg-warn-bg px-4 py-2 text-xs text-warn-fg">
                 <span className="font-semibold">{t("productImport.noteLabel")}</span>{" "}
                 {t("productImport.openingStockNoteShort")}{" "}
                 <span className="font-medium">{t("productImport.inventoryAdjLink")}</span>{" "}
@@ -313,30 +313,30 @@ export function ProductImportDialog({
                       <tr
                         key={row.rowNum}
                         className={clsx(
-                          row.status === "error" && "bg-red-50",
-                          row.status === "warning" && "bg-amber-50",
+                          row.status === "error" && "bg-danger-bg",
+                          row.status === "warning" && "bg-warn-bg",
                         )}
                       >
-                        <td className="px-3 py-2 text-slate-400">{row.rowNum}</td>
+                        <td className="px-3 py-2 text-fg-muted">{row.rowNum}</td>
                         <td className="px-3 py-2">
                           <StatusBadge status={row.status} />
                         </td>
                         <td className="px-3 py-2 font-medium text-slate-800">
                           {row.rawName || (
-                            <span className="italic text-red-400">
+                            <span className="italic text-danger-fg">
                               {t("productImport.blankName")}
                             </span>
                           )}
                         </td>
                         <td className="px-3 py-2 text-slate-600">
                           {row.rawSku || (
-                            <span className="text-slate-400">
+                            <span className="text-fg-muted">
                               {t("productImport.autoSku")}
                             </span>
                           )}
                         </td>
                         <td className="px-3 py-2 font-mono text-slate-600">
-                          {row.rawBarcode || <span className="font-sans text-slate-400">—</span>}
+                          {row.rawBarcode || <span className="font-sans text-fg-muted">—</span>}
                         </td>
                         <td className="px-3 py-2 text-right tabular-nums text-slate-800">
                           {row.priceInclVatCents > 0
@@ -357,10 +357,10 @@ export function ProductImportDialog({
                         </td>
                         <td className="px-3 py-2 max-w-xs">
                           {row.errors.map((e, i) => (
-                            <div key={i} className="text-red-700">{e}</div>
+                            <div key={i} className="text-danger-fg">{e}</div>
                           ))}
                           {row.warnings.map((w, i) => (
-                            <div key={i} className="text-amber-700">{w}</div>
+                            <div key={i} className="text-warn-fg">{w}</div>
                           ))}
                         </td>
                       </tr>
@@ -385,7 +385,7 @@ export function ProductImportDialog({
           {/* ── IMPORTING step ── */}
           {step === "importing" && (
             <div className="flex flex-col items-center gap-3 py-12 text-slate-600">
-              <div className="h-6 w-6 animate-spin rounded-full border-2 border-teal-600 border-t-transparent" />
+              <div className="h-6 w-6 animate-spin rounded-full border-2 border-brand-600 border-t-transparent" />
               <p className="text-sm">
                 {t("productImport.importing", { count: String(validRows.length) })}
               </p>
@@ -396,7 +396,7 @@ export function ProductImportDialog({
           {step === "done" && (
             <div className="space-y-4 py-4">
               <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 text-xl">
+                <div className="flex h-10 w-10 items-center justify-center rounded-full bg-good-bg text-good-fg text-xl">
                   ✓
                 </div>
                 <div>
@@ -414,12 +414,12 @@ export function ProductImportDialog({
               </div>
 
               {failedCount > 0 && (
-                <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700">
+                <div className="rounded-md border border-danger-line bg-danger-bg px-4 py-3 text-xs text-danger-fg">
                   {t("productImport.failedNote", { count: String(failedCount) })}
                 </div>
               )}
 
-              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+              <div className="rounded-lg border border-warn-line bg-warn-bg px-4 py-3 text-xs text-warn-fg">
                 <span className="font-semibold">{t("productImport.nextStepLabel")}</span>{" "}
                 {t("productImport.nextStepText")}{" "}
                 <span className="font-medium">{t("productImport.nextStepLink")}</span>{" "}

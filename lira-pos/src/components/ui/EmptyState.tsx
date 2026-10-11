@@ -25,7 +25,10 @@ export function EmptyState({
         className,
       )}
     >
-      <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-400">
+      {/* Empty states are one of the few places the brief lets Greaz show
+          personality, so the glyph sits in a warm brand tint rather than grey.
+          It stays a tint and not a flood: this still appears inside tables. */}
+      <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-panel bg-brand-soft text-brand-ink ring-1 ring-inset ring-brand-line">
         {icon ?? (
           <svg viewBox="0 0 24 24" fill="none" className="h-6 w-6">
             <path
@@ -38,9 +41,9 @@ export function EmptyState({
           </svg>
         )}
       </div>
-      <p className="text-sm font-medium text-slate-700">{title}</p>
+      <p className="greaz-display text-base uppercase text-fg">{title}</p>
       {description && (
-        <p className="mt-1 max-w-sm text-sm text-slate-500">{description}</p>
+        <p className="mt-1 max-w-sm text-sm text-fg-muted">{description}</p>
       )}
       {action && <div className="mt-4">{action}</div>}
     </div>

@@ -40,7 +40,7 @@ function StatCard({
   tone?: "neutral" | "muted" | "good" | "warn";
 }) {
   return (
-    <div className="rounded-xl border border-slate-200/80 bg-white p-4 shadow-card transition-shadow hover:shadow-card-hover">
+    <div className="rounded-xl border border-slate-200/80 bg-surface p-4 shadow-card transition-shadow hover:shadow-card-hover">
       <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
         {label}
       </div>
@@ -48,17 +48,17 @@ function StatCard({
         className={clsx(
           "mt-1.5 text-2xl font-bold tabular-nums tracking-tight",
           tone === "good"
-            ? "text-emerald-600"
+            ? "text-good-fg"
             : tone === "warn"
-              ? "text-amber-600"
+              ? "text-warn-fg"
               : tone === "muted"
-                ? "text-slate-400"
+                ? "text-fg-muted"
                 : "text-slate-900",
         )}
       >
         {value}
       </div>
-      {sub && <div className="mt-0.5 text-xs text-slate-400">{sub}</div>}
+      {sub && <div className="mt-0.5 text-xs text-fg-muted">{sub}</div>}
     </div>
   );
 }
@@ -92,17 +92,17 @@ function DrawerRow({
             "text-sm tabular-nums",
             isBold ? "font-semibold" : "",
             tone === "good"
-              ? "text-emerald-700"
+              ? "text-good-fg"
               : tone === "warn"
-                ? "text-amber-700"
+                ? "text-warn-fg"
                 : tone === "muted"
-                  ? "text-slate-400"
+                  ? "text-fg-muted"
                   : "text-slate-900",
           )}
         >
           {value}
         </span>
-        {sub && <div className="text-xs text-slate-400">{sub}</div>}
+        {sub && <div className="text-xs text-fg-muted">{sub}</div>}
       </div>
     </div>
   );
@@ -371,7 +371,7 @@ export default function ShiftSummary() {
       </div>
 
       {error && (
-        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-md border border-danger-line bg-danger-bg px-4 py-3 text-sm text-danger-fg">
           {error}
         </div>
       )}
@@ -417,26 +417,26 @@ export default function ShiftSummary() {
       {activeShift && (
         <>
           {/* Shift status banner */}
-          <div className="flex flex-wrap items-center gap-4 rounded-lg border border-emerald-200 bg-emerald-50 px-5 py-3">
-            <div className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
+          <div className="flex flex-wrap items-center gap-4 rounded-lg border border-good-line bg-good-bg px-5 py-3">
+            <div className="h-2.5 w-2.5 rounded-full bg-good" />
             <div className="flex-1">
-              <span className="text-sm font-semibold text-emerald-800">
+              <span className="text-sm font-semibold text-good-fg">
                 {t("shift.shiftOpen")}
               </span>
-              <span className="ms-3 text-sm text-emerald-700">
+              <span className="ms-3 text-sm text-fg-muted">
                 {t("shift.openedAt")} {formatLocalDateTime(activeShift.openedAt)}
               </span>
             </div>
             <div className="flex gap-6 text-sm">
-              <span className="text-slate-600">
+              <span className="text-fg-muted">
                 {t("shift.openingUsd")}{" "}
-                <span className="font-medium text-slate-900">
+                <span className="font-medium text-fg">
                   {formatUsd(activeShift.openingCashUsdCents)}
                 </span>
               </span>
-              <span className="text-slate-600">
+              <span className="text-fg-muted">
                 {t("shift.openingLbp")}{" "}
-                <span className="font-medium text-slate-900">
+                <span className="font-medium text-fg">
                   {formatLbp(activeShift.openingCashLbp)}
                 </span>
               </span>
@@ -522,7 +522,7 @@ export default function ShiftSummary() {
                           <td className="px-5 py-2.5 text-end tabular-nums text-slate-700">
                             {nativeDisplay}
                             {row.currency === "LBP" && row.amountUsdCentsEquivalent > 0 && (
-                              <div className="text-xs text-slate-400">
+                              <div className="text-xs text-fg-muted">
                                 ≈ {formatUsd(row.amountUsdCentsEquivalent)}
                               </div>
                             )}
@@ -552,7 +552,7 @@ export default function ShiftSummary() {
                       return (
                         <tr className="bg-slate-50 font-semibold">
                           <td className="px-5 py-2.5 text-slate-900">{t("common.total")}</td>
-                          <td className="px-5 py-2.5 text-end text-xs text-slate-400">—</td>
+                          <td className="px-5 py-2.5 text-end text-xs text-fg-muted">—</td>
                           <td className="px-5 py-2.5 text-end tabular-nums text-slate-900">
                             {formatUsd(totalUsd)}
                           </td>
@@ -679,7 +679,7 @@ export default function ShiftSummary() {
 
                 {/* USD column */}
                 <div>
-                  <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-fg-muted">
                     {t("shift.usdLabel")}
                   </div>
                   <div className="divide-y divide-slate-100">
@@ -743,7 +743,7 @@ export default function ShiftSummary() {
 
                 {/* LBP column */}
                 <div>
-                  <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-fg-muted">
                     {t("shift.lbpLabel")}
                   </div>
                   <div className="divide-y divide-slate-100">

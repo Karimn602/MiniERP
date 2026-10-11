@@ -58,7 +58,7 @@ export function SearchInput({
           aria-hidden
           viewBox="0 0 20 20"
           fill="none"
-          className="h-4 w-4 text-slate-400"
+          className="h-4 w-4 text-fg-subtle"
         >
           <circle cx="9" cy="9" r="6" stroke="currentColor" strokeWidth="1.8" />
           <path

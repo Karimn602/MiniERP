@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+  DESIGN PREVIEW — NOT PART OF THE APPLICATION.
+
+  A second Vite entry used only to inspect the Classic and Midnight
+  appearances at 1366x768. `vite build` takes `index.html` as its single
+  input, so this page and everything it imports are absent from any shipped
+  bundle. Open it with `npm run dev:sandbox` at /preview.html.
+-->
+<html lang="en" data-theme="classic">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Greaz POS — appearance preview</title>
+    <script>
+      // Same pre-paint appearance restore as index.html; see the note there.
+      // The preview additionally honours ?theme=midnight|classic, so a
+      // screenshot of either appearance can be taken without driving the
+      // control by hand. Preview-only — index.html has no such override.
+      try {
+        var forced = new URLSearchParams(location.search).get("theme");
+        if (forced === "midnight" || forced === "classic") {
+          document.documentElement.dataset.theme = forced;
+        } else {
+          var mode = "__VITE_APP_MODE__";
+          var saved = localStorage.getItem("greaz.ui.appearance.v1." + mode);
+          if (saved === "midnight") document.documentElement.dataset.theme = "midnight";
+        }
+        if (new URLSearchParams(location.search).get("nofx") === "1") {
+          document.documentElement.dataset.nofx = "1";
+        }
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/preview/main.tsx"></script>
+  </body>
+</html>

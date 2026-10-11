@@ -25,33 +25,33 @@ export function StatCard({
   return (
     <div
       className={clsx(
-        "rounded-xl border border-slate-200/80 bg-white p-4 shadow-card transition-shadow hover:shadow-card-hover",
+        "rounded-panel border border-line bg-surface p-4 shadow-panel transition-shadow hover:shadow-tile-hover",
         className,
       )}
     >
       <div className="flex items-center justify-between gap-2">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-fg-muted">
           {label}
         </div>
-        {icon && <div className="text-slate-300">{icon}</div>}
+        {icon && <div className="text-fg-subtle">{icon}</div>}
       </div>
       <div
         className={clsx(
           "mt-1.5 text-2xl font-bold tabular-nums tracking-tight",
           tone === "good"
-            ? "text-emerald-600"
+            ? "text-good-fg"
             : tone === "bad"
-              ? "text-red-600"
+              ? "text-danger-fg"
               : tone === "warn"
-                ? "text-amber-600"
+                ? "text-warn-fg"
                 : tone === "brand"
-                  ? "text-brand"
-                  : "text-slate-900",
+                  ? "text-brand-ink"
+                  : "text-fg",
         )}
       >
         {value}
       </div>
-      {hint && <div className="mt-0.5 text-xs text-slate-400">{hint}</div>}
+      {hint && <div className="mt-0.5 text-xs text-fg-subtle">{hint}</div>}
     </div>
   );
 }

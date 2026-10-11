@@ -8,14 +8,14 @@ export function NetworkBadge() {
       className={clsx(
         "inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-medium ring-1 ring-inset",
         online
-          ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
-          : "bg-slate-100 text-slate-600 ring-slate-200",
+          ? "bg-good-bg text-good-fg ring-good-line"
+          : "bg-paper text-fg-muted ring-line",
       )}
     >
       <span
         className={clsx(
           "h-2 w-2 rounded-full",
-          online ? "bg-emerald-500 animate-pulse" : "bg-slate-400",
+          online ? "bg-good animate-pulse" : "bg-fg-subtle",
         )}
       />
       {online ? "Online" : "Offline"}

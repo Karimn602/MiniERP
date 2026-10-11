@@ -453,6 +453,7 @@ export default function Products() {
   return (
     <div className="space-y-6">
       <PageHeader
+        eyebrow={t("products.eyebrow")}
         title={t("products.title")}
         subtitle={t("products.subtitle")}
         actions={
@@ -493,7 +494,7 @@ export default function Products() {
           />
 
           {loadError && (
-            <div className="border-b border-red-200 bg-red-50 px-5 py-3 text-xs text-red-700">
+            <div className="border-b border-danger-line bg-danger-bg px-5 py-3 text-xs text-danger-fg">
               {t("products.loadFailed", { error: loadError })}
             </div>
           )}
@@ -503,7 +504,7 @@ export default function Products() {
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm" style={{ minWidth: "52rem" }}>
-                <thead className="border-b border-slate-200 bg-slate-50/70 text-start text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                <thead className="border-b border-slate-200 bg-slate-50/70 text-start text-[11px] font-semibold uppercase tracking-wider text-fg-muted">
                   <tr>
                     <th className="px-5 py-2.5 font-semibold">{t("products.colProduct")}</th>
                     <th className="whitespace-nowrap px-5 py-2.5 font-semibold">{t("products.colBarcode")}</th>
@@ -521,7 +522,7 @@ export default function Products() {
                     <tr key={p.id} className="transition-colors hover:bg-brand-50/40">
                       <td className="px-5 py-3">
                         <div className="font-medium text-slate-900">{p.name}</div>
-                        <div className="mt-0.5 text-xs text-slate-400">
+                        <div className="mt-0.5 text-xs text-fg-muted">
                           <span className="font-medium text-slate-500">
                             {p.sku ? `SKU ${p.sku}` : t("products.noSku")}
                           </span>
@@ -554,11 +555,11 @@ export default function Products() {
                           <span
                             className={clsx(
                               "font-medium",
-                              p.quantityOnHand < 0 ? "text-red-600" : "text-slate-700",
+                              p.quantityOnHand < 0 ? "text-danger-fg" : "text-slate-700",
                             )}
                           >
                             {p.quantityOnHand}{" "}
-                            <span className="font-normal text-slate-400">{p.baseUom.uomCode}</span>
+                            <span className="font-normal text-fg-muted">{p.baseUom.uomCode}</span>
                           </span>
                         )}
                       </td>
@@ -692,7 +693,7 @@ export default function Products() {
                     onChange={(e) =>
                       setForm((f) => ({ ...f, vatRateId: e.target.value }))
                     }
-                    className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+                    className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
                   >
                     {vatRates.map((v) => (
                       <option key={v.id} value={v.id}>
@@ -764,7 +765,7 @@ export default function Products() {
                     <span className="font-medium text-slate-700">
                       {formatUnitCostUsd(selectedProduct.avgCostExclVatMicrocents)}
                     </span>
-                    <span className="ml-1 text-slate-400">{t("products.avgCostNote")}</span>
+                    <span className="ml-1 text-fg-muted">{t("products.avgCostNote")}</span>
                   </div>
                 )}
               </div>
@@ -786,7 +787,7 @@ export default function Products() {
                         ? (selectedProduct?.quantityOnHand ?? 0)
                         : 0}
                       {form.mode === "new" && (
-                        <span className="ml-1 text-xs text-slate-400">
+                        <span className="ml-1 text-xs text-fg-muted">
                           {t("products.adjustViaInventory")}
                         </span>
                       )}
@@ -827,7 +828,7 @@ export default function Products() {
                         saleUomCode: f.saleUomCode || e.target.value,
                       }))
                     }
-                    className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20 disabled:bg-slate-100"
+                    className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20 disabled:bg-slate-100"
                   >
                     {uoms.map((u) => (
                       <option key={u.code} value={u.code}>
@@ -847,7 +848,7 @@ export default function Products() {
                         saleUomCode: e.target.value,
                       }))
                     }
-                    className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+                    className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
                   >
                     {uoms.map((u) => (
                       <option key={u.code} value={u.code}>
@@ -893,7 +894,7 @@ export default function Products() {
                               saleFactorDen: "1",
                             }))
                           }
-                          className="mt-1 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+                          className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
                         />
                       </label>
                       {isSimple && qtyInt >= 1 ? (
@@ -905,7 +906,7 @@ export default function Products() {
                           })}
                         </p>
                       ) : (
-                        <p className="text-xs text-amber-600">
+                        <p className="text-xs text-warn-fg">
                           {t("products.uomAdvanced")}
                         </p>
                       )}
@@ -931,13 +932,13 @@ export default function Products() {
             </div>
 
             {saveError && (
-              <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+              <div className="rounded-md border border-danger-line bg-danger-bg px-3 py-2 text-xs text-danger-fg">
                 {saveError}
               </div>
             )}
 
             {saveOk && (
-              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+              <div className="rounded-md border border-good-line bg-good-bg px-3 py-2 text-xs text-good-fg">
                 {saveOk}
               </div>
             )}

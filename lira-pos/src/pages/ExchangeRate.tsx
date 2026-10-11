@@ -140,7 +140,7 @@ export default function ExchangeRate() {
     return (
       <Card>
         <CardBody>
-          <p className="text-sm text-red-700">{t("exchangeRate.loadFailed", { error: loadError })}</p>
+          <p className="text-sm text-danger-fg">{t("exchangeRate.loadFailed", { error: loadError })}</p>
         </CardBody>
       </Card>
     );
@@ -202,7 +202,7 @@ export default function ExchangeRate() {
             </div>
 
             {sanityWarning && (
-              <div className="rounded-lg border border-orange-200 bg-orange-50 p-3 text-xs text-orange-900">
+              <div className="rounded-lg border border-warn-line bg-warn-bg p-3 text-xs text-warn-fg">
                 ⚠ {sanityWarning}
               </div>
             )}
@@ -214,7 +214,7 @@ export default function ExchangeRate() {
                 </div>
                 <div className="grid grid-cols-3 gap-2 text-xs">
                   {preview.map((p) => (
-                    <div key={p.usdCents} className="rounded bg-white px-3 py-2">
+                    <div key={p.usdCents} className="rounded bg-surface px-3 py-2">
                       <div className="font-medium text-slate-900">
                         {formatUsd(p.usdCents)}
                       </div>
@@ -238,7 +238,7 @@ export default function ExchangeRate() {
                     : t("exchangeRate.saveRate")}
               </Button>
               {justSaved && (
-                <span className="text-sm text-emerald-700">{t("exchangeRate.justSaved")}</span>
+                <span className="text-sm text-good-fg">{t("exchangeRate.justSaved")}</span>
               )}
             </div>
           </CardBody>
@@ -271,7 +271,7 @@ export default function ExchangeRate() {
                 history.map((r) => (
                   <tr
                     key={r.id}
-                    className={clsx(r.effectiveDate === today && "bg-emerald-50/40")}
+                    className={clsx(r.effectiveDate === today && "bg-good-bg/40")}
                   >
                     <td className="px-5 py-2 text-slate-900">
                       <div>{formatPrettyDate(r.effectiveDate)}</div>
@@ -306,11 +306,11 @@ function StatusBanner({
 
   if (status === "none") {
     return (
-      <div className="rounded-md border border-amber-200 bg-amber-50 p-4">
-        <p className="text-sm font-medium text-amber-900">
+      <div className="rounded-md border border-warn-line bg-warn-bg p-4">
+        <p className="text-sm font-medium text-warn-fg">
           {t("exchangeRate.statusNoneTitle")}
         </p>
-        <p className="mt-1 text-xs text-amber-800">
+        <p className="mt-1 text-xs text-warn-fg">
           {t("exchangeRate.statusNoneBody")}
         </p>
       </div>
@@ -319,21 +319,21 @@ function StatusBanner({
 
   if (status === "current" && current) {
     return (
-      <div className="rounded-md border border-emerald-200 bg-emerald-50 p-4">
+      <div className="rounded-md border border-good-line bg-good-bg p-4">
         <div className="flex items-center justify-between">
           <div>
-            <p className="text-sm font-medium text-emerald-900">
+            <p className="text-sm font-medium text-good-fg">
               {t("exchangeRate.statusCurrentTitle")}
             </p>
-            <p className="mt-1 text-xs text-emerald-800">
+            <p className="mt-1 text-xs text-good-fg">
               {t("exchangeRate.statusCurrentBody")}
             </p>
           </div>
           <div className="text-end">
-            <div className="text-xl font-semibold text-emerald-900">
+            <div className="text-xl font-semibold text-good-fg">
               {formatRate(current.rateLbpPerUsd)}
             </div>
-            <div className="text-xs text-emerald-800">
+            <div className="text-xs text-good-fg">
               {formatPrettyDate(current.effectiveDate)}
             </div>
           </div>
@@ -345,22 +345,22 @@ function StatusBanner({
   if (status === "stale" && current) {
     const days = daysBetween(current.effectiveDate, todayLocalDate());
     return (
-      <div className="rounded-md border border-orange-200 bg-orange-50 p-4">
+      <div className="rounded-md border border-warn-line bg-warn-bg p-4">
         <div className="flex items-center justify-between">
           <div>
-            <p className="text-sm font-medium text-orange-900">
+            <p className="text-sm font-medium text-warn-fg">
               {t("exchangeRate.statusStaleTitle", { relative: relativeFromToday(current.effectiveDate) })}
             </p>
-            <p className="mt-1 text-xs text-orange-800">
+            <p className="mt-1 text-xs text-warn-fg">
               {t("exchangeRate.statusStaleBody")}
               {days >= 3 && ` ${t("exchangeRate.statusStaleDays")}`}
             </p>
           </div>
           <div className="text-end">
-            <div className="text-xl font-semibold text-orange-900">
+            <div className="text-xl font-semibold text-warn-fg">
               {formatRate(current.rateLbpPerUsd)}
             </div>
-            <div className="text-xs text-orange-800">
+            <div className="text-xs text-warn-fg">
               {formatPrettyDate(current.effectiveDate)}
             </div>
           </div>

@@ -2,8 +2,13 @@
 //
 // POS Register — Phase 3 v1.
 //
-// Workflow:
-//   1. Cashier scans a barcode (Enter submits) or picks via the search box.
+// Workflow (restaurant-first since the Greaz UX pass):
+//   1. Cashier CLICKS the item the customer ordered on the menu tile grid.
+//      Clicking the same tile again increments that line — it is the same
+//      `addProductToCart` the scanner has always used, so there are no second
+//      cart semantics to keep in step. Typing in the menu filter narrows the
+//      grid; a barcode scan (secondary, collapsed) and the name search still
+//      reach the identical function.
 //   2. The line is added to the ACTIVE cart, defaulting to qty=1 in the
 //      barcode's UoM (or the product's default sale UoM if no barcode was used).
 //   3. Cashier may bump qty up/down or remove a line.
@@ -25,7 +30,6 @@
 //
 // Business rules enforced here (defense-in-depth; backend also re-checks):
 //   - Only active products are sellable.
-//   - Stock products must have at least one barcode.
 //   - quantity_in_uom must be a positive integer.
 //   - For stock products, quantity_base must not exceed quantity_on_hand —
 //     UNLESS "Allow negative inventory" is enabled in POS setup.
@@ -34,6 +38,7 @@
 //   - Total paid (USD-equiv) must be >= total invoice.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { useActiveContext } from "../state/activeContext";
 import { productsRepo } from "../db/repos/products";
 import { exchangeRatesRepo } from "../db/repos/exchangeRates";
@@ -50,12 +55,21 @@ import type {
 } from "../db/types";
 import { query } from "../db/client";
 import { ReceiptPrint } from "../components/ReceiptPrint";
-import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { PageHeader } from "../components/ui/PageHeader";
 import { EmptyState } from "../components/ui/EmptyState";
 import { ProductPicker } from "../components/ProductPicker";
+import { MenuTile } from "../components/pos/MenuTile";
+import { MenuPane, MenuChip } from "../components/pos/MenuPane";
+import {
+  AmountLine,
+  CartLineRow,
+  RailHeading,
+  ShiftChip,
+  TinyButton,
+  TotalBlock,
+} from "../components/pos/OrderRail";
 import {
   formatLbp,
   formatRate,
@@ -66,6 +80,16 @@ import {
   usdCentsToLbp,
 } from "../lib/money";
 import { computeSaleLineMath, type SaleLineMath } from "../lib/saleMath";
+import {
+  MENU_GROUP_ALL,
+  deriveMenuGroups,
+  filterMenu,
+  filterMenuByGroup,
+  isMenuOutOfStock,
+  isMenuSellable,
+  menuTilePriceInclVatCents,
+  sortMenu,
+} from "../lib/menuGrid";
 import { allocateLineDiscounts, postDiscountLineTotals } from "../lib/discount";
 import {
   createCheckoutRegistry,
@@ -272,11 +296,28 @@ export default function PosRegister() {
   const [rate, setRate] = useState<ExchangeRate | null>(null);
   const [rateError, setRateError] = useState<string | null>(null);
 
+  // ----- Menu tile grid (the primary way a Greaz cashier adds items) -----
+  const [menu, setMenu] = useState<ProductWithUoms[]>([]);
+  const [menuLoading, setMenuLoading] = useState(true);
+  const [menuError, setMenuError] = useState<string | null>(null);
+  const [menuFilter, setMenuFilter] = useState("");
+  const [menuGroupId, setMenuGroupId] = useState<string>(MENU_GROUP_ALL);
+
+  // Barcode is TERTIARY here: collapsed by default so it does not hold the
+  // focus or the eye on a till where nothing gets scanned.
+  const [barcodeOpen, setBarcodeOpen] = useState(false);
+  // Discount is likewise folded away until asked for, so it stops occupying
+  // prime selling space and stops inviting an accidental discount.
+  const [discountOpen, setDiscountOpen] = useState(false);
+
   // Scan box
   const [scanInput, setScanInput] = useState("");
   const [scanError, setScanError] = useState<string | null>(null);
   const scanRef = useRef<HTMLInputElement>(null);
 
+  // Only meaningful while the barcode panel is open — when it is closed the ref
+  // is null and this is a no-op, which is what we want: a restaurant cashier
+  // should not have the caret parked in a scanner field.
   const focusScanInput = useCallback(() => {
     requestAnimationFrame(() => scanRef.current?.focus());
   }, []);
@@ -379,6 +420,33 @@ export default function PosRegister() {
     }
   }, [storeId]);
 
+  /**
+   * Load the sellable menu.
+   *
+   * `listEnriched` is the existing read-only repo call and already filters to
+   * `is_active = 1`; `isMenuSellable` re-checks client-side so a tile can never
+   * outlive a deactivation in a stale list. Reloaded after every posted sale
+   * because `quantity_on_hand` has moved and the out-of-stock tiles with it.
+   */
+  const reloadMenu = useCallback(async () => {
+    setMenuError(null);
+    try {
+      // Guarded inside the try so the `finally` always clears the loading flag.
+      // Returning early above it would strand the grid on "Loading menu…".
+      if (!storeId) return;
+      const rows = await productsRepo.listEnriched({ storeId });
+      setMenu(sortMenu(rows.filter(isMenuSellable)));
+    } catch (e) {
+      // One unloadable product throws for the whole list (productsRepo.enrich
+      // refuses a product with no base or default sale UoM). Report it instead
+      // of white-screening the till — the cashier can still scan and search.
+      setMenu([]);
+      setMenuError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMenuLoading(false);
+    }
+  }, [storeId]);
+
   const reloadShift = useCallback(async () => {
     if (!storeId) return;
     try {
@@ -393,8 +461,9 @@ export default function PosRegister() {
     if (hydrated) {
       void reloadRate();
       void reloadShift();
+      void reloadMenu();
     }
-  }, [hydrated, reloadRate, reloadShift]);
+  }, [hydrated, reloadRate, reloadShift, reloadMenu]);
 
   // ----- Scan handler -----
   async function handleScan() {
@@ -425,15 +494,40 @@ export default function PosRegister() {
   }
 
   /**
+   * Add a product by clicking its menu tile — the primary Greaz gesture.
+   *
+   * Nothing special: the product's own default sale UoM, qty 1, no barcode.
+   * Clicking the same tile again lands on `addProductToCart`'s existing
+   * "already in the cart → bump the qty" branch, which is why repeat-clicking
+   * increments instead of stacking duplicate rows.
+   */
+  function handleTileClick(product: ProductWithUoms) {
+    addProductToCart(product, product.defaultSaleUom, null);
+  }
+
+  /** Chips above the grid. See `deriveMenuGroups` for why these are not
+   *  "Burgers / Wraps / Drinks" yet. */
+  const menuGroups = useMemo(
+    () => deriveMenuGroups(menu, allowNegativeInventory),
+    [menu, allowNegativeInventory],
+  );
+
+  /** The tiles actually shown: group chip first, then the text filter. */
+  const visibleMenu = useMemo(
+    () => filterMenu(filterMenuByGroup(menu, menuGroupId, allowNegativeInventory), menuFilter),
+    [menu, menuGroupId, allowNegativeInventory, menuFilter],
+  );
+
+  /**
    * Core cart-add logic. Reusable from scan and search paths. Operates on the
    * ACTIVE cart only.
    *
    * Rules:
    *   - Active products only.
-   *   - Non-service products without a primary barcode are not sellable
-   *     (catalog policy: "barcode-first" for stock items).
    *   - If the same (product, uom) is already in the cart, bump its qty
-   *     by 1 rather than adding a duplicate row.
+   *     by 1 rather than adding a duplicate row. This is what makes clicking a
+   *     menu tile twice mean "two of those" — the tile path adds nothing new,
+   *     it just calls this.
    *   - Stock cap: refuse to push qty_base beyond product.quantity_on_hand,
    *     UNLESS "Allow negative inventory" is enabled in POS setup.
    */
@@ -447,10 +541,15 @@ export default function PosRegister() {
       setScanError(t("pos.errInactiveProduct", { name: product.name }));
       return;
     }
-    if (!product.isService && product.primaryBarcode === null) {
-      setScanError(t("pos.errNoBarcode", { name: product.name }));
-      return;
-    }
+    // NOTE — a stocked product used to be refused here unless it carried a
+    // primary barcode ("barcode-first" catalog policy). That rule made a
+    // restaurant menu unsellable: a Double has no barcode, so every burger was
+    // refused by every path, tile, search and scan alike. It was a FRONTEND
+    // policy only — `post_sale` treats `barcode_used_snapshot` as an optional
+    // receipt snapshot (`Option<String>`) and has never required or validated
+    // one — so dropping it changes no payload, no posting rule and no catalog
+    // semantics. A tile adds a line with `barcodeUsed: null`, exactly as the
+    // name-search path already did for services.
 
     setLines((prev) => {
       const existingIdx = prev.findIndex(
@@ -929,6 +1028,9 @@ export default function PosRegister() {
       settleCheckoutAttempt(cartId);
       clearCart(cartId);
       setReceiptSale(details);
+      // Stock moved, so the grid's out-of-stock tiles are stale. Fire and
+      // forget: a failed refresh must not turn a posted sale into an error.
+      void reloadMenu();
     } catch (e) {
       // Definitive failure. The identity is deliberately KEPT: if the cashier
       // fixes the problem and posts again, that is the same checkout, and if
@@ -981,50 +1083,89 @@ export default function PosRegister() {
   // ============================================================================
 
   if (!hydrated) {
-    return <div className="text-sm text-slate-500">{t("pos.loadingRegister")}</div>;
+    return <div className="text-sm text-fg-muted">{t("pos.loadingRegister")}</div>;
   }
 
   const costingMethodLabel =
     costMethod === "weighted_average" ? t("pos.weightedAverage") : t("pos.lastPurchase");
 
   return (
-    <div className="space-y-6">
+    <div className="flex flex-col gap-3.5 squat:gap-2 tiny:gap-1.5 lg:min-h-0 lg:flex-1">
+      {/* The POS is the one HERO screen — the approved restaurant banner.
+          Warm paper inside a border with a red kicker on Classic, a solid
+          #BD1029 field on Midnight; one component, two token sets. Every other
+          page keeps the plain header, so the band means "you are selling"
+          rather than "this app has a coloured header". */}
       <PageHeader
+        variant="hero"
+        eyebrow={t("pos.eyebrow")}
         title={t("pos.title")}
         subtitle={t("pos.subtitle")}
         actions={
           <>
-            {rate ? (
-              <div className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-soft">
-                <span className="font-semibold text-slate-800">{t("pos.rateLocked")}</span>{" "}
-                <span className="tabular-nums">{formatRate(rate.rateLbpPerUsd)}</span>
-              </div>
-            ) : (
-              <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-800">
-                {t("pos.noExchangeRate")}
-              </div>
-            )}
-            <div className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-600 shadow-soft">
-              <span className="font-semibold text-slate-800">{t("pos.costingLabel")}:</span>{" "}
-              {costingMethodLabel}
-            </div>
-            <Button variant="secondary" size="sm" onClick={() => setSettingsOpen(true)}>
+            {/* The prototype's status chip. The dot is green on an open shift
+                and amber when the till is blocked, so the state of the
+                register is readable from across the counter. */}
+            <ShiftChip
+              tone={activeShift === null ? "warn" : "good"}
+              title={
+                activeShift === null ? t("pos.noOpenShiftBold") : t("pos.shiftOpenChip")
+              }
+              detail={
+                rate
+                  ? `${formatRate(rate.rateLbpPerUsd)} · ${costingMethodLabel}`
+                  : t("pos.noExchangeRate")
+              }
+            />
+            <TinyButton onClick={() => setSettingsOpen(true)}>
               {t("pos.posSettings")}
-            </Button>
+            </TinyButton>
           </>
         }
       />
 
-      {/* Shift warning */}
+      {/* Shift warning — unchanged in force, and now it carries the way out.
+          A novice should not have to hunt the sidebar for the page that unblocks
+          the till. The link NAVIGATES only; nothing here opens a shift. */}
       {activeShift === null && (
-        <div className="flex items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-          <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 h-5 w-5 shrink-0 text-amber-500">
+        <div className="flex flex-wrap items-center gap-3 rounded-panel border border-warn-line bg-warn-bg px-4 py-2.5 text-sm text-warn-fg">
+          <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5 shrink-0 text-warn-fg">
             <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
-          <span>
+          <span className="flex-1">
             <span className="font-semibold">{t("pos.noOpenShiftBold")}</span>{" "}
             {t("pos.goTo")} <strong>{t("nav.shiftSummary")}</strong> {t("pos.toOpenShift")}
           </span>
+          <Link
+            to="/shift"
+            className="inline-flex shrink-0 items-center justify-center rounded-chip bg-warn px-3 py-1.5 text-xs font-bold text-ink-900 shadow-soft transition-colors hover:brightness-95"
+          >
+            {t("pos.openShiftAction")}
+          </Link>
+        </div>
+      )}
+
+      {/* No-rate warning. This used to be a small header chip reading "LBP
+          payments disabled", which understated it: `post_sale` locks an exchange
+          rate on EVERY sale, so without one nothing can post — a pure USD-cash
+          sale included. The requirement is unchanged; only the sentence now
+          matches it. Suppressed while the shift banner is already showing, so a
+          cold start does not stack two red walls above the menu. */}
+      {rate === null && activeShift !== null && (
+        <div className="flex flex-wrap items-center gap-3 rounded-panel border border-warn-line bg-warn-bg px-4 py-2.5 text-sm text-warn-fg">
+          <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5 shrink-0 text-warn-fg">
+            <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <span className="flex-1">
+            <span className="font-semibold">{t("pos.noRateTitle")}</span>{" "}
+            {t("pos.noRateBody")}
+          </span>
+          <Link
+            to="/exchange-rate"
+            className="inline-flex shrink-0 items-center justify-center rounded-chip bg-warn px-3 py-1.5 text-xs font-bold text-ink-900 shadow-soft transition-colors hover:brightness-95"
+          >
+            {t("pos.goToExchangeRate")}
+          </Link>
         </div>
       )}
 
@@ -1036,10 +1177,10 @@ export default function PosRegister() {
       )}
 
       {receiptSale && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm print:hidden">
-          <div className="max-h-[90vh] w-full max-w-sm animate-scale-in overflow-y-auto rounded-2xl bg-white shadow-2xl">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-scrim/50 p-4 backdrop-blur-sm print:hidden">
+          <div className="greaz-paper-doc max-h-[90vh] w-full max-w-sm animate-scale-in overflow-y-auto rounded-panel shadow-2xl">
             <ReceiptPrint sale={receiptSale} storeName={storeName} />
-            <div className="flex gap-2 border-t border-slate-200 p-4 print:hidden">
+            <div className="flex gap-2 border-t border-line p-4 print:hidden">
               <Button variant="primary" className="flex-1" onClick={() => window.print()}>
                 {t("pos.printReceipt")}
               </Button>
@@ -1054,17 +1195,17 @@ export default function PosRegister() {
       {/* POS Register setup drawer */}
       {settingsOpen && (
         <div
-          className="fixed inset-0 z-40 flex justify-end bg-slate-900/40 backdrop-blur-sm print:hidden"
+          className="fixed inset-0 z-40 flex justify-end bg-scrim/40 backdrop-blur-sm print:hidden"
           onClick={() => setSettingsOpen(false)}
         >
           <div
-            className="h-full w-full max-w-sm animate-fade-in overflow-y-auto border-slate-200 bg-white shadow-2xl ltr:border-l rtl:border-r"
+            className="h-full w-full max-w-sm animate-fade-in overflow-y-auto border-line bg-surface shadow-2xl ltr:border-l rtl:border-r"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between border-b border-slate-200 p-4">
+            <div className="flex items-center justify-between border-b border-line p-4">
               <div>
-                <h3 className="text-lg font-semibold text-slate-900">{t("pos.setupTitle")}</h3>
-                <p className="text-xs text-slate-500">{t("pos.setupSubtitle")}</p>
+                <h3 className="greaz-display text-lg uppercase text-fg">{t("pos.setupTitle")}</h3>
+                <p className="text-xs text-fg-muted">{t("pos.setupSubtitle")}</p>
               </div>
               <Button variant="ghost" size="sm" onClick={() => setSettingsOpen(false)}>
                 {t("common.close")}
@@ -1075,10 +1216,10 @@ export default function PosRegister() {
               {/* Costing method */}
               <div className="space-y-2">
                 <div>
-                  <p className="text-sm font-medium text-slate-800">{t("pos.costMethodTitle")}</p>
-                  <p className="text-xs text-slate-500">{t("pos.costMethodSubtitle")}</p>
+                  <p className="text-sm font-semibold text-fg">{t("pos.costMethodTitle")}</p>
+                  <p className="text-xs text-fg-muted">{t("pos.costMethodSubtitle")}</p>
                 </div>
-                <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 p-3 text-sm transition-colors hover:bg-slate-50">
+                <label className="flex cursor-pointer items-start gap-2.5 rounded-chip border border-line p-3 text-sm transition-colors hover:bg-paper">
                   <input
                     type="radio"
                     name="cogs-method"
@@ -1087,11 +1228,11 @@ export default function PosRegister() {
                     className="mt-1 accent-brand"
                   />
                   <span>
-                    <span className="block font-medium text-slate-800">{t("pos.weightedAverage")}</span>
-                    <span className="text-xs text-slate-500">{t("pos.weightedAverageDesc")}</span>
+                    <span className="block font-semibold text-fg">{t("pos.weightedAverage")}</span>
+                    <span className="text-xs text-fg-muted">{t("pos.weightedAverageDesc")}</span>
                   </span>
                 </label>
-                <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-slate-200 p-3 text-sm transition-colors hover:bg-slate-50">
+                <label className="flex cursor-pointer items-start gap-2.5 rounded-chip border border-line p-3 text-sm transition-colors hover:bg-paper">
                   <input
                     type="radio"
                     name="cogs-method"
@@ -1100,14 +1241,14 @@ export default function PosRegister() {
                     className="mt-1 accent-brand"
                   />
                   <span>
-                    <span className="block font-medium text-slate-800">{t("pos.lastPurchase")}</span>
-                    <span className="text-xs text-slate-500">{t("pos.lastPurchaseDesc")}</span>
+                    <span className="block font-semibold text-fg">{t("pos.lastPurchase")}</span>
+                    <span className="text-xs text-fg-muted">{t("pos.lastPurchaseDesc")}</span>
                   </span>
                 </label>
               </div>
 
               {/* Allow negative inventory */}
-              <div className="border-t border-slate-200 pt-4">
+              <div className="border-t border-line pt-4">
                 <label className="flex cursor-pointer items-start gap-3 text-sm">
                   <input
                     type="checkbox"
@@ -1116,10 +1257,10 @@ export default function PosRegister() {
                     className="mt-1 h-4 w-4 accent-brand"
                   />
                   <span>
-                    <span className="block font-medium text-slate-800">
+                    <span className="block font-semibold text-fg">
                       {t("pos.allowNegativeInventory")}
                     </span>
-                    <span className="text-xs text-slate-500">
+                    <span className="text-xs text-fg-muted">
                       {t("pos.allowNegativeInventoryHelp")}
                     </span>
                   </span>
@@ -1130,78 +1271,217 @@ export default function PosRegister() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        {/* ─── LEFT: Scan + cart ───────────────────────────────────────── */}
-        <div className="space-y-6 lg:col-span-2">
-          <Card>
-            <CardHeader title={t("pos.addItemTitle")} subtitle={t("pos.addItemSubtitle")} />
-            <CardBody className="space-y-3">
+      {/* Tighter gaps than the rest of the app on purpose: at 1366x768 this one
+          screen has to hold the menu, the cart and the whole payment panel
+          without the cashier scrolling to find Post Sale. */}
+      {/* ─── THE COUNTER ───────────────────────────────────────────────────
+          The approved layout, and the reason this is not a generic POS: a
+          quick-service till is a wall of food on the left and ONE narrow
+          column on the right carrying the order from first tap to cash.
+
+          The cart used to be a six-column table BELOW the menu in a two-span
+          left column, which pushed the payment panel and the Post Sale button
+          off the bottom of a 768px-tall screen. Nothing the table showed was
+          dropped to fit the 325px rail — the UoM and the unit price moved onto
+          a muted sub-line under each item name. */}
+      <div className="grid grid-cols-1 gap-3.5 lg:min-h-0 lg:flex-1 lg:grid-cols-[minmax(0,1fr)_300px] xl:grid-cols-[minmax(0,1fr)_325px]">
+        {/* ─── LEFT: the menu. Tap an item, it goes in the cart. ────────── */}
+        <MenuPane
+          title={t("pos.menuTitle")}
+          subtitle={t("pos.menuSubtitle")}
+          search={
+            <>
+              {/* SECONDARY: narrow the grid. Instant, client-side over the
+                  loaded menu — no round trip while a queue is waiting. */}
+              <div className="relative">
+                <span className="pointer-events-none absolute inset-y-0 flex items-center text-fg-subtle ltr:left-3 rtl:right-3">
+                  <svg viewBox="0 0 24 24" fill="none" className="h-3.5 w-3.5">
+                    <path d="m21 21-4.3-4.3M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16Z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                  </svg>
+                </span>
+                <input
+                  value={menuFilter}
+                  onChange={(e) => setMenuFilter(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      setMenuFilter("");
+                      return;
+                    }
+                    // Enter on a narrowed-to-one grid adds that item, so a
+                    // cashier who prefers typing never has to reach for the
+                    // mouse. Anything else needs a deliberate tap.
+                    if (e.key === "Enter" && visibleMenu.length === 1) {
+                      e.preventDefault();
+                      handleTileClick(visibleMenu[0]);
+                      setMenuFilter("");
+                    }
+                  }}
+                  placeholder={t("pos.menuFilterPlaceholder")}
+                  aria-label={t("pos.menuFilterPlaceholder")}
+                  className="w-[168px] rounded-chip border border-line bg-paper py-2.5 text-[11px] text-fg placeholder-fg-subtle transition-colors hover:border-fg-subtle focus:border-brand focus:outline-none ltr:pl-8 ltr:pr-3 rtl:pr-8 rtl:pl-3"
+                />
+              </div>
+              {/* TERTIARY: barcode / full-catalog search, folded away. */}
+              <Button
+                variant={barcodeOpen ? "primary" : "secondary"}
+                size="sm"
+                onClick={() => {
+                  const next = !barcodeOpen;
+                  setBarcodeOpen(next);
+                  if (next) focusScanInput();
+                }}
+                aria-expanded={barcodeOpen}
+                title={t("pos.moreWaysToAdd")}
+              >
+                <svg viewBox="0 0 24 24" fill="none" className="h-4 w-4">
+                  <path d="M3 5v14M7 5v14M11 5v14M15 5v14M19 5v14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                </svg>
+                {t("pos.scanLabel")}
+              </Button>
+            </>
+          }
+        >
+          {/* Collapsed secondary input row */}
+          {barcodeOpen && (
+            <div className="mt-3 space-y-2.5 rounded-chip border border-line bg-paper p-3">
+              <p className="text-[11px] font-semibold text-fg-muted">{t("pos.moreWaysToAdd")}</p>
               <div className="flex gap-2">
-                <div className="relative flex-1">
-                  <span className="pointer-events-none absolute inset-y-0 flex items-center text-slate-400 ltr:left-3.5 rtl:right-3.5">
-                    <svg viewBox="0 0 24 24" fill="none" className="h-5 w-5">
-                      <path d="M3 5v14M7 5v14M11 5v14M15 5v14M19 5v14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                    </svg>
-                  </span>
-                  <input
-                    ref={scanRef}
-                    value={scanInput}
-                    onChange={(e) => setScanInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        void handleScan();
-                      }
-                    }}
-                    placeholder={t("pos.scanBarcodePlaceholder")}
-                    autoFocus
-                    className="w-full rounded-lg border border-slate-300 bg-white py-2.5 text-base shadow-soft transition-colors hover:border-slate-400 focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15 ltr:pl-11 ltr:pr-3 rtl:pr-11 rtl:pl-3"
-                  />
-                </div>
-                <Button variant="primary" onClick={handleScan} disabled={!scanInput.trim()}>
+                <input
+                  ref={scanRef}
+                  value={scanInput}
+                  onChange={(e) => setScanInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleScan();
+                    }
+                  }}
+                  placeholder={t("pos.scanBarcodePlaceholder")}
+                  aria-label={t("pos.scanBarcodePlaceholder")}
+                  className="w-full flex-1 rounded-chip border border-line bg-surface px-3 py-2 text-sm text-fg placeholder-fg-subtle transition-colors hover:border-fg-subtle focus:border-brand focus:outline-none"
+                />
+                <Button variant="secondary" onClick={handleScan} disabled={!scanInput.trim()}>
                   {t("common.add")}
                 </Button>
               </div>
-              <div>
-                <p className="mb-1 text-xs text-slate-500">{t("pos.orSearchByName")}</p>
-                <ProductPicker
-                  storeId={storeId!}
-                  onPick={handlePick}
-                  excludeIds={[]}
-                  placeholder={t("pos.searchProductsPlaceholder")}
-                />
-              </div>
-              {scanError && <p className="text-xs text-red-600">{scanError}</p>}
-            </CardBody>
-          </Card>
+              {/* Full catalog search — reaches products beyond the loaded menu
+                  page, and matches an exact barcode too. */}
+              <ProductPicker
+                storeId={storeId!}
+                onPick={handlePick}
+                excludeIds={[]}
+                placeholder={t("pos.searchProductsPlaceholder")}
+              />
+            </div>
+          )}
 
-          {/* Cart tabs */}
-          <div className="flex flex-wrap items-center gap-2">
+          {scanError && (
+            <p className="mt-3 rounded-chip bg-danger-bg px-3 py-2 text-xs font-medium text-danger-fg">
+              {scanError}
+            </p>
+          )}
+          {menuError && (
+            <p className="mt-3 rounded-chip bg-danger-bg px-3 py-2 text-xs font-medium text-danger-fg">
+              {menuError}
+            </p>
+          )}
+
+          {/* GROUP CHIPS. Shown only when there is more than one group — a lone
+              "All" chip is a control that filters nothing, and a cashier should
+              not have to learn that.
+
+              These are NOT the prototype's Burgers / Sides / Wraps row, and
+              cannot be until `products` has a category column. That caveat
+              used to be printed under the grid, where a cashier mid-service
+              could do nothing with it; it lives in docs/MENU-CATEGORIES.md
+              now. See `lib/menuGrid.ts::deriveMenuGroups` for the seam. */}
+          {menuGroups.length > 1 && (
+            <div className="mt-[15px] flex shrink-0 flex-wrap items-center gap-[7px] squat:mt-2.5 squat:flex-nowrap squat:overflow-x-auto squat:pb-1">
+              {menuGroups.map((g) => (
+                <MenuChip
+                  key={g.id}
+                  selected={g.id === menuGroupId}
+                  count={g.count}
+                  onClick={() => setMenuGroupId(g.id)}
+                >
+                  {t(g.labelKey)}
+                </MenuChip>
+              ))}
+            </div>
+          )}
+
+          {/* The grid. Four across where there is room, three at 125% Windows
+              scaling. Capped and internally scrolled so the page itself never
+              grows past the viewport — that is what keeps the order rail, and
+              with it the Post Sale button, on screen at 1366x768. */}
+          {menuLoading ? (
+            <p className="py-6 text-center text-sm text-fg-muted">{t("pos.menuLoading")}</p>
+          ) : menu.length === 0 ? (
+            <EmptyState title={t("pos.menuEmpty")} />
+          ) : visibleMenu.length === 0 ? (
+            <p className="py-6 text-center text-sm text-fg-muted">
+              {t("pos.menuNoMatches", { term: menuFilter.trim() })}
+            </p>
+          ) : (
+            <div className="-mx-1 mt-3.5 max-h-[32rem] min-h-0 overflow-y-auto px-1 py-0.5 squat:mt-2.5 lg:max-h-none lg:flex-1">
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 xl:grid-cols-4">
+                {visibleMenu.map((p) => (
+                  <MenuTile
+                    key={p.id}
+                    name={p.name}
+                    price={formatUsd(menuTilePriceInclVatCents(p))}
+                    outOfStock={isMenuOutOfStock(p, allowNegativeInventory)}
+                    outOfStockLabel={t("pos.menuOutOfStock")}
+                    onClick={() => handleTileClick(p)}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+        </MenuPane>
+
+        {/* ─── RIGHT: the order rail ─────────────────────────────────────
+            Bounded to the height actually available, and split in two: a
+            SCROLLING upper region (tabs, order lines, discount, totals, amount
+            due) and a PINNED cash panel. The payment card is the rail's own
+            footer rather than content inside the scroller, so Post Sale and
+            the cash fields are always on screen without covering anything —
+            they are outside the scrolled box, not floating over it.
+
+            This replaces a stack of per-element size trims that still left
+            Post Sale ~35px below the fold at 1366x768 once a discount was
+            expanded, and further at 125% scaling. Nothing is hidden to make
+            it fit now: the lira remaining/change lines, the conversion hint
+            and the discount labels are all back. */}
+          <div className="flex min-w-0 flex-col gap-3 squat:gap-2 lg:h-full lg:min-h-0 lg:overflow-y-auto">
+          {/* Cart tabs. Not in the prototype — Greaz can park an order and
+              serve the next customer, which a single-order mockup has no slot
+              for. Kept compact so it reads as a strip above the order, not as
+              a second navigation. */}
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5">
             {carts.map((c) => {
               const isActive = c.id === activeCartId;
               return (
                 <div
                   key={c.id}
                   className={clsx(
-                    "inline-flex items-center rounded-lg border shadow-soft transition-colors",
+                    "inline-flex items-center rounded-chip border transition-colors",
                     isActive
-                      ? "border-brand bg-brand/10 ring-1 ring-brand/20"
-                      : "border-slate-200 bg-white hover:bg-slate-50",
+                      ? "border-brand bg-brand-soft"
+                      : "border-line bg-surface hover:bg-paper",
                   )}
                 >
                   <button
                     type="button"
                     onClick={() => switchCart(c.id)}
                     className={clsx(
-                      "px-3 py-1.5 text-sm",
-                      isActive ? "font-semibold text-brand" : "text-slate-700",
+                      "px-2.5 py-1.5 text-[11px] font-extrabold",
+                      isActive ? "text-brand-700" : "text-fg-muted",
                     )}
                   >
                     {t("pos.cartLabel", { n: String(c.seq) })}
-                    {c.lines.length > 0 ? (
+                    {c.lines.length > 0 && (
                       <span className="tabular-nums"> ({c.lines.length})</span>
-                    ) : (
-                      <span className="text-slate-400"> · {t("pos.cartEmpty")}</span>
                     )}
                   </button>
                   {carts.length > 1 && (
@@ -1214,7 +1494,7 @@ export default function PosRegister() {
                       disabled={postingCartId === c.id}
                       aria-label={t("pos.closeCart")}
                       title={t("pos.closeCart")}
-                      className="px-2 py-1.5 text-slate-400 hover:text-red-600 disabled:cursor-not-allowed disabled:text-slate-300 disabled:hover:text-slate-300"
+                      className="px-1.5 py-1.5 text-fg-subtle hover:text-danger-fg disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       ×
                     </button>
@@ -1222,178 +1502,199 @@ export default function PosRegister() {
                 </div>
               );
             })}
-            <Button variant="secondary" size="sm" onClick={addCart}>
+            <button
+              type="button"
+              onClick={addCart}
+              className="rounded-chip border border-dashed border-line px-2.5 py-1.5 text-[11px] font-extrabold text-fg-muted transition-colors hover:border-brand hover:text-brand-ink"
+            >
               + {t("pos.newCart")}
-            </Button>
+            </button>
           </div>
 
-          <Card>
-            <CardHeader
-              title={t("pos.cartTitle")}
-              subtitle={
-                lines.length === 0
-                  ? t("pos.cartEmpty")
-                  : t("pos.cartLinesCount", { count: String(lines.length) })
-              }
+          {/* ── ORDER ────────────────────────────────────────────────────
+              The card is BOUNDED and never scrolls as a whole. Its heading,
+              its totals and the AMOUNT DUE block are fixed; the lines and the
+              discount editor share the one scroll region between them. That
+              ordering is the whole point: the figure the customer is being
+              asked to pay, and the button that takes it, can never be scrolled
+              off, however long the order or however the discount is open. */}
+          <section className="flex flex-col overflow-hidden rounded-panel border border-line bg-surface p-[15px] shadow-panel squat:p-2.5 tiny:p-2 lg:min-h-[6.75rem] lg:flex-1">
+            <RailHeading
               actions={
-                lines.length > 0 ? (
-                  <Button
-                    variant="ghost"
-                    // Same reason as Close: clearing retires the identity.
-                    disabled={postingCartId === activeCartId}
-                    onClick={() => { clearActiveCart(); focusScanInput(); }}
-                  >
-                    {t("pos.clearCart")}
-                  </Button>
-                ) : undefined
+                <>
+                  {/* The discount TRIGGER rides in the heading rather than
+                      taking a full row of its own. At 1366x768 that row was
+                      ~42px the order lines could not spare, and a control that
+                      is used on a minority of sales should not outrank the
+                      lines on every sale. The panel it opens still appears
+                      below, in full. */}
+                  {!(discountOpen || discountCents > 0) && (
+                    <TinyButton onClick={() => setDiscountOpen(true)}>
+                      + {t("pos.discountSectionTitle")}
+                    </TinyButton>
+                  )}
+                  {lines.length > 0 && (
+                    <TinyButton
+                      // Same reason as Close: clearing retires the identity.
+                      disabled={postingCartId === activeCartId}
+                      onClick={() => { clearActiveCart(); focusScanInput(); }}
+                    >
+                      {t("pos.clearCart")}
+                    </TinyButton>
+                  )}
+                </>
               }
-            />
-            {lines.length === 0 ? (
-              <EmptyState
-                title={t("pos.cartEmptyMessage")}
-                icon={
-                  <svg viewBox="0 0 24 24" fill="none" className="h-6 w-6">
-                    <path d="M3 6h18l-1.5 9h-12L6 6Zm0 0L5 3H2m6 18a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm10 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-                  </svg>
-                }
-              />
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="min-w-full text-sm">
-                  <thead className="border-b border-slate-200 bg-slate-50/80 text-left text-xs uppercase tracking-wide text-slate-500">
-                    <tr>
-                      <th className="px-5 py-2.5 font-semibold">{t("pos.colProduct")}</th>
-                      <th className="px-5 py-2.5 font-semibold">{t("pos.colUom")}</th>
-                      <th className="px-5 py-2.5 text-end font-semibold">{t("pos.colUnitPrice")}</th>
-                      <th className="px-5 py-2.5 text-center font-semibold">{t("pos.colQty")}</th>
-                      <th className="px-5 py-2.5 text-end font-semibold">{t("pos.colLineTotal")}</th>
-                      <th className="px-5 py-2.5"></th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {lines.map((l) => (
-                      <tr key={l.draftId} className="transition-colors hover:bg-slate-50/70">
-                        <td className="px-5 py-3">
-                          <div className="font-medium text-slate-900">{l.product.name}</div>
-                          <div className="text-xs text-slate-500">
-                            {l.product.sku && <>SKU: {l.product.sku} · </>}
-                            {!l.product.isService && (
-                              <>
-                                {t("pos.stockLabel")}{" "}
-                                {formatSignedStockQty(l.product.quantityOnHand, l.uom.factor)}{" "}
-                                {l.uom.uomCode}
-                              </>
-                            )}
-                            {l.product.isService && (
-                              <span className="italic">{t("pos.serviceLabel")}</span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="px-5 py-3 text-slate-600">{l.uom.uomCode}</td>
-                        <td className="px-5 py-3 text-end tabular-nums text-slate-700">
-                          {formatUsd(l.math.unitPriceInclVatCents)}
-                        </td>
-                        <td className="px-5 py-3 text-center">
-                          <QuantityStepper
-                            value={l.quantityInUom}
-                            onChange={(n) => setLineQty(l.draftId, n)}
-                            onAfterStep={focusScanInput}
-                          />
-                        </td>
-                        <td className="px-5 py-3 text-end font-semibold tabular-nums text-slate-900">
-                          {formatUsd(l.math.lineTotalInclVatCents)}
-                        </td>
-                        <td className="px-5 py-3 text-end">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => { removeLine(l.draftId); focusScanInput(); }}
-                          >
-                            {t("common.remove")}
-                          </Button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+            >
+              {t("pos.cartLabel", { n: String(activeCart.seq) })}
+            </RailHeading>
+
+            {/* The order lines are the primary independently scrollable
+                region: a long order scrolls HERE first, so the discount, the
+                totals and the amount due stay where the cashier last saw them
+                instead of sliding about. */}
+            <div className="-mx-1 mt-3 min-h-[2.75rem] flex-1 scroll-p-2 overflow-y-auto tiny:min-h-0 px-1 squat:mt-1.5">
+              {lines.length === 0 ? (
+                <div className="rounded-chip border border-dashed border-line bg-paper px-2.5 py-8 text-center text-xs text-fg-muted squat:py-4">
+                  {t("pos.cartEmptyMessage")}
+                </div>
+              ) : (
+                <div>
+                  {lines.map((l) => (
+                    <CartLineRow
+                      key={l.draftId}
+                      name={l.product.name}
+                      detail={
+                        <>
+                          {formatUsd(l.math.unitPriceInclVatCents)} · {l.uom.uomCode}
+                          {!l.product.isService && (
+                            <>
+                              {" · "}
+                              {t("pos.stockLabel")}{" "}
+                              {formatSignedStockQty(l.product.quantityOnHand, l.uom.factor)}
+                            </>
+                          )}
+                          {l.product.isService && <> · {t("pos.serviceLabel")}</>}
+                        </>
+                      }
+                      amount={formatUsd(l.math.lineTotalInclVatCents)}
+                      quantity={l.quantityInUom}
+                      onDecrease={() => { setLineQty(l.draftId, l.quantityInUom - 1); focusScanInput(); }}
+                      onIncrease={() => { setLineQty(l.draftId, l.quantityInUom + 1); focusScanInput(); }}
+                      onRemove={() => { removeLine(l.draftId); focusScanInput(); }}
+                      decreaseLabel={t("pos.decreaseQty")}
+                      increaseLabel={t("pos.increaseQty")}
+                      removeLabel={t("common.remove")}
+                    />
+                  ))}
+                </div>
+              )}
+
+              {/* Discount — folded away by default. It used to sit permanently
+                as two always-open fields on the one panel the cashier uses
+                every sale, inviting a mis-keyed discount. The controls and the
+                formulas behind them are untouched; only their disclosure
+                changed.
+
+                Forced open whenever a discount is actually in effect, so a
+                discount can never be applied and invisible — including one
+                restored with a parked cart from localStorage. */}
+              {(discountOpen || discountCents > 0) && (
+                <div className="mt-3 squat:mt-2">
+                <div className="rounded-chip border border-line bg-paper p-2.5 squat:p-2">
+                  {/* No heading row: the two fields already say "Discount %"
+                      and "Discount $", so a third label repeating the word was
+                      ~24px the order lines could not spare. Clear moves onto
+                      the row, keeping a full-size target. */}
+                  <div className="grid grid-cols-[1fr_1fr_auto] items-end gap-2">
+                    <div className="min-w-0">
+                      <Input
+                        label={t("pos.discountPct")}
+                        inputMode="decimal"
+                        placeholder="0"
+                        suffix="%"
+                        value={discountPctInput}
+                        onChange={(e) => handleDiscountPctChange(e.target.value)}
+                      />
+                    </div>
+                    <div className="min-w-0">
+                      <Input
+                        label={t("pos.discountAmt")}
+                        inputMode="decimal"
+                        placeholder="0.00"
+                        prefix="$"
+                        value={discountAmountInput}
+                        onChange={(e) => handleDiscountAmountChange(e.target.value)}
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // Clearing goes through the same handler the inputs
+                        // use, so the % / $ pair stays in sync exactly as it
+                        // does on any other edit.
+                        handleDiscountAmountChange("");
+                        setDiscountOpen(false);
+                      }}
+                      className="h-[34px] shrink-0 rounded-chip border border-line px-2.5 text-[11px] font-semibold text-fg-muted transition-colors hover:text-fg"
+                    >
+                      {discountCents > 0 ? t("pos.discountClear") : t("common.close")}
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
-          </Card>
-        </div>
 
-        {/* ─── RIGHT: Totals + payment ─────────────────────────────────── */}
-        <div className="space-y-6">
-          <Card>
-            <CardHeader title={t("pos.totalsTitle")} />
-            <CardBody className="space-y-3 text-sm">
-              {/* Discount inputs */}
-              <div>
-                <p className="mb-1.5 text-xs font-medium text-slate-600">
-                  {t("pos.discountSectionTitle")}
-                </p>
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="min-w-0">
-                    <Input
-                      label={t("pos.discountPct")}
-                      inputMode="decimal"
-                      placeholder="0"
-                      suffix="%"
-                      value={discountPctInput}
-                      onChange={(e) => handleDiscountPctChange(e.target.value)}
-                    />
-                  </div>
-                  <div className="min-w-0">
-                    <Input
-                      label={t("pos.discountAmt")}
-                      inputMode="decimal"
-                      placeholder="0.00"
-                      prefix="$"
-                      value={discountAmountInput}
-                      onChange={(e) => handleDiscountAmountChange(e.target.value)}
-                    />
-                  </div>
-                </div>
-              </div>
 
-              <div className="space-y-1">
-                <TotalsRow
-                  label={t("pos.subtotalExclVat")}
-                  value={formatUsd(totals.preDiscountSubtotalExclVat)}
+              {/* Totals. Real VAT, unlike the prototype's "to confirm in POS
+                  setup" placeholder — this till computes it. They scroll with
+                  the lines rather than being pinned: the AMOUNT DUE block
+                  below is the figure that must always be on screen, and these
+                  three sit immediately above it. */}
+              <div className="mt-3 space-y-1 border-t border-line pt-2.5 squat:mt-2 squat:pt-2">
+              <AmountLine
+                label={t("pos.subtotalExclVat")}
+                value={formatUsd(totals.preDiscountSubtotalExclVat)}
+              />
+              {totals.discount > 0 && (
+                <AmountLine
+                  label={t("pos.discount")}
+                  value={`-${formatUsd(totals.discount)}`}
+                  tone="warn"
                 />
-                {totals.discount > 0 && (
-                  <TotalsRow
-                    label={t("pos.discount")}
-                    value={`-${formatUsd(totals.discount)}`}
-                    tone="warn"
-                  />
-                )}
-                <TotalsRow label={t("pos.vat")} value={formatUsd(totals.postDiscountVat)} />
+              )}
+                <AmountLine label={t("pos.vat")} value={formatUsd(totals.postDiscountVat)} />
               </div>
+            </div>
 
-              <div className="-mx-5 -mb-5 mt-1 rounded-b-xl border-t border-slate-200 bg-slate-50/70 px-5 py-4">
-                <div className="flex items-end justify-between gap-3">
-                  <span className="text-sm font-medium text-slate-600">
-                    {t("pos.totalInclVat")}
-                  </span>
-                  <span className="text-3xl font-bold tabular-nums tracking-tight text-slate-900">
-                    {formatUsd(totals.postDiscountTotal)}
-                  </span>
-                </div>
-                {rate && (
-                  <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
-                    <span>{t("pos.lbpEquivalent")}</span>
-                    <span className="tabular-nums">
-                      {formatLbp(usdCentsToLbp(totals.postDiscountTotal, rate.rateLbpPerUsd))}
-                    </span>
-                  </div>
-                )}
-              </div>
-            </CardBody>
-          </Card>
+            {/* The amount to collect — the loudest figure on the screen, and
+                pinned: it is what the customer is being asked to pay, so it
+                must never be the thing that scrolls away. */}
+            <TotalBlock
+              label={t("pos.totalInclVat")}
+              value={formatUsd(totals.postDiscountTotal)}
+              secondaryLabel={rate ? t("pos.lbpEquivalent") : undefined}
+              secondaryValue={
+                rate
+                  ? formatLbp(usdCentsToLbp(totals.postDiscountTotal, rate.rateLbpPerUsd))
+                  : undefined
+              }
+            />
+          </section>
 
-          <Card>
-            <CardHeader title={t("pos.paymentTitle")} subtitle={t("pos.paymentSubtitle")} />
-            <CardBody className="space-y-3">
+          {/* ── TAKE CASH ──────────────────────────────────────────────── */}
+          {/* `shrink-0`, and the order card above it scrolls instead. The Post
+              Sale button is the one control that must never need a scroll to
+              reach: at 1366x768 the rail is capped to the viewport, the ORDER
+              gives up height first, and the cash panel stays put. */}
+          {/* The rail's pinned footer — a sibling of the order card, not
+              content inside it, so it can never be scrolled away and never
+              overlaps a figure. */}
+          <section className="shrink-0 rounded-panel border border-line bg-surface p-[15px] shadow-panel squat:p-2.5">
+            <h3 className="greaz-display text-[19px] uppercase leading-none text-fg squat:text-[18px] tiny:sr-only">
+              {t("pos.paymentTitle")}
+            </h3>
+
+            <div className="mt-3 space-y-2.5 squat:mt-1.5 squat:space-y-1.5 tiny:grid tiny:grid-cols-2 tiny:gap-2 tiny:space-y-0">
               <Input
                 label={t("pos.cashUsdReceived")}
                 inputMode="decimal"
@@ -1403,186 +1704,131 @@ export default function PosRegister() {
                 onChange={(e) => setCashUsdInput(e.target.value)}
               />
               <Input
-                label={rate ? t("pos.cashLbpReceived") : t("pos.cashLbpNoRate")}
+                label={
+                  rate
+                    ? payments.cashLbp > 0
+                      ? `${t("pos.cashLbpReceived")} · ≈ ${formatUsd(payments.cashLbpAsUsdCents)}`
+                      : t("pos.cashLbpReceived")
+                    : t("pos.cashLbpNoRate")
+                }
                 inputMode="numeric"
                 placeholder={rate ? "0" : "—"}
                 suffix="L.L."
                 value={cashLbpInput}
                 disabled={!rate}
                 onChange={(e) => setCashLbpInput(e.target.value)}
-                hint={
-                  rate && payments.cashLbp > 0
-                    ? `≈ ${formatUsd(payments.cashLbpAsUsdCents)}`
-                    : undefined
-                }
               />
-              <Input
-                label={t("pos.cardUsdReceived")}
-                inputMode="decimal"
-                placeholder="0.00"
-                prefix="$"
-                value={cardUsdInput}
-                onChange={(e) => setCardUsdInput(e.target.value)}
-              />
+              {/* Card tender is HIDDEN, not removed. Greaz takes physical cash,
+                  so the field was noise on every sale. Everything behind it is
+                  untouched and still reachable: `cardUsdInput` state, the
+                  parse, the card-overpayment guard, the `card_usd` payment
+                  payload, the Rust command, the schema and the tests.
 
-              <div className="space-y-1 rounded-lg border border-slate-200/70 bg-slate-50 p-3 text-sm">
-                <TotalsRow
-                  label={t("pos.totalPaidUsdEquiv")}
-                  value={formatUsd(payments.totalPaidUsdCents)}
-                />
-                {remainingCents > 0 ? (
-                  <>
-                    <TotalsRow
-                      label={t("pos.remaining")}
-                      value={formatUsd(remainingCents)}
+                  What is NOT acceptable is money that pays silently: a cart
+                  parked in localStorage before this change can still carry a
+                  card amount, and it would keep counting toward "total paid"
+                  with no field on screen to explain the number. So a non-empty
+                  card value surfaces itself, with a way to clear it. */}
+              {cardUsdInput.trim() !== "" && (
+                <div className="flex items-start justify-between gap-2 rounded-chip border border-warn-line bg-warn-bg px-2.5 py-2">
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-extrabold text-warn-fg">
+                      {t("pos.cardUsdReceived")}:{" "}
+                      <span className="tabular-nums">{cardUsdInput}</span>
+                    </p>
+                    <p className="text-[10px] leading-snug text-warn-fg opacity-90">
+                      {t("pos.cardLegacyNotice")}
+                    </p>
+                  </div>
+                  <TinyButton onClick={() => setCardUsdInput("")}>
+                    {t("common.remove")}
+                  </TinyButton>
+                </div>
+              )}
+            </div>
+
+            {/* The prototype's `.paycalc` box. */}
+            <div className="mt-3 space-y-1 rounded-chip border border-line bg-paper p-2.5 squat:mt-1.5 squat:p-2">
+              <AmountLine
+                label={t("pos.totalPaidUsdEquiv")}
+                value={formatUsd(payments.totalPaidUsdCents)}
+              />
+              {remainingCents > 0 ? (
+                <>
+                  <AmountLine
+                    label={t("pos.remaining")}
+                    value={formatUsd(remainingCents)}
+                    tone="warn"
+                  />
+                  {rate && (
+                    <AmountLine
+                      label={t("pos.lbpRemaining")}
+                      value={formatLbp(usdCentsToLbp(remainingCents, rate.rateLbpPerUsd))}
                       tone="warn"
+                      muted
                     />
-                    {rate && (
-                      <TotalsRow
-                        label={t("pos.lbpRemaining")}
-                        value={formatLbp(usdCentsToLbp(remainingCents, rate.rateLbpPerUsd))}
-                        tone="warn"
-                        muted
-                      />
-                    )}
-                  </>
-                ) : changeCents > 0 ? (
-                  <>
-                    <TotalsRow
-                      label={t("pos.changeDue")}
-                      value={formatUsd(changeCents)}
+                  )}
+                </>
+              ) : changeCents > 0 ? (
+                <>
+                  <AmountLine
+                    label={t("pos.changeDue")}
+                    value={formatUsd(changeCents)}
+                    tone="good"
+                    strong
+                  />
+                  {rate && (
+                    <AmountLine
+                      label={t("pos.lbpChange")}
+                      value={formatLbp(usdCentsToLbp(changeCents, rate.rateLbpPerUsd))}
                       tone="good"
-                      strong
+                      muted
                     />
-                    {rate && (
-                      <TotalsRow
-                        label={t("pos.lbpChange")}
-                        value={formatLbp(usdCentsToLbp(changeCents, rate.rateLbpPerUsd))}
-                        tone="good"
-                        muted
-                      />
-                    )}
-                  </>
-                ) : lines.length > 0 ? (
-                  <TotalsRow label={t("pos.statusLabel")} value={t("pos.exactPayment")} tone="good" />
-                ) : null}
-              </div>
+                  )}
+                </>
+              ) : lines.length > 0 ? (
+                <AmountLine
+                  label={t("pos.statusLabel")}
+                  value={t("pos.exactPayment")}
+                  tone="good"
+                />
+              ) : null}
+            </div>
 
-              {payments.errors.length > 0 && (
-                <p className="text-xs text-red-600">{payments.errors[0]}</p>
-              )}
-              {rateError === "NO_EXCHANGE_RATE_SET" && (
-                <p className="text-xs text-amber-700">{t("pos.noRateHint")}</p>
-              )}
-              {submitError && <p className="text-xs text-red-600">{submitError}</p>}
+            {payments.errors.length > 0 && (
+              <p className="mt-2 text-[11px] text-danger-fg">{payments.errors[0]}</p>
+            )}
+            {rateError === "NO_EXCHANGE_RATE_SET" && (
+              <p className="mt-2 text-[11px] text-warn-fg">{t("pos.noRateHint")}</p>
+            )}
+            {submitError && <p className="mt-2 text-[11px] text-danger-fg">{submitError}</p>}
 
-              <Button
-                variant="primary"
-                className="w-full py-3 text-base"
-                disabled={!canPost}
-                onClick={handlePost}
-              >
-                {submitting ? t("pos.posting") : t("pos.postSale")}
-                {!submitting && (
-                  <kbd className="ms-2 rounded border border-white/30 bg-white/15 px-1.5 py-0.5 text-[10px] font-semibold leading-none">
-                    F5
-                  </kbd>
-                )}
-              </Button>
-            </CardBody>
-          </Card>
+            {/* The one unmistakable action on the page — the prototype's
+                `.payaction`: full width, solid brand red, display face. Nothing
+                else on this screen is allowed to look like it. */}
+            <button
+              type="button"
+              disabled={!canPost}
+              onClick={handlePost}
+              className="greaz-display mt-3 w-full rounded-chip bg-brand px-4 py-3.5 text-[15px] uppercase tracking-wide text-brand-fg transition-all hover:bg-brand-hover active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-brand squat:mt-2 squat:py-2.5"
+            >
+              {submitting ? t("pos.posting") : t("pos.postSale")}
+              {!submitting && (
+                // The key cap is DARKENED, not lightened. `bg-white/15`
+                // lifted the pill to #D83D51 / #E93D59 under a white glyph —
+                // 4.46:1 on Classic and 3.98:1 on Midnight, so the shortcut on
+                // the one button that posts money was under AA in both
+                // appearances. A black wash instead reads as an inset cap and
+                // takes the glyph to 7.53:1 / 6.62:1; the white hairline keeps
+                // the cap's edge against the button.
+                <kbd className="ms-2 rounded border border-white/30 bg-black/20 px-1.5 py-0.5 text-[10px] font-semibold leading-none">
+                  F5
+                </kbd>
+              )}
+            </button>
+          </section>
         </div>
       </div>
-    </div>
-  );
-}
-
-// ============================================================================
-// Small presentational helpers
-// ============================================================================
-
-function TotalsRow({
-  label,
-  value,
-  strong,
-  muted,
-  tone,
-}: {
-  label: string;
-  value: string;
-  strong?: boolean;
-  muted?: boolean;
-  tone?: "good" | "warn";
-}) {
-  return (
-    <div className="flex items-center justify-between">
-      <span
-        className={clsx(
-          "text-xs",
-          muted ? "text-slate-400" : "text-slate-600",
-          tone === "warn" && "text-amber-700",
-          tone === "good" && "text-emerald-700",
-        )}
-      >
-        {label}
-      </span>
-      <span
-        className={clsx(
-          "tabular-nums",
-          strong ? "text-base font-semibold text-slate-900" : "text-sm",
-          muted && !strong && "text-slate-500",
-          tone === "warn" && !strong && "text-amber-800",
-          tone === "good" && !strong && "text-emerald-800",
-          tone === "warn" && strong && "text-amber-900",
-          tone === "good" && strong && "text-emerald-900",
-        )}
-      >
-        {value}
-      </span>
-    </div>
-  );
-}
-
-function QuantityStepper({
-  value,
-  onChange,
-  onAfterStep,
-}: {
-  value: number;
-  onChange: (n: number) => void;
-  onAfterStep?: () => void;
-}) {
-  const { t } = useTranslation();
-
-  return (
-    <div className="inline-flex items-center rounded-lg border border-slate-300 bg-white shadow-soft">
-      <button
-        type="button"
-        onClick={() => { onChange(value - 1); onAfterStep?.(); }}
-        disabled={value <= 1}
-        className="flex h-8 w-8 items-center justify-center text-lg text-slate-600 transition-colors hover:bg-slate-100 disabled:opacity-40 ltr:rounded-l-lg rtl:rounded-r-lg"
-        aria-label={t("pos.decreaseQty")}
-      >
-        −
-      </button>
-      <input
-        type="number"
-        min={1}
-        value={value}
-        onChange={(e) => {
-          const n = Number(e.target.value);
-          if (Number.isInteger(n) && n > 0) onChange(n);
-        }}
-        className="h-8 w-11 border-x border-slate-200 bg-white text-center text-sm font-medium tabular-nums focus:outline-none focus:ring-2 focus:ring-inset focus:ring-brand/30"
-      />
-      <button
-        type="button"
-        onClick={() => { onChange(value + 1); onAfterStep?.(); }}
-        className="flex h-8 w-8 items-center justify-center text-lg text-slate-600 transition-colors hover:bg-slate-100 ltr:rounded-r-lg rtl:rounded-l-lg"
-        aria-label={t("pos.increaseQty")}
-      >
-        +
-      </button>
     </div>
   );
 }

@@ -86,7 +86,7 @@ export default function Suppliers() {
         actions={
           <div className="flex items-center gap-3">
             {justSaved && (
-              <span className="text-sm font-medium text-emerald-600">{t("suppliers.supplierAdded")}</span>
+              <span className="text-sm font-medium text-good-fg">{t("suppliers.supplierAdded")}</span>
             )}
 
             <Button
@@ -192,9 +192,9 @@ export default function Suppliers() {
                         className={clsx(
                           "px-5 py-2 text-end font-medium",
                           bal > 0
-                            ? "text-red-700"
+                            ? "text-danger-fg"
                             : bal < 0
-                              ? "text-emerald-700"
+                              ? "text-good-fg"
                               : "text-slate-500",
                         )}
                       >
@@ -322,7 +322,7 @@ function NewSupplierForm({
         />
 
         {error && (
-          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          <div className="rounded-md border border-danger-line bg-danger-bg p-3 text-sm text-danger-fg">
             {error}
           </div>
         )}

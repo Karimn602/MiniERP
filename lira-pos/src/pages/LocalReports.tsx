@@ -137,7 +137,7 @@ export default function LocalReports() {
                 type="date"
                 value={dateFrom}
                 onChange={(e) => setDateFrom(e.target.value)}
-                className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 shadow-soft transition-colors hover:border-slate-400 focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15"
+                className="rounded-lg border border-slate-300 bg-surface px-3 py-1.5 text-sm text-slate-900 shadow-soft transition-colors hover:border-slate-400 focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15"
               />
             </div>
             <div className="flex flex-col gap-1">
@@ -146,7 +146,7 @@ export default function LocalReports() {
                 type="date"
                 value={dateTo}
                 onChange={(e) => setDateTo(e.target.value)}
-                className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm text-slate-900 shadow-soft transition-colors hover:border-slate-400 focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15"
+                className="rounded-lg border border-slate-300 bg-surface px-3 py-1.5 text-sm text-slate-900 shadow-soft transition-colors hover:border-slate-400 focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15"
               />
             </div>
             <Button variant="primary" onClick={handleApply} disabled={loading}>
@@ -157,7 +157,7 @@ export default function LocalReports() {
       />
 
       {loadError && (
-        <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-xl border border-danger-line bg-danger-bg px-4 py-3 text-sm text-danger-fg">
           {t("localReports.loadFailed", { error: loadError })}
         </div>
       )}
@@ -239,7 +239,7 @@ export default function LocalReports() {
                       <td
                         className={clsx(
                           "px-5 py-2 text-end tabular-nums",
-                          returnedRevenue > 0 ? "text-amber-700" : "text-slate-400",
+                          returnedRevenue > 0 ? "text-warn-fg" : "text-fg-muted",
                         )}
                       >
                         {returnedRevenue > 0 ? `\u2212 ${formatUsd(returnedRevenue)}` : "\u2014"}
@@ -256,7 +256,7 @@ export default function LocalReports() {
                       <td
                         className={clsx(
                           "px-5 py-2 text-end tabular-nums font-medium",
-                          profit >= 0 ? "text-emerald-700" : "text-red-700",
+                          profit >= 0 ? "text-good-fg" : "text-danger-fg",
                         )}
                       >
                         {formatUsd(profit)}
@@ -312,7 +312,7 @@ export default function LocalReports() {
                       <td className="px-5 py-2 text-end tabular-nums text-slate-700">
                         {row.netQty}
                         {row.returnedQty > 0 && (
-                          <div className="text-xs text-amber-700">
+                          <div className="text-xs text-warn-fg">
                             {`\u2212${row.returnedQty}`}
                           </div>
                         )}
@@ -326,7 +326,7 @@ export default function LocalReports() {
                       <td
                         className={clsx(
                           "px-5 py-2 text-end tabular-nums font-medium",
-                          profit >= 0 ? "text-emerald-700" : "text-red-700",
+                          profit >= 0 ? "text-good-fg" : "text-danger-fg",
                         )}
                       >
                         {formatUsd(profit)}

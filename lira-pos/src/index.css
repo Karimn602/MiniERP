@@ -3,12 +3,284 @@
 @tailwind components;
 @tailwind utilities;
 
-html, body, #root {
+/* ===========================================================================
+   GREAZ APPEARANCE TOKENS — Classic (C) and Midnight (B).
+
+   Source of truth: design-references/greaz-theme-references/ — the approved
+   prototype, the two 1366x768 screenshots and the implementation brief.
+
+   Values are space-separated RGB triplets, not hex, so Tailwind can compose
+   them with its opacity modifiers (`bg-surface/80`). Role names and the
+   mapping to Tailwind class names live in tailwind.config.js.
+
+   `:root` IS Classic. That matters twice over: Classic is the documented
+   default on first launch, and it is also the fallback when the stored
+   preference is absent, invalid, or unreadable — so the correct appearance
+   needs no JavaScript to have run.
+   =========================================================================== */
+:root,
+:root[data-theme="classic"] {
+  /* Brand -------------------------------------------------------------- */
+  --greaz-brand: 209 27 50; /* #D11B32 */
+  --greaz-brand-fg: 255 255 255;
+  --greaz-brand-hover: 180 22 42;
+  /* Brand red as TEXT, as opposed to `--greaz-brand`, which is a FILL.
+     On Classic they are the same colour: #D11B32 on paper is 5.14:1, so the
+     approved light appearance needs no adjustment and gets none. They part
+     company on Midnight, where a saturated red cannot carry text at all —
+     even pure #FF0000 is only 4.4:1 on the Midnight tile — so the dark
+     appearance resolves this to a lighter red. Anything that is a brand
+     GLYPH or brand LETTERFORM uses this; `bg-brand` keeps `--greaz-brand`. */
+  --greaz-brand-ink: 209 27 50;
+  --greaz-brand-soft: 251 226 230; /* #FBE2E6 — the prototype's --selection */
+  --greaz-brand-line: 246 201 205;
+  --greaz-brand-50: 255 241 242;
+  --greaz-brand-100: 255 225 227;
+  --greaz-brand-200: 255 199 203;
+  --greaz-brand-300: 255 159 166;
+  --greaz-brand-400: 250 102 114;
+  --greaz-brand-700: 180 22 42;
+  --greaz-brand-800: 149 20 39;
+  --greaz-brand-900: 125 21 37;
+
+  /* Surfaces ----------------------------------------------------------- */
+  --greaz-page: 248 246 244; /* #F8F6F4 */
+  --greaz-surface: 255 255 255; /* #FFFFFF */
+  --greaz-paper: 255 249 245; /* #FFF9F5 */
+  --greaz-tile: 255 249 245; /* #FFF9F5 */
+  --greaz-line: 226 216 213; /* #E2D8D5 */
+
+  /* Text --------------------------------------------------------------- */
+  --greaz-fg: 32 22 23; /* #201617 */
+  --greaz-fg-muted: 111 103 102; /* #6F6766 */
+  /* The faintest text tier. It was #968C8A, which is 3.27:1 on white and
+     3.14:1 on paper — below AA, and below even the 3:1 non-text bar, while
+     carrying the workspace label, StatCard hints and the cart's remove
+     glyph. Darkened until it clears 4.5:1 on every Classic surface
+     (4.61:1 on `page`, the worst) and no further, so it stays a third tier
+     below `--greaz-fg-muted` (5.51:1) rather than collapsing into it. */
+  --greaz-fg-subtle: 118 110 109;
+
+  /* Sidebar rail — PALE on Classic, which is the single biggest visual
+     difference from the pre-theme build and is what the approved Classic
+     screenshot shows. */
+  --greaz-rail: 253 249 247; /* #FDF9F7 */
+  --greaz-rail-fg: 41 29 29; /* #291D1D */
+  --greaz-rail-muted: 111 103 102;
+  --greaz-rail-line: 226 216 213;
+  --greaz-rail-hover: 241 236 233;
+
+  /* Restaurant hero band — paper with a border on Classic. */
+  --greaz-banner: 255 249 245;
+  --greaz-banner-fg: 32 22 23;
+  --greaz-banner-kicker: 209 27 50; /* brand red */
+  --greaz-banner-sub: 111 103 102;
+  --greaz-chip: 255 235 233; /* #FFEBE9 */
+  --greaz-chip-fg: 32 22 23;
+  --greaz-chip-line: 226 216 213;
+
+  /* Semantic status ----------------------------------------------------- */
+  --greaz-warn: 217 141 16;
+  --greaz-warn-bg: 255 248 235;
+  --greaz-warn-line: 245 217 160;
+  --greaz-warn-fg: 138 91 8;
+  --greaz-danger: 185 28 28;
+  /* The destructive BUTTON fill. Deliberately its own token and not
+     `--greaz-danger`: on Midnight the danger text colour is a light rose, and
+     a light fill would make "delete" the brightest control on the screen. It
+     also has to stay visibly apart from `--greaz-brand`, which is red too. */
+  --greaz-danger-solid: 159 18 32;
+  --greaz-danger-solid-fg: 255 255 255;
+  --greaz-danger-bg: 254 240 241;
+  --greaz-danger-line: 246 201 205;
+  --greaz-danger-fg: 163 18 31;
+  --greaz-good: 5 150 105;
+  --greaz-good-bg: 236 253 245;
+  --greaz-good-line: 167 231 201;
+  --greaz-good-fg: 10 110 69;
+  /* The POSITIVE solid fill, mirroring `--greaz-danger-solid`. A selected
+     "+" direction toggle is a filled control with text on it, and the
+     accent `--greaz-good` is too light to carry text: white on it is
+     3.8:1, under AA. This is the darker fill that can. */
+  --greaz-good-solid: 10 110 69;
+  --greaz-good-solid-fg: 255 255 255;
+  /* Informational — the fourth status role. `Badge tone="info"` was the one
+     tone still on a literal Tailwind hue (`sky-50`/`sky-700`), which cannot
+     invert, so an info pill stayed a pale sticker on Midnight. */
+  --greaz-info: 2 132 199;
+  --greaz-info-bg: 240 249 255;
+  --greaz-info-line: 186 230 253;
+  --greaz-info-fg: 3 105 161;
+
+  --greaz-scrim: 26 22 22;
+
+  /* Geometry — Classic is the SQUARER appearance (prototype: tiles and chips
+     5px, panels 8px). Getting this backwards is the easiest way to make both
+     themes look like the same theme. */
+  --greaz-radius-tile: 5px;
+  --greaz-radius-panel: 8px;
+  --greaz-radius-chip: 5px;
+
+  --greaz-shadow-panel: 0 4px 15px rgb(35 19 19 / 0.055);
+  --greaz-shadow-soft: 0 1px 2px 0 rgb(35 19 19 / 0.05);
+  --greaz-shadow-tile: 0 1px 2px 0 rgb(35 19 19 / 0.05);
+  --greaz-shadow-tile-hover: 0 3px 14px rgb(224 21 51 / 0.16);
+
+  --greaz-focus: 240 175 50; /* #F0AF32 — one focus colour for both themes */
+
+  /* The poster face. Impact ships with Windows, so this needs no webfont and
+     keeps the app offline-first. */
+  --greaz-font-display: Impact, "Haettenschweiler", "Arial Narrow Bold",
+    "Arial Black", Inter, sans-serif;
+  /* Impact ships in ONE weight. Asking for 900 makes the browser synthesise a
+     bolder face on top of an already-heavy one, which renders as a smeared
+     double edge — the prototype declares no weight at all for exactly this
+     reason. The Arabic stack below is a normal-weight UI face and does want
+     the extra weight, so it is a token rather than a constant. */
+  --greaz-font-display-weight: 400;
+
+  /* Phase 1 compatibility ramp — Tailwind v3's own slate hexes, VERBATIM, so
+     the default appearance of every not-yet-migrated back-office page is
+     pixel-identical to the pre-theme build. */
+  --slate-50: 248 250 252;
+  --slate-100: 241 245 249;
+  --slate-200: 226 232 240;
+  --slate-300: 203 213 225;
+  --slate-400: 148 163 184;
+  --slate-500: 100 116 139;
+  --slate-600: 71 85 105;
+  --slate-700: 51 65 85;
+  --slate-800: 30 41 59;
+  --slate-900: 15 23 42;
+  --slate-950: 2 6 23;
+}
+
+:root[data-theme="midnight"] {
+  /* Brighter red: #D11B32 goes muddy against #171617. */
+  --greaz-brand: 229 27 60; /* #E51B3C */
+  --greaz-brand-fg: 255 255 255;
+  --greaz-brand-hover: 247 51 81;
+  /* #FF7D8D. The Midnight brand FILL (#E51B3C) is 3.52:1 as text on a tile,
+     which is what made the menu price unreadable. Red cannot be both
+     saturated and legible on near-black, so brand letterforms lighten here
+     (6.63:1 on tile) while `bg-brand` stays the approved #E51B3C. This is
+     the same decision the palette already made in lightening the Classic
+     red to #E51B3C for Midnight, carried one rung further for text. */
+  --greaz-brand-ink: 255 125 141;
+  --greaz-brand-soft: 82 36 45; /* #52242D */
+  --greaz-brand-line: 112 51 59;
+  --greaz-brand-50: 56 26 32;
+  --greaz-brand-100: 82 36 45;
+  --greaz-brand-200: 112 51 59;
+  --greaz-brand-300: 255 154 165;
+  --greaz-brand-400: 250 122 136;
+  --greaz-brand-700: 255 125 141;
+  --greaz-brand-800: 255 154 165;
+  --greaz-brand-900: 255 189 196;
+
+  --greaz-page: 23 22 23; /* #171617 */
+  --greaz-surface: 39 33 35; /* #272123 */
+  --greaz-paper: 34 29 29; /* #221D1D */
+  --greaz-tile: 36 31 32; /* #241F20 — the prototype overrides tiles OFF
+                             --paper on Midnight; they are not the same fill */
+  --greaz-line: 85 68 72; /* #554448 */
+
+  --greaz-fg: 255 246 242; /* #FFF6F2 */
+  --greaz-fg-muted: 182 165 164; /* #B6A5A4 */
+  /* Was #8C7C7C — 3.98:1 on `surface`, which is where the workspace label
+     sits. Lightened to clear 4.5:1 on every Midnight surface (5.50:1 on
+     `surface`) while staying below `--greaz-fg-muted` (6.71:1). */
+  --greaz-fg-subtle: 164 149 148;
+
+  --greaz-rail: 13 12 13; /* #0D0C0D */
+  --greaz-rail-fg: 255 244 239; /* #FFF4EF */
+  --greaz-rail-muted: 171 154 152; /* #AB9A98 */
+  --greaz-rail-line: 58 50 52;
+  --greaz-rail-hover: 31 28 29;
+
+  --greaz-banner: 189 16 41; /* #BD1029 — solid red band */
+  --greaz-banner-fg: 255 255 255;
+  /* The hero band is a SOLID red on Midnight, so everything riding on it is
+     light-on-red and the band's own darkness sets the ceiling. The kicker was
+     #F6B3BA (3.69:1) and the subtitle #DECDCA (4.19:1) — both 10-11px, so
+     both need 4.5:1 and neither had it. Lifted to 5.03:1 and 5.09:1. They
+     stay tinted rather than going white: the kicker must still read as a
+     pink accent against the white poster title above it. */
+  --greaz-banner-kicker: 255 219 223; /* #FFDBDF */
+  --greaz-banner-sub: 240 226 223; /* #F0E2DF */
+  --greaz-chip: 41 36 35; /* #292423 */
+  --greaz-chip-fg: 241 232 225; /* #F1E8E1 */
+  --greaz-chip-line: 89 67 71; /* #594347 */
+
+  --greaz-warn: 242 179 56;
+  --greaz-warn-bg: 46 37 18;
+  --greaz-warn-line: 107 84 35;
+  --greaz-warn-fg: 242 200 121;
+  --greaz-danger: 255 107 122;
+  --greaz-danger-solid: 142 31 40;
+  --greaz-danger-solid-fg: 255 227 230;
+  --greaz-danger-bg: 53 26 30;
+  --greaz-danger-line: 112 51 59;
+  --greaz-danger-fg: 255 154 165;
+  --greaz-good: 58 208 138;
+  --greaz-good-bg: 18 41 31;
+  --greaz-good-line: 44 91 68;
+  --greaz-good-fg: 111 217 168;
+  --greaz-good-solid: 22 94 63;
+  --greaz-good-solid-fg: 222 247 234;
+  --greaz-info: 96 170 224;
+  --greaz-info-bg: 20 33 48;
+  --greaz-info-line: 45 72 99;
+  --greaz-info-fg: 125 196 240;
+
+  --greaz-scrim: 0 0 0;
+
+  /* Midnight is the ROUNDER appearance. */
+  --greaz-radius-tile: 13px;
+  --greaz-radius-panel: 14px;
+  --greaz-radius-chip: 9px;
+
+  --greaz-shadow-panel: 0 2px 15px rgb(0 0 0 / 0.17);
+  --greaz-shadow-soft: 0 1px 2px 0 rgb(0 0 0 / 0.25);
+  --greaz-shadow-tile: 0 1px 2px 0 rgb(0 0 0 / 0.3);
+  --greaz-shadow-tile-hover: 0 3px 14px rgb(229 27 60 / 0.3);
+
+  /* Phase 1 readability net for the 783 un-migrated `slate-*` usages: a warm
+     inversion of the ramp above, so back-office text stays legible on Midnight
+     until Phase 2 moves those pages onto the semantic roles. This block is
+     scaffolding and is meant to be DELETED by Phase 2, not built on. */
+  --slate-50: 31 27 28;
+  --slate-100: 39 33 35;
+  --slate-200: 74 61 64;
+  --slate-300: 99 83 86;
+  --slate-400: 141 126 125;
+  --slate-500: 182 165 164;
+  --slate-600: 201 186 184;
+  --slate-700: 224 210 206;
+  --slate-800: 240 229 224;
+  --slate-900: 255 246 242;
+  --slate-950: 255 255 255;
+}
+
+/* Arabic has no Impact. Rendering the poster face under `lang="ar"` would show
+   tofu or fall back per-glyph mid-word, so the display stack is swapped for a
+   real Arabic family — and the italic/rotation flourishes the Latin wordmark
+   uses are dropped, because a slanted Arabic wordmark reads as a rendering
+   fault rather than as styling. */
+:root[lang="ar"] {
+  --greaz-font-display: "Segoe UI", "Noto Sans Arabic", "Tahoma", "Arial",
+    sans-serif;
+  --greaz-font-display-weight: 800;
+}
+
+html,
+body,
+#root {
   height: 100%;
 }
 
 body {
-  @apply bg-slate-100 text-slate-900 antialiased;
+  @apply bg-page text-fg antialiased;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -21,35 +293,252 @@ body {
 }
 
 ::selection {
-  background-color: rgb(15 118 110 / 0.18); /* brand teal, soft */
+  background-color: rgb(var(--greaz-brand-soft));
+  color: rgb(var(--greaz-fg));
 }
 
-/* Slim, unobtrusive scrollbars — desktop POS feel. */
+/* One focus treatment, both appearances — the prototype's amber ring, which is
+   the only colour that stays visible on warm white AND on #171617. Brand red
+   would vanish into the Midnight banner and into every red button. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 3px solid rgb(var(--greaz-focus));
+  outline-offset: 2px;
+}
+
+/* ===========================================================================
+   GREAZ brand character.
+
+   The poster voice is opt-in: only elements that ASK for `.greaz-display` get
+   it. Never put it on a number the cashier reads back to a customer, on a
+   table cell, or on a form input — see the Arabic note above for the other
+   reason.
+   =========================================================================== */
+.greaz-display {
+  font-family: var(--greaz-font-display);
+  font-weight: var(--greaz-font-display-weight);
+  letter-spacing: 0.1px;
+  font-synthesis: none;
+}
+
+/* The prototype's wordmark and hero title: Impact, italic, tight tracking. The
+   italic and the tracking are suppressed under Arabic. */
+.greaz-poster {
+  font-family: var(--greaz-font-display);
+  font-weight: var(--greaz-font-display-weight);
+  font-style: italic;
+  letter-spacing: -0.4px;
+  text-transform: uppercase;
+  font-synthesis: none;
+}
+:root[lang="ar"] .greaz-poster {
+  font-style: normal;
+  letter-spacing: 0;
+}
+
+/* The uppercase, wide-tracked micro-label used for eyebrows and chips. */
+.font-eyebrow {
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+/* The hazard hatch of the training strip. Identical in BOTH appearances by
+   instruction: a safety warning that changes with a cosmetic preference is a
+   safety warning someone will learn to stop seeing. */
+.greaz-hazard {
+  background-color: #f5b02a;
+  background-image: repeating-linear-gradient(
+    135deg,
+    #f8ae1f 0 10px,
+    #f4be45 10px 20px
+  );
+  color: #442e06;
+}
+
+/* ---------------------------------------------------------------------------
+   Sauce drip.
+
+   Retained from the pre-theme Greaz pass, but NOT rendered by either approved
+   concept: the prototype sets `.banner:after { opacity: 0 }` on both Classic
+   and Midnight. Kept available (and confined by rule to chrome — never behind
+   a cart line, total, table or form) so a future concept can switch it back on
+   without rebuilding it.
+   --------------------------------------------------------------------------- */
+.greaz-drip::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  bottom: -11px;
+  height: 12px;
+  background-repeat: repeat-x;
+  background-size: 54px 12px;
+  background-position: 0 0;
+  background-image:
+    radial-gradient(circle at 9px 0, var(--greaz-drip-color) 5.5px, transparent 6px),
+    radial-gradient(circle at 27px 0, var(--greaz-drip-color) 8px, transparent 8.5px),
+    radial-gradient(circle at 44px 0, var(--greaz-drip-color) 4px, transparent 4.5px);
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------------
+   Paper documents.
+
+   A receipt or credit-memo PREVIEW is a picture of what the thermal printer
+   will produce, so it is black on white in both appearances — it is not a
+   panel of the app that happens to contain text. The same variable pin the
+   print rules use is applied here, so what the cashier checks on screen and
+   what comes out of the printer cannot drift apart.
+   --------------------------------------------------------------------------- */
+.greaz-paper-doc {
+  --greaz-fg: 0 0 0;
+  --greaz-fg-muted: 60 60 60;
+  --greaz-fg-subtle: 90 90 90;
+  --greaz-brand-ink: 209 27 50;
+  --greaz-surface: 255 255 255;
+  --greaz-paper: 255 255 255;
+  --greaz-line: 180 180 180;
+  --slate-50: 250 250 250;
+  --slate-100: 244 244 244;
+  --slate-200: 220 220 220;
+  --slate-300: 190 190 190;
+  --slate-400: 130 130 130;
+  --slate-500: 90 90 90;
+  --slate-600: 70 70 70;
+  --slate-700: 50 50 50;
+  --slate-800: 25 25 25;
+  --slate-900: 0 0 0;
+  --slate-950: 0 0 0;
+  /* Status roles pinned too. The print markup carries none today, but the
+     page-level status surfaces are now THEMED rather than literal, so a
+     status colour that ever reaches a receipt would otherwise arrive at its
+     Midnight value — light green on white paper. Pinning keeps the
+     "appearance-independent by construction" claim above true. */
+  --greaz-good-fg: 10 110 69;
+  --greaz-good-bg: 236 253 245;
+  --greaz-good-line: 167 231 201;
+  --greaz-warn-fg: 138 91 8;
+  --greaz-warn-bg: 255 248 235;
+  --greaz-warn-line: 245 217 160;
+  --greaz-danger-fg: 163 18 31;
+  --greaz-danger-bg: 254 240 241;
+  --greaz-danger-line: 246 201 205;
+  --greaz-info-fg: 3 105 161;
+  --greaz-info-bg: 240 249 255;
+  --greaz-info-line: 186 230 253;
+  background-color: #fff;
+  color: #000;
+}
+
+/* `[data-nofx]` is set only by the design preview, to make a screenshot
+   deterministic; the reduced-motion query is the real accessibility rule. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+:root[data-nofx] *,
+:root[data-nofx] *::before,
+:root[data-nofx] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* Slim, unobtrusive scrollbars — desktop POS feel, themed so the Midnight
+   track does not read as a bright seam down the menu grid. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgb(148 163 184 / 0.6) transparent;
+  scrollbar-color: rgb(var(--greaz-fg-muted) / 0.45) transparent;
 }
 *::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 *::-webkit-scrollbar-thumb {
-  background-color: rgb(148 163 184 / 0.55);
+  background-color: rgb(var(--greaz-fg-muted) / 0.4);
   border: 2px solid transparent;
   background-clip: content-box;
   border-radius: 9999px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background-color: rgb(100 116 139 / 0.7);
+  background-color: rgb(var(--greaz-fg-muted) / 0.65);
 }
 
+/* ===========================================================================
+   PRINT — appearance-independent, by construction.
+
+   A receipt and a credit memo are legal-ish documents on thermal paper. They
+   must come out black on white whichever appearance the cashier happens to be
+   looking at, and the print components are full of `text-slate-*` classes that
+   now resolve through the themed ramp — so on Midnight they would print white
+   on white.
+
+   The fix is to pin the variables back to their Classic values INSIDE the
+   print root, rather than to hunt every class in those components. The reset
+   covers the ramp and the roles the print markup can reach.
+   =========================================================================== */
 @media print {
-  body * { visibility: hidden; }
+  body * {
+    visibility: hidden;
+  }
   #receipt-print-root,
   #receipt-print-root *,
   #receipt-print,
-  #receipt-print * { visibility: visible; }
-  #receipt-print {
+  #receipt-print *,
+  #credit-memo-print-root,
+  #credit-memo-print-root *,
+  #credit-memo-print,
+  #credit-memo-print * {
+    visibility: visible;
+  }
+  #receipt-print-root,
+  #receipt-print,
+  #credit-memo-print-root,
+  #credit-memo-print {
+    --greaz-fg: 0 0 0;
+    --greaz-fg-muted: 60 60 60;
+    --greaz-fg-subtle: 90 90 90;
+    --greaz-brand-ink: 209 27 50;
+    --greaz-surface: 255 255 255;
+    --greaz-paper: 255 255 255;
+    --greaz-page: 255 255 255;
+    --greaz-line: 180 180 180;
+    --slate-50: 250 250 250;
+    --slate-100: 244 244 244;
+    --slate-200: 220 220 220;
+    --slate-300: 190 190 190;
+    --slate-400: 130 130 130;
+    --slate-500: 90 90 90;
+    --slate-600: 70 70 70;
+    --slate-700: 50 50 50;
+    --slate-800: 25 25 25;
+    --slate-900: 0 0 0;
+    --slate-950: 0 0 0;
+    /* Status roles pinned too. The print markup carries none today, but the
+       page-level status surfaces are now THEMED rather than literal, so a
+       status colour that ever reaches a receipt would otherwise arrive at its
+       Midnight value — light green on white paper. Pinning keeps the
+       "appearance-independent by construction" claim above true. */
+    --greaz-good-fg: 10 110 69;
+    --greaz-good-bg: 236 253 245;
+    --greaz-good-line: 167 231 201;
+    --greaz-warn-fg: 138 91 8;
+    --greaz-warn-bg: 255 248 235;
+    --greaz-warn-line: 245 217 160;
+    --greaz-danger-fg: 163 18 31;
+    --greaz-danger-bg: 254 240 241;
+    --greaz-danger-line: 246 201 205;
+    --greaz-info-fg: 3 105 161;
+    --greaz-info-bg: 240 249 255;
+    --greaz-info-line: 186 230 253;
+  }
+  #receipt-print,
+  #credit-memo-print {
     position: fixed;
     top: 0;
     left: 0;
@@ -59,5 +548,8 @@ body {
     font-size: 10px;
     font-family: 'Courier New', Courier, monospace;
   }
-  @page { size: 80mm auto; margin: 4mm; }
+  @page {
+    size: 80mm auto;
+    margin: 4mm;
+  }
 }

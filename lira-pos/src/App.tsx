@@ -6,6 +6,7 @@ import { IS_SANDBOX } from "./lib/appMode";
 import { ensureDbReady } from "./db/migrate";
 import { hydrateActiveContext } from "./state/activeContext";
 import { I18nProvider } from "./lib/i18n";
+import { ThemeProvider } from "./lib/theme";
 import PosRegister from "./pages/PosRegister";
 import Products from "./pages/Products";
 import Inventory from "./pages/Inventory";
@@ -50,14 +51,15 @@ export default function App() {
   }, []);
 
   return (
-    <I18nProvider>
+    <ThemeProvider>
+      <I18nProvider>
       {stage === "error" ? (
         <div className="flex h-screen flex-col">
           <SandboxBanner />
-          <div className="flex flex-1 items-center justify-center bg-red-50 p-8">
-            <div className="max-w-lg space-y-2 rounded-lg border border-red-200 bg-white p-6 shadow-sm">
-              <h2 className="text-lg font-semibold text-red-800">Startup failed</h2>
-              <pre className="whitespace-pre-wrap text-xs text-red-900">{error}</pre>
+          <div className="flex flex-1 items-center justify-center bg-danger-bg p-8">
+            <div className="max-w-lg space-y-2 rounded-lg border border-danger-line bg-surface p-6 shadow-sm">
+              <h2 className="text-lg font-semibold text-danger-fg">Startup failed</h2>
+              <pre className="whitespace-pre-wrap text-xs text-danger-fg">{error}</pre>
             </div>
           </div>
         </div>
@@ -97,6 +99,7 @@ export default function App() {
           </Routes>
         </BrowserRouter>
       )}
-    </I18nProvider>
+      </I18nProvider>
+    </ThemeProvider>
   );
 }

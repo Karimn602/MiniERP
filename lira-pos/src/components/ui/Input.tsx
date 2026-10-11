@@ -10,6 +10,17 @@ interface InputProps
   prefix?: ReactNode;
 }
 
+/**
+ * Text field.
+ *
+ * The fill is `paper`, not `surface`: the approved prototype insets its inputs
+ * against the panel they sit on (`--paper` on Classic, #221D1D on Midnight)
+ * rather than making them the same white as the card. On Midnight that inset
+ * is the only thing that marks a field as a field.
+ *
+ * The typed value is deliberately NOT the display face — Impact has no Arabic
+ * glyphs and is wrong for a number a cashier types and reads back.
+ */
 export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
   { label, hint, error, prefix, suffix, className, id, ...rest },
   ref,
@@ -23,22 +34,21 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
       {label && (
         <label
           htmlFor={reactId}
-          className="block text-xs font-medium text-slate-600"
+          className="block text-[11px] font-extrabold text-fg squat:text-[10px]"
         >
           {label}
         </label>
       )}
       <div
         className={clsx(
-          "flex items-stretch overflow-hidden rounded-lg border bg-white shadow-soft transition-colors",
-          "focus-within:ring-4",
+          "flex items-stretch overflow-hidden rounded-chip border bg-paper transition-colors",
           error
-            ? "border-red-400 focus-within:border-red-500 focus-within:ring-red-100"
-            : "border-slate-300 hover:border-slate-400 focus-within:border-brand focus-within:ring-brand/15",
+            ? "border-danger"
+            : "border-line hover:border-fg-subtle focus-within:border-brand",
         )}
       >
         {prefix && (
-          <span className="flex items-center border-e border-slate-200 bg-slate-50 px-3 text-sm font-medium text-slate-500">
+          <span className="flex shrink-0 items-center border-e border-line px-3 text-sm font-medium text-fg-muted">
             {prefix}
           </span>
         )}
@@ -49,22 +59,22 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
           aria-describedby={error ? errId : hint ? hintId : undefined}
           {...rest}
           className={clsx(
-            "flex-1 bg-transparent px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:outline-none",
+            "w-full min-w-0 flex-1 bg-transparent px-3 py-2 text-sm text-fg placeholder-fg-subtle focus:outline-none squat:py-1.5",
             className,
           )}
         />
         {suffix && (
-          <span className="flex items-center border-s border-slate-200 bg-slate-50 px-3 text-sm font-medium text-slate-500">
+          <span className="flex shrink-0 items-center border-s border-line px-3 text-sm font-medium text-fg-muted">
             {suffix}
           </span>
         )}
       </div>
       {error ? (
-        <p id={errId} className="text-xs text-red-600">
+        <p id={errId} className="text-xs text-danger-fg">
           {error}
         </p>
       ) : hint ? (
-        <p id={hintId} className="text-xs text-slate-500">
+        <p id={hintId} className="text-xs text-fg-muted">
           {hint}
         </p>
       ) : null}

@@ -165,7 +165,7 @@ export default function Purchases() {
         actions={
           <div className="flex items-center gap-3">
             {justSaved && (
-              <span className="text-sm font-medium text-emerald-600">
+              <span className="text-sm font-medium text-good-fg">
                 {t("purchases.postedSuccess", { number: String(justSaved.number) })}
               </span>
             )}
@@ -203,7 +203,7 @@ export default function Purchases() {
 
         {loadError ? (
           <CardBody>
-            <p className="text-sm text-red-700">
+            <p className="text-sm text-danger-fg">
               {t("purchases.loadFailed", { error: loadError })}
             </p>
           </CardBody>
@@ -273,8 +273,8 @@ export default function Purchases() {
                       <span
                         className={clsx(
                           "rounded px-2 py-0.5 text-xs font-medium",
-                          p.status === "posted" && "bg-emerald-100 text-emerald-800",
-                          p.status === "draft" && "bg-amber-100 text-amber-800",
+                          p.status === "posted" && "bg-good-bg text-good-fg",
+                          p.status === "draft" && "bg-warn-bg text-warn-fg",
                           p.status === "voided" &&
                             "bg-slate-200 text-slate-600 line-through",
                         )}
@@ -297,13 +297,13 @@ export default function Purchases() {
       {selectedId && (
         <>
           <div
-            className="fixed inset-0 z-40 bg-slate-900/20 backdrop-blur-sm"
+            className="fixed inset-0 z-40 bg-scrim/20 backdrop-blur-sm"
             onClick={() => {
               setSelectedId(null);
               setDetails(null);
             }}
           />
-          <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-white shadow-2xl">
+          <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-surface shadow-2xl">
             <PurchaseDetailCard
               purchase={details}
               loading={detailsLoading}
@@ -587,7 +587,7 @@ function NewPurchaseForm({
                       {formatUsd(totals.vat)}
                     </td>
 
-                    <td className="px-3 py-2 text-right font-semibold text-emerald-900">
+                    <td className="px-3 py-2 text-right font-semibold text-good-fg">
                       {formatUsd(totals.total)}
                     </td>
 
@@ -607,13 +607,13 @@ function NewPurchaseForm({
         />
 
         {submitError && (
-          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          <div className="rounded-md border border-danger-line bg-danger-bg p-3 text-sm text-danger-fg">
             {submitError}
           </div>
         )}
 
         {!submitError && validationErrors.length > 0 && lines.length > 0 && (
-          <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+          <div className="rounded-md border border-warn-line bg-warn-bg p-3 text-xs text-warn-fg">
             {validationErrors[0]}
           </div>
         )}
@@ -688,7 +688,7 @@ function PurchaseLinesTable({ lines }: { lines: PurchaseItem[] }) {
                 {line.productSkuSnapshot ?? "—"}
               </td>
 
-              <td className="px-4 py-2 text-xs text-slate-400">—</td>
+              <td className="px-4 py-2 text-xs text-fg-muted">—</td>
 
               <td className="px-4 py-2 text-xs text-slate-600">
                 {line.uomCodeSnapshot}
@@ -764,7 +764,7 @@ function PurchaseDetailCard({
         {loading ? (
           <p className="text-sm text-slate-500">{t("purchases.detailLoadingMsg")}</p>
         ) : error ? (
-          <p className="text-sm text-red-700">{error}</p>
+          <p className="text-sm text-danger-fg">{error}</p>
         ) : purchase ? (
           <>
             <div className="grid grid-cols-2 gap-3">
@@ -795,9 +795,9 @@ function PurchaseDetailCard({
                     className={clsx(
                       "rounded px-2 py-0.5 text-xs font-medium",
                       purchase.status === "posted" &&
-                        "bg-emerald-100 text-emerald-800",
+                        "bg-good-bg text-good-fg",
                       purchase.status === "draft" &&
-                        "bg-amber-100 text-amber-800",
+                        "bg-warn-bg text-warn-fg",
                       purchase.status === "voided" &&
                         "bg-slate-200 text-slate-600 line-through",
                     )}
@@ -873,7 +873,7 @@ function LineRow({
   const product = line.product;
 
   return (
-    <tr className={clsx(line.error && "bg-red-50/40")}>
+    <tr className={clsx(line.error && "bg-danger-bg/40")}>
       <td className="px-3 py-2 align-top">
         <div className="font-medium text-slate-900">{product.name}</div>
 
@@ -889,7 +889,7 @@ function LineRow({
         <select
           value={line.selectedUomId}
           onChange={(e) => onUpdate({ selectedUomId: e.target.value })}
-          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
+          className="rounded-md border border-slate-300 bg-surface px-2 py-1 text-xs shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand/20"
         >
           {product.uoms.map((u) => (
             <option key={u.id} value={u.id}>
@@ -941,7 +941,7 @@ function LineRow({
       </td>
 
       <td className="px-3 py-2 align-top">
-        <div className="inline-flex rounded-md border border-slate-300 bg-white text-xs shadow-sm">
+        <div className="inline-flex rounded-md border border-slate-300 bg-surface text-xs shadow-sm">
           <button
             type="button"
             onClick={() => onUpdate({ costMode: "inclusive" })}
@@ -982,7 +982,7 @@ function LineRow({
         {line.math ? formatUsd(line.math.lineTotalInclVatCents) : "—"}
 
         {line.error && (
-          <div className="mt-0.5 text-[10px] font-normal text-red-600">
+          <div className="mt-0.5 text-[10px] font-normal text-danger-fg">
             {line.error}
           </div>
         )}

@@ -107,11 +107,11 @@ export function ProductPicker({
             setOpen(false);
           }
         }}
-        className="block w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+        className="block w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
       />
 
       {open && (
-        <ul className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-auto rounded-md border border-slate-200 bg-white shadow-lg">
+        <ul className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-auto rounded-md border border-slate-200 bg-surface shadow-lg">
           {loading && (
             <li className="px-3 py-2 text-xs text-slate-500">Searching…</li>
           )}

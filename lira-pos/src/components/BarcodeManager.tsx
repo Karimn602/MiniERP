@@ -93,7 +93,7 @@ export function BarcodeManager({
           No barcodes yet. Add at least one so this product can be scanned.
         </p>
       ) : (
-        <ul className="divide-y divide-slate-100 rounded-md border border-slate-200 bg-white">
+        <ul className="divide-y divide-slate-100 rounded-md border border-slate-200 bg-surface">
           {rows.map((b) => (
             <li key={b.id} className="flex items-center gap-2 px-3 py-2">
               <button
@@ -102,7 +102,7 @@ export function BarcodeManager({
                 title={b.isPrimary ? "Primary barcode" : "Make primary"}
                 className={clsx(
                   "text-base leading-none",
-                  b.isPrimary ? "text-amber-500" : "text-slate-300 hover:text-amber-400",
+                  b.isPrimary ? "text-warn-fg" : "text-fg-subtle hover:text-warn-fg",
                 )}
               >
                 ★
@@ -111,7 +111,7 @@ export function BarcodeManager({
                 {b.barcode}
               </code>
               {b.isPrimary && (
-                <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-800">
+                <span className="rounded bg-warn-bg px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-warn-fg">
                   primary
                 </span>
               )}
@@ -150,7 +150,7 @@ export function BarcodeManager({
           {addBusy ? "Adding…" : "Add"}
         </Button>
       </div>
-      {addError && <p className="text-xs text-red-600">{addError}</p>}
+      {addError && <p className="text-xs text-danger-fg">{addError}</p>}
     </div>
   );
 }

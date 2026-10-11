@@ -3,7 +3,11 @@ import clsx from "clsx";
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: "primary" | "secondary" | "ghost" | "danger";
-  size?: "sm" | "md";
+  /**
+   * `lg` is for front-of-house: the POS Post Sale button and anything a cashier
+   * hits at speed. Back-office screens stay on `md` / `sm`.
+   */
+  size?: "sm" | "md" | "lg";
 }
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button(
@@ -15,16 +19,25 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       ref={ref}
       {...rest}
       className={clsx(
-        "inline-flex select-none items-center justify-center gap-1.5 rounded-lg font-semibold tracking-tight transition-all duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-white active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none disabled:active:scale-100",
-        size === "sm" ? "px-3 py-1.5 text-xs" : "px-4 py-2 text-sm",
-        variant === "primary" &&
-          "bg-brand text-brand-fg shadow-soft hover:bg-brand-hover hover:shadow-card-hover focus-visible:ring-brand",
+        // No focus ring utilities here: the app has ONE focus treatment, the
+        // prototype's amber outline, applied globally in index.css. It is the
+        // only colour that stays visible against both warm white and #171617,
+        // and a per-component ring would have had to be re-picked per theme.
+        "inline-flex select-none items-center justify-center gap-1.5 rounded-chip font-semibold tracking-tight transition-all duration-150 active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none disabled:active:scale-100",
+        size === "sm" && "px-3 py-1.5 text-xs",
+        size === "md" && "px-4 py-2 text-sm",
+        // Tall and roomy — a gloved thumb on a trackpad, not a mouse pointer.
+        size === "lg" && "px-5 py-3 text-base",
+        variant === "primary" && "bg-brand text-brand-fg shadow-soft hover:bg-brand-hover",
         variant === "secondary" &&
-          "border border-slate-300 bg-white text-slate-700 shadow-soft hover:border-slate-400 hover:bg-slate-50 focus-visible:ring-slate-400",
-        variant === "ghost" &&
-          "bg-transparent text-slate-600 hover:bg-slate-100 hover:text-slate-900 focus-visible:ring-slate-300",
+          "border border-line bg-surface text-fg shadow-soft hover:bg-paper",
+        variant === "ghost" && "bg-transparent text-fg-muted hover:bg-paper hover:text-fg",
+        // Destructive stays distinguishable now that the BRAND is also red:
+        // danger is darker, flatter and ringed, so "delete" never reads as
+        // "the main action" at a glance. It gets its own token rather than
+        // reusing `danger` text colour, which is a light rose on Midnight.
         variant === "danger" &&
-          "bg-red-600 text-white shadow-soft hover:bg-red-700 focus-visible:ring-red-500",
+          "bg-danger-solid text-danger-solid-fg shadow-soft ring-1 ring-inset ring-black/25 hover:brightness-110",
         className,
       )}
     >

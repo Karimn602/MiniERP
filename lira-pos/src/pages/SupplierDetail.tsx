@@ -58,7 +58,7 @@ export default function SupplierDetail() {
     return (
       <div className="space-y-2">
         <p className="text-sm text-slate-600">{t("supplierDetail.notFound")}</p>
-        <Link to="/suppliers" className="text-sm text-brand underline">
+        <Link to="/suppliers" className="text-sm text-brand-ink underline">
           {t("supplierDetail.backToSuppliers")}
         </Link>
       </div>
@@ -69,7 +69,7 @@ export default function SupplierDetail() {
     <div className="space-y-6">
       <div className="flex items-start justify-between">
         <div>
-          <Link to="/suppliers" className="text-xs text-brand hover:underline">
+          <Link to="/suppliers" className="text-xs text-brand-ink hover:underline">
             {t("supplierDetail.allSuppliers")}
           </Link>
 
@@ -93,9 +93,9 @@ export default function SupplierDetail() {
             className={clsx(
               "text-2xl font-semibold",
               balance > 0
-                ? "text-red-700"
+                ? "text-danger-fg"
                 : balance < 0
-                  ? "text-emerald-700"
+                  ? "text-good-fg"
                   : "text-slate-900",
             )}
           >
@@ -103,7 +103,7 @@ export default function SupplierDetail() {
           </div>
 
           {balance < 0 && (
-            <div className="text-[10px] text-emerald-700">{t("supplierDetail.creditOnFile")}</div>
+            <div className="text-[10px] text-good-fg">{t("supplierDetail.creditOnFile")}</div>
           )}
         </div>
       </div>
@@ -117,7 +117,7 @@ export default function SupplierDetail() {
         </Button>
 
         {justSaved && (
-          <span className="text-sm text-emerald-700">{t("supplierDetail.entryPosted")}</span>
+          <span className="text-sm text-good-fg">{t("supplierDetail.entryPosted")}</span>
         )}
       </div>
 
@@ -181,8 +181,8 @@ export default function SupplierDetail() {
                       className={clsx(
                         "px-5 py-2 text-end font-medium",
                         e.amountSignedCents > 0
-                          ? "text-red-700"
-                          : "text-emerald-700",
+                          ? "text-danger-fg"
+                          : "text-good-fg",
                       )}
                     >
                       {e.amountSignedCents > 0 ? "+" : ""}
@@ -377,15 +377,15 @@ function RecordEntryForm({
 
             <div className="flex items-center gap-2">
               {kind === "adjustment" && (
-                <div className="inline-flex rounded-md border border-slate-300 bg-white text-xs shadow-sm">
+                <div className="inline-flex rounded-md border border-slate-300 bg-surface text-xs shadow-sm">
                   <button
                     type="button"
                     onClick={() => setAdjustmentSign("+")}
                     className={clsx(
                       "px-2 py-1.5",
                       adjustmentSign === "+"
-                        ? "bg-red-600 text-white"
-                        : "text-slate-600 hover:bg-slate-50",
+                        ? "bg-danger-solid text-danger-solid-fg"
+                        : "text-fg-muted hover:bg-paper",
                     )}
                     title={t("supplierDetail.increaseOwed")}
                   >
@@ -398,8 +398,8 @@ function RecordEntryForm({
                     className={clsx(
                       "px-2 py-1.5",
                       adjustmentSign === "-"
-                        ? "bg-emerald-600 text-white"
-                        : "text-slate-600 hover:bg-slate-50",
+                        ? "bg-good-solid text-good-solid-fg"
+                        : "text-fg-muted hover:bg-paper",
                     )}
                     title={t("supplierDetail.decreaseOwed")}
                   >
@@ -408,7 +408,7 @@ function RecordEntryForm({
                 </div>
               )}
 
-              <div className="flex flex-1 items-center rounded-md border border-slate-300 bg-white px-2 shadow-sm">
+              <div className="flex flex-1 items-center rounded-md border border-slate-300 bg-surface px-2 shadow-sm">
                 <span className="text-xs text-slate-500">$</span>
 
                 <input
@@ -448,7 +448,7 @@ function RecordEntryForm({
         />
 
         {error && (
-          <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+          <div className="rounded-md border border-danger-line bg-danger-bg p-3 text-sm text-danger-fg">
             {error}
           </div>
         )}

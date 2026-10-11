@@ -186,7 +186,7 @@ export default function SalesHistory() {
             />
 
             {loadError && (
-              <div className="border-b border-red-200 bg-red-50 px-5 py-3 text-xs text-red-700">
+              <div className="border-b border-danger-line bg-danger-bg px-5 py-3 text-xs text-danger-fg">
                 {t("salesHistory.loadFailed", { error: loadError })}
               </div>
             )}
@@ -262,7 +262,7 @@ export default function SalesHistory() {
                           <td
                             className={clsx(
                               "px-5 py-2 text-end tabular-nums font-medium",
-                              profit >= 0 ? "text-emerald-700" : "text-red-700",
+                              profit >= 0 ? "text-good-fg" : "text-danger-fg",
                             )}
                           >
                             {formatUsd(profit)}
@@ -304,13 +304,13 @@ export default function SalesHistory() {
         {selectedId && (
           <>
             <div
-              className="fixed inset-0 z-40 bg-slate-900/20 backdrop-blur-sm"
+              className="fixed inset-0 z-40 bg-scrim/20 backdrop-blur-sm"
               onClick={() => {
                 setSelectedId(null);
                 setDetails(null);
               }}
             />
-            <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-white shadow-2xl">
+            <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-surface shadow-2xl">
               <SaleDetailCard
                 sale={details}
                 loading={detailsLoading}
@@ -334,7 +334,7 @@ export default function SalesHistory() {
       </div>
 
       {returnNotice && (
-        <div className="fixed bottom-6 end-6 z-[60] rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800 shadow-card print:hidden">
+        <div className="fixed bottom-6 end-6 z-[60] rounded-lg border border-good-line bg-good-bg px-4 py-3 text-sm text-good-fg shadow-card print:hidden">
           {returnNotice}
         </div>
       )}
@@ -381,7 +381,7 @@ export default function SalesHistory() {
 function ReturnBadge({ status }: { status: SaleReturnStatus }) {
   const { t } = useTranslation();
   if (status === "none") {
-    return <span className="text-xs text-slate-400">{t("salesHistory.returnStatusNone")}</span>;
+    return <span className="text-xs text-fg-muted">{t("salesHistory.returnStatusNone")}</span>;
   }
   return (
     <Badge tone={status === "full" ? "bad" : "warn"}>
@@ -457,7 +457,7 @@ function SaleDetailCard({
         {loading ? (
           <p className="text-sm text-slate-500">{t("salesHistory.detailLoading")}</p>
         ) : error ? (
-          <p className="text-sm text-red-700">{error}</p>
+          <p className="text-sm text-danger-fg">{error}</p>
         ) : sale ? (
           <>
             <div className="grid grid-cols-2 gap-3">
@@ -585,7 +585,7 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
                   {line.barcodeUsedSnapshot ? (
                     <code>{line.barcodeUsedSnapshot}</code>
                   ) : (
-                    <span className="text-slate-400">—</span>
+                    <span className="text-fg-muted">—</span>
                   )}
                 </td>
 
@@ -613,7 +613,7 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
                 <td
                   className={clsx(
                     "px-4 py-2 text-end tabular-nums font-medium",
-                    profit >= 0 ? "text-emerald-700" : "text-red-700",
+                    profit >= 0 ? "text-good-fg" : "text-danger-fg",
                   )}
                 >
                   {formatUsd(profit)}
@@ -702,21 +702,21 @@ function CreateReturnButton({
 
   if (sale.status !== "posted") {
     return (
-      <span className="text-xs text-slate-400 print:hidden">
+      <span className="text-xs text-fg-muted print:hidden">
         {t("salesHistory.createReturnDisabledVoided")}
       </span>
     );
   }
   if (returnStatus === "full") {
     return (
-      <span className="text-xs text-slate-400 print:hidden">
+      <span className="text-xs text-fg-muted print:hidden">
         {t("salesHistory.createReturnDisabledFull")}
       </span>
     );
   }
   if (!hasOpenShift) {
     return (
-      <span className="text-xs text-amber-600 print:hidden">
+      <span className="text-xs text-warn-fg print:hidden">
         {t("salesHistory.createReturnDisabledNoShift")}
       </span>
     );

@@ -6,7 +6,23 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async ({ mode }) => ({
-  plugins: [react()],
+  plugins: [
+    react(),
+    // The appearance boot script in index.html needs the same build identity
+    // `appMode.ts` gets, so the sandbox and production builds read different
+    // localStorage keys. `define` cannot reach index.html and there is no
+    // `.env` file for Vite's own `%VITE_*%` HTML replacement to read, so the
+    // one placeholder is substituted here. Same single source — Vite's `mode`.
+    {
+      name: "greaz-html-app-mode",
+      transformIndexHtml(html: string) {
+        return html.replace(
+          /__VITE_APP_MODE__/g,
+          mode === "sandbox" ? "sandbox" : "production",
+        );
+      },
+    },
+  ],
 
   // Build-time application mode (see src/lib/appMode.ts).
   //

@@ -310,10 +310,10 @@ export function CreateReturnModal({
   return (
     <>
       <div
-        className="fixed inset-0 z-40 bg-slate-900/30 backdrop-blur-sm"
+        className="fixed inset-0 z-40 bg-scrim/30 backdrop-blur-sm"
         onClick={submitting ? undefined : onClose}
       />
-      <div className="fixed inset-y-0 end-0 z-50 w-[880px] max-w-[92vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-white shadow-2xl">
+      <div className="fixed inset-y-0 end-0 z-50 w-[880px] max-w-[92vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-surface shadow-2xl">
         <Card className="border-0 shadow-none">
           <CardHeader
             title={t("createReturn.title")}
@@ -332,19 +332,19 @@ export function CreateReturnModal({
             {loading ? (
               <p className="text-sm text-slate-500">{t("createReturn.loading")}</p>
             ) : loadError ? (
-              <p className="text-sm text-red-700">
+              <p className="text-sm text-danger-fg">
                 {t("createReturn.loadFailed", { error: loadError })}
               </p>
             ) : (
               <>
                 {!shift && (
-                  <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                  <div className="rounded-md border border-warn-line bg-warn-bg px-4 py-3 text-sm text-warn-fg">
                     {t("createReturn.noOpenShift")}
                   </div>
                 )}
 
                 {submitError && (
-                  <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                  <div className="rounded-md border border-danger-line bg-danger-bg px-4 py-3 text-sm text-danger-fg">
                     {t("createReturn.failed", { error: submitError })}
                   </div>
                 )}
@@ -400,7 +400,7 @@ export function CreateReturnModal({
                                   {unit ? ` / ${unit}` : ""}
                                 </div>
                                 {chosen && (
-                                  <div className="mt-0.5 text-xs font-medium text-brand">
+                                  <div className="mt-0.5 text-xs font-medium text-brand-ink">
                                     {formatUsd(chosen.lineRefundCents)}
                                   </div>
                                 )}
@@ -431,12 +431,12 @@ export function CreateReturnModal({
                                       [line.saleItemId]: e.target.value,
                                     }))
                                   }
-                                  className="w-24 rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-end text-sm tabular-nums shadow-soft focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15 disabled:bg-slate-100 disabled:text-slate-400"
+                                  className="w-24 rounded-lg border border-slate-300 bg-surface px-2 py-1.5 text-end text-sm tabular-nums shadow-soft focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15 disabled:bg-slate-100 disabled:text-fg-muted"
                                 />
                               </td>
                               <td className="px-4 py-2">
                                 {line.isService ? (
-                                  <span className="text-xs text-slate-400">
+                                  <span className="text-xs text-fg-muted">
                                     {t("createReturn.restockService")}
                                   </span>
                                 ) : (
@@ -495,7 +495,7 @@ export function CreateReturnModal({
                   </p>
 
                   {availability.length === 0 ? (
-                    <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                    <div className="mt-3 rounded-md border border-warn-line bg-warn-bg px-4 py-3 text-sm text-warn-fg">
                       {t("createReturn.refundNoMethods")}
                     </div>
                   ) : (
@@ -532,7 +532,7 @@ export function CreateReturnModal({
                                     ? formatUsd(a.remainingNative)
                                     : formatLbp(a.remainingNative)}
                                   {a.refundedNative > 0 && (
-                                    <div className="text-xs text-slate-400">
+                                    <div className="text-xs text-fg-muted">
                                       {a.currency === "USD"
                                         ? formatUsd(a.availableNative)
                                         : formatLbp(a.availableNative)}
@@ -552,14 +552,14 @@ export function CreateReturnModal({
                                       }))
                                     }
                                     className={clsx(
-                                      "w-32 rounded-lg border bg-white px-2 py-1.5 text-end text-sm tabular-nums shadow-soft focus:outline-none focus:ring-4",
+                                      "w-32 rounded-lg border bg-surface px-2 py-1.5 text-end text-sm tabular-nums shadow-soft focus:outline-none focus:ring-4",
                                       over
-                                        ? "border-red-400 focus:border-red-500 focus:ring-red-100"
+                                        ? "border-danger focus:border-danger focus:ring-danger-line"
                                         : "border-slate-300 focus:border-brand focus:ring-brand/15",
                                     )}
                                   />
                                   {leg && a.currency === "LBP" && (
-                                    <div className="text-xs text-slate-400">
+                                    <div className="text-xs text-fg-muted">
                                       ≈ {formatUsd(leg.usdEquivalent)}
                                     </div>
                                   )}
@@ -609,7 +609,7 @@ export function CreateReturnModal({
                     <span
                       className={clsx(
                         "font-semibold tabular-nums",
-                        remainderCents === 0 ? "text-emerald-700" : "text-amber-700",
+                        remainderCents === 0 ? "text-good-fg" : "text-warn-fg",
                       )}
                     >
                       {formatUsd(remainderCents)}
@@ -622,7 +622,7 @@ export function CreateReturnModal({
                     </p>
                   )}
                   {selected.length > 0 && remainderCents !== 0 && (
-                    <p className="mt-2 text-xs text-amber-700">
+                    <p className="mt-2 text-xs text-warn-fg">
                       {t("createReturn.mustMatch")}
                     </p>
                   )}

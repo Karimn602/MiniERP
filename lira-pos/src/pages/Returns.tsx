@@ -141,7 +141,7 @@ export default function Returns() {
           <CardHeader title={t("returns.listTitle")} subtitle={cardSubtitle} />
 
           {loadError && (
-            <div className="border-b border-red-200 bg-red-50 px-5 py-3 text-xs text-red-700">
+            <div className="border-b border-danger-line bg-danger-bg px-5 py-3 text-xs text-danger-fg">
               {t("returns.loadFailed", { error: loadError })}
             </div>
           )}
@@ -228,13 +228,13 @@ export default function Returns() {
         {selectedId && (
           <>
             <div
-              className="fixed inset-0 z-40 bg-slate-900/20 backdrop-blur-sm"
+              className="fixed inset-0 z-40 bg-scrim/20 backdrop-blur-sm"
               onClick={() => {
                 setSelectedId(null);
                 setDetails(null);
               }}
             />
-            <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-white shadow-2xl">
+            <div className="fixed inset-y-0 end-0 z-50 w-[820px] max-w-[80vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-surface shadow-2xl">
               <CreditMemoDetail
                 memo={details}
                 loading={detailsLoading}
@@ -307,7 +307,7 @@ function CreditMemoDetail({
         {loading ? (
           <p className="text-sm text-slate-500">{t("returns.detailLoading")}</p>
         ) : error ? (
-          <p className="text-sm text-red-700">{error}</p>
+          <p className="text-sm text-danger-fg">{error}</p>
         ) : memo ? (
           <>
             <div className="grid grid-cols-2 gap-3">

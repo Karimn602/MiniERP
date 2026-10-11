@@ -72,7 +72,7 @@ export function SupplierPicker({
   return (
     <div ref={wrapperRef} className="relative">
       {value ? (
-        <div className="flex items-center justify-between rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm">
+        <div className="flex items-center justify-between rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm">
           <div>
             <div className="font-medium text-slate-900">{value.name}</div>
             {value.contactName && (
@@ -96,12 +96,12 @@ export function SupplierPicker({
             setOpen(true);
           }}
           onFocus={() => setOpen(true)}
-          className="block w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20 disabled:bg-slate-50"
+          className="block w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20 disabled:bg-slate-50"
         />
       )}
 
       {!value && open && !creating && (
-        <ul className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-auto rounded-md border border-slate-200 bg-white shadow-lg">
+        <ul className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-auto rounded-md border border-slate-200 bg-surface shadow-lg">
           {results.length === 0 ? (
             <li className="px-3 py-2 text-xs text-slate-500">
               No suppliers match.
@@ -143,7 +143,7 @@ export function SupplierPicker({
       )}
 
       {!value && open && creating && (
-        <div className="absolute left-0 right-0 top-full z-20 mt-1 rounded-md border border-slate-200 bg-white p-3 shadow-lg">
+        <div className="absolute left-0 right-0 top-full z-20 mt-1 rounded-md border border-slate-200 bg-surface p-3 shadow-lg">
           <label className="block text-xs font-medium text-slate-700">
             New supplier name
           </label>
@@ -160,7 +160,7 @@ export function SupplierPicker({
             }}
             className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
           />
-          {error && <p className="mt-1 text-xs text-red-600">{error}</p>}
+          {error && <p className="mt-1 text-xs text-danger-fg">{error}</p>}
           <div className="mt-2 flex gap-2">
             <Button variant="primary" size="sm" onClick={handleCreate}>
               Create
