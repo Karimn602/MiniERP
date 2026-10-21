@@ -77,6 +77,10 @@ fn create_payload(product_id: &str, sku: &str, name: &str) -> SaveProductPayload
         reorder_point: None,
         is_service: false,
         is_active: true,
+        // Presentational and optional; the catalog tests are about the
+        // transactional write, not the menu grid.
+        category: None,
+        icon: None,
         base_uom_code: "each".to_string(),
         sale_uom_code: "each".to_string(),
         sale_factor_num: 1,
@@ -105,6 +109,10 @@ fn update_payload(name: &str) -> SaveProductPayload {
         reorder_point: None,
         is_service: false,
         is_active: true,
+        // Presentational and optional; the catalog tests are about the
+        // transactional write, not the menu grid.
+        category: None,
+        icon: None,
         base_uom_code: "each".to_string(),
         sale_uom_code: "each".to_string(),
         sale_factor_num: 1,
@@ -705,5 +713,246 @@ async fn a_created_product_starts_at_zero_stock_and_zero_cost() {
         .await,
         0,
         "both cents mirrors too"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GZ-WP0-01 — a VAT rate is CHOSEN, never defaulted
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Stress 001 created a product through the untouched Products form and got a
+// VAT-EXEMPT one, because the form preselected `vatRates[0]` and the repo
+// returns Exempt first. The till then charged no output VAT on every sale of
+// it, and `sale_items.vat_rate_bps_snapshot` makes that permanent for the sales
+// already posted.
+//
+// The frontend fix is to preselect nothing. These tests pin the BACKSTOP: the
+// command itself refuses an unspecified rate, so the rule survives any caller —
+// the form, the spreadsheet importer, or anything added later.
+
+/// An empty VAT rate is refused before any database work happens.
+#[test]
+fn a_create_without_a_vat_rate_is_refused() {
+    let mut payload = create_payload(P_NEW, "SKU-E1", "Latte");
+    payload.vat_rate_id = String::new();
+
+    let err = crate::catalog::validate_save_product(&payload).unwrap_err();
+    assert!(
+        err.contains("VAT rate"),
+        "the refusal must name the field: {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("exempt"),
+        "and say why it matters, rather than just 'invalid': {err}"
+    );
+}
+
+/// Whitespace is not a choice either.
+#[test]
+fn a_blank_vat_rate_is_refused_however_it_is_spelled() {
+    for blank in ["", " ", "   ", "\t", "\n"] {
+        let mut payload = create_payload(P_NEW, "SKU-E1", "Latte");
+        payload.vat_rate_id = blank.to_string();
+        assert!(
+            crate::catalog::validate_save_product(&payload).is_err(),
+            "blank {blank:?} must be refused"
+        );
+    }
+}
+
+/// An UPDATE is held to the same rule: an edit cannot blank the rate either.
+#[test]
+fn an_update_without_a_vat_rate_is_refused_too() {
+    let mut payload = update_payload("Coffee 250g");
+    payload.vat_rate_id = String::new();
+    assert!(crate::catalog::validate_save_product(&payload).is_err());
+}
+
+/// The guard is about ABSENCE, not about exemption: a deliberately exempt
+/// product is a thing Greaz supports and must still save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deliberately_exempt_product_still_saves() {
+    let db = shop().await;
+    let mut payload = create_payload(P_NEW, "SKU-E1", "Printed receipt book");
+    payload.vat_rate_id = VAT_EXEMPT_ID.to_string();
+
+    save_product_with_pool(db.pool(), payload).await.unwrap();
+
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT vat_rate_id FROM products WHERE id = '{P_NEW}'"
+        ))
+        .await,
+        VAT_EXEMPT_ID,
+        "exemption chosen on purpose is honoured"
+    );
+}
+
+/// A standard-rated create is unaffected — the guard adds no new refusal to any
+/// payload a real caller sends, which is what makes it non-breaking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_normal_create_is_unaffected_by_the_guard() {
+    let db = shop().await;
+    save_product_with_pool(db.pool(), create_payload(P_NEW, "SKU-E1", "Latte"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT vat_rate_id FROM products WHERE id = '{P_NEW}'"
+        ))
+        .await,
+        VAT_STD_ID
+    );
+}
+
+/// Nothing is written when the rate is missing — the refusal is a pre-pass, so
+/// a rejected create leaves no half-built catalog object behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_create_writes_nothing_at_all() {
+    let db = shop().await;
+    let before = db.scalar_i64("SELECT COUNT(*) FROM products").await;
+    let uoms_before = db.scalar_i64("SELECT COUNT(*) FROM product_uoms").await;
+
+    let mut payload = create_payload(P_NEW, "SKU-E1", "Latte");
+    payload.vat_rate_id = "   ".to_string();
+    assert!(save_product_with_pool(db.pool(), payload).await.is_err());
+
+    assert_eq!(db.scalar_i64("SELECT COUNT(*) FROM products").await, before);
+    assert_eq!(
+        db.scalar_i64("SELECT COUNT(*) FROM product_uoms").await,
+        uoms_before
+    );
+}
+
+// ============================================================================
+// WP-3 — the menu presentation fields through save_product
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_category_and_icon_round_trip_through_save_product() {
+    let db = shop().await;
+
+    let mut create = create_payload("cat-p1", "SKU-CAT1", "Double Burger");
+    create.category = Some("burgers".into());
+    create.icon = Some("B".into());
+    save_product_with_pool(db.pool(), create).await.expect("create with a section");
+
+    assert_eq!(
+        db.scalar_string("SELECT category FROM products WHERE id='cat-p1'").await,
+        "burgers"
+    );
+    assert_eq!(db.scalar_string("SELECT icon FROM products WHERE id='cat-p1'").await, "B");
+
+    // An update may move it to another section, and may clear the icon.
+    let mut update = update_payload("Double Burger");
+    update.product_id = "cat-p1".into();
+    update.sku = Some("SKU-CAT1".into());
+    update.category = Some("sides".into());
+    update.icon = None;
+    save_product_with_pool(db.pool(), update).await.expect("update the section");
+
+    assert_eq!(
+        db.scalar_string("SELECT category FROM products WHERE id='cat-p1'").await,
+        "sides"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id='cat-p1' AND icon IS NULL").await,
+        1,
+        "clearing the icon stores NULL"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blank_category_is_stored_as_null_not_as_an_empty_section() {
+    // One representation of absence. Persisting "" would make an uncategorised
+    // product a product in a section named nothing — which the UI would bucket
+    // correctly, but `WHERE category IS NULL` would not find.
+    let db = shop().await;
+
+    let mut create = create_payload("cat-p2", "SKU-CAT2", "Mystery Item");
+    create.category = Some("   ".into());
+    create.icon = Some("".into());
+    save_product_with_pool(db.pool(), create).await.expect("create with blanks");
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id='cat-p2' AND category IS NULL").await,
+        1
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id='cat-p2' AND icon IS NULL").await,
+        1
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE category = ''").await,
+        0,
+        "no product is ever in a section named the empty string"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_product_saved_without_a_section_is_still_a_valid_product() {
+    // Omitting both fields is how every existing caller behaves, and must keep
+    // working: `#[serde(default)]` makes them optional on the wire.
+    let db = shop().await;
+
+    save_product_with_pool(db.pool(), create_payload("cat-p3", "SKU-CAT3", "Plain"))
+        .await
+        .expect("create with no presentation fields at all");
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id='cat-p3' AND is_active = 1").await,
+        1
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id='cat-p3' AND category IS NULL").await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saving_a_section_moves_no_stock_and_no_cost() {
+    // The fields are presentational, and `save_product` has no authority over
+    // stock or cost (GZ-HI-10). Changing a product's menu section must not be
+    // a back door to either.
+    let db = shop().await;
+
+    let mut create = create_payload("cat-p4", "SKU-CAT4", "Fries");
+    create.category = Some("sides".into());
+    save_product_with_pool(db.pool(), create).await.expect("create");
+
+    db.exec(
+        "UPDATE products
+            SET quantity_on_hand = 40,
+                avg_cost_excl_vat_microcents = 1234567,
+                avg_cost_excl_vat_cents = 1
+          WHERE id = 'cat-p4'",
+    )
+    .await;
+
+    let mut update = update_payload("Fries");
+    update.product_id = "cat-p4".into();
+    update.sku = Some("SKU-CAT4".into());
+    update.category = Some("addons".into());
+    save_product_with_pool(db.pool(), update).await.expect("re-section it");
+
+    assert_eq!(
+        db.scalar_string("SELECT category FROM products WHERE id='cat-p4'").await,
+        "addons"
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT quantity_on_hand FROM products WHERE id='cat-p4'").await,
+        40,
+        "stock untouched"
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT avg_cost_excl_vat_microcents FROM products WHERE id='cat-p4'").await,
+        1234567,
+        "cost untouched"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM inventory_movements WHERE product_id='cat-p4'").await,
+        0,
+        "and no movement was invented"
     );
 }

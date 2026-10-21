@@ -191,6 +191,16 @@ export interface PaymentFixture {
 export interface SaleFixture {
   postedAt: string;
   shiftId?: string | null;
+  /** `"counter"` (the default) or `"online_delivery"` (WP-4). */
+  channel?: "counter" | "online_delivery";
+  /** The driver who carried a delivery order (WP-6). */
+  driverId?: string | null;
+  /**
+   * The driver's delivery charge. NOT part of any sale total — the fixture
+   * writes it to its own column exactly as `post_sale` does, so a report that
+   * started folding it into revenue would fail here.
+   */
+  deliveryFeeCents?: number;
   /** Header discount in cents. Lines are already net of it. */
   discountCents?: number;
   status?: "posted" | "draft" | "voided";
@@ -220,8 +230,9 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
        exchange_rate_lbp_per_usd, exchange_rate_id,
        subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
        discount_cents, cogs_total_cents, cogs_method,
-       sale_type, status, posted_at
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'weighted_average', 'normal', 'draft', NULL)`,
+       sale_type, status, posted_at, channel, driver_id, delivery_fee_cents
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'weighted_average', 'normal', 'draft', NULL,
+               ?, ?, ?)`,
   ).run(
     saleId,
     STORE_ID,
@@ -235,6 +246,9 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
     total,
     sale.discountCents ?? 0,
     cogs,
+    sale.channel ?? "counter",
+    sale.driverId ?? null,
+    sale.deliveryFeeCents ?? 0,
   );
 
   for (const line of sale.lines) {
@@ -772,4 +786,86 @@ function nextCreditMemoNumber(db: DatabaseSync): number {
     .prepare("SELECT COALESCE(MAX(credit_memo_number), 0) AS n FROM sales_credit_memos")
     .get() as { n: number };
   return row.n + 1;
+}
+
+
+// ---------------------------------------------------------------------------
+// Drivers and the driver clearing subledger (WP-6)
+// ---------------------------------------------------------------------------
+
+export function seedDriver(
+  db: DatabaseSync,
+  driverId: string,
+  name: string,
+  opts: { isActive?: boolean } = {},
+): string {
+  db.prepare(
+    `INSERT INTO drivers (id, store_id, name, is_active) VALUES (?, ?, ?, ?)`,
+  ).run(driverId, STORE_ID, name, opts.isActive === false ? 0 : 1);
+  return driverId;
+}
+
+export interface DriverLedgerFixture {
+  driverId: string;
+  entryType: "collection" | "remittance" | "return_credit" | "adjustment";
+  /**
+   * SIGNED cents, as the column stores them: positive means the driver owes
+   * the shop more. The fixture does NOT derive the sign, deliberately — the
+   * sign-discipline trigger from migration 015 is live against this insert, so
+   * a test that wrote a remittance positive would be refused here exactly as a
+   * bad writer would be in production.
+   */
+  amountCents: number;
+  entryDate: string;
+  postedAt: string;
+  relatedSaleId?: string | null;
+  relatedCreditMemoId?: string | null;
+  receivedCurrency?: "USD" | "LBP" | null;
+  receivedNativeUsdCents?: number;
+  receivedNativeLbp?: number;
+  exchangeRateId?: string | null;
+  exchangeRateLbpPerUsd?: number | null;
+  notes?: string | null;
+  reference?: string | null;
+  /**
+   * The shift the cash landed in. REQUIRED for a remittance since migration
+   * 016 — a remittance is a drawer event, and one with no shift is cash that
+   * reached no till. The trigger is live against this insert, so a fixture
+   * that omits it is refused exactly as a bad writer would be.
+   */
+  shiftId?: string | null;
+}
+
+export function insertDriverLedgerEntry(
+  db: DatabaseSync,
+  entry: DriverLedgerFixture,
+): string {
+  const entryId = id("drvledger");
+  db.prepare(
+    `INSERT INTO driver_ledger (
+       id, store_id, driver_id, entry_type, amount_cents, entry_date, notes,
+       related_sale_id, related_credit_memo_id,
+       received_currency, received_native_usd_cents, received_native_lbp,
+       exchange_rate_id, exchange_rate_lbp_per_usd, reference, shift_id, posted_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    entryId,
+    STORE_ID,
+    entry.driverId,
+    entry.entryType,
+    entry.amountCents,
+    entry.entryDate,
+    entry.notes ?? null,
+    entry.relatedSaleId ?? null,
+    entry.relatedCreditMemoId ?? null,
+    entry.receivedCurrency ?? null,
+    entry.receivedNativeUsdCents ?? 0,
+    entry.receivedNativeLbp ?? 0,
+    entry.exchangeRateId ?? null,
+    entry.exchangeRateLbpPerUsd ?? null,
+    entry.reference ?? null,
+    entry.shiftId ?? null,
+    entry.postedAt,
+  );
+  return entryId;
 }

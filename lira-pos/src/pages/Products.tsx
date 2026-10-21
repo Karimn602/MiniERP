@@ -24,10 +24,24 @@ import { Badge } from "../components/ui/Badge";
 import { BarcodeManager } from "../components/BarcodeManager";
 import { formatUsd, parseUsdInput } from "../lib/money";
 import { formatUnitCostUsd } from "../lib/cost";
-import { addVat, stripVat } from "../lib/vat";
-import { classifyBarcode as inferBarcodeType, isValidEan13 } from "../lib/barcode";
+import { addVat, formatBps, stripVat } from "../lib/vat";
+import {
+  classifyBarcode as inferBarcodeType,
+  failsEan13Checksum,
+  productFormBarcodeError,
+} from "../lib/barcode";
+import {
+  MENU_CATEGORIES,
+  UNCATEGORIZED_ID,
+  resolveCategory,
+} from "../lib/menuCategories";
 import { gcd, makeFactor, type Factor } from "../lib/uom";
 import { useTranslation } from "../lib/i18n";
+import {
+  defaultVatRateIdForNewProduct,
+  isKnownVatRateId,
+  preferredBaseUomCode,
+} from "../lib/catalogDefaults";
 
 type ProductMode = "new" | "edit";
 
@@ -40,6 +54,10 @@ interface ProductFormState {
   description: string;
 
   barcode: string;
+  /** Menu section id, or "" for none. Stored normalised; see menuCategories. */
+  category: string;
+  /** Decorative tile glyph, or "" to fall back to the section's. */
+  icon: string;
 
   vatRateId: string;
   vatPricingMode: "inclusive" | "exclusive";
@@ -66,6 +84,8 @@ const EMPTY_FORM: ProductFormState = {
   description: "",
 
   barcode: "",
+  category: "",
+  icon: "",
 
   vatRateId: "",
   vatPricingMode: "inclusive",
@@ -73,8 +93,8 @@ const EMPTY_FORM: ProductFormState = {
 
   reorderPointInput: "",
 
-  baseUomCode: "pcs",
-  saleUomCode: "pcs",
+  baseUomCode: "",
+  saleUomCode: "",
   saleFactorNum: "1",
   saleFactorDen: "1",
   salePriceInput: "",
@@ -171,11 +191,18 @@ export default function Products() {
       setVatRates(vatRows);
       setUoms(uomRows);
 
+      // Fill only what the operator has NOT already chosen, and only with a
+      // defensible value. The VAT rate is deliberately left empty — see
+      // `defaultVatRateIdForNewProduct` — and the units come from a stable
+      // code, never from `uomRows[0]`, which is "Box".
+      const pieceUom = preferredBaseUomCode(uomRows);
       setForm((prev) => ({
         ...prev,
-        vatRateId: prev.vatRateId || vatRows[0]?.id || "",
-        baseUomCode: prev.baseUomCode || uomRows[0]?.code || "pcs",
-        saleUomCode: prev.saleUomCode || uomRows[0]?.code || "pcs",
+        vatRateId: isKnownVatRateId(prev.vatRateId, vatRows)
+          ? prev.vatRateId
+          : defaultVatRateIdForNewProduct(),
+        baseUomCode: prev.baseUomCode || pieceUom || "",
+        saleUomCode: prev.saleUomCode || pieceUom || "",
       }));
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
@@ -222,11 +249,15 @@ export default function Products() {
   const filteredProducts = products;
 
   function resetForm() {
+    // A fresh form carries NO VAT rate: preselecting `vatRates[0]` is what
+    // made every unattended Create produce a VAT-exempt product (GZ-WP0-01).
+    // The units default to a piece unit chosen by code, not by position.
+    const pieceUom = preferredBaseUomCode(uoms);
     setForm({
       ...EMPTY_FORM,
-      vatRateId: vatRates[0]?.id || "",
-      baseUomCode: uoms[0]?.code || "pcs",
-      saleUomCode: uoms[0]?.code || "pcs",
+      vatRateId: defaultVatRateIdForNewProduct(),
+      baseUomCode: pieceUom || "",
+      saleUomCode: pieceUom || "",
     });
     setSelectedProduct(null);
     setSaveError(null);
@@ -253,6 +284,8 @@ export default function Products() {
       description: product.description ?? "",
 
       barcode: product.primaryBarcode?.barcode ?? "",
+      category: product.category ?? "",
+      icon: product.icon ?? "",
 
       vatRateId: product.vatRateId,
       vatPricingMode: product.vatPricingMode,
@@ -303,15 +336,23 @@ export default function Products() {
 
       const barcode = form.barcode.trim();
 
-      if (form.mode === "new" && !form.isService && !barcode) {
-        throw new Error(t("products.errBarcodeRequired"));
-      }
-
-      if (barcode.length === 13 && /^\d+$/.test(barcode) && !isValidEan13(barcode)) {
-        throw new Error(t("products.errEan13Invalid"));
-      }
+      // Scoped to what this save will actually WRITE. An update submits no
+      // barcode, so it refuses none — which is what used to make a product
+      // with a historical non-checksum code impossible to edit at all
+      // (GZ-WP2-A). New and changed barcodes are validated where they are
+      // entered: here on create, and in `BarcodeManager` thereafter.
+      const barcodeProblem = productFormBarcodeError(
+        form.mode === "new" ? "new" : "edit",
+        barcode,
+        form.isService,
+      );
+      if (barcodeProblem === "required") throw new Error(t("products.errBarcodeRequired"));
+      if (barcodeProblem === "badEan13") throw new Error(t("products.errEan13Invalid"));
 
       if (!form.vatRateId) throw new Error(t("products.errVatRequired"));
+      if (!form.baseUomCode.trim() || !form.saleUomCode.trim()) {
+        throw new Error(t("products.errUomRequired"));
+      }
       if (!form.priceInput.trim()) throw new Error(t("products.errPriceRequired"));
 
       const typedPriceCents = parseUsdInput(form.priceInput);
@@ -378,6 +419,8 @@ export default function Products() {
           priceInclVatCents: price.inclVatCents,
           reorderPoint,
           isService: form.isService,
+          category: form.category || null,
+          icon: form.icon || null,
           barcode: barcode || null,
           barcodeType: barcode ? inferBarcodeType(barcode) : null,
           baseUomCode: form.baseUomCode,
@@ -405,6 +448,8 @@ export default function Products() {
           reorderPoint,
           isService: form.isService,
           isActive: form.isActive,
+          category: form.category || null,
+          icon: form.icon || null,
           baseUomCode: form.baseUomCode,
           saleUomCode: form.saleUomCode,
           saleFactor: factor,
@@ -654,6 +699,46 @@ export default function Products() {
               )}
             </div>
 
+            {/* WP-3: how this item PRESENTS on the register's menu grid.
+                Both fields are optional and neither is financial — a product
+                with no section shows under "Other" and a product with no icon
+                borrows its section's glyph, so an existing catalogue stays
+                valid and sellable without being categorised first. */}
+            <div className="rounded-md border border-slate-200 p-3">
+              <div className="mb-2 text-sm font-medium text-slate-900">
+                {t("products.menuSection")}
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-[2fr_1fr]">
+                <label className="block text-xs font-medium text-slate-700">
+                  {t("products.categoryLabel")}
+                  <select
+                    value={form.category}
+                    onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))}
+                    className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  >
+                    <option value="">{t("menuCategory.none")}</option>
+                    {MENU_CATEGORIES.filter((c) => c.id !== UNCATEGORIZED_ID).map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {t(c.labelKey)}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="mt-1 block font-normal text-slate-500">
+                    {t("products.categoryHint")}
+                  </span>
+                </label>
+
+                <Input
+                  label={t("products.iconLabel")}
+                  value={form.icon}
+                  onChange={(e) => setForm((f) => ({ ...f, icon: e.target.value }))}
+                  placeholder={resolveCategory(form.category).fallbackIcon}
+                  hint={t("products.iconHint")}
+                />
+              </div>
+            </div>
+
             <div className="rounded-md border border-slate-200 p-3">
               <div className="mb-2 text-sm font-medium text-slate-900">
                 {t("products.barcodeSection")}
@@ -668,9 +753,7 @@ export default function Products() {
                   }
                   placeholder={t("products.barcodePlaceholder")}
                   hint={
-                    form.barcode.length === 13 &&
-                    /^\d+$/.test(form.barcode) &&
-                    !isValidEan13(form.barcode)
+                    failsEan13Checksum(form.barcode)
                       ? t("products.barcodeEanHint")
                       : undefined
                   }
@@ -695,12 +778,26 @@ export default function Products() {
                     }
                     className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
                   >
+                    <option value="" disabled>
+                      {t("products.vatRateChoose")}
+                    </option>
                     {vatRates.map((v) => (
                       <option key={v.id} value={v.id}>
                         {v.name}
                       </option>
                     ))}
                   </select>
+                  {/* The chosen rate, spelled out next to the control. A
+                      cashier-turned-manager reads "Exempt — 0%" and stops;
+                      "Exempt" alone looks like an administrative label. */}
+                  <span className="mt-1 block text-[11px] font-normal text-slate-500">
+                    {form.vatRateId
+                      ? t("products.vatRateChosen", {
+                          name: vatRates.find((v) => v.id === form.vatRateId)?.name ?? "",
+                          pct: formatBps(currentVatBps),
+                        })
+                      : t("products.vatRateUnchosen")}
+                  </span>
                 </label>
 
                 <div className="grid grid-cols-2 gap-2">
@@ -830,6 +927,9 @@ export default function Products() {
                     }
                     className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20 disabled:bg-slate-100"
                   >
+                    <option value="" disabled>
+                      {t("products.uomChoose")}
+                    </option>
                     {uoms.map((u) => (
                       <option key={u.code} value={u.code}>
                         {u.name} ({u.code})
@@ -850,6 +950,9 @@ export default function Products() {
                     }
                     className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
                   >
+                    <option value="" disabled>
+                      {t("products.uomChoose")}
+                    </option>
                     {uoms.map((u) => (
                       <option key={u.code} value={u.code}>
                         {u.name} ({u.code})

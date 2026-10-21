@@ -5,6 +5,7 @@ const en = {
     inventory: "Inventory",
     purchases: "Purchases",
     suppliers: "Suppliers",
+    drivers: "Drivers",
     exchangeRate: "Exchange Rate",
     shiftSummary: "Shift Summary",
     salesHistory: "Sales History",
@@ -36,7 +37,146 @@ const en = {
     search: "Search",
     close: "Close",
     total: "Total",
+    dismiss: "Dismiss",
   },
+  // --- Menu sections (WP-3). Ids are stable and stored; these are labels. ---
+  menuCategory: {
+    burgers: "Burgers",
+    wraps: "Wraps",
+    sides: "Sides",
+    addons: "Add-ons",
+    drinks: "Drinks",
+    uncategorized: "Other",
+    none: "No section",
+  },
+
+  // --- Order channel (WP-4). NOT a payment method; see lib/salesChannel.ts.
+  drivers: {
+    title: "Drivers",
+    subtitle: "What each driver is holding for the shop, and what he has brought back.",
+    tabBalances: "Balances",
+    tabPeople: "Drivers",
+    outstandingTitle: "Outstanding by driver",
+    peopleTitle: "Driver records",
+    includeInactive: "Show retired drivers",
+    emptyTitle: "No drivers yet",
+    emptyBody:
+      "Add the drivers who deliver for you. A delivery order needs a driver before it can be confirmed.",
+    colDriver: "Driver",
+    colOrders: "Delivery orders",
+    colFees: "Driver's fees",
+    reportTitle: "Drivers — delivery and settlements",
+    reportSubtitle:
+      "Delivery work and charges are for the period. Balances are everything still unsettled.",
+    reportEmpty: "No delivery orders and no driver balances.",
+    remittedInPeriod: "Cash in from drivers this period: {{amount}} over {{n}} settlement(s).",
+    reportNote:
+      "Driver's fees are the driver's own income and are in NO sales figure on this page. Driver settlements are cash coming in against money already counted as revenue when the order posted — never add them to sales. The tax treatment of the delivery charge is still to be confirmed with the accountant.",
+    colCollected: "Collected",
+    colRemitted: "Handed over",
+    colReturns: "Returns",
+    colOutstanding: "Still owes",
+    retired: "Retired",
+    retire: "Retire",
+    reinstate: "Reinstate",
+    addDriver: "Add driver",
+    name: "Name",
+    phone: "Phone",
+    settle: "Record money in",
+    history: "History",
+    creditOnFile: "{{amount}} credit on file",
+    unreconciled:
+      "{{n}} driver balance(s) do not match their own movements. Report this before settling.",
+    unresolvedTitle: "Hand-overs that need checking",
+    unresolvedSubtitle:
+      "These were sent but gave no answer. Check each one before closing the shift \u2014 do NOT record it again.",
+    unresolvedLine: "{{name}} \u2014 {{amount}}: outcome unknown.",
+    checkThis: "Check this hand-over",
+    sendAgain: "Send again",
+    discardAttempt: "Discard",
+    confirmDiscard:
+      "Discarding throws away the only reference that can match this hand-over to a recorded entry. Check it first. Discard anyway?",
+    probePosted: "It was recorded. The balance and the drawer already include it.",
+    probeNotPosted: "It was NOT recorded. Nothing was taken, so it is safe to send again.",
+    probeIndeterminate:
+      "The check could not be completed, so nothing is confirmed either way. Try the check again.",
+    settleTitle: "Money in from {{name}}",
+    settleSubtitle: "He is holding {{amount}} of the shop's money.",
+    currency: "Currency handed over",
+    amountUsd: "Amount in dollars",
+    amountLbp: "Amount in lira",
+    reference: "Reference (optional)",
+    noRate: "No exchange rate on record for today. Set one before taking lira.",
+    lbpEquivalent: "That is {{amount}} at today's rate.",
+    recordSettlement: "Record money in",
+    recording: "Recording…",
+    settleNote:
+      "This records cash the driver actually handed over and reduces what he owes. It is not a sale and adds no revenue.",
+    settledNotice: "Recorded {{amount}} from {{name}}. He still owes {{balance}}.",
+    historyTitle: "{{name}} — settlement history",
+    noHistory: "Nothing recorded for this driver yet.",
+    fromOrder: "from an order",
+    fromReturn: "from a return",
+    entry: {
+      collection: "Collected on delivery",
+      remittance: "Handed over to the shop",
+      return_credit: "Credited back (return)",
+      adjustment: "Correction",
+    },
+    err: {
+    noOpenShift:
+      "No shift is open. A driver hand-over is cash into the drawer, so open a shift before taking it.",
+    notPersisted:
+      "This hand-over was NOT sent. The till could not save it first, and it will not record money it might be unable to recognise again. Nothing was taken. Free some space or restart the till, then try again.",
+      amountInvalid: "Enter the amount he handed over.",
+      amountZero: "Enter an amount greater than zero.",
+      nothingOutstanding: "This driver is not holding any of the shop's money.",
+      exceedsOutstanding: "That is more than he is holding. The shop does not carry driver advances.",
+    },
+  },
+
+  delivery: {
+    driver: "Driver",
+    driverUnassigned: "— choose a driver —",
+    noDrivers: "No drivers set up yet. Add one in Drivers.",
+    driversUnavailable: "The driver list could not be loaded. Counter orders still work.",
+    fee: "Delivery charge",
+    feeNote: "The driver keeps this. The customer pays it to him, not to the shop.",
+    collectByDriver: "Driver collects",
+    noCashHere:
+      "Nothing is taken at the till for this order. The driver collects the food total from the customer and owes it to the shop.",
+    collectNote:
+      "The driver will collect the food total from the customer and owe it to the shop. Nothing goes in the drawer now.",
+    foodTotal: "Food (shop receipt)",
+    driverFee: "Driver delivery fee",
+    customerPays: "Customer pays driver",
+    err: {
+      driverRequired: "Choose the driver who is taking this order.",
+      feeNeedsDriver: "A delivery charge needs the driver who collects it.",
+      driverNeedsDelivery: "Only a delivery order can have a driver. Switch the channel first.",
+      feeInvalid: "Enter the delivery charge as an amount, like 3 or 3.50.",
+    },
+  },
+
+  channel: {
+    groupLabel: "Where this order came from",
+    counter: "Counter",
+    counterShort: "Counter",
+    onlineDelivery: "WhatsApp / Delivery",
+    onlineDeliveryShort: "Delivery",
+    total: "Total",
+    reportTitle: "Orders by channel",
+    orders: "Orders",
+    grossRevenue: "Gross revenue",
+    refunds: "Refunds",
+    netRevenue: "Net revenue",
+    shareOfOrders: "Share of orders",
+    shareOfRevenue: "Share of revenue",
+    noOrders: "No orders in this period",
+    notAPaymentMethod:
+      "The channel records where an order came from, not how it was paid. A delivery order may be settled by Driver Collection, which owes the food money to the driver rather than putting it in the till — see Drivers. Delivery charges are the driver's and are NOT in any figure above.",
+  },
+
   pos: {
     shiftOpenChip: "Shift open",
     title: "POS Register",
@@ -93,13 +233,72 @@ const en = {
     decreaseQty: "Decrease quantity",
     increaseQty: "Increase quantity",
 
+    cartRestoredTitle: "This order was waiting from before — we re-checked it against today's menu.",
+    cartRestoredRepriced: "{{name}} was {{before}}, now {{after}}. The order uses the new price.",
+    cartRestoredGone: "{{name}} is no longer on the menu and was removed from the order.",
+    cartRestoredUomGone: "{{name}} no longer sells in that unit and was removed from the order.",
+    // GZ-WP0-08 — a restored cart that still holds a checkout identity.
+    unresolvedCheckoutTitle: "This order was being paid for when the register stopped.",
+    unresolvedCheckoutBody:
+      "We cannot tell whether the payment went through. The order is locked exactly as it was sent so that pressing Post Sale again is safe: if it did go through, you get that same receipt back instead of a second charge. Check the receipt list if you are unsure.",
+    discardUnresolved: "Discard this attempt",
+    // --- P1-A: an unresolved or in-flight checkout -----------------------
+    postingInFlightTitle: "Sending this payment…",
+    postingInFlightBody:
+      "The order is locked until the till hears back. Please do not close the application.",
+    unresolvedCheckoutLegacyBody:
+      "We cannot tell whether the payment went through, and this order was saved by an older version that did not keep enough detail to send it again safely. Use Check this order to find out what happened, then either print its receipt or discard it and ring it up again.",
+    reconcileCheck: "Check this order",
+    reconcileChecking: "Checking…",
+    reconcileNotCommitted:
+      "Checked: this payment did NOT go through. Press Post Sale to take it now.",
+    reconcileNotCommittedLegacy:
+      "Checked: this payment did NOT go through. Discard this attempt and ring the order up again.",
+    reconcileIndeterminate:
+      "The check could not be completed, so nothing is confirmed either way. The order stays locked — try the check again.",
+    errLegacyUnresolved:
+      "This order cannot be sent again, because it was saved without the details the till needs to recognise it. Use Check this order instead.",
+    errAttemptNotPersisted:
+      "This order was NOT sent. The till could not save it first, and it will not take a payment it might be unable to recognise again. Nothing was charged. Free some space or restart the till, then try again.",
+    // --- P1-B: posted, but the receipt could not be shown ----------------
+    receiptUnavailableTitle: "Sale posted — receipt #{{receipt}}",
+    receiptUnavailableBody:
+      "The sale is recorded and the payment is taken. Only the receipt could not be opened just now. Do NOT ring this order up again — you can retry below, or reprint it from Sales History.",
+    receiptRetry: "Show receipt",
+    receiptNotFound:
+      "The sale is recorded, but its receipt could not be found to display. Look it up in Sales History.",
+    // --- P1-D: a restored cart awaiting revalidation ---------------------
+    awaitRevalidationTitle: "Checking this saved order against today’s menu…",
+    awaitRevalidationPending:
+      "This order was waiting from before. It cannot be posted until its prices have been re-checked — just a moment.",
+    awaitRevalidationFailed:
+      "The menu could not be loaded, so this saved order’s prices could not be re-checked. It will not be posted at prices nobody has verified. Retry the menu, or clear the order and ring it up again.",
+    awaitRevalidationRetry: "Retry menu",
+    confirmDiscardUnresolved:
+      "Discard this unresolved payment attempt?\n\n" +
+      "If the sale actually did go through, the register will no longer be able to find it, " +
+      "and ringing the order up again would charge the customer twice. " +
+      "Check the receipt list and the drawer first.",
     totalsTitle: "Totals",
     subtotalExclVat: "Subtotal (excl-VAT)",
+    itemsInclVat: "Items (incl-VAT)",
+    netExclVat: "Net (excl-VAT)",
     discount: "Discount",
     discountSectionTitle: "Discount",
     discountPct: "Discount %",
     discountAmt: "Discount USD",
     discountClear: "Clear discount",
+    discountTooLarge:
+      "{{requested}} is more than this order can take. The most you can discount is {{max}}, which leaves $0.01 on the total. Nothing has been applied — change the amount or clear it.",
+    discountInvalid: "That is not a USD amount. Nothing has been applied.",
+    // GZ-WP0-07 — the percentage box refuses out loud instead of blanking the
+    // amount and letting the order post at full price.
+    discountPctInvalid:
+      "That is not a percentage. Nothing has been applied — type a number from 1 to 100, or clear it.",
+    discountPctTooLarge:
+      "{{requested}}% is more than the whole order. The most you can discount is 100%. Nothing has been applied — change it or clear it.",
+    discountPctTooSmall:
+      "{{requested}}% of this order is less than one cent, so there is nothing to take off. Nothing has been applied — raise it or clear it.",
     subtotalBeforeDiscount: "Subtotal (before discount)",
     vat: "VAT",
     totalInclVat: "Total (incl-VAT)",
@@ -205,6 +404,7 @@ const en = {
     openingCash: "Opening cash",
     cashReceived: "Cash received",
     changeGiven: "Change given",
+    driverRemittances: "Driver hand-overs",
     expectedInDrawer: "Expected in drawer",
     closingCashUsd: "Closing counted cash (USD)",
     closingCashLbp: "Closing counted cash (LBP)",
@@ -240,6 +440,7 @@ const en = {
       card_lbp: "Card LBP",
       bank_transfer: "Bank Transfer",
       wallet: "Wallet",
+      driver_collection: "Driver Collection",
       store_credit: "Store Credit",
       other: "Other",
     },
@@ -286,6 +487,13 @@ const en = {
     serviceItem: "Service item — no inventory movement",
     activeLabel: "Active",
 
+    menuSection: "Menu appearance",
+    categoryLabel: "Menu section",
+    categoryHint:
+      "Groups this item on the register’s menu grid. Optional — an item with no section appears under “Other”.",
+    iconLabel: "Icon",
+    iconHint:
+      "A single character shown on the tile, usually an emoji. Leave blank to use the section’s own symbol.",
     barcodeSection: "Barcode",
     barcodeLabel: "Barcode",
     barcodeLabelOptional: "Barcode (optional)",
@@ -294,6 +502,9 @@ const en = {
 
     vatSection: "VAT and price",
     vatRateLabel: "VAT rate",
+    vatRateChoose: "Choose a VAT rate…",
+    vatRateChosen: "This product will be saved at {{name}} ({{pct}}).",
+    vatRateUnchosen: "No VAT rate chosen yet. Greaz is VAT-registered, so this must be set deliberately.",
     vatInclusive: "VAT inclusive",
     vatExclusive: "VAT exclusive",
     salePriceInclVat: "Sale price incl. VAT",
@@ -311,6 +522,7 @@ const en = {
 
     uomSection: "Units of measure",
     stockUnit: "Stock unit",
+    uomChoose: "Choose a unit…",
     sellingUnit: "Selling unit",
     sameUom: "Selling unit is the same as stock unit.",
     uomFactorLabel: "How many {{base}} are inside 1 {{sale}}?",
@@ -331,7 +543,9 @@ const en = {
     errSkuRequired: "SKU is required.",
     errBarcodeRequired: "Barcode is required for stock products.",
     errEan13Invalid: "EAN-13 checksum is invalid. Double-check the barcode.",
-    errVatRequired: "VAT rate is required.",
+    errVatRequired:
+      "Choose a VAT rate before saving. It is not defaulted, because a product saved as exempt charges no VAT and every sale of it snapshots that permanently.",
+    errUomRequired: "Choose a stock unit and a selling unit before saving.",
     errPriceRequired: "Sale price is required.",
     errReorderNegative: "Reorder point cannot be negative.",
     errUomFactor: "UoM factor must be a positive whole number.",

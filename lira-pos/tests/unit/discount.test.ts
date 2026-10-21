@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   allocateLineDiscounts,
+  evaluateDiscountAmount,
+  maxDiscountCents,
+  percentToDiscountCents,
   postDiscountLineTotals,
   type DiscountAllocatableLine,
 } from "../../src/lib/discount";
@@ -159,5 +162,202 @@ describe("allocation and decomposition together", () => {
       preTotal - discount,
     );
     expect(parts[1].vat).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GZ-WP0-03 — an excessive discount is refused, never silently clamped
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("evaluateDiscountAmount (GZ-WP0-03)", () => {
+  it("accepts an amount the cart can bear, exactly as typed", () => {
+    expect(evaluateDiscountAmount("2.00", 1000)).toEqual({ kind: "ok", cents: 200 });
+  });
+
+  it("REFUSES an excessive discount instead of clamping it", () => {
+    // The defect: $50.00 off a $3.00 order used to become $2.99 and a 1c sale,
+    // with the box still reading 50.00 and nothing explaining the difference.
+    const got = evaluateDiscountAmount("50.00", 300);
+    expect(got.kind).toBe("exceeds");
+    expect(got.cents).toBe(0); // nothing applied — the totals stay truthful
+    if (got.kind === "exceeds") {
+      expect(got.requestedCents).toBe(5000);
+      expect(got.maxCents).toBe(299);
+    }
+  });
+
+  it("accepts exactly the maximum, and refuses one cent more", () => {
+    expect(evaluateDiscountAmount("2.99", 300)).toEqual({ kind: "ok", cents: 299 });
+    expect(evaluateDiscountAmount("3.00", 300).kind).toBe("exceeds");
+  });
+
+  it("leaves at least one cent on every accepted discount", () => {
+    for (const preTotal of [1, 2, 3, 100, 999, 123_456]) {
+      for (const cents of [0, 1, Math.floor(preTotal / 2), preTotal - 1, preTotal, preTotal + 1]) {
+        if (cents < 0) continue;
+        const res = evaluateDiscountAmount((cents / 100).toFixed(2), preTotal);
+        if (res.kind === "ok") expect(preTotal - res.cents).toBeGreaterThanOrEqual(1);
+        else expect(res.cents).toBe(0);
+      }
+    }
+  });
+
+  it("treats blank, zero and an empty cart as no discount at all", () => {
+    expect(evaluateDiscountAmount("", 1000)).toEqual({ kind: "none", cents: 0 });
+    expect(evaluateDiscountAmount("   ", 1000)).toEqual({ kind: "none", cents: 0 });
+    expect(evaluateDiscountAmount("0.00", 1000)).toEqual({ kind: "none", cents: 0 });
+    expect(evaluateDiscountAmount("5.00", 0)).toEqual({ kind: "none", cents: 0 });
+  });
+
+  it("refuses a non-amount rather than silently reading it as zero", () => {
+    for (const bad of ["abc", "1.234", "-5.00", "1,000", "$5"]) {
+      const got = evaluateDiscountAmount(bad, 10_000);
+      expect(got.kind, bad).toBe("invalid");
+      expect(got.cents).toBe(0);
+    }
+  });
+
+  it("never returns a non-zero amount on any rejecting branch", () => {
+    // The whole point: an unresolved discount contributes nothing, so the
+    // figures on screen always describe the cart as it actually stands.
+    for (const raw of ["", "abc", "999999.00", "-1.00", "0.00"]) {
+      const got = evaluateDiscountAmount(raw, 500);
+      if (got.kind !== "ok") expect(got.cents).toBe(0);
+    }
+  });
+});
+
+describe("maxDiscountCents", () => {
+  it("is the pre-discount total less one cent", () => {
+    expect(maxDiscountCents(1000)).toBe(999);
+    expect(maxDiscountCents(1)).toBe(0);
+  });
+
+  it("never goes negative on an empty or zero-value cart", () => {
+    expect(maxDiscountCents(0)).toBe(0);
+    expect(maxDiscountCents(-50)).toBe(0);
+  });
+});
+
+describe("percentToDiscountCents", () => {
+  it("floors, so a derived amount never exceeds the percentage agreed", () => {
+    // 33% of $10.00 is 330.0; 33% of $3.33 is 109.89 -> 109, not 110.
+    expect(percentToDiscountCents("33", 1000)).toBe(330);
+    expect(percentToDiscountCents("33", 333)).toBe(109);
+  });
+
+  it("does NOT clamp — an over-large percentage yields its true cash value", () => {
+    // Clamping here is what made the % box and the $ box describe different
+    // discounts. The refusal happens once, in evaluateDiscountAmount.
+    expect(percentToDiscountCents("100", 300)).toBe(300);
+    expect(evaluateDiscountAmount("3.00", 300).kind).toBe("exceeds");
+  });
+
+  it("rejects a percentage that is not usable", () => {
+    for (const bad of ["", "abc", "0", "-5", "101", "150"]) {
+      expect(percentToDiscountCents(bad, 1000), bad).toBeNull();
+    }
+    expect(percentToDiscountCents("50", 0)).toBeNull();
+  });
+
+  it("round-trips the two boxes without drifting", () => {
+    for (const preTotal of [300, 1000, 1999, 12_345]) {
+      for (const pct of ["5", "10", "12.5", "33", "99"]) {
+        const cents = percentToDiscountCents(pct, preTotal)!;
+        const res = evaluateDiscountAmount((cents / 100).toFixed(2), preTotal);
+        if (res.kind === "ok") expect(res.cents).toBe(cents);
+      }
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GZ-WP0-04 — the register's totals strip must add up
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Rebuild the exact figures `PosRegister`'s totals memo produces, from the two
+ * functions that own them. The rail now renders these and `handlePost` posts
+ * them, so an identity proved here is an identity on the screen AND on the
+ * receipt.
+ */
+function railFigures(cart: { total: number; bps: number }[], discountCents: number) {
+  const allocatable = cart.map((l) => ({ math: { lineTotalInclVatCents: l.total } }));
+  const alloc = allocateLineDiscounts(allocatable, discountCents);
+  let netExclVat = 0;
+  let vat = 0;
+  let total = 0;
+  cart.forEach((l, i) => {
+    const pd = postDiscountLineTotals(l.total, alloc[i], l.bps);
+    netExclVat += pd.subtotalExclVat;
+    vat += pd.vat;
+    total += pd.totalInclVat;
+  });
+  return {
+    itemsInclVat: cart.reduce((s, l) => s + l.total, 0),
+    discount: discountCents,
+    netExclVat,
+    vat,
+    total,
+  };
+}
+
+describe("the totals strip adds up (GZ-WP0-04)", () => {
+  const CARTS: { name: string; cart: { total: number; bps: number }[] }[] = [
+    { name: "the S16 cart that exposed it: 2 x $6.00 incl-VAT", cart: [{ total: 1200, bps: STANDARD }] },
+    { name: "single VAT-inclusive line", cart: [{ total: 600, bps: STANDARD }] },
+    { name: "exempt line", cart: [{ total: 1000, bps: 0 }] },
+    { name: "mixed exempt and standard", cart: [{ total: 1000, bps: 0 }, { total: 600, bps: STANDARD }] },
+    {
+      name: "awkward primes",
+      cart: [{ total: 997, bps: STANDARD }, { total: 983, bps: STANDARD }, { total: 1, bps: STANDARD }],
+    },
+    { name: "many small lines", cart: Array.from({ length: 9 }, () => ({ total: 333, bps: STANDARD })) },
+  ];
+
+  it("subtotal + VAT = total when there is no discount", () => {
+    // The original bug showed here with no discount at all: the rail printed
+    // the PRE-discount subtotal, 1082, beside VAT 119 and a total of 1200.
+    for (const { name, cart } of CARTS) {
+      const f = railFigures(cart, 0);
+      expect(f.netExclVat + f.vat, name).toBe(f.total);
+    }
+    const s16 = railFigures(CARTS[0].cart, 0);
+    expect(s16).toMatchObject({ netExclVat: 1081, vat: 119, total: 1200 });
+    expect(s16.netExclVat + s16.vat).toBe(1200);
+  });
+
+  it("items minus discount = total, and net + VAT = total, for every discount", () => {
+    for (const { name, cart } of CARTS) {
+      const preTotal = cart.reduce((s, l) => s + l.total, 0);
+      for (const d of [1, 2, 7, 50, Math.floor(preTotal / 3), Math.floor(preTotal / 2), preTotal - 1]) {
+        if (d <= 0 || d > maxDiscountCents(preTotal)) continue;
+        const f = railFigures(cart, d);
+        expect(f.itemsInclVat - f.discount, `${name} @${d}: items ladder`).toBe(f.total);
+        expect(f.netExclVat + f.vat, `${name} @${d}: VAT ladder`).toBe(f.total);
+      }
+    }
+  });
+
+  it("never shows a negative VAT or a negative net", () => {
+    for (const { name, cart } of CARTS) {
+      const preTotal = cart.reduce((s, l) => s + l.total, 0);
+      for (const d of [0, 1, maxDiscountCents(preTotal)]) {
+        const f = railFigures(cart, d);
+        expect(f.vat, name).toBeGreaterThanOrEqual(0);
+        expect(f.netExclVat, name).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  it("the displayed total is what an accepted discount produces, not a clamped one", () => {
+    // $50.00 off a $3.00 order is refused, so the rail shows the undiscounted
+    // order — NOT a 1c total derived from an amount nobody agreed to.
+    const cart = [{ total: 300, bps: STANDARD }];
+    const refused = evaluateDiscountAmount("50.00", 300);
+    expect(refused.cents).toBe(0);
+    const f = railFigures(cart, refused.cents);
+    expect(f.total).toBe(300);
+    expect(f.netExclVat + f.vat).toBe(300);
   });
 });

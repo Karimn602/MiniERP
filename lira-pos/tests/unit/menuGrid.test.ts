@@ -65,6 +65,8 @@ function product(over: Partial<ProductWithUoms> & { name: string }): ProductWith
     reorderPoint: null,
     isActive: true,
     isService: false,
+    category: null,
+    icon: null,
     createdAt: "2026-01-01",
     updatedAt: "2026-01-01",
     uoms: [base],

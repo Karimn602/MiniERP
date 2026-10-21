@@ -34,6 +34,7 @@ const icons = {
   products: <Icon d="M3.3 7 12 3l8.7 4-8.7 4-8.7-4ZM3.3 7v10l8.7 4 8.7-4V7M12 11v10" />,
   inventory: <Icon d="M4 7h16M4 12h16M4 17h16M8 4v3M16 4v3" />,
   purchases: <Icon d="M6 6h15l-1.5 9h-12L6 6Zm0 0L5 3H2m6 17a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm10 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" />,
+  drivers: <Icon d="M5 17a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Zm14 0a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5ZM7.5 14.5h7l2-6M13 5h3l1.5 3.5M9 8.5h5" />,
   suppliers: <Icon d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2M9 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm8 10v-2a4 4 0 0 0-3-3.9M14 5.1A3 3 0 0 1 14 11" />,
   rate: <Icon d="M4 7h11m0 0-3-3m3 3-3 3M20 17H9m0 0 3-3m-3 3 3 3" />,
   shift: <Icon d="M12 7v5l3 2m6-2a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />,
@@ -113,6 +114,9 @@ export function AppShell() {
           </NavLink>
           <NavLink to="/purchases" icon={icons.purchases}>{t("nav.purchases")}</NavLink>
           <NavLink to="/suppliers" icon={icons.suppliers}>{t("nav.suppliers")}</NavLink>
+          {/* Drivers sits beside Suppliers: both are counterparties the shop
+              runs a running balance with, one owed to and one owed by. */}
+          <NavLink to="/drivers" icon={icons.drivers}>{t("nav.drivers")}</NavLink>
 
           <NavGroupLabel>{t("nav.groupBackOffice")}</NavGroupLabel>
           <NavLink to="/sales" icon={icons.sales}>{t("nav.salesHistory")}</NavLink>

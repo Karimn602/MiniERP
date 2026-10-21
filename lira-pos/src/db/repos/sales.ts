@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { query } from "../client";
 import { newId } from "../../lib/ids";
+import type { SalesChannel } from "../../lib/salesChannel";
 import type {
   PaymentCurrency,
   PaymentMethod,
@@ -217,6 +218,34 @@ export interface PostSaleInput {
   exchangeRateId: string;
   exchangeRateLbpPerUsd: number;
   notes: string | null;
+  /**
+   * Where the order came from (WP-4). `"counter"` or `"online_delivery"`.
+   *
+   * Part of the sale's canonical content, so a replay carrying a different
+   * channel is refused as a conflict rather than silently ignored. NOT a
+   * payment method — see `lib/salesChannel.ts`.
+   */
+  channel: SalesChannel;
+  /**
+   * The shop's own driver who carried this order (WP-6).
+   *
+   * REQUIRED when any payment is `driver_collection`, and refused on a counter
+   * sale: a receivable has to be owed by somebody. A delivery order may name a
+   * driver without a driver-collection tender — a prepaid order still gets
+   * carried — and then raises no receivable.
+   *
+   * Part of the sale's canonical content, so a replay naming a different driver
+   * is refused as a conflict rather than silently ignored.
+   */
+  driverId: string | null;
+  /**
+   * What the customer paid the DRIVER for the delivery, in USD cents.
+   *
+   * Not revenue, not VAT-rated, and not part of any sale total — he keeps it.
+   * See `lib/driverCollection.ts` for the whole arrangement and the open tax
+   * question.
+   */
+  deliveryFeeCents: number;
   cogsMethod: CogsMethod;
   discountCents: number;
   allowNegativeInventory: boolean;

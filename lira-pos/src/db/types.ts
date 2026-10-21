@@ -78,6 +78,17 @@ export interface Product {
   reorderPoint: number | null;
   isActive: boolean;
   isService: boolean;
+  /**
+   * Menu section id, or null for uncategorised (migration 013).
+   *
+   * A stable id such as `"burgers"`, never a label — see
+   * `lib/menuCategories.ts`, which owns the canonical list, the normalisation
+   * and the localized labels. Presentational: no posting command reads it and
+   * it is snapshotted onto no sale line.
+   */
+  category: string | null;
+  /** Short decorative glyph for the menu tile, or null to use the section's. */
+  icon: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -290,6 +301,14 @@ export type PaymentMethod =
   | "bank_transfer"
   | "wallet"
   | "store_credit"
+  /**
+   * The shop's own driver carried a WhatsApp order and collected for it (WP-6).
+   *
+   * Non-cash, like a card: it settles the sale in full, it puts nothing in the
+   * drawer, and the money arrives later. What it raises is a receivable against
+   * the named driver, in `driver_ledger`. See `lib/driverCollection.ts`.
+   */
+  | "driver_collection"
   | "other";
 
 export type PaymentCurrency = "USD" | "LBP";
@@ -402,7 +421,92 @@ export type CreditMemoStatus = "draft" | "posted" | "voided";
  * customer-credit ledger, so a store-credit refund would be a liability
  * recorded nowhere. Migration 011's CHECK says the same thing in the engine.
  */
+/**
+ * `driver_collection` IS included, deliberately: a return on a delivery order
+ * credits the DRIVER's balance, because he is holding the money being given
+ * back. The existing cap keeps it honest — a memo may refund only a method the
+ * sale actually took — so it is reachable on a driver-collected sale and on no
+ * other. `store_credit` stays excluded; Greaz has no customer ledger.
+ */
 export type RefundMethod = Exclude<PaymentMethod, "store_credit">;
+
+// ---------------------------------------------------------------------------
+// Drivers and the driver clearing subledger (WP-6)
+// ---------------------------------------------------------------------------
+
+/** One of the shop's own delivery drivers. */
+export interface Driver {
+  id: string;
+  storeId: string;
+  name: string;
+  phone: string | null;
+  notes: string | null;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * What a driver owes the shop, and how he got there — the `driver_balances`
+ * view. Every figure is summed from the SAME ledger rows, so the parts always
+ * add up to `outstandingCents`.
+ */
+export interface DriverBalance {
+  driverId: string;
+  storeId: string;
+  driverName: string;
+  isActive: boolean;
+  /** Positive = he is holding the shop's money. */
+  outstandingCents: UsdCents;
+  /** Food money collected on delivery orders, ever. */
+  collectedCents: UsdCents;
+  /** Handed back to the shop, ever. Positive. */
+  remittedCents: UsdCents;
+  /** Credited back through returns, ever. Positive. */
+  returnCreditCents: UsdCents;
+  /** Signed-off corrections, net and signed. */
+  adjustmentCents: UsdCents;
+  collectionCount: number;
+  lastActivityAt: string | null;
+}
+
+export type DriverLedgerEntryType =
+  /** A delivery sale posted; the driver is holding its food money. */
+  | "collection"
+  /** He handed cash over. */
+  | "remittance"
+  /** A credit memo reduced what the order was worth. */
+  | "return_credit"
+  /** A signed-off correction, in either direction. */
+  | "adjustment";
+
+/**
+ * One append-only row of the driver subledger. `amountCents` is SIGNED:
+ * positive means he owes the shop more.
+ */
+export interface DriverLedgerEntry {
+  id: string;
+  storeId: string;
+  driverId: string;
+  entryType: DriverLedgerEntryType;
+  amountCents: UsdCents;
+  entryDate: string;
+  notes: string | null;
+  /** Source traceability: the receipt, or the credit memo. */
+  relatedSaleId: string | null;
+  relatedCreditMemoId: string | null;
+  /** Remittance only: the cash that physically arrived, in its own unit. */
+  receivedCurrency: PaymentCurrency | null;
+  receivedNativeUsdCents: UsdCents;
+  receivedNativeLbp: number;
+  exchangeRateId: string | null;
+  exchangeRateLbpPerUsd: number | null;
+  reference: string | null;
+  shiftId: string | null;
+  createdByUserId: string | null;
+  deviceId: string | null;
+  postedAt: string;
+}
 
 /**
  * The header of one return document.

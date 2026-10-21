@@ -90,15 +90,53 @@ import {
   menuTilePriceInclVatCents,
   sortMenu,
 } from "../lib/menuGrid";
-import { allocateLineDiscounts, postDiscountLineTotals } from "../lib/discount";
+import {
+  allocateLineDiscounts,
+  discountBlocksPosting,
+  evaluateCartDiscount,
+  percentToDiscountCents,
+  postDiscountLineTotals,
+} from "../lib/discount";
 import {
   createCheckoutRegistry,
   createSubmissionGate,
   type CheckoutRegistry,
   type SubmissionGate,
 } from "../lib/checkout";
+import { resolveIcon } from "../lib/menuCategories";
+import {
+  DEFAULT_SALES_CHANNEL,
+  SALES_CHANNEL_OPTIONS,
+  resolveSalesChannel,
+  type SalesChannel,
+} from "../lib/salesChannel";
 import { fromBaseQty, type Factor } from "../lib/uom";
 import { newId } from "../lib/ids";
+import {
+  revalidateRestoredCarts,
+  type RevalidationResult,
+} from "../lib/cartRestore";
+import { browserCartStorage, persistCarts } from "../lib/cartStore";
+import {
+  DRIVER_COLLECTION,
+  deliveryBlocker,
+  deliveryTotals,
+  parseFeeCents,
+} from "../lib/driverCollection";
+import { driversRepo } from "../db/repos/drivers";
+import type { Driver } from "../db/types";
+import {
+  attemptOnRestore,
+  beginAttempt,
+  checkoutStatus,
+  classifyPostFailure,
+  failureMessage,
+  isLegacyUnresolvedCart,
+  isUsableAttempt,
+  toUnknown,
+  type FrozenPostSaleRequest,
+  type PostAttempt,
+} from "../lib/postAttempt";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
@@ -167,6 +205,46 @@ interface CartState {
    * keeps its identity across a reload.
    */
   checkoutId?: string;
+  /**
+   * The frozen checkout attempt, when one is open (P1-A / P1-C).
+   *
+   * Written BEFORE `post_sale` is invoked and carried until the outcome is
+   * known, so it is exactly as durable as the cart record it lives in. While
+   * it is present the cart is LOCKED: its canonical request is either on the
+   * wire or is the key to a sale that may already have committed, and in
+   * neither case may it move. See `lib/postAttempt.ts`.
+   */
+  attempt?: PostAttempt;
+  /**
+   * Where this order came from (WP-4). Per-cart, so two open orders can be one
+   * counter and one delivery, and persisted with the cart so it survives a
+   * reload.
+   *
+   * Immutable once a posting attempt opens, and that needs no extra guard: the
+   * channel is part of the frozen canonical request, and the cart's own edit
+   * choke points already refuse everything while an attempt is live. It is
+   * also compared on replay, so a retry cannot re-attribute the sale.
+   */
+  channel?: SalesChannel;
+  /**
+   * The shop's own driver carrying this delivery order (WP-6).
+   *
+   * Per-cart and persisted, like the channel, and frozen into the canonical
+   * request — so a retry owes the receivable to the driver the cashier chose,
+   * and a replay naming a different one is refused as a conflict.
+   */
+  driverId?: string | null;
+  /** The delivery charge, exactly as typed. Parsed by `parseFeeCents`. */
+  deliveryFeeInput?: string;
+  /**
+   * Settle this order by DRIVER COLLECTION rather than cash or card.
+   *
+   * A separate flag rather than an inferred one: "this delivery is collected
+   * for by the driver" is a decision the cashier makes, and inferring it from
+   * the channel would have made every delivery order raise a receivable —
+   * including one the customer already paid for by card.
+   */
+  driverCollect?: boolean;
 }
 
 function createEmptyCart(seq: number): CartState {
@@ -179,6 +257,10 @@ function createEmptyCart(seq: number): CartState {
     cardUsdInput: "",
     discountPctInput: "",
     discountAmountInput: "",
+    channel: DEFAULT_SALES_CHANNEL,
+    driverId: null,
+    deliveryFeeInput: "",
+    driverCollect: false,
   };
 }
 
@@ -207,6 +289,33 @@ function loadAllowNegative(): boolean {
     return false;
   }
 }
+
+/**
+ * The carts as they come back from storage, with their attempts normalised.
+ *
+ * A persisted attempt in state `posting` means the process went away while a
+ * request was on the wire — which is the definition of an UNKNOWN outcome, not
+ * of a post still running. Promoting it here means the cashier never sees a
+ * spinner for a request that no longer exists, and the cart is locked for
+ * reconciliation from the very first render (P1-A).
+ */
+function restoreCarts(): CartState[] {
+  return loadOpenCarts().map((c) =>
+    isUsableAttempt(c.attempt)
+      ? { ...c, attempt: attemptOnRestore(c.attempt, RESTORED_IN_FLIGHT) }
+      : c,
+  );
+}
+
+/**
+ * The `message` stamped on an attempt promoted by `restoreCarts`.
+ *
+ * Not translated, and not shown on its own: the operator-facing explanation is
+ * a locale string chosen from the attempt's STATE, and this is the supplementary
+ * detail beside it. Keeping it out of the dictionary means a cart persisted
+ * under one language reads correctly under another.
+ */
+const RESTORED_IN_FLIGHT = "The application closed while this payment was being sent.";
 
 function loadOpenCarts(): CartState[] {
   try {
@@ -245,7 +354,7 @@ export default function PosRegister() {
 
   // ----- Multi-cart state (loaded once from localStorage) -----
   const initialCartsRef = useRef<CartState[] | null>(null);
-  if (initialCartsRef.current === null) initialCartsRef.current = loadOpenCarts();
+  if (initialCartsRef.current === null) initialCartsRef.current = restoreCarts();
   const [carts, setCarts] = useState<CartState[]>(initialCartsRef.current);
   const [activeCartId, setActiveCartId] = useState<string>(initialCartsRef.current[0].id);
 
@@ -256,16 +365,142 @@ export default function PosRegister() {
 
   // Convenience views into the active cart.
   const lines = activeCart.lines;
+  const activeChannel = resolveSalesChannel(activeCart?.channel);
+  const isDelivery = activeChannel === "online_delivery";
+  const activeDriverId = activeCart?.driverId ?? null;
+  const deliveryFeeInput = activeCart?.deliveryFeeInput ?? "";
+  /**
+   * A delivery order IS collected for by its driver (WP-7 SS3).
+   *
+   * Not a toggle any more. The confirmed workflow has one shape — the driver
+   * takes the food out, collects from the customer and brings the food money
+   * back — so "WhatsApp Delivery, settled some other way" is not a thing the
+   * cashier should be able to ring up. Deriving it from the channel and the
+   * driver, rather than storing a flag, means:
+   *
+   *   * blank tender can NEVER become cashier cash on a delivery order, which
+   *     is what the auto-pay path would otherwise do with it;
+   *   * a cart persisted by an older build, or hand-edited, cannot post a
+   *     receivable with no driver behind it, nor a delivery order as cash.
+   *
+   * The stored `driverCollect` field is kept on the cart only so an older
+   * record stays readable; nothing reads it as authority.
+   */
+  const driverCollect = isDelivery && !!activeDriverId;
+  const deliveryFeeCents = parseFeeCents(deliveryFeeInput);
+
   const { cashUsdInput, cashLbpInput, cardUsdInput, discountPctInput, discountAmountInput } =
     activeCart;
 
-  // Persist carts (survives page navigation within a session).
+  // ----- Restored carts are re-checked against the live catalog once -----
+  //
+  // The carts above came out of localStorage with a whole product snapshot
+  // frozen inside each line — price, VAT rate and UoM factors as they were
+  // when the line was rung. The register posts from exactly those fields, so
+  // without this a cart parked across a price change or a VAT-rate change
+  // would post at the OLD money and `sale_items` would snapshot it for ever
+  // (GZ-WP0-05). See `lib/cartRestore.ts`.
+  //
+  // Runs once, on the first catalog load after boot: re-ringing a cashier's
+  // open order underneath them on every menu refresh would be its own kind of
+  // surprise, and every later change is already rung against fresh data.
+  const [restoreNotice, setRestoreNotice] = useState<RevalidationResult<CartLine> | null>(null);
+  const restoreCheckedRef = useRef(false);
+
+  /**
+   * Checkout attempts that were INTENTIONALLY retired: cart id → the
+   * `checkoutId` that was retired.
+   *
+   * The attempt barrier in `lib/cartStore.ts` stops a mirror write dropping a
+   * live attempt. That protection has to be lifted for the one case where
+   * removing it is the whole point — a sale that committed, or a refusal that
+   * proved nothing committed, or a checkout the cashier discarded. Without this
+   * the retired attempt could never leave storage and the cart would come back
+   * after a restart looking unresolved for a sale that is already settled.
+   *
+   * It records the IDENTITY, not just the cart (GZ-P1-2). A cart id outlives
+   * any number of checkouts, so a permission minted when one attempt settled
+   * would still have been in the set when the NEXT attempt's write landed —
+   * authorising the deletion of an identity nobody had resolved.
+   */
+  const retiredAttemptsRef = useRef<Map<string, string>>(new Map());
+  /**
+   * Record that THIS cart's THIS attempt is being retired on purpose.
+   *
+   * Called from inside the state updater that retires it, which is the only
+   * place the live attempt is readable synchronously: React hands the updater
+   * the current cart, whereas a snapshot captured outside can predate an
+   * attempt that landed in between — and a permission minted from a stale
+   * snapshot is the second half of GZ-P1-2. Writing a ref inside an updater is
+   * a deliberate exception to keeping them pure; the write is idempotent (the
+   * same cart id and identity), so a double invocation in development changes
+   * nothing.
+   *
+   * A cart with no usable attempt needs no permission at all: the barrier only
+   * protects attempts it can read.
+   */
+  const permitAttemptDrop = useCallback((cart: CartState) => {
+    if (!isUsableAttempt(cart.attempt)) return;
+    const next = new Map(retiredAttemptsRef.current);
+    next.set(cart.id, cart.attempt.checkoutId);
+    retiredAttemptsRef.current = next;
+  }, []);
+  /**
+   * Whether the restored carts have been re-checked against the catalog (P1-D).
+   *
+   * This was a bare ref, which triggers no rerender and so could gate nothing:
+   * Post Sale and F5 were live from the first frame, and a restored cart could
+   * post at its frozen snapshot while the catalog was still loading — or after
+   * the load had FAILED, which the old pass treated as "try again later" and
+   * silently never did. Prices, VAT rates and conversions nobody had checked.
+   *
+   * `pending` blocks posting an ordinary restored cart. `failed` blocks it and
+   * says so with a retry. `done` is the only state that permits it.
+   */
+  const [restoreCheck, setRestoreCheck] = useState<"pending" | "done" | "failed">("pending");
+  // Only a cart that actually came back from storage needs re-checking; a cart
+  // created in this session was rung against the catalog already in hand.
+  const restoredCartIdsRef = useRef<Set<string>>(
+    new Set((initialCartsRef.current ?? []).filter((c) => c.lines.length > 0).map((c) => c.id)),
+  );
+
+  /**
+   * Carts frozen because they hold an unresolved checkout attempt (GZ-WP0-08).
+   *
+   * A restored cart that still carries its `checkoutId` is a payment whose
+   * answer never arrived. The ONLY safe operation on it is replaying that
+   * identity with the payload byte-for-byte as it was sent, because that is
+   * what `post_sale` compares a retry against. So the cart is not revalidated
+   * and not editable: every content edit is refused at the two choke points
+   * below, and the cashier is offered Retry or Discard.
+   *
+   * Kept as state for rendering AND as a ref for the guards — the guards run
+   * inside `useCallback`s that must not be rebuilt on every lock change, and a
+   * ref is readable synchronously, which is what a refusal needs.
+   */
+
+  // Mirror the carts into storage (survives page navigation within a session).
+  //
+  // Best-effort BY DESIGN, and the asymmetry with the posting path below is the
+  // point. A cart edit that fails to persist costs the cashier a re-ring after
+  // a restart and can charge nobody twice, so failing the edit would be worse
+  // than losing it. A checkout ATTEMPT that fails to persist is the opposite:
+  // it is the only key to a sale that may exist, so `runPost` writes it through
+  // `persistCarts` itself and refuses to invoke unless the write is proven.
   useEffect(() => {
-    try {
-      localStorage.setItem(OPEN_CARTS_KEY, JSON.stringify(carts));
-    } catch {
-      /* ignore */
-    }
+    // MODE: mirror. `persistCarts` refuses a mirror write that would remove an
+    // attempt storage is holding, whatever render this effect's `carts` came
+    // from — so the verified write `runPost` makes before dispatching cannot
+    // be undone by a writer that knows nothing about checkouts.
+    //
+    // `retiredAttemptsRef` is the one exception: an attempt the register
+    // deliberately settled or discarded. Cleared only once the write lands, so
+    // a refused or failed write does not lose the permission.
+    const verdict = persistCarts(browserCartStorage(), OPEN_CARTS_KEY, carts, {
+      mode: "mirror",
+      allowDropFor: retiredAttemptsRef.current,
+    });
+    if (verdict.ok) retiredAttemptsRef.current = new Map();
   }, [carts]);
 
   // ----- POS setup -----
@@ -291,6 +526,16 @@ export default function PosRegister() {
 
   // Active shift — null = no open shift; undefined = still loading
   const [activeShift, setActiveShift] = useState<Shift | null | undefined>(undefined);
+
+  // The shop's own delivery drivers (WP-6).
+  //
+  // Active only: these are the people an order may be assigned to, and a
+  // retired driver must not appear in that list. A failure here is NOT fatal to
+  // the register — counter trade must keep working if the driver list cannot be
+  // read — so it leaves the list empty, and the delivery flow reports that it
+  // has nobody to assign rather than posting without one.
+  const [drivers, setDrivers] = useState<Driver[]>([]);
+  const [driversError, setDriversError] = useState<string | null>(null);
 
   // Exchange rate (read once on mount; locked into the sale at post time).
   const [rate, setRate] = useState<ExchangeRate | null>(null);
@@ -336,6 +581,54 @@ export default function PosRegister() {
    */
   const [postingCartId, setPostingCartId] = useState<string | null>(null);
 
+  //
+  // DERIVED from the carts themselves, never held as a second piece of state.
+  //
+  // An earlier version kept a `lockedCartIds` set alongside the carts and had
+  // to remember to add and remove ids as attempts opened and closed. Two
+  // records of one fact drift: the restore pass set it, `clearCart` unset it,
+  // and anything that forgot left a cart either wedged or unguarded. The lock
+  // is a property OF a cart — does it hold an unresolved attempt? — so it is
+  // read off the cart every render and cannot disagree with it.
+  //
+  // It also cannot depend on the catalog loading. The restore pass waits for
+  // the menu and gives up when it is empty, so a lock applied from there left
+  // a frozen checkout fully editable on exactly the morning the menu would not
+  // load. `checkoutStatus` reads the persisted cart and nothing else.
+  const inFlightCartIds = useMemo(
+    () => new Set(postingCartId ? [postingCartId] : []),
+    [postingCartId],
+  );
+
+  const lockedCartIds = useMemo(
+    () =>
+      new Set(
+        carts.filter((c) => checkoutStatus(c, inFlightCartIds, c.id).locked).map((c) => c.id),
+      ),
+    [carts, inFlightCartIds],
+  );
+  const lockedCartIdsRef = useRef<ReadonlySet<string>>(lockedCartIds);
+  lockedCartIdsRef.current = lockedCartIds;
+
+  // Read synchronously by `clearCart` and `discardUnresolvedCheckout`, which
+  // are plain functions called from handlers and cannot wait for a rerender.
+  const postingCartIdRef = useRef<string | null>(postingCartId);
+  postingCartIdRef.current = postingCartId;
+
+  /**
+   * Mark this cart's request no longer on the wire.
+   *
+   * Writes the REF first and the state after. `clearCart` and
+   * `discardUnresolvedCheckout` read the ref synchronously, and the success
+   * path calls `clearCart` in the same tick — so leaving the ref until the
+   * rerender made the guard refuse the very clear that follows a posted sale,
+   * and the basket stayed on screen after the customer had paid.
+   */
+  const settleInFlight = useCallback((cartId: string) => {
+    if (postingCartIdRef.current === cartId) postingCartIdRef.current = null;
+    setPostingCartId((current) => (current === cartId ? null : current));
+  }, []);
+
   // Synchronous submission safety — see lib/checkout.ts for why React state
   // cannot do this job. The gate drops a second entry in the same frame; the
   // registry keeps one checkout identity per cart across retries.
@@ -346,13 +639,40 @@ export default function PosRegister() {
   if (checkoutsRef.current === null) {
     checkoutsRef.current = createCheckoutRegistry(
       newId,
+      // Either marker carries an identity: a WP-1 frozen attempt, or a bare
+      // `checkoutId` from an older build.
       Object.fromEntries(
         initialCartsRef.current
-          .filter((c) => c.checkoutId)
-          .map((c) => [c.id, c.checkoutId as string]),
+          .map((c) => {
+            const id = isUsableAttempt(c.attempt) ? c.attempt.checkoutId : c.checkoutId;
+            return id ? ([c.id, id] as const) : null;
+          })
+          .filter((e): e is readonly [string, string] => e !== null),
       ),
     );
   }
+
+  /**
+   * A sale that POSTED but whose receipt could not be shown (P1-B).
+   *
+   * Deliberately not an error: the money is taken and the sale is in the
+   * ledger. All that failed is a read, so this carries the receipt number the
+   * cashier needs and a retry, and never suggests ringing the order again.
+   */
+  const [receiptNotice, setReceiptNotice] = useState<{
+    saleId: string;
+    receiptNumber: number;
+    message: string;
+  } | null>(null);
+
+  /** Which cart is being probed against the database right now. */
+  const [reconciling, setReconciling] = useState<string | null>(null);
+  /** The outcome of the last probe, for the cart it was run against. */
+  const [reconcileVerdict, setReconcileVerdict] = useState<{
+    cartId: string;
+    kind: "notCommitted" | "indeterminate";
+    message?: string;
+  } | null>(null);
 
   // ----- Cart mutation helpers -----
   const updateCartById = useCallback(
@@ -362,8 +682,14 @@ export default function PosRegister() {
     [],
   );
 
+  // The two choke points for editing the ACTIVE cart's content: every input
+  // setter goes through `updateActiveCart`, every line change through
+  // `setLines`. Both refuse while the cart is locked, which is what makes
+  // "frozen" true of the cart rather than merely true of the buttons — a
+  // keyboard shortcut, a barcode scan and a menu tile all land here (GZ-WP0-08).
   const updateActiveCart = useCallback(
     (updater: (c: CartState) => CartState) => {
+      if (lockedCartIdsRef.current.has(activeCartId)) return;
       setCarts((prev) => prev.map((c) => (c.id === activeCartId ? updater(c) : c)));
     },
     [activeCartId],
@@ -371,12 +697,55 @@ export default function PosRegister() {
 
   const setLines = useCallback(
     (updater: (prev: CartLine[]) => CartLine[]) => {
+      if (lockedCartIdsRef.current.has(activeCartId)) return;
       setCarts((prev) =>
         prev.map((c) => (c.id === activeCartId ? { ...c, lines: updater(c.lines) } : c)),
       );
     },
     [activeCartId],
   );
+
+  // ----- Attempt lifecycle (P1-A) -----
+  //
+  // These go through `updateCartById`, which carries no lock guard: they are
+  // how a locked cart is legitimately resolved, so guarding them would wedge
+  // every cart they are meant to free.
+
+  /**
+   * Retire the attempt. The cart becomes editable again.
+   *
+   * Drops the legacy `checkoutId` too. On the refusal path nothing committed,
+   * so letting the cart come back under a fresh identity is safe — whereas
+   * leaving the field behind would make the cart read as a legacy unresolved
+   * one and lock it again for a checkout that provably never happened.
+   */
+  const clearAttempt = useCallback(
+    (cartId: string) => {
+      // Permit the mirror to drop THIS attempt, recorded from the cart React
+      // hands the updater: by the time the effect observes the change the
+      // permission is already in hand, and it names the identity being retired
+      // rather than the cart, so it cannot authorise dropping the next one.
+      updateCartById(cartId, (c) => {
+        permitAttemptDrop(c);
+        const { attempt: _a, checkoutId: _c, ...rest } = c;
+        return rest;
+      });
+    },
+    [permitAttemptDrop, updateCartById],
+  );
+
+  /** Keep the identity and the request; record that the outcome is unknown. */
+  const setAttemptUnknown = useCallback(
+    (cartId: string, message: string) => {
+      updateCartById(cartId, (c) =>
+        isUsableAttempt(c.attempt) ? { ...c, attempt: toUnknown(c.attempt, message) } : c,
+      );
+    },
+    [updateCartById],
+  );
+
+  /** Write a brand-new attempt onto a cart, lock guard or not. */
+  const updateCartUnconditionally = updateCartById;
 
   const setCashUsdInput = useCallback(
     (v: string) => updateActiveCart((c) => ({ ...c, cashUsdInput: v })),
@@ -390,6 +759,55 @@ export default function PosRegister() {
     (v: string) => updateActiveCart((c) => ({ ...c, cardUsdInput: v })),
     [updateActiveCart],
   );
+  /**
+   * Change the active cart's channel.
+   *
+   * Goes through `updateActiveCart`, so it is refused while the cart holds a
+   * posting attempt — the same gate that stops a line or a tender moving.
+   */
+  const setChannel = useCallback(
+    (channel: SalesChannel) =>
+      updateActiveCart((c) =>
+        // Leaving delivery clears everything that only means something there.
+        // Otherwise a cart switched to Counter would still be carrying a driver
+        // and a fee, which `post_sale` refuses — and rightly: a courier booked
+        // against a walk-in receipt describes nothing that happened.
+        channel === "online_delivery"
+          ? { ...c, channel }
+          : { ...c, channel, driverId: null, deliveryFeeInput: "" },
+      ),
+    [updateActiveCart],
+  );
+
+  /**
+   * Assign (or unassign) the driver carrying the active order.
+   *
+   * Assigning one on a delivery order is what makes it driver-collected, so it
+   * also RETIRES any tender already typed. That is a correctness fix rather
+   * than tidiness: `buildFrozenRequest` emits ONE `driver_collection` leg for
+   * the food total and nothing else, so cash or card still sitting in those
+   * boxes would be silently dropped — money on the screen that the receipt
+   * would never show. A parked cart carrying a legacy card amount is cleared
+   * for the same reason.
+   *
+   * Unassigning him retires the tender with him, and needs no second field to
+   * keep in step: `driverCollect` is derived from this plus the channel.
+   */
+  const setDriverId = useCallback(
+    (driverId: string | null) =>
+      updateActiveCart((c) =>
+        driverId
+          ? { ...c, driverId, cashUsdInput: "", cashLbpInput: "", cardUsdInput: "" }
+          : { ...c, driverId: null },
+      ),
+    [updateActiveCart],
+  );
+
+  const setDeliveryFeeInput = useCallback(
+    (v: string) => updateActiveCart((c) => ({ ...c, deliveryFeeInput: v })),
+    [updateActiveCart],
+  );
+
   const setDiscountPctInput = useCallback(
     (v: string) => updateActiveCart((c) => ({ ...c, discountPctInput: v })),
     [updateActiveCart],
@@ -457,13 +875,100 @@ export default function PosRegister() {
     }
   }, [storeId]);
 
+  const reloadDrivers = useCallback(async () => {
+    if (!storeId) return;
+    try {
+      setDrivers(await driversRepo.list({ storeId }));
+      setDriversError(null);
+    } catch (e) {
+      // Counter trade must keep working, so this is reported and not thrown.
+      setDrivers([]);
+      setDriversError(e instanceof Error ? e.message : String(e));
+    }
+  }, [storeId]);
+
   useEffect(() => {
     if (hydrated) {
       void reloadRate();
       void reloadShift();
       void reloadMenu();
+      void reloadDrivers();
     }
-  }, [hydrated, reloadRate, reloadShift, reloadMenu]);
+  }, [hydrated, reloadRate, reloadShift, reloadMenu, reloadDrivers]);
+
+  // Re-check restored carts once the catalog is actually in hand. `menuLoading`
+  // gates it so an empty `menu` mid-load cannot be read as "every product was
+  // deleted" and empty the cashier's order.
+  useEffect(() => {
+    if (menuLoading || restoreCheckedRef.current) return;
+    if (restoredCartIdsRef.current.size === 0) {
+      restoreCheckedRef.current = true;
+      setRestoreCheck("done");
+      return;
+    }
+    if (menu.length === 0) {
+      // A failed or empty load is NOT an empty catalog, so nothing is dropped
+      // — but it is also not a successful re-check, so it must not read as one.
+      // Left un-checked (the ref stays false) so a later successful reload
+      // still runs the pass, and reported as `failed` so posting stays blocked
+      // in the meantime instead of proceeding on unverified prices (P1-D).
+      setRestoreCheck("failed");
+      return;
+    }
+    restoreCheckedRef.current = true;
+    setRestoreCheck("done");
+
+    // Computed BEFORE the state update, not inside the updater. A `setCarts`
+    // updater runs when React gets round to it, so collecting the findings
+    // from inside one left both arrays empty on the very next line and the
+    // cashier got a silently re-priced cart with no notice — the exact failure
+    // this fix exists to prevent, reintroduced one level down.
+    //
+    // The policy itself lives in `lib/cartRestore.ts`: which carts may be
+    // repriced and which are frozen unresolved checkouts is one decision, and
+    // this page holds no copy of it (GZ-WP0-08).
+    const current = new Map(menu.map((p) => [p.id, p]));
+    const outcome = revalidateRestoredCarts(
+      carts,
+      restoredCartIdsRef.current,
+      current,
+      lineMathFor,
+    );
+
+    // `outcome.locked` is not applied here: the lock is derived from each
+    // cart's own attempt every render, so there is nothing to apply. The two
+    // agree by construction — both ask whether the cart holds an unresolved
+    // checkout.
+    if (!outcome.changed) return;
+    // FUNCTIONAL update, merged against the latest state rather than assigned
+    // from this effect's snapshot. `carts` is read outside the dependency array
+    // above (see the eslint note), so `outcome.carts` is computed from whatever
+    // render scheduled this effect — assigning it wholesale would discard any
+    // cart change committed since, including a checkout attempt opened by a
+    // post that is already on the wire.
+    //
+    // The revalidation outcome is applied per cart, by id, and only to carts
+    // that are still present and still attempt-free: `cartRestore` freezes a
+    // cart holding an unresolved checkout and never reprices it, so a cart that
+    // has since acquired an attempt must keep it untouched.
+    const revalidated = new Map(outcome.carts.map((c) => [c.id, c]));
+    setCarts((prev) =>
+      prev.map((c) => {
+        const next = revalidated.get(c.id);
+        if (!next) return c;
+        if (isUsableAttempt(c.attempt) || c.checkoutId) return c;
+        return next;
+      }),
+    );
+    setRestoreNotice({
+      lines: [],
+      dropped: outcome.dropped,
+      repriced: outcome.repriced,
+      changed: true,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once; the
+    // `restoreCheckedRef` guard above is what makes `carts` safe to read here.
+  }, [menu, menuLoading]);
 
   // ----- Scan handler -----
   async function handleScan() {
@@ -642,24 +1147,118 @@ export default function PosRegister() {
   // basket up a second time. The button is disabled in that window too — this
   // check covers every other path to the same function.
   function clearCart(cartId: string) {
-    if (checkoutsRef.current?.isPosting(cartId)) return;
+    // IN-FLIGHT is the one state this must refuse. `submitAttempt` calls this
+    // itself on a committed sale, so the guard cannot be "is there an attempt"
+    // — it has to be "is a request on the wire right now".
+    //
+    // The registry's own `isPosting` used to answer that, and no longer can:
+    // WP-1 mints identities with `idFor` and never calls `beginAttempt`, so
+    // that flag is permanently false and the check it guarded was dead. The
+    // live answer is `postingCartId`, which `submitAttempt` sets and clears.
+    // The Clear and Close buttons are disabled in that window too; this covers
+    // every other path to the same function.
+    if (postingCartIdRef.current === cartId) return;
     checkoutsRef.current?.retire(cartId);
-    updateCartById(cartId, (c) => ({
-      ...c,
-      lines: [],
-      cashUsdInput: "",
-      cashLbpInput: "",
-      cardUsdInput: "",
-      discountPctInput: "",
-      discountAmountInput: "",
-      checkoutId: undefined,
-    }));
+    // Clearing a cart retires its attempt intentionally — a committed sale, or
+    // a checkout the cashier discarded — so the mirror is allowed to drop it.
+    // Without this the barrier would hold the attempt in storage for ever and
+    // the cart would come back from a restart looking unresolved for a sale
+    // that is already settled.
+    updateCartById(cartId, (c) => {
+      permitAttemptDrop(c);
+      return {
+        ...c,
+        lines: [],
+        cashUsdInput: "",
+        cashLbpInput: "",
+        cardUsdInput: "",
+        discountPctInput: "",
+        discountAmountInput: "",
+        checkoutId: undefined,
+        // The attempt goes with it, which is also what unlocks the cart: the
+        // lock is derived from this field, so there is nothing else to reset.
+        attempt: undefined,
+        // And the channel resets. A cleared cart is the NEXT customer, who is at
+        // the counter until someone says otherwise. Letting it stick would
+        // silently post the next counter order as a delivery — mis-attributed
+        // revenue with nothing on screen to say so, which is a worse failure
+        // than a cashier having to press Online again.
+        channel: DEFAULT_SALES_CHANNEL,
+        // And so do the delivery fields, for exactly the same reason (WP-7 SS3).
+        // The channel reset alone was not enough: a cleared cart kept its driver
+        // and its delivery charge, so the next order could post a receivable
+        // against a driver who never saw it, or a fee the customer never agreed,
+        // the moment anyone switched it back to Delivery. Nothing about one
+        // customer may survive into the next.
+        driverId: null,
+        deliveryFeeInput: "",
+        driverCollect: false,
+      };
+    });
     setSubmitError(null);
     setScanError(null);
   }
 
   function clearActiveCart() {
     clearCart(activeCartId);
+  }
+
+  /**
+   * Resolve an unknown outcome by asking the database (P1-A).
+   *
+   * Read-only and authoritative. `post_sale` consumes a checkout identity on
+   * exactly one commit, so a sale under that id is proof the attempt committed
+   * and the absence of one is proof it had not, as of this read. Nothing here
+   * posts, retries or writes — which is what makes it safe to offer as the
+   * FIRST action on an unresolved cart, including a legacy cart whose canonical
+   * request was never frozen and so can never be replayed.
+   */
+  async function reconcileCheckout(cartId: string) {
+    const cart = carts.find((c) => c.id === cartId);
+    if (!cart) return;
+    const status = checkoutStatus(cart, inFlightCartIds, cartId);
+    if (!status.checkoutId || status.inFlight) return;
+
+    setReconciling(cartId);
+    setSubmitError(null);
+    try {
+      const found = await salesRepo.findByIdWithDetails(status.checkoutId);
+      if (found) {
+        // It committed. Clear the cart and show the receipt it earned.
+        clearCart(cartId);
+        setReceiptSale(found);
+        void reloadMenu();
+        return;
+      }
+      // No sale under this identity. The attempt is safe to post for real.
+      setReconcileVerdict({ cartId, kind: "notCommitted" });
+    } catch (e) {
+      // The probe itself failed. NOTHING is proven, so the cart stays locked.
+      setReconcileVerdict({ cartId, kind: "indeterminate", message: failureMessage(e) });
+    } finally {
+      setReconciling(null);
+    }
+  }
+
+  /**
+   * Abandon a frozen checkout attempt (GZ-WP0-08).
+   *
+   * This is the ONE way out of a locked cart other than a successful retry,
+   * and it is deliberately the only destructive one. Retiring the identity
+   * throws away the only key that could reconcile the attempt to a sale that
+   * may already have committed, so if it did commit this order is now invisible
+   * to the register and a re-ring would charge the customer twice. The cashier
+   * is told exactly that and has to agree; nothing here can decide it for them,
+   * because only the receipt list and the drawer can say what really happened.
+   */
+  function discardUnresolvedCheckout(cartId: string) {
+    if (!lockedCartIdsRef.current.has(cartId)) return;
+    // Never while the request is still on the wire: the answer may be seconds
+    // away, and throwing the identity away now is the one move that cannot be
+    // undone. The cashier waits for a verdict and then decides.
+    if (postingCartIdRef.current === cartId) return;
+    if (!window.confirm(t("pos.confirmDiscardUnresolved"))) return;
+    clearCart(cartId);
   }
 
   /**
@@ -671,21 +1270,6 @@ export default function PosRegister() {
    * The attempt is marked unresolved until `settleAttempt`, which is what
    * makes the identity un-retirable in the meantime.
    */
-  /** Mark this cart's posting attempt resolved. Safe to call more than once. */
-  function settleCheckoutAttempt(cartId: string) {
-    checkoutsRef.current!.settleAttempt(cartId);
-    setPostingCartId((current) => (current === cartId ? null : current));
-  }
-
-  function beginCheckoutAttempt(cartId: string): string {
-    const { id, issued } = checkoutsRef.current!.beginAttempt(cartId);
-    setPostingCartId(cartId);
-    // Persist a newly minted identity with the cart, so a parked cart keeps it
-    // across a reload.
-    if (issued) updateCartById(cartId, (c) => ({ ...c, checkoutId: id }));
-    return id;
-  }
-
   // ----- Multi-cart controls -----
   function switchCart(id: string) {
     if (id === activeCartId) return;
@@ -712,11 +1296,31 @@ export default function PosRegister() {
     if (checkoutsRef.current?.isPosting(id)) return;
     const cart = carts.find((c) => c.id === id);
     if (!cart) return;
-    if (cart.lines.length > 0 && !window.confirm(t("pos.confirmCloseCart"))) return;
+    // Closing a FROZEN cart discards its checkout identity exactly as the
+    // rail's Discard does, so it asks the same question. "Close it and discard
+    // them?" is about losing the lines; this is about possibly losing a sale
+    // that already took the customer's money (GZ-WP0-08).
+    const prompt = lockedCartIdsRef.current.has(id)
+      ? t("pos.confirmDiscardUnresolved")
+      : t("pos.confirmCloseCart");
+    if (cart.lines.length > 0 && !window.confirm(prompt)) return;
 
     checkoutsRef.current?.retire(id);
+    // FUNCTIONAL, and filtered by id rather than assigned from `carts`: this
+    // runs after a blocking `window.confirm`, so the snapshot taken above can
+    // be arbitrarily old by the time the cashier answers — and an in-flight
+    // post's attempt may have landed in the meantime.
+    //
+    // The retirement permission is taken from `prev` for the same reason. The
+    // cart being closed may have acquired its attempt while the confirm dialog
+    // was open, and a permission minted from the stale snapshot would have
+    // named the wrong identity — or none (GZ-P1-2).
     const remaining = carts.filter((c) => c.id !== id);
-    setCarts(remaining);
+    setCarts((prev) => {
+      const closing = prev.find((c) => c.id === id);
+      if (closing) permitAttemptDrop(closing);
+      return prev.filter((c) => c.id !== id);
+    });
     if (id === activeCartId) {
       setActiveCartId(remaining[0].id);
       setSubmitError(null);
@@ -725,42 +1329,82 @@ export default function PosRegister() {
     }
   }
 
-  // ----- Discount cents (derived from amount input; clamped so total stays ≥ 1 cent) -----
-  const discountCents = useMemo(() => {
-    const preTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
-    if (preTotal <= 0 || !discountAmountInput.trim()) return 0;
-    try {
-      const raw = parseUsdInput(discountAmountInput);
-      return Math.min(Math.max(raw, 0), Math.max(preTotal - 1, 0));
-    } catch {
-      return 0;
+  // ----- Discount: evaluated, never silently clamped (GZ-WP0-03) -----
+  //
+  // `discount` carries BOTH the money and the verdict. A refused request
+  // contributes zero to the totals and blocks posting, so what the cashier
+  // typed, what the rail shows and what gets posted can never disagree.
+  const preDiscountTotalCents = useMemo(
+    () => lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0),
+    [lines],
+  );
+
+  // BOTH boxes, one verdict. The percentage box used to be evaluated nowhere at
+  // all: an unusable percentage blanked the derived amount, so the amount box
+  // reported "nothing typed" and the order posted at FULL PRICE with the typed
+  // percentage still on screen (GZ-WP0-07). `evaluateCartDiscount` judges the
+  // pair, and the money, the message and the posting block all come off it.
+  const discount = useMemo(
+    () => evaluateCartDiscount(discountPctInput, discountAmountInput, preDiscountTotalCents),
+    [discountPctInput, discountAmountInput, preDiscountTotalCents],
+  );
+  const discountCents = discount.cents;
+
+  const discountPanelRef = useRef<HTMLParagraphElement | null>(null);
+
+  const discountMessage = (() => {
+    switch (discount.kind) {
+      case "none":
+      case "ok":
+        return null;
+      case "pctInvalid":
+        return t("pos.discountPctInvalid");
+      case "pctExceeds":
+        return t("pos.discountPctTooLarge", { requested: String(discount.requestedPct) });
+      case "pctTooSmall":
+        return t("pos.discountPctTooSmall", { requested: String(discount.requestedPct) });
+      case "amountInvalid":
+        return t("pos.discountInvalid");
+      case "amountExceeds":
+        return t("pos.discountTooLarge", {
+          requested: formatUsd(discount.requestedCents),
+          max: formatUsd(discount.maxCents),
+        });
     }
-  }, [discountAmountInput, lines]);
+  })();
+
+  // A refusal the cashier cannot see is not feedback. The order rail scrolls
+  // its lines, the discount editor and the totals through one region, so on a
+  // cart of any length the message lands below the fold — and all the cashier
+  // sees is a greyed-out Post Sale with no stated reason.
+  useEffect(() => {
+    if (discountMessage === null) return;
+    // The message itself, not the panel: aligning the panel's top leaves the
+    // sentence clipped against the bottom of the scroll region on a full cart.
+    discountPanelRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [discountMessage]);
 
   // ----- Discount input handlers (keep % and $ in sync) -----
+  //
+  // The percentage box writes the EXACT cash value of the percentage, even
+  // when that is more than the cart can bear. Clamping it here is what used to
+  // make the two boxes describe different discounts; letting the refusal
+  // surface once, in one place, is what keeps them honest.
   function handleDiscountPctChange(value: string) {
     setDiscountPctInput(value);
-    const preTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
-    const pct = parseFloat(value);
-    if (!isNaN(pct) && pct > 0 && preTotal > 0) {
-      const cents = Math.min(Math.floor((preTotal * pct) / 100), Math.max(preTotal - 1, 0));
-      setDiscountAmountInput(cents > 0 ? (cents / 100).toFixed(2) : "");
-    } else {
-      setDiscountAmountInput("");
-    }
+    const cents = percentToDiscountCents(value, preDiscountTotalCents);
+    setDiscountAmountInput(cents !== null && cents > 0 ? (cents / 100).toFixed(2) : "");
   }
 
   function handleDiscountAmountChange(value: string) {
     setDiscountAmountInput(value);
-    const preTotal = lines.reduce((s, l) => s + l.math.lineTotalInclVatCents, 0);
-    if (!value.trim() || preTotal <= 0) {
+    if (!value.trim() || preDiscountTotalCents <= 0) {
       setDiscountPctInput("");
       return;
     }
     try {
       const cents = parseUsdInput(value);
-      const clamped = Math.min(Math.max(cents, 0), Math.max(preTotal - 1, 0));
-      const pct = Math.round((clamped / preTotal) * 10000) / 100;
+      const pct = Math.round((cents / preDiscountTotalCents) * 10000) / 100;
       setDiscountPctInput(pct > 0 ? String(pct) : "");
     } catch {
       setDiscountPctInput("");
@@ -795,6 +1439,11 @@ export default function PosRegister() {
       preDiscountSubtotalExclVat,
       preDiscountTotal,
       discount: discountCents,
+      // The figure the rail must show, and the one that was always missing.
+      // It is computed here, posted to Rust as the line subtotals, and now
+      // displayed — one value, three uses, so the screen cannot disagree with
+      // the receipt (GZ-WP0-04).
+      postDiscountSubtotalExclVat,
       postDiscountVat,
       postDiscountTotal,
       lineAllocations,
@@ -863,6 +1512,35 @@ export default function PosRegister() {
     };
   }, [cashUsdInput, cashLbpInput, cardUsdInput, rate, totals.postDiscountTotal, t]);
 
+  /** Is the cart on screen a frozen, unresolved checkout attempt? */
+  const isActiveCartLocked = lockedCartIds.has(activeCartId);
+
+  /** The checkout state of the cart on screen, in one place. */
+  const activeCheckout = useMemo(
+    () =>
+      checkoutStatus(
+        activeCart ?? { lines: [] },
+        inFlightCartIds,
+        activeCartId,
+      ),
+    [activeCart, inFlightCartIds, activeCartId],
+  );
+
+  /**
+   * An ordinary restored cart that has not been re-checked yet (P1-D).
+   *
+   * Scoped to carts that actually came back from storage: one rung up in this
+   * session was priced against the catalog in hand. And scoped AWAY from a cart
+   * holding a frozen attempt, whose request is already fixed and depends on no
+   * catalog at all — blocking its retry would strand the one operation that can
+   * reconcile a lost response.
+   */
+  const activeCartAwaitsRevalidation =
+    lines.length > 0 &&
+    restoredCartIdsRef.current.has(activeCartId) &&
+    !activeCheckout.locked &&
+    restoreCheck !== "done";
+
   const remainingCents = totals.postDiscountTotal - payments.totalPaidUsdCents;
   const changeCents = payments.totalPaidUsdCents - totals.postDiscountTotal;
 
@@ -872,17 +1550,65 @@ export default function PosRegister() {
     cardUsdInput.trim() === "";
   const isAutoPayMode = allPaymentsEmpty && lines.length > 0 && totals.postDiscountTotal > 0;
 
+  /**
+   * The delivery arrangement's own verdict, or null when there is nothing
+   * wrong. Mirrors `prepare_sale`'s three rules so the cashier is told BEFORE
+   * pressing Post rather than refused after; the backend remains the authority.
+   */
+  const deliveryVerdict = deliveryBlocker({
+    channel: activeChannel,
+    driverId: activeDriverId,
+    feeInput: deliveryFeeInput,
+    collectsByDriver: driverCollect,
+  });
+
   const isFullyPaid =
     lines.length > 0 &&
     payments.errors.length === 0 &&
-    (isAutoPayMode || remainingCents <= 0);
+    // A driver-collected order IS settled: the driver has taken
+    // responsibility for the food money, which is what the tender records.
+    // There is no cash to count and no remainder to chase.
+    (driverCollect || isAutoPayMode || remainingCents <= 0);
+
+  /**
+   * A cart holding a replayable frozen attempt may ALWAYS be re-sent.
+   *
+   * Every gate below exists to validate a request that is about to be BUILT,
+   * and this cart's request was built and frozen long ago. Requiring today's
+   * rate and today's open shift for a replay would strand recovery exactly
+   * when it is needed most — the morning after, before anyone has opened a
+   * shift or entered a rate, which is precisely when an unresolved checkout
+   * from last night is sitting on the screen. The backend resolves the replay
+   * on the identity before it looks at anything else, so a reconciliation does
+   * not need a shift of its own (P1-A).
+   */
+  const canReplayFrozenAttempt =
+    activeCheckout.request !== null && !submitting && !activeCheckout.inFlight;
 
   const canPost =
-    !submitting &&
+    canReplayFrozenAttempt ||
+    (!submitting &&
     lines.length > 0 &&
     isFullyPaid &&
     rate !== null &&
-    !!activeShift;
+    !!activeShift &&
+    // An unresolved discount is a disagreement between what was asked for and
+    // what the cart can do. Posting through it would settle that disagreement
+    // silently, in the customer's disfavour or the shop's (GZ-WP0-03) — and for
+    // an unusable PERCENTAGE it would post the order at full price while the
+    // screen still showed the discount the cashier typed (GZ-WP0-07).
+    //
+    // Gated on the verdict, not on the message: a message is a translated
+    // string and a missing key would re-enable posting through a refused
+    // discount. The verdict is the authority. F5 reads `canPost` through
+    // `canPostRef`, so this blocks the shortcut too.
+    !discountBlocksPosting(discount) &&
+    // A restored cart posts only once its prices have been re-checked (P1-D).
+    !activeCartAwaitsRevalidation &&
+    // And a delivery order must name who carried it and what he charged.
+    // Gated on the verdict rather than its message, for the same reason the
+    // discount is: a missing translation must not re-enable posting.
+    deliveryVerdict === null);
 
   // ----- Post (active cart only) -----
   //
@@ -902,148 +1628,289 @@ export default function PosRegister() {
     }
   }
 
-  async function runPost() {
-    if (!storeId || !rate || !activeShift) return;
-    setSubmitError(null);
-    if (lines.length === 0) {
-      setSubmitError(t("pos.errCartEmpty"));
-      return;
-    }
-    if (payments.errors.length > 0) {
-      setSubmitError(payments.errors[0]);
-      return;
-    }
+  /**
+   * Build the complete canonical request for the cart on screen, or explain
+   * why it cannot be built.
+   *
+   * Everything the backend compares on replay is decided HERE and once: the
+   * shift, the locked rate and its value, the cashier, the COGS method, the
+   * lines and the tender. The result is then frozen onto the cart, and posting
+   * never reads live state again (P1-C).
+   */
+  function buildFrozenRequest(checkoutId: string): FrozenPostSaleRequest | string {
+    if (!storeId) return t("pos.errCartEmpty");
+    if (!rate) return t("pos.noExchangeRate");
+    if (!activeShift) return t("pos.noOpenShiftBold");
+    if (lines.length === 0) return t("pos.errCartEmpty");
+    // Before the tender is read, because a driver-collection leg is only
+    // meaningful once there is a driver to owe it.
+    if (deliveryVerdict !== null) return t(`delivery.err.${deliveryVerdict}`);
+    if (payments.errors.length > 0) return payments.errors[0];
     if (!isAutoPayMode && payments.totalPaidUsdCents < totals.postDiscountTotal) {
-      setSubmitError(
-        t("pos.errUnderpaid", {
-          tendered: formatUsd(payments.totalPaidUsdCents),
-          total: formatUsd(totals.postDiscountTotal),
-        }),
-      );
-      return;
+      return t("pos.errUnderpaid", {
+        tendered: formatUsd(payments.totalPaidUsdCents),
+        total: formatUsd(totals.postDiscountTotal),
+      });
     }
 
-    // The cart this attempt belongs to, and its checkout identity. Both are
-    // captured now: the cashier may switch carts while the post is in flight,
-    // and the sale that comes back belongs to THIS cart.
-    const cartId = activeCartId;
-    const checkoutId = beginCheckoutAttempt(cartId);
+    // Build post-discount line payloads. Line values sent to Rust are post-discount
+    // so that Rust sums produce the correct discounted header totals automatically.
+    const linePayloads: Omit<PostSaleLineInput, "saleItemId">[] = lines.map((l, i) => {
+      const lineDiscount = totals.lineAllocations[i];
+      const pd = postDiscountLineTotals(
+        l.math.lineTotalInclVatCents,
+        lineDiscount,
+        l.math.vatBps,
+      );
+      return {
+        productId: l.product.id,
+        productNameSnapshot: l.product.name,
+        productSkuSnapshot: l.product.sku,
+        uomCodeSnapshot: l.uom.uomCode,
+        factorNumSnapshot: l.uom.factor.num,
+        factorDenSnapshot: l.uom.factor.den,
+        quantityInUom: l.math.quantityInUom,
+        quantityBase: l.math.quantityBase,
+        unitPriceExclVatCents: l.math.unitPriceExclVatCents,
+        unitPriceInclVatCents: l.math.unitPriceInclVatCents,
+        vatRateIdSnapshot: l.product.vatRateId,
+        vatRateBpsSnapshot: l.product.vatRate.rateBps,
+        lineSubtotalExclVatCents: pd.subtotalExclVat,
+        lineVatCents: pd.vat,
+        lineTotalInclVatCents: pd.totalInclVat,
+        lineDiscountCents: lineDiscount,
+        barcodeUsedSnapshot: l.barcodeUsed,
+        barcodeTypeSnapshot: l.barcodeType,
+        isService: l.product.isService,
+      };
+    });
 
-    setSubmitting(true);
-    try {
-      // Build post-discount line payloads. Line values sent to Rust are post-discount
-      // so that Rust sums produce the correct discounted header totals automatically.
-      const linePayloads: Omit<PostSaleLineInput, "saleItemId">[] = lines.map((l, i) => {
-        const lineDiscount = totals.lineAllocations[i];
-        const pd = postDiscountLineTotals(
-          l.math.lineTotalInclVatCents,
-          lineDiscount,
-          l.math.vatBps,
-        );
-        return {
-          productId: l.product.id,
-          productNameSnapshot: l.product.name,
-          productSkuSnapshot: l.product.sku,
-          uomCodeSnapshot: l.uom.uomCode,
-          factorNumSnapshot: l.uom.factor.num,
-          factorDenSnapshot: l.uom.factor.den,
-          quantityInUom: l.math.quantityInUom,
-          quantityBase: l.math.quantityBase,
-          unitPriceExclVatCents: l.math.unitPriceExclVatCents,
-          unitPriceInclVatCents: l.math.unitPriceInclVatCents,
-          vatRateIdSnapshot: l.product.vatRateId,
-          vatRateBpsSnapshot: l.product.vatRate.rateBps,
-          lineSubtotalExclVatCents: pd.subtotalExclVat,
-          lineVatCents: pd.vat,
-          lineTotalInclVatCents: pd.totalInclVat,
-          lineDiscountCents: lineDiscount,
-          barcodeUsedSnapshot: l.barcodeUsed,
-          barcodeTypeSnapshot: l.barcodeType,
-          isService: l.product.isService,
-        };
+    const paymentPayloads: Omit<PostSalePaymentInput, "paymentId">[] = [];
+    if (driverCollect) {
+      // ONE leg, for the food total, tendered `driver_collection`.
+      //
+      // Not cash and not card: the money is in the driver's pocket, so the
+      // drawer must not count it and the card rail was never touched. The
+      // backend turns this into a receivable against the named driver, in the
+      // same transaction as the sale.
+      //
+      // The DELIVERY FEE IS NOT IN IT. He keeps the fee and the customer pays
+      // it to him, so putting it here would make the shop claim money it has
+      // agreed is his — and would make the tender exceed the sale total, which
+      // `post_sale` refuses anyway.
+      paymentPayloads.push({
+        method: DRIVER_COLLECTION,
+        currency: "USD",
+        amountNativeUsdCents: totals.postDiscountTotal,
+        amountNativeLbp: 0,
+        amountUsdCentsEquivalent: totals.postDiscountTotal,
+        reference: null,
       });
-
-      const paymentPayloads: Omit<PostSalePaymentInput, "paymentId">[] = [];
-      if (isAutoPayMode) {
+    } else if (isAutoPayMode) {
+      paymentPayloads.push({
+        method: "cash_usd",
+        currency: "USD",
+        amountNativeUsdCents: totals.postDiscountTotal,
+        amountNativeLbp: 0,
+        amountUsdCentsEquivalent: totals.postDiscountTotal,
+        reference: null,
+      });
+    } else {
+      if (payments.cashUsdCents > 0) {
         paymentPayloads.push({
           method: "cash_usd",
           currency: "USD",
-          amountNativeUsdCents: totals.postDiscountTotal,
+          amountNativeUsdCents: payments.cashUsdCents,
           amountNativeLbp: 0,
-          amountUsdCentsEquivalent: totals.postDiscountTotal,
+          amountUsdCentsEquivalent: payments.cashUsdCents,
           reference: null,
         });
-      } else {
-        if (payments.cashUsdCents > 0) {
-          paymentPayloads.push({
-            method: "cash_usd",
-            currency: "USD",
-            amountNativeUsdCents: payments.cashUsdCents,
-            amountNativeLbp: 0,
-            amountUsdCentsEquivalent: payments.cashUsdCents,
-            reference: null,
-          });
-        }
-        if (payments.cashLbp > 0) {
-          paymentPayloads.push({
-            method: "cash_lbp",
-            currency: "LBP",
-            amountNativeUsdCents: 0,
-            amountNativeLbp: payments.cashLbp,
-            amountUsdCentsEquivalent: payments.cashLbpAsUsdCents,
-            reference: null,
-          });
-        }
-        if (payments.cardUsdCents > 0) {
-          paymentPayloads.push({
-            method: "card_usd",
-            currency: "USD",
-            amountNativeUsdCents: payments.cardUsdCents,
-            amountNativeLbp: 0,
-            amountUsdCentsEquivalent: payments.cardUsdCents,
-            reference: null,
-          });
-        }
       }
+      if (payments.cashLbp > 0) {
+        paymentPayloads.push({
+          method: "cash_lbp",
+          currency: "LBP",
+          amountNativeUsdCents: 0,
+          amountNativeLbp: payments.cashLbp,
+          amountUsdCentsEquivalent: payments.cashLbpAsUsdCents,
+          reference: null,
+        });
+      }
+      if (payments.cardUsdCents > 0) {
+        paymentPayloads.push({
+          method: "card_usd",
+          currency: "USD",
+          amountNativeUsdCents: payments.cardUsdCents,
+          amountNativeLbp: 0,
+          amountUsdCentsEquivalent: payments.cardUsdCents,
+          reference: null,
+        });
+      }
+    }
 
-      const result = await salesRepo.post({
-        saleId: checkoutId,
-        storeId,
-        cashierUserId: userId,
-        deviceId: null,
-        shiftId: activeShift.id,
-        exchangeRateId: rate.id,
-        exchangeRateLbpPerUsd: rate.rateLbpPerUsd,
-        notes: null,
-        cogsMethod: costMethod,
-        discountCents: totals.discount,
-        allowNegativeInventory,
-        lines: linePayloads,
-        payments: paymentPayloads,
-      });
+    return {
+      saleId: checkoutId,
+      storeId,
+      cashierUserId: userId,
+      deviceId: null,
+      shiftId: activeShift.id,
+      exchangeRateId: rate.id,
+      exchangeRateLbpPerUsd: rate.rateLbpPerUsd,
+      notes: null,
+      // Frozen with the rest of the request, so the channel a retry posts is
+      // the channel the cashier chose — not whatever the cart says by the time
+      // the retry happens (P1-C), and not something a replay can change.
+      channel: activeChannel,
+      // Frozen with the rest of the request: the receivable a retry raises is
+      // owed by the driver the cashier chose, and the fee is the one that was
+      // on the screen. Both are compared on replay.
+      driverId: isDelivery ? activeDriverId : null,
+      deliveryFeeCents: isDelivery ? (deliveryFeeCents ?? 0) : 0,
+      cogsMethod: costMethod,
+      discountCents: totals.discount,
+      allowNegativeInventory,
+      lines: linePayloads,
+      payments: paymentPayloads,
+    };
+  }
 
-      const details = await salesRepo.findByIdWithDetails(result.saleId);
-      // Definitive success. Settle the attempt FIRST — clearCart refuses to
-      // retire the identity of a cart that is still posting — then clear.
-      settleCheckoutAttempt(cartId);
-      clearCart(cartId);
+  /**
+   * Load and show a posted sale's receipt — a SEPARATE step from posting.
+   *
+   * It used to share `runPost`'s one `try`, so a receipt query that failed
+   * reported a committed sale as a failed one and invited the cashier to ring
+   * it again (P1-B). A receipt is a view of a sale that already exists; it can
+   * fail, be retried and be reprinted, and none of that is a financial event.
+   */
+  async function showReceiptFor(saleId: string, receiptNumber: number) {
+    setReceiptNotice(null);
+    try {
+      const details = await salesRepo.findByIdWithDetails(saleId);
+      if (!details) {
+        setReceiptNotice({ saleId, receiptNumber, message: t("pos.receiptNotFound") });
+        return;
+      }
       setReceiptSale(details);
+    } catch (e) {
+      // The sale is posted and the money is taken. All that failed is a read.
+      setReceiptNotice({ saleId, receiptNumber, message: failureMessage(e) });
+    }
+  }
+
+  /**
+   * Send one frozen attempt and deal with every outcome it can have.
+   *
+   * The attempt is already persisted on its cart before this runs, so a kill
+   * at any point inside it leaves a cart that comes back locked, holding the
+   * exact request that went out.
+   */
+  async function submitAttempt(cartId: string, attempt: PostAttempt) {
+    setSubmitError(null);
+    setPostingCartId(cartId);
+    setSubmitting(true);
+
+    try {
+      // THE FROZEN REQUEST — never a rebuild from current state.
+      const result = await salesRepo.post(attempt.request);
+
+      // Committed, and that is authoritative on its own, before any receipt
+      // is fetched. The in-flight marker is released FIRST, because `clearCart`
+      // refuses a cart whose request is still on the wire — the ordering WP-0
+      // established and WP-1 keeps.
+      settleInFlight(cartId);
+      clearAttempt(cartId);
+      clearCart(cartId);
       // Stock moved, so the grid's out-of-stock tiles are stale. Fire and
       // forget: a failed refresh must not turn a posted sale into an error.
       void reloadMenu();
+      await showReceiptFor(result.saleId, result.receiptNumber);
     } catch (e) {
-      // Definitive failure. The identity is deliberately KEPT: if the cashier
-      // fixes the problem and posts again, that is the same checkout, and if
-      // the sale actually did commit before the error reached us, the retry
-      // reconciles to it instead of ringing it up twice.
-      settleCheckoutAttempt(cartId);
-      setSubmitError(e instanceof Error ? e.message : String(e));
+      const failure = classifyPostFailure(e);
+      if (failure.kind === "rejected") {
+        // PROVEN not committed, by the backend's own contract. The cart goes
+        // back to the cashier to fix, keeping its identity: nothing posted
+        // under it, so a retry of the corrected basket is still one checkout.
+        clearAttempt(cartId);
+        setSubmitError(failure.message);
+      } else {
+        // No verdict reached us. The sale may exist. Keep the identity AND the
+        // frozen request, leave the cart locked, and offer reconciliation.
+        setAttemptUnknown(cartId, failure.message);
+        setSubmitError(null);
+      }
     } finally {
-      // Idempotent; the success and failure paths have normally settled
-      // already. Here so no path can leave a cart wedged as "posting".
-      settleCheckoutAttempt(cartId);
+      // Idempotent; the success path has normally settled already. Here so no
+      // path can leave a cart wedged as "posting".
+      settleInFlight(cartId);
       setSubmitting(false);
     }
+  }
+
+  async function runPost() {
+    const cartId = activeCartId;
+    const cart = carts.find((c) => c.id === cartId);
+    if (!cart) return;
+
+    // A cart holding a replayable attempt posts THAT, unchanged. This is the
+    // retry path, and the only one that can reconcile a lost response.
+    const existing = isUsableAttempt(cart.attempt) ? cart.attempt : null;
+    if (existing) {
+      await submitAttempt(cartId, existing);
+      return;
+    }
+
+    // A legacy unresolved cart has an identity but no frozen request, so it
+    // cannot be replayed canonically — rebuilding one from the cart plus
+    // today's shift and rate is precisely the P1-C defect. Reconciling by
+    // identity is the only safe move, and it is read-only.
+    if (isLegacyUnresolvedCart(cart)) {
+      setSubmitError(t("pos.errLegacyUnresolved"));
+      return;
+    }
+
+    const checkoutId = checkoutsRef.current!.idFor(cartId).id;
+    const built = buildFrozenRequest(checkoutId);
+    if (typeof built === "string") {
+      setSubmitError(built);
+      return;
+    }
+
+    // PERSIST BEFORE INVOKING — synchronously, proven, and fatal if it fails.
+    //
+    // The attempt is written into the cart record, so it is exactly as durable
+    // as the cart itself; `lib/postAttempt.ts` states what that does and does
+    // not guarantee, and `lib/cartStore.ts` states why this write cannot go
+    // through the mirroring effect above. In short: an effect runs after React
+    // commits, `salesRepo.post` is dispatched before this function yields, so
+    // the effect would have mirrored the attempt AFTER the request was already
+    // on the wire — and would have swallowed a quota failure on the way.
+    //
+    // The attempt CARRIES its identity, so `checkoutId` is not written beside
+    // it. That field now means one thing only — "an identity from a build that
+    // froze no request" — which is what `isLegacyUnresolvedCart` tests for.
+    // Writing both made a cart whose attempt had just been cleared look legacy,
+    // and re-locked it after a refusal that had proven nothing was committed.
+    const attempt = beginAttempt(checkoutId, built, new Date().toISOString());
+    const persisted = persistCarts(
+      browserCartStorage(),
+      OPEN_CARTS_KEY,
+      carts.map((c) => (c.id === cartId ? { ...c, attempt } : c)),
+      // The proof names the IDENTITY as well as the cart (GZ-P1-2): the array
+      // above is built from `carts`, and a presence-only check would be
+      // satisfied by a previous attempt that a stale snapshot had left in it,
+      // while this call went on to invoke under `checkoutId`.
+      { requireAttemptFor: { cartId, checkoutId } },
+    );
+    if (!persisted.ok) {
+      // Nothing has been sent, and nothing will be. The cart is left EDITABLE
+      // and attempt-free: locking it would strand the order behind a
+      // reconciliation offer for a request that was never made, and the
+      // identity is still unconsumed, so the next press is a first attempt.
+      setSubmitError(`${t("pos.errAttemptNotPersisted")} (${persisted.message})`);
+      return;
+    }
+    updateCartUnconditionally(cartId, (c) => ({ ...c, attempt }));
+    await submitAttempt(cartId, attempt);
   }
 
   // ----- New sale (after receipt): hop to a parked cart if the current one is empty -----
@@ -1123,6 +1990,184 @@ export default function PosRegister() {
           </>
         }
       />
+
+      {/* A restored order was re-checked and something had moved. Dismissible
+          and non-blocking: the cart is already correct — it was re-rung at
+          today's catalog before this appeared — so this is a notification, not
+          a decision. It names every line it touched, because "prices changed"
+          without saying which is worse than silence (GZ-WP0-05). */}
+      {restoreNotice && (
+        <div
+          role="status"
+          className="flex flex-wrap items-start gap-3 rounded-panel border border-warn-line bg-warn-bg px-4 py-2.5 text-sm text-warn-fg"
+        >
+          <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 h-5 w-5 shrink-0 text-warn-fg">
+            <path d="M12 8v5m0 3h.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="flex-1 space-y-1">
+            <p className="font-semibold">{t("pos.cartRestoredTitle")}</p>
+            {restoreNotice.repriced.map((r, i) => (
+              <p key={`r${i}`}>
+                {t("pos.cartRestoredRepriced", {
+                  name: r.productName,
+                  before: formatUsd(r.beforeUnitInclVatCents),
+                  after: formatUsd(r.afterUnitInclVatCents),
+                })}
+              </p>
+            ))}
+            {restoreNotice.dropped.map((d, i) => (
+              <p key={`d${i}`}>
+                {t(d.reason === "uom" ? "pos.cartRestoredUomGone" : "pos.cartRestoredGone", {
+                  name: d.productName,
+                })}
+              </p>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() => setRestoreNotice(null)}
+            className="shrink-0 rounded-chip border border-warn-line px-3 py-1.5 text-xs font-bold transition-colors hover:brightness-95"
+          >
+            {t("common.close")}
+          </button>
+        </div>
+      )}
+
+      {/* A sale that POSTED but whose receipt could not be shown (P1-B).
+          Deliberately a `status`, not an `alert`: nothing is wrong with the
+          sale. It names the receipt number so the cashier can write it down,
+          and offers the read again. It never suggests ringing the order up. */}
+      {receiptNotice && (
+        <div
+          role="status"
+          className="flex flex-wrap items-start gap-3 rounded-panel border border-warn-line bg-warn-bg px-4 py-2.5 text-sm text-warn-fg"
+        >
+          <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 h-5 w-5 shrink-0 text-warn-fg">
+            <path d="M9 12.5 11 14.5 15 10M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="flex-1 space-y-1">
+            <p className="font-semibold">
+              {t("pos.receiptUnavailableTitle", {
+                receipt: String(receiptNotice.receiptNumber),
+              })}
+            </p>
+            <p>{t("pos.receiptUnavailableBody")}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              void showReceiptFor(receiptNotice.saleId, receiptNotice.receiptNumber)
+            }
+            className="shrink-0 rounded-chip border border-warn-line px-3 py-1.5 text-xs font-bold transition-colors hover:brightness-95"
+          >
+            {t("pos.receiptRetry")}
+          </button>
+          <button
+            type="button"
+            onClick={() => setReceiptNotice(null)}
+            className="shrink-0 rounded-chip border border-warn-line px-3 py-1.5 text-xs font-bold transition-colors hover:brightness-95"
+          >
+            {t("common.close")}
+          </button>
+        </div>
+      )}
+
+      {/* An IN-FLIGHT post. The cart is locked while the request is on the
+          wire, and this says why nothing responds to typing (P1-A). */}
+      {activeCheckout.inFlight && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center gap-3 rounded-panel border border-line bg-paper px-4 py-2.5 text-sm text-fg"
+        >
+          <span className="font-semibold">{t("pos.postingInFlightTitle")}</span>
+          <span className="flex-1 text-fg-muted">{t("pos.postingInFlightBody")}</span>
+        </div>
+      )}
+
+      {/* An UNRESOLVED checkout (P1-A). Not dismissible and not a
+          notification: the cart is frozen and the cashier has a decision.
+          The actions are ordered by safety —
+            1. Check this order: a read-only probe of the database by identity,
+               which is the only action that can PROVE what happened.
+            2. Post Sale (in the rail): replays the frozen request, which
+               reconciles to the sale if it committed.
+            3. Discard: throws the identity away, and says what that costs. */}
+      {isActiveCartLocked && !activeCheckout.inFlight && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-start gap-3 rounded-panel border border-danger-line bg-danger-bg px-4 py-2.5 text-sm text-danger-fg"
+        >
+          <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 h-5 w-5 shrink-0 text-danger-fg">
+            <path d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="flex-1 space-y-1">
+            <p className="font-semibold">{t("pos.unresolvedCheckoutTitle")}</p>
+            <p>
+              {activeCheckout.legacy
+                ? t("pos.unresolvedCheckoutLegacyBody")
+                : t("pos.unresolvedCheckoutBody")}
+            </p>
+            {reconcileVerdict?.cartId === activeCartId && (
+              <p className="font-semibold">
+                {reconcileVerdict.kind === "notCommitted"
+                  ? activeCheckout.legacy
+                    ? t("pos.reconcileNotCommittedLegacy")
+                    : t("pos.reconcileNotCommitted")
+                  : t("pos.reconcileIndeterminate")}
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            disabled={reconciling === activeCartId}
+            onClick={() => void reconcileCheckout(activeCartId)}
+            className="shrink-0 rounded-chip border border-danger-line px-3 py-1.5 text-xs font-bold transition-colors hover:brightness-95 disabled:opacity-50"
+          >
+            {reconciling === activeCartId
+              ? t("pos.reconcileChecking")
+              : t("pos.reconcileCheck")}
+          </button>
+          <button
+            type="button"
+            onClick={() => discardUnresolvedCheckout(activeCartId)}
+            className="shrink-0 rounded-chip border border-danger-line px-3 py-1.5 text-xs font-bold transition-colors hover:brightness-95"
+          >
+            {t("pos.discardUnresolved")}
+          </button>
+        </div>
+      )}
+
+      {/* A restored cart whose prices have not been re-checked (P1-D). The
+          refusal is visible and retryable rather than a silently disabled
+          button, because the cashier has a customer waiting and needs to know
+          whether to wait or to re-ring. */}
+      {activeCartAwaitsRevalidation && (
+        <div
+          role="alert"
+          className="flex flex-wrap items-start gap-3 rounded-panel border border-warn-line bg-warn-bg px-4 py-2.5 text-sm text-warn-fg"
+        >
+          <svg viewBox="0 0 24 24" fill="none" className="mt-0.5 h-5 w-5 shrink-0 text-warn-fg">
+            <path d="M12 8v5m0 3h.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="flex-1 space-y-1">
+            <p className="font-semibold">{t("pos.awaitRevalidationTitle")}</p>
+            <p>
+              {restoreCheck === "failed"
+                ? t("pos.awaitRevalidationFailed")
+                : t("pos.awaitRevalidationPending")}
+            </p>
+          </div>
+          {restoreCheck === "failed" && (
+            <button
+              type="button"
+              onClick={() => void reloadMenu()}
+              className="shrink-0 rounded-chip border border-warn-line px-3 py-1.5 text-xs font-bold transition-colors hover:brightness-95"
+            >
+              {t("pos.awaitRevalidationRetry")}
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Shift warning — unchanged in force, and now it carries the way out.
           A novice should not have to hunt the sidebar for the page that unblocks
@@ -1430,6 +2475,16 @@ export default function PosRegister() {
                     key={p.id}
                     name={p.name}
                     price={formatUsd(menuTilePriceInclVatCents(p))}
+                    // WP-3: the tile's two reserved slots, now fed from the
+                    // catalog. `meta` is the product's own description — the
+                    // "BBQ or buffalo sauce" line a cashier is asked about —
+                    // and `symbol` is its icon, falling back to its section's
+                    // glyph so an uncategorised product still looks deliberate.
+                    // Neither is matched on the product NAME: a shop that
+                    // renames an item, or sells in Arabic, would silently get
+                    // the wrong picture.
+                    meta={p.description ?? undefined}
+                    symbol={resolveIcon(p.icon, p.category)}
                     outOfStock={isMenuOutOfStock(p, allowNegativeInventory)}
                     outOfStockLabel={t("pos.menuOutOfStock")}
                     onClick={() => handleTileClick(p)}
@@ -1528,7 +2583,7 @@ export default function PosRegister() {
                       is used on a minority of sales should not outrank the
                       lines on every sale. The panel it opens still appears
                       below, in full. */}
-                  {!(discountOpen || discountCents > 0) && (
+                  {!(discountOpen || discountCents > 0 || discountMessage !== null) && (
                     <TinyButton onClick={() => setDiscountOpen(true)}>
                       + {t("pos.discountSectionTitle")}
                     </TinyButton>
@@ -1537,9 +2592,19 @@ export default function PosRegister() {
                     <TinyButton
                       // Same reason as Close: clearing retires the identity.
                       disabled={postingCartId === activeCartId}
-                      onClick={() => { clearActiveCart(); focusScanInput(); }}
+                      // On a FROZEN cart, Clear is the destructive escape and
+                      // must ask: it throws away the only key that could
+                      // reconcile a payment that may already have gone through.
+                      // Routing it through the same confirmed path as the
+                      // banner's Discard means there is no quiet way out
+                      // (GZ-WP0-08).
+                      onClick={() => {
+                        if (isActiveCartLocked) discardUnresolvedCheckout(activeCartId);
+                        else clearActiveCart();
+                        focusScanInput();
+                      }}
                     >
-                      {t("pos.clearCart")}
+                      {isActiveCartLocked ? t("pos.discardUnresolved") : t("pos.clearCart")}
                     </TinyButton>
                   )}
                 </>
@@ -1547,6 +2612,178 @@ export default function PosRegister() {
             >
               {t("pos.cartLabel", { n: String(activeCart.seq) })}
             </RailHeading>
+
+            {/* WHERE THIS ORDER CAME FROM (WP-4).
+                Two segments rather than a dropdown: the cashier has to be able
+                to see which one is selected without opening anything, and at a
+                glance from across the counter. Counter is first and is the
+                default, because it is the overwhelming majority of orders.
+
+                Disabled, not hidden, while the cart is locked: hiding it would
+                leave the cashier unable to see which channel an unresolved
+                order was taken on, at exactly the moment they need to know.
+
+                It is NOT a payment control and says nothing about settlement —
+                an online order still has to be paid for before it will post.
+                See lib/salesChannel.ts. */}
+            <div
+              role="group"
+              aria-label={t("channel.groupLabel")}
+              className="mt-2 flex items-center gap-1.5 squat:mt-1.5"
+            >
+              {SALES_CHANNEL_OPTIONS.map((opt) => {
+                const selected = activeChannel === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    aria-pressed={selected}
+                    disabled={isActiveCartLocked}
+                    onClick={() => setChannel(opt.id)}
+                    className={clsx(
+                      "flex-1 rounded-chip border px-2 py-1.5 text-[11px] font-extrabold uppercase tracking-wide transition-colors",
+                      selected
+                        ? "border-brand bg-brand text-brand-fg"
+                        : "border-line bg-paper text-fg-muted hover:text-fg",
+                      isActiveCartLocked && "cursor-not-allowed opacity-50",
+                    )}
+                  >
+                    {t(opt.shortLabelKey)}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* THE DELIVERY ARRANGEMENT (WP-6).
+                Only on a delivery order, because a driver and a delivery
+                charge mean nothing on a counter sale — and `post_sale` refuses
+                them there.
+
+                Three things the cashier must be able to tell apart, so they
+                are three separate controls and three separate figures: WHO
+                carried it, WHAT he charged, and the fact that HE collects for
+                it. The totals block below spells out the food, the fee and
+                what the customer hands over.
+
+                Disabled rather than hidden while the cart is locked, like the
+                channel segments: an unresolved delivery order is exactly when
+                the cashier needs to see which driver it was assigned to. */}
+            {isDelivery && (
+              <div className="mt-2 space-y-1.5 rounded-chip border border-line bg-paper p-2 squat:mt-1.5">
+                <label
+                  className="block text-[10px] font-extrabold uppercase tracking-wide text-fg-muted"
+                  htmlFor="pos-driver"
+                >
+                  {t("delivery.driver")}
+                </label>
+                <select
+                  id="pos-driver"
+                  value={activeDriverId ?? ""}
+                  disabled={isActiveCartLocked}
+                  onChange={(e) => setDriverId(e.target.value || null)}
+                  className={clsx(
+                    "w-full rounded-chip border border-line bg-surface px-2 py-1.5 text-xs font-bold text-fg",
+                    isActiveCartLocked && "cursor-not-allowed opacity-50",
+                  )}
+                >
+                  <option value="">{t("delivery.driverUnassigned")}</option>
+                  {drivers.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+                {driversError !== null && (
+                  <p className="text-[10px] font-bold text-danger">{t("delivery.driversUnavailable")}</p>
+                )}
+                {driversError === null && drivers.length === 0 && (
+                  <p className="text-[10px] font-bold text-fg-muted">{t("delivery.noDrivers")}</p>
+                )}
+
+                <label
+                  className="block pt-0.5 text-[10px] font-extrabold uppercase tracking-wide text-fg-muted"
+                  htmlFor="pos-delivery-fee"
+                >
+                  {t("delivery.fee")}
+                </label>
+                <input
+                  id="pos-delivery-fee"
+                  inputMode="decimal"
+                  value={deliveryFeeInput}
+                  disabled={isActiveCartLocked}
+                  onChange={(e) => setDeliveryFeeInput(e.target.value)}
+                  placeholder="0.00"
+                  aria-invalid={deliveryFeeCents === null}
+                  className={clsx(
+                    "w-full rounded-chip border bg-surface px-2 py-1.5 text-xs font-bold text-fg",
+                    deliveryFeeCents === null ? "border-danger" : "border-line",
+                    isActiveCartLocked && "cursor-not-allowed opacity-50",
+                  )}
+                />
+                {/* The fee is the DRIVER's, and the screen says so rather than
+                    leaving the cashier to infer it from a layout. */}
+                <p className="text-[10px] leading-snug text-fg-muted">{t("delivery.feeNote")}</p>
+
+                {/* NOT a toggle (WP-7 SS3). A WhatsApp order is settled by its
+                    driver collecting — that is the whole workflow — so this
+                    STATES the tender rather than offering a choice. Offering
+                    one is what let a delivery order fall through to the
+                    auto-pay path and become cashier cash.
+
+                    It reads as active once a driver is assigned; until then the
+                    message below says what is missing. */}
+                <p
+                  data-testid="driver-collection-tender"
+                  // Whether this order IS driver-collected, for the tests and
+                  // for anything reading the DOM. Derived, like the tender.
+                  data-active={driverCollect ? "true" : "false"}
+                  className={clsx(
+                    "mt-1 rounded-chip border px-2 py-2 text-center text-[11px] font-extrabold uppercase tracking-wide",
+                    driverCollect
+                      ? "border-brand bg-brand text-brand-fg"
+                      : "border-line bg-surface text-fg-muted",
+                  )}
+                >
+                  {t("delivery.collectByDriver")}
+                </p>
+
+                {/* THE THREE FIGURES. `customerPays` is computed here and
+                    stored nowhere: it is the only one of the three that is
+                    nobody's revenue and nobody's receivable. */}
+                {(() => {
+                  const split = deliveryTotals(totals.postDiscountTotal, deliveryFeeCents ?? 0);
+                  return (
+                    <dl className="mt-1 space-y-0.5 border-t border-line pt-1.5 text-[11px]">
+                      <div className="flex justify-between">
+                        <dt className="text-fg-muted">{t("delivery.foodTotal")}</dt>
+                        <dd className="font-bold text-fg">{formatUsd(split.foodInclVatCents)}</dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-fg-muted">{t("delivery.driverFee")}</dt>
+                        <dd className="font-bold text-fg">{formatUsd(split.deliveryFeeCents)}</dd>
+                      </div>
+                      <div className="flex justify-between border-t border-line pt-0.5">
+                        <dt className="font-extrabold text-fg">{t("delivery.customerPays")}</dt>
+                        <dd className="font-extrabold text-fg">
+                          {formatUsd(split.customerPaysCents)}
+                        </dd>
+                      </div>
+                    </dl>
+                  );
+                })()}
+
+                {driverCollect && (
+                  <p className="text-[10px] font-bold leading-snug text-fg-muted">
+                    {t("delivery.collectNote")}
+                  </p>
+                )}
+                {deliveryVerdict !== null && (
+                  <p className="text-[10px] font-bold leading-snug text-danger">
+                    {t(`delivery.err.${deliveryVerdict}`)}
+                  </p>
+                )}
+              </div>
+            )}
 
             {/* The order lines are the primary independently scrollable
                 region: a long order scrolls HERE first, so the discount, the
@@ -1598,7 +2835,7 @@ export default function PosRegister() {
                 Forced open whenever a discount is actually in effect, so a
                 discount can never be applied and invisible — including one
                 restored with a parked cart from localStorage. */}
-              {(discountOpen || discountCents > 0) && (
+              {(discountOpen || discountCents > 0 || discountMessage !== null) && (
                 <div className="mt-3 squat:mt-2">
                 <div className="rounded-chip border border-line bg-paper p-2.5 squat:p-2">
                   {/* No heading row: the two fields already say "Discount %"
@@ -1637,9 +2874,23 @@ export default function PosRegister() {
                       }}
                       className="h-[34px] shrink-0 rounded-chip border border-line px-2.5 text-[11px] font-semibold text-fg-muted transition-colors hover:text-fg"
                     >
-                      {discountCents > 0 ? t("pos.discountClear") : t("common.close")}
+                      {discountCents > 0 || discountMessage !== null
+                        ? t("pos.discountClear")
+                        : t("common.close")}
                     </button>
                   </div>
+                  {/* Says what was asked for, what the most this cart can take
+                      is, and — by being here at all — that nothing has been
+                      applied. Post Sale is disabled until it clears. */}
+                  {discountMessage && (
+                    <p
+                      ref={discountPanelRef}
+                      role="alert"
+                      className="mt-2 text-[11px] font-semibold leading-snug text-danger-fg"
+                    >
+                      {discountMessage}
+                    </p>
+                  )}
                 </div>
               </div>
             )}
@@ -1650,16 +2901,43 @@ export default function PosRegister() {
                   the lines rather than being pinned: the AMOUNT DUE block
                   below is the figure that must always be on screen, and these
                   three sit immediately above it. */}
+              {/* Every adjacent pair of figures here ties EXACTLY, and all of
+                  them come from the one totals memo that also builds the
+                  posting payload — no second calculation anywhere.
+
+                  Without a discount:  subtotal + VAT = total.
+                  With one:            items − discount = total, and
+                                       net + VAT = total.
+
+                  The strip used to print the PRE-discount subtotal beside a
+                  post-discount VAT and total, so the three numbers a cashier
+                  reads to a customer did not add up — by a cent on a
+                  VAT-inclusive price even with no discount, and by the whole
+                  discount with one (GZ-WP0-04). The discount is deducted from
+                  the VAT-INCLUSIVE amount, which is why it is shown against
+                  the items line and not against the net: subtracting a gross
+                  discount from a net subtotal would be a new, wrong sum. */}
               <div className="mt-3 space-y-1 border-t border-line pt-2.5 squat:mt-2 squat:pt-2">
-              <AmountLine
-                label={t("pos.subtotalExclVat")}
-                value={formatUsd(totals.preDiscountSubtotalExclVat)}
-              />
-              {totals.discount > 0 && (
+              {totals.discount > 0 ? (
+                <>
+                  <AmountLine
+                    label={t("pos.itemsInclVat")}
+                    value={formatUsd(totals.preDiscountTotal)}
+                  />
+                  <AmountLine
+                    label={t("pos.discount")}
+                    value={`-${formatUsd(totals.discount)}`}
+                    tone="warn"
+                  />
+                  <AmountLine
+                    label={t("pos.netExclVat")}
+                    value={formatUsd(totals.postDiscountSubtotalExclVat)}
+                  />
+                </>
+              ) : (
                 <AmountLine
-                  label={t("pos.discount")}
-                  value={`-${formatUsd(totals.discount)}`}
-                  tone="warn"
+                  label={t("pos.subtotalExclVat")}
+                  value={formatUsd(totals.postDiscountSubtotalExclVat)}
                 />
               )}
                 <AmountLine label={t("pos.vat")} value={formatUsd(totals.postDiscountVat)} />
@@ -1694,6 +2972,16 @@ export default function PosRegister() {
               {t("pos.paymentTitle")}
             </h3>
 
+            {/* The payment panel's one job is to say what is being taken HERE.
+                On a driver-collected order that is nothing, and saying so is
+                what stops a cashier hunting for a drawer figure that will not
+                appear. */}
+            {driverCollect && (
+              <p className="mt-2 rounded-chip border border-line bg-paper px-2.5 py-2 text-[11px] font-bold leading-snug text-fg-muted">
+                {t("delivery.noCashHere")}
+              </p>
+            )}
+
             <div className="mt-3 space-y-2.5 squat:mt-1.5 squat:space-y-1.5 tiny:grid tiny:grid-cols-2 tiny:gap-2 tiny:space-y-0">
               <Input
                 label={t("pos.cashUsdReceived")}
@@ -1701,6 +2989,10 @@ export default function PosRegister() {
                 placeholder="0.00"
                 prefix="$"
                 value={cashUsdInput}
+                // Nothing is taken at the counter on a driver-collected order,
+                // so the boxes are closed rather than left to be filled in and
+                // then ignored at post time.
+                disabled={driverCollect}
                 onChange={(e) => setCashUsdInput(e.target.value)}
               />
               <Input
@@ -1715,7 +3007,7 @@ export default function PosRegister() {
                 placeholder={rate ? "0" : "—"}
                 suffix="L.L."
                 value={cashLbpInput}
-                disabled={!rate}
+                disabled={!rate || driverCollect}
                 onChange={(e) => setCashLbpInput(e.target.value)}
               />
               {/* Card tender is HIDDEN, not removed. Greaz takes physical cash,

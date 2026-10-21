@@ -12,6 +12,8 @@ mod adjustments;
 mod catalog;
 mod cost;
 mod cost_precision;
+mod demo_menu;
+mod drivers;
 mod hardening;
 mod immutability;
 mod known_defects;

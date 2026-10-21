@@ -2,9 +2,11 @@
 
 use crate::cost::{cents_to_microcents, COST_SCALE};
 use crate::test_support::{
-    app_migrator, assert_not_production_db, latest_migration_version, migration_count, TempDb,
-    RATE_ID, STORE_ID, USER_ID, VAT_STD_ID,
+    app_migrator, assert_not_production_db, driver_balance, latest_migration_version,
+    migration_count, seed_driver, seed_driver_in_store, seed_store, TempDb, RATE_ID, STORE_ID,
+    USER_ID, VAT_STD_ID,
 };
+use sqlx::Row;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn all_migrations_apply_to_a_virgin_database() {
@@ -1230,6 +1232,7 @@ async fn an_upgraded_database_can_post_a_return_against_its_own_history() {
             notes: None,
             exchange_rate_id: None,
             exchange_rate_lbp_per_usd: None,
+            manager_approval: None,
             lines: vec![crate::posting::PostCreditMemoLine {
                 credit_memo_line_id: "memo-upgrade-line".to_string(),
                 original_sale_item_id: RET_SALE_ITEM.to_string(),
@@ -1806,5 +1809,1020 @@ async fn migration_012_does_not_disturb_the_earlier_guards() {
         .await
         .is_err(),
         "a payment must still be negative"
+    );
+}
+
+// ============================================================================
+// Migration 013 — menu presentation (WP-3)
+// ============================================================================
+//
+// Two nullable TEXT columns on `products`, plus one index. The whole point of
+// the migration is that it changes nothing about an existing catalogue, so
+// these tests are mostly about what did NOT happen.
+
+/// A database as a pre-WP-3 release left it, carrying one real product.
+async fn pre_wp3_database() -> TempDb {
+    let db = TempDb::at_schema_version(12).await;
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, description, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents, quantity_on_hand, is_service
+         ) VALUES ('wp3-burger', '{STORE_ID}', 'SKU-B1', 'Double Burger',
+                   '2 patties', '{VAT_STD_ID}', 'inclusive', 540, 600, 25, 0)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents, quantity_on_hand, is_service
+         ) VALUES ('wp3-service', '{STORE_ID}', 'SKU-S1', 'Delivery',
+                   '{VAT_STD_ID}', 'inclusive', 180, 200, 0, 1)"
+    ))
+    .await;
+    db
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_013_adds_the_columns_as_null_and_changes_no_product() {
+    let db = pre_wp3_database().await;
+
+    // Before: the columns do not exist at all.
+    assert_eq!(db.count("SELECT COUNT(*) FROM pragma_table_info('products') WHERE name='category'").await, 0);
+    assert_eq!(db.count("SELECT COUNT(*) FROM pragma_table_info('products') WHERE name='icon'").await, 0);
+
+    db.migrate_again().await.expect("migration 013 must apply to a v12 database");
+
+    // After: present, and NULL for every row that already existed. A shop
+    // mid-service is not asked to categorise its catalogue before it can sell.
+    assert_eq!(db.count("SELECT COUNT(*) FROM pragma_table_info('products') WHERE name='category'").await, 1);
+    assert_eq!(db.count("SELECT COUNT(*) FROM pragma_table_info('products') WHERE name='icon'").await, 1);
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM products
+              WHERE id IN ('wp3-burger', 'wp3-service') AND category IS NULL AND icon IS NULL"
+        )
+        .await,
+        2,
+        "every pre-existing product is uncategorised, not defaulted"
+    );
+    // And the demo catalogue migration 003 seeds is in the same position: no
+    // row anywhere is given a default section.
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE category IS NOT NULL OR icon IS NOT NULL")
+            .await,
+        0,
+        "migration 013 writes no data at all"
+    );
+
+    // And nothing else about those products moved.
+    assert_eq!(
+        db.scalar_string("SELECT name FROM products WHERE id='wp3-burger'").await,
+        "Double Burger"
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT price_incl_vat_cents FROM products WHERE id='wp3-burger'").await,
+        600
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT quantity_on_hand FROM products WHERE id='wp3-burger'").await,
+        25
+    );
+    assert_eq!(
+        db.scalar_string("SELECT description FROM products WHERE id='wp3-burger'").await,
+        "2 patties"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_product_with_no_category_stays_perfectly_usable() {
+    // The compatibility promise, in the terms the register actually loads a
+    // product on: active, priced, stocked, and selectable by store.
+    let db = pre_wp3_database().await;
+    db.migrate_again().await.expect("migrate");
+
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products
+              WHERE id IN ('wp3-burger', 'wp3-service') AND store_id = '{STORE_ID}' AND is_active = 1"
+        ))
+        .await,
+        2,
+        "both uncategorised products are still active and loadable"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products
+              WHERE id IN ('wp3-burger', 'wp3-service') AND store_id = '{STORE_ID}'
+                AND category IS NULL AND price_incl_vat_cents > 0"
+        ))
+        .await,
+        2,
+        "and still priced"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_013_is_idempotent_through_the_real_runner() {
+    let db = pre_wp3_database().await;
+    db.migrate_again().await.expect("first run");
+    let before = db.count("SELECT COUNT(*) FROM _sqlx_migrations").await;
+
+    db.migrate_again().await.expect("second run must succeed");
+    db.migrate_again().await.expect("third run must succeed");
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM _sqlx_migrations").await, before);
+    assert_eq!(db.count(&format!("SELECT COUNT(*) FROM products WHERE id IN ('wp3-burger', 'wp3-service')")).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v12_upgrade_converges_on_the_same_schema_as_a_fresh_install() {
+    // An upgraded database and a brand-new one must be indistinguishable, or a
+    // bug only reproduces on one of them.
+    let fresh = TempDb::new().await;
+    let upgraded = pre_wp3_database().await;
+    upgraded.migrate_again().await.expect("migration 013 must apply");
+
+    let schema_sql = "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+                      (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        fresh.scalar_string(schema_sql).await,
+        upgraded.scalar_string(schema_sql).await,
+        "a v12 upgrade and a fresh install must have identical schemas"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn category_and_icon_are_free_text_and_nullable_by_design() {
+    // No CHECK constraint: a restaurant's sections change far more often than
+    // its schema should, and a CHECK would make adding "Breakfast" a migration.
+    // Normalisation is the write boundary's job
+    // (`lib/menuCategories.ts::normalizeCategoryId`), because a CHECK can only
+    // reject a value, never fold two spellings into one.
+    let db = pre_wp3_database().await;
+    db.migrate_again().await.expect("migrate");
+
+    db.exec("UPDATE products SET category = 'burgers', icon = 'B' WHERE id = 'wp3-burger'").await;
+    assert_eq!(
+        db.scalar_string("SELECT category FROM products WHERE id='wp3-burger'").await,
+        "burgers"
+    );
+
+    // A section the application does not know is STORED, not rejected — and the
+    // UI buckets it under "Other" rather than hiding the product.
+    db.exec("UPDATE products SET category = 'breakfast' WHERE id = 'wp3-service'").await;
+    assert_eq!(
+        db.scalar_string("SELECT category FROM products WHERE id='wp3-service'").await,
+        "breakfast"
+    );
+
+    // And both can go back to NULL.
+    db.exec(&format!("UPDATE products SET category = NULL, icon = NULL WHERE id IN ('wp3-burger', 'wp3-service')")).await;
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products
+              WHERE id IN ('wp3-burger', 'wp3-service') AND category IS NULL AND icon IS NULL"
+        ))
+        .await,
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn neither_new_column_is_financial() {
+    // Stated as a schema assertion so it cannot drift: a product's menu section
+    // is not part of what was sold. `sale_items` snapshots the name and the
+    // price at post time, and that is the whole record of the item.
+    let db = TempDb::new().await;
+
+    for column in ["category", "icon"] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM pragma_table_info('sale_items') WHERE name='{column}'"
+            ))
+            .await,
+            0,
+            "{column} must not be snapshotted onto a sale line"
+        );
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM pragma_table_info('inventory_movements') WHERE name='{column}'"
+            ))
+            .await,
+            0,
+            "{column} must not reach an inventory movement"
+        );
+    }
+}
+
+// ============================================================================
+// 014 -> 015 -> 016, ON A POPULATED DATABASE (WP-7 §6)
+//
+// Migration 015 does something no other migration in this project does: it
+// REBUILDS two tables. SQLite cannot alter a CHECK constraint, so adding the
+// `driver_collection` tender meant the documented create-copy-drop-rename on
+// `sale_payments` and `sales_credit_memo_refunds`.
+//
+// A rebuild is the single most dangerous shape a migration can take on a
+// financial table. It can silently lose rows, re-type a column, drop an index,
+// leave an immutability trigger off, or re-derive a value that was supposed to
+// be historical. None of that shows up on an empty database, which is exactly
+// why these tests populate one first: a real shop's books, upgraded, and then
+// compared row for row against what they were.
+//
+// `at_schema_version(14)` builds the database as the previous release left it
+// and `migrate_again()` runs the rest through the real sqlx runner — the same
+// code path a user's upgrade takes, not a hand-applied script.
+// ============================================================================
+
+/// A v14 shop with real books: a posted cash sale, a posted card sale, a
+/// posted credit memo with a refund leg, a purchase, and a supplier ledger
+/// entry. Everything a rebuild could damage.
+async fn populated_v14() -> TempDb {
+    populated_at_schema_version(14).await
+}
+
+/// The same books, built on a database left at `version`.
+///
+/// GZ-P1-3 and GZ-P1-4 ship as migration 017, and the databases that will
+/// receive it are at v14 (the previous release), v15 and v16 (the disposable
+/// qualification identities). Every one of those upgrades is exercised, because
+/// "it works from v14" says nothing about a database that already carries the
+/// trigger 017 replaces.
+async fn populated_at_schema_version(version: i64) -> TempDb {
+    let db = TempDb::at_schema_version(version).await;
+
+    sqlx::query(
+        "INSERT INTO exchange_rates (id, store_id, effective_date, rate_lbp_per_usd, source)
+         VALUES ('rate-v14', ?, '2026-03-01', 89500, 'manual')",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed rate");
+
+    sqlx::query(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opening_cash_usd_cents, status)
+         VALUES ('shift-v14', ?, ?, 5000, 'open')",
+    )
+    .bind(STORE_ID)
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed shift");
+
+    sqlx::query(
+        "INSERT INTO products (id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+                               price_excl_vat_cents, price_incl_vat_cents, quantity_on_hand)
+         VALUES ('prod-v14', ?, 'SKU-V14', 'Legacy Burger', ?, 'inclusive', 901, 1000, 100)",
+    )
+    .bind(STORE_ID)
+    .bind(VAT_STD_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed product");
+
+    // Two posted sales, built draft-then-promoted the way the commands do.
+    for (sale_id, receipt, method, native, change) in [
+        ("sale-v14-cash", 1_i64, "cash_usd", 1_000_i64, 150_i64),
+        ("sale-v14-card", 2, "card_usd", 1_000, 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO sales (id, store_id, shift_id, cashier_user_id, receipt_number,
+                                exchange_rate_id, exchange_rate_lbp_per_usd,
+                                subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+                                cogs_total_cents, cogs_method, sale_type, status, channel)
+             VALUES (?, ?, 'shift-v14', ?, ?, 'rate-v14', 89500, 901, 99, 1000, 300,
+                     'weighted_average', 'normal', 'draft', 'counter')",
+        )
+        .bind(sale_id)
+        .bind(STORE_ID)
+        .bind(USER_ID)
+        .bind(receipt)
+        .execute(db.pool())
+        .await
+        .expect("seed sale");
+
+        sqlx::query(
+            "INSERT INTO sale_payments (id, sale_id, store_id, method, currency,
+                                        amount_native_usd_cents, amount_usd_cents_equivalent,
+                                        change_given_usd_cents, reference, created_at)
+             VALUES (?, ?, ?, ?, 'USD', ?, ?, ?, 'legacy-ref', '2026-03-01T10:00:00.000Z')",
+        )
+        .bind(format!("pay-{sale_id}"))
+        .bind(sale_id)
+        .bind(STORE_ID)
+        .bind(method)
+        .bind(native)
+        .bind(native)
+        .bind(change)
+        .execute(db.pool())
+        .await
+        .expect("seed payment");
+
+        sqlx::query("UPDATE sales SET status = 'posted', posted_at = '2026-03-01T10:00:00.000Z' WHERE id = ?")
+            .bind(sale_id)
+            .execute(db.pool())
+            .await
+            .expect("promote sale");
+    }
+
+    // A posted credit memo with a refund leg — the other rebuilt table.
+    sqlx::query(
+        "INSERT INTO sales_credit_memos (id, store_id, original_sale_id, credit_memo_number,
+                                         shift_id, cashier_user_id, exchange_rate_id,
+                                         exchange_rate_lbp_per_usd, subtotal_excl_vat_cents,
+                                         vat_total_cents, total_incl_vat_cents,
+                                         refund_total_usd_cents, status)
+         VALUES ('memo-v14', ?, 'sale-v14-cash', 1, 'shift-v14', ?, 'rate-v14', 89500,
+                 450, 50, 500, 500, 'draft')",
+    )
+    .bind(STORE_ID)
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed memo");
+
+    sqlx::query(
+        "INSERT INTO sales_credit_memo_refunds (id, credit_memo_id, store_id, method, currency,
+                                                amount_native_usd_cents,
+                                                amount_usd_cents_equivalent, reference, created_at)
+         VALUES ('refund-v14', 'memo-v14', ?, 'cash_usd', 'USD', 500, 500, 'legacy-refund',
+                 '2026-03-01T11:00:00.000Z')",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed refund leg");
+
+    sqlx::query("UPDATE sales_credit_memos SET status = 'posted', posted_at = '2026-03-01T11:00:00.000Z' WHERE id = 'memo-v14'")
+        .execute(db.pool())
+        .await
+        .expect("promote memo");
+
+    db
+}
+
+/// Every column of every row of a table, as one comparable string.
+///
+/// The digest is assembled in SQL from `PRAGMA table_info`, so it covers every
+/// column the table actually has — including ones a later migration adds —
+/// without this helper needing to know the schema. Values are cast to TEXT so
+/// the comparison is over what is STORED: a rebuild that re-typed a column
+/// would change the text of its values and fail here.
+async fn snapshot(db: &TempDb, table: &str) -> Vec<String> {
+    let cols: Vec<String> = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("table_info {table}: {e}"))
+        .iter()
+        .map(|r| r.try_get::<String, _>("name").expect("column name"))
+        .collect();
+    assert!(!cols.is_empty(), "{table} must exist to be snapshotted");
+
+    let digest = cols
+        .iter()
+        .map(|c| format!("COALESCE(CAST({c} AS TEXT), '<NULL>')"))
+        .collect::<Vec<_>>()
+        .join(" || '|' || ");
+
+    sqlx::query_scalar::<_, String>(&format!(
+        "SELECT {digest} AS digest FROM {table} ORDER BY id"
+    ))
+    .fetch_all(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("snapshot {table}: {e}"))
+}
+
+async fn object_names(db: &TempDb, kind: &str, table: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT name FROM sqlite_master WHERE type = ? AND tbl_name = ? ORDER BY name",
+    )
+    .bind(kind)
+    .bind(table)
+    .fetch_all(db.pool())
+    .await
+    .expect("read sqlite_master")
+}
+
+#[tokio::test]
+async fn the_upgrade_preserves_every_financial_row_byte_for_byte() {
+    let db = populated_v14().await;
+
+    let payments_before = snapshot(&db, "sale_payments").await;
+    let refunds_before = snapshot(&db, "sales_credit_memo_refunds").await;
+    let sales_before = snapshot(&db, "sales").await;
+    let memos_before = snapshot(&db, "sales_credit_memos").await;
+    assert_eq!(payments_before.len(), 2, "two tenders to carry over");
+    assert_eq!(refunds_before.len(), 1);
+
+    db.migrate_again().await.expect("015 and 016 must apply to a populated v14 database");
+
+    // `sales` and `sales_credit_memos` gain columns, so only the REBUILT tables
+    // can be compared whole. Those are the ones at risk.
+    assert_eq!(
+        snapshot(&db, "sale_payments").await,
+        payments_before,
+        "the sale_payments rebuild must not alter a single stored value"
+    );
+    assert_eq!(
+        snapshot(&db, "sales_credit_memo_refunds").await,
+        refunds_before,
+        "nor the refunds rebuild"
+    );
+
+    // And the untouched tables are still their old selves, column for column,
+    // apart from the two columns 015 adds with defaults.
+    assert_eq!(snapshot(&db, "sales").await.len(), sales_before.len());
+    assert_eq!(snapshot(&db, "sales_credit_memos").await.len(), memos_before.len());
+    let (driver, fee): (Option<String>, i64) =
+        sqlx::query_as("SELECT driver_id, delivery_fee_cents FROM sales WHERE id = 'sale-v14-cash'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(driver, None, "a historical sale names no driver");
+    assert_eq!(fee, 0, "and carries no delivery fee");
+}
+
+#[tokio::test]
+async fn the_upgrade_keeps_the_indexes_and_the_immutability_triggers() {
+    let db = populated_v14().await;
+    let pay_idx_before = object_names(&db, "index", "sale_payments").await;
+    let pay_trg_before = object_names(&db, "trigger", "sale_payments").await;
+    let ref_idx_before = object_names(&db, "index", "sales_credit_memo_refunds").await;
+    let ref_trg_before = object_names(&db, "trigger", "sales_credit_memo_refunds").await;
+
+    db.migrate_again().await.expect("upgrade");
+
+    assert_eq!(object_names(&db, "index", "sale_payments").await, pay_idx_before);
+    assert_eq!(object_names(&db, "trigger", "sale_payments").await, pay_trg_before);
+    assert_eq!(
+        object_names(&db, "index", "sales_credit_memo_refunds").await,
+        ref_idx_before
+    );
+    assert_eq!(
+        object_names(&db, "trigger", "sales_credit_memo_refunds").await,
+        ref_trg_before
+    );
+
+    // Not just present — ARMED. A rebuild that recreated a trigger with the
+    // wrong WHEN clause would pass a name check and fail here.
+    let insert = sqlx::query(
+        "INSERT INTO sale_payments (id, sale_id, store_id, method, currency,
+                                    amount_native_usd_cents, amount_usd_cents_equivalent)
+         VALUES ('smuggled', 'sale-v14-cash', ?, 'cash_usd', 'USD', 1, 1)",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(insert.is_err(), "a posted sale must still refuse another tender");
+
+    let update = sqlx::query("UPDATE sale_payments SET reference = 'x' WHERE id = 'pay-sale-v14-cash'")
+        .execute(db.pool())
+        .await;
+    assert!(update.is_err(), "a posted tender must still be immutable");
+
+    let delete = sqlx::query("DELETE FROM sale_payments WHERE id = 'pay-sale-v14-cash'")
+        .execute(db.pool())
+        .await;
+    assert!(delete.is_err(), "and undeletable");
+
+    let memo_insert = sqlx::query(
+        "INSERT INTO sales_credit_memo_refunds (id, credit_memo_id, store_id, method, currency,
+                                                amount_native_usd_cents,
+                                                amount_usd_cents_equivalent)
+         VALUES ('smuggled-refund', 'memo-v14', ?, 'cash_usd', 'USD', 1, 1)",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(memo_insert.is_err(), "a posted memo must still refuse another refund leg");
+}
+
+#[tokio::test]
+async fn the_upgrade_leaves_foreign_keys_and_integrity_intact() {
+    let db = populated_v14().await;
+    db.migrate_again().await.expect("upgrade");
+
+    let violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(db.pool())
+        .await
+        .expect("fk check");
+    assert!(violations.is_empty(), "the rebuild must repoint nothing");
+
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(db.pool())
+        .await
+        .expect("integrity check");
+    assert_eq!(integrity, "ok");
+
+    // The rebuilt table is still a child of `sales`: a tender for a sale that
+    // does not exist must be refused by the foreign key, not accepted.
+    let orphan = sqlx::query(
+        "INSERT INTO sale_payments (id, sale_id, store_id, method, currency,
+                                    amount_native_usd_cents, amount_usd_cents_equivalent)
+         VALUES ('orphan', 'no-such-sale', ?, 'cash_usd', 'USD', 1, 1)",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(orphan.is_err(), "the foreign key survived the rebuild");
+}
+
+#[tokio::test]
+async fn the_upgrade_adds_the_new_tender_without_widening_the_old_list() {
+    let db = populated_v14().await;
+
+    // Before: the method is refused outright.
+    sqlx::query(
+        "INSERT INTO sales (id, store_id, shift_id, cashier_user_id, receipt_number,
+                            exchange_rate_id, exchange_rate_lbp_per_usd,
+                            subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+                            cogs_total_cents, cogs_method, sale_type, status, channel)
+         VALUES ('sale-draft', ?, 'shift-v14', ?, 9, 'rate-v14', 89500, 901, 99, 1000, 0,
+                 'weighted_average', 'normal', 'draft', 'counter')",
+    )
+    .bind(STORE_ID)
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed draft");
+
+    let before = sqlx::query(
+        "INSERT INTO sale_payments (id, sale_id, store_id, method, currency,
+                                    amount_native_usd_cents, amount_usd_cents_equivalent)
+         VALUES ('dc-before', 'sale-draft', ?, 'driver_collection', 'USD', 1000, 1000)",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(before.is_err(), "v14 knows no driver collection");
+
+    db.migrate_again().await.expect("upgrade");
+
+    // After: accepted.
+    sqlx::query(
+        "INSERT INTO sale_payments (id, sale_id, store_id, method, currency,
+                                    amount_native_usd_cents, amount_usd_cents_equivalent)
+         VALUES ('dc-after', 'sale-draft', ?, 'driver_collection', 'USD', 1000, 1000)",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await
+    .expect("driver collection is a tender now");
+
+    // And nothing else crept in: the CHECK is still a closed list.
+    let nonsense = sqlx::query(
+        "INSERT INTO sale_payments (id, sale_id, store_id, method, currency,
+                                    amount_native_usd_cents, amount_usd_cents_equivalent)
+         VALUES ('nonsense', 'sale-draft', ?, 'crypto', 'USD', 1, 1)",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(nonsense.is_err(), "the rebuild must not have widened the list");
+}
+
+#[tokio::test]
+async fn a_failed_upgrade_rolls_back_and_leaves_v14_usable() {
+    // A rebuild that failed halfway would be the worst outcome of all: the old
+    // table dropped and the new one incomplete. sqlx runs each migration in a
+    // transaction, and this proves it for THIS migration by making it fail —
+    // a pre-existing row that violates a constraint 015 introduces.
+    //
+    // `drivers` has a UNIQUE index on (store_id, name_key), so a pre-seeded
+    // duplicate cannot be the trigger; instead the failure is forced on the
+    // table 015 creates, by taking its name first.
+    let db = populated_v14().await;
+    sqlx::query("CREATE TABLE drivers (id TEXT PRIMARY KEY, bogus TEXT NOT NULL)")
+        .execute(db.pool())
+        .await
+        .expect("squat on the name 015 wants");
+
+    let outcome = db.migrate_again().await;
+    assert!(outcome.is_err(), "015 cannot create a table that already exists differently");
+
+    // The v14 books are untouched and still readable.
+    let payments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sale_payments")
+        .fetch_one(db.pool())
+        .await
+        .expect("sale_payments still exists");
+    assert_eq!(payments, 2, "no rows were lost to the failed upgrade");
+
+    let refunds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sales_credit_memo_refunds")
+        .fetch_one(db.pool())
+        .await
+        .expect("refunds still exist");
+    assert_eq!(refunds, 1);
+
+    let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(db.pool())
+        .await
+        .expect("integrity");
+    assert_eq!(integrity, "ok");
+
+    // And no half-built rebuild table was left behind.
+    let leftovers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+          WHERE name IN ('sale_payments_v15', 'sales_credit_memo_refunds_v15')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("scan for leftovers");
+    assert_eq!(leftovers, 0, "a rolled-back rebuild leaves no scaffolding");
+}
+
+#[tokio::test]
+async fn the_driver_ledger_constraints_are_correct_after_the_upgrade() {
+    let db = populated_v14().await;
+    db.migrate_again().await.expect("upgrade");
+
+    seed_driver(&db, "drv-a", "Ali").await;
+
+    // A collection must name a sale and be positive.
+    for (what, sql) in [
+        (
+            "a collection with no sale",
+            "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents, entry_date)
+             VALUES ('bad-1', ?, 'drv-a', 'collection', 100, '2026-03-02')",
+        ),
+        (
+            "a negative collection",
+            "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                        entry_date, related_sale_id)
+             VALUES ('bad-2', ?, 'drv-a', 'collection', -100, '2026-03-02', 'sale-v14-cash')",
+        ),
+        (
+            "a positive remittance",
+            "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                        entry_date, received_currency, received_native_usd_cents,
+                                        shift_id)
+             VALUES ('bad-3', ?, 'drv-a', 'remittance', 100, '2026-03-02', 'USD', 100, 'shift-v14')",
+        ),
+        (
+            "a remittance with no shift",
+            "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                        entry_date, received_currency, received_native_usd_cents)
+             VALUES ('bad-4', ?, 'drv-a', 'remittance', -100, '2026-03-02', 'USD', 100)",
+        ),
+        (
+            "an adjustment with no reason",
+            "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                        entry_date)
+             VALUES ('bad-5', ?, 'drv-a', 'adjustment', 100, '2026-03-02')",
+        ),
+        (
+            "a lira remittance with no rate",
+            "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                        entry_date, received_currency, received_native_lbp,
+                                        shift_id)
+             VALUES ('bad-6', ?, 'drv-a', 'remittance', -100, '2026-03-02', 'LBP', 89500,
+                     'shift-v14')",
+        ),
+    ] {
+        let outcome = sqlx::query(sql).bind(STORE_ID).execute(db.pool()).await;
+        assert!(outcome.is_err(), "{what} must be refused");
+    }
+
+    // A collection against a sale that does NOT name this driver is refused:
+    // the historical v14 sales have no driver at all.
+    let unrelated = sqlx::query(
+        "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                    entry_date, related_sale_id)
+         VALUES ('bad-7', ?, 'drv-a', 'collection', 1000, '2026-03-02', 'sale-v14-cash')",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(
+        unrelated.is_err(),
+        "a collection must name the driver the sale itself records"
+    );
+
+    // And the honest row posts, against a delivery sale that does name him.
+    sqlx::query(
+        "INSERT INTO sales (id, store_id, shift_id, cashier_user_id, receipt_number,
+                            exchange_rate_id, exchange_rate_lbp_per_usd,
+                            subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+                            cogs_total_cents, cogs_method, sale_type, status, channel,
+                            driver_id, delivery_fee_cents)
+         VALUES ('sale-delivery', ?, 'shift-v14', ?, 7, 'rate-v14', 89500, 901, 99, 1000, 300,
+                 'weighted_average', 'normal', 'draft', 'online_delivery', 'drv-a', 200)",
+    )
+    .bind(STORE_ID)
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed a delivery sale");
+
+    sqlx::query(
+        "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                    entry_date, related_sale_id)
+         VALUES ('good-1', ?, 'drv-a', 'collection', 1000, '2026-03-02', 'sale-delivery')",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await
+    .expect("a collection against this driver's own sale posts");
+
+    // Append-only.
+    assert!(
+        sqlx::query("UPDATE driver_ledger SET amount_cents = 1 WHERE id = 'good-1'")
+            .execute(db.pool())
+            .await
+            .is_err(),
+        "driver ledger entries are immutable"
+    );
+    assert!(
+        sqlx::query("DELETE FROM driver_ledger WHERE id = 'good-1'")
+            .execute(db.pool())
+            .await
+            .is_err(),
+        "and undeletable"
+    );
+}
+
+#[tokio::test]
+async fn a_return_credit_cannot_reference_an_unrelated_driver_store_or_sale() {
+    // The specific hole §6 names. A ledger entry is only meaningful if it is
+    // filed against the right party, in the right store, for the right document.
+    let db = populated_v14().await;
+    db.migrate_again().await.expect("upgrade");
+
+    seed_driver(&db, "drv-a", "Ali").await;
+    seed_store(&db, "store-b", "Other branch").await;
+    seed_driver_in_store(&db, "drv-b", "Outsider", "store-b", true).await;
+
+    // A posted sale cannot be re-pointed at a driver after the fact. Worth
+    // asserting here as well as in the WP-6 suite: re-attributing a posted
+    // receipt is how a receivable would move between two people's balances.
+    let repoint = sqlx::query(
+        "UPDATE sales SET channel = 'online_delivery', driver_id = 'drv-a'
+          WHERE id = 'sale-v14-card'",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(repoint.is_err(), "a posted sale's driver is immutable");
+
+    let wrong_driver = sqlx::query(
+        "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                    entry_date, related_sale_id)
+         VALUES ('bad-driver', ?, 'drv-a', 'collection', 100, '2026-03-02', 'sale-v14-cash')",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(
+        wrong_driver.is_err(),
+        "a collection must name the driver the SALE records"
+    );
+
+    // An entry filed in a store that is not the driver's.
+    let wrong_store = sqlx::query(
+        "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                    entry_date, notes)
+         VALUES ('bad-store', 'store-b', 'drv-a', 'adjustment', 100, '2026-03-02', 'why')",
+    )
+    .execute(db.pool())
+    .await;
+    assert!(wrong_store.is_err(), "the entry's store must be the driver's store");
+
+    // A return credit against a memo, driving the balance negative, is refused
+    // automatically (migration 016) — the §5 rule, in the engine.
+    let negative = sqlx::query(
+        "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents,
+                                    entry_date, related_credit_memo_id)
+         VALUES ('bad-neg', ?, 'drv-a', 'return_credit', -100, '2026-03-02', 'memo-v14')",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(negative.is_err(), "no automatic negative receivable");
+
+    // And a return credit with no memo at all is not an entry anyone can trace.
+    let untraceable = sqlx::query(
+        "INSERT INTO driver_ledger (id, store_id, driver_id, entry_type, amount_cents, entry_date)
+         VALUES ('bad-trace', ?, 'drv-a', 'return_credit', -1, '2026-03-02')",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await;
+    assert!(untraceable.is_err(), "a return credit must name its memo");
+}
+
+#[tokio::test]
+async fn the_upgrade_is_idempotent() {
+    // Running the migrator twice is what a restart does. Nothing may be
+    // rebuilt a second time, and no row may move.
+    let db = populated_v14().await;
+    db.migrate_again().await.expect("first upgrade");
+    let payments = snapshot(&db, "sale_payments").await;
+    let refunds = snapshot(&db, "sales_credit_memo_refunds").await;
+
+    db.migrate_again().await.expect("second run is a no-op");
+
+    assert_eq!(snapshot(&db, "sale_payments").await, payments);
+    assert_eq!(snapshot(&db, "sales_credit_memo_refunds").await, refunds);
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(db.pool())
+        .await
+        .expect("read version");
+    // Pinned against the migrator itself rather than a literal, so adding a
+    // migration does not require editing an assertion about a rebuild.
+    assert_eq!(version, latest_migration_version());
+}
+
+// ============================================================================
+// 017, ON POPULATED v15 AND v16 DATABASES (GZ-P1-3, GZ-P1-4)
+// ============================================================================
+//
+// 017 replaces a guard that v16 databases already carry and adds one v15 never
+// had. Two properties have to hold on every one of those upgrades, and they
+// pull in opposite directions:
+//
+//   * the NEW rules bind from the moment the migration lands, for every writer;
+//   * the rows already there are history and do not move — including the rows
+//     that would be refused today, because they were legitimate when they were
+//     written and `driver_ledger` is append-only.
+//
+// Each test below writes exactly such a row FIRST, under the rules of the day,
+// upgrades, and then checks both halves.
+
+/// A remittance insert, as a writer of the day would make it.
+async fn insert_remittance(
+    db: &TempDb,
+    id: &str,
+    driver: &str,
+    cents: i64,
+    shift: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO driver_ledger (
+           id, store_id, driver_id, entry_type, amount_cents, entry_date,
+           received_currency, received_native_usd_cents, shift_id
+         ) VALUES (?, ?, ?, 'remittance', ?, '2026-03-02', 'USD', ?, ?)",
+    )
+    .bind(id)
+    .bind(STORE_ID)
+    .bind(driver)
+    .bind(-cents)
+    .bind(cents)
+    .bind(shift)
+    .execute(db.pool())
+    .await
+    .map(|_| ())
+}
+
+/// A return credit pointed at `memo`, as a writer of the day would make it.
+async fn insert_return_credit(
+    db: &TempDb,
+    id: &str,
+    driver: &str,
+    cents: i64,
+    memo: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO driver_ledger (
+           id, store_id, driver_id, entry_type, amount_cents, entry_date,
+           related_credit_memo_id
+         ) VALUES (?, ?, ?, 'return_credit', ?, '2026-03-02', ?)",
+    )
+    .bind(id)
+    .bind(STORE_ID)
+    .bind(driver)
+    .bind(-cents)
+    .bind(memo)
+    .execute(db.pool())
+    .await
+    .map(|_| ())
+}
+
+/// Give a driver something to owe, the one way a caller may choose the sign.
+async fn seed_driver_balance(db: &TempDb, id: &str, driver: &str, cents: i64) {
+    sqlx::query(
+        "INSERT INTO driver_ledger (
+           id, store_id, driver_id, entry_type, amount_cents, entry_date, notes
+         ) VALUES (?, ?, ?, 'adjustment', ?, '2026-03-01', 'opening position, signed off')",
+    )
+    .bind(id)
+    .bind(STORE_ID)
+    .bind(driver)
+    .bind(cents)
+    .execute(db.pool())
+    .await
+    .expect("seed a driver balance");
+}
+
+#[tokio::test]
+async fn migration_017_upgrades_a_populated_v15_database_and_keeps_its_history() {
+    // v15 had NO shift rule for a remittance and no source rule for a return
+    // credit. Both of the rows below were legal the day they were written.
+    let db = populated_at_schema_version(15).await;
+    seed_driver(&db, "drv-a", "Ali").await;
+    seed_driver_balance(&db, "adj-open", "drv-a", 10_000).await;
+
+    insert_remittance(&db, "remit-v15", "drv-a", 1_000, None)
+        .await
+        .expect("a shift-less remittance was legal at v15");
+    insert_return_credit(&db, "credit-v15", "drv-a", 500, "memo-v14")
+        .await
+        .expect("an unchecked return credit was legal at v15");
+
+    let before = snapshot(&db, "driver_ledger").await;
+    db.migrate_again().await.expect("016 and 017 must apply to a populated v15 database");
+
+    // History stands, byte for byte, including the two rows the new rules
+    // would refuse today.
+    assert_eq!(snapshot(&db, "driver_ledger").await, before);
+    assert_eq!(driver_balance(&db, "drv-a").await, 10_000 - 1_000 - 500);
+
+    // And the rules bind from here on.
+    assert!(
+        insert_remittance(&db, "remit-new", "drv-a", 100, None).await.is_err(),
+        "a new remittance must name a shift"
+    );
+    assert!(
+        insert_return_credit(&db, "credit-new", "drv-a", 100, "memo-v14").await.is_err(),
+        "a new return credit must come from this driver's own return"
+    );
+    // The legitimate hand-over still posts, into the open shift the books have.
+    insert_remittance(&db, "remit-ok", "drv-a", 100, Some("shift-v14"))
+        .await
+        .expect("a remittance into the open shift posts");
+}
+
+#[tokio::test]
+async fn migration_017_replaces_the_weaker_trigger_on_a_populated_v16_database() {
+    // THE UPGRADE THAT MATTERS. A v16 database already carries
+    // `trg_driver_ledger_remittance_needs_shift` in its 016 form, so 017 has to
+    // REPLACE it — a `CREATE IF NOT EXISTS` would silently leave the weak one
+    // in place and this test is what would have caught that.
+    let db = populated_at_schema_version(16).await;
+    seed_driver(&db, "drv-a", "Ali").await;
+    seed_driver_balance(&db, "adj-open", "drv-a", 10_000).await;
+
+    // A shift that has been closed and counted.
+    sqlx::query(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opening_cash_usd_cents,
+                             closed_at, closed_by_user_id, status)
+         VALUES ('shift-closed', ?, ?, 0, '2026-03-01T16:00:00.000Z', ?, 'closed')",
+    )
+    .bind(STORE_ID)
+    .bind(USER_ID)
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed a closed shift");
+
+    // Legal at v16: the trigger asked only that the shift exist and be this
+    // store's. This is the row whose cash lands in a drawer nobody recounts.
+    insert_remittance(&db, "remit-v16", "drv-a", 1_000, Some("shift-closed"))
+        .await
+        .expect("a remittance into a closed shift was legal at v16");
+    insert_return_credit(&db, "credit-v16", "drv-a", 500, "memo-v14")
+        .await
+        .expect("an unchecked return credit was legal at v16");
+
+    let before = snapshot(&db, "driver_ledger").await;
+    db.migrate_again().await.expect("017 must apply to a populated v16 database");
+    assert_eq!(snapshot(&db, "driver_ledger").await, before, "history stands");
+
+    // The replaced trigger now refuses the same insert.
+    let err = insert_remittance(&db, "remit-new", "drv-a", 100, Some("shift-closed"))
+        .await
+        .expect_err("a closed shift may not acquire new cash")
+        .to_string();
+    assert!(err.contains("closed"), "got: {err}");
+
+    assert!(
+        insert_return_credit(&db, "credit-new", "drv-a", 100, "memo-v14").await.is_err(),
+        "and a return credit must come from this driver's own return"
+    );
+
+    // The open shift still takes one, so the rule is not simply "no".
+    insert_remittance(&db, "remit-ok", "drv-a", 100, Some("shift-v14"))
+        .await
+        .expect("a remittance into the open shift posts");
+    assert_eq!(driver_balance(&db, "drv-a").await, 10_000 - 1_000 - 500 - 100);
+}
+
+#[tokio::test]
+async fn a_fresh_database_carries_both_017_guards() {
+    // The other direction: a shop installed today must get the same rules as a
+    // shop that upgraded, which is only true if 017 is in the fresh chain too.
+    let db = TempDb::new().await;
+    let objects = object_names(&db, "trigger", "driver_ledger").await;
+    assert!(objects.contains(&"trg_driver_ledger_remittance_needs_shift".to_string()));
+    assert!(objects.contains(&"trg_driver_ledger_return_credit_source".to_string()));
+
+    let sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master
+          WHERE type='trigger' AND name='trg_driver_ledger_remittance_needs_shift'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("read the trigger body");
+    assert!(
+        sql.contains("status") && sql.contains("'open'"),
+        "the fresh database must have the OPEN-shift form of the guard, got: {sql}"
     );
 }

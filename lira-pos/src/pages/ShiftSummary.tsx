@@ -208,12 +208,20 @@ export default function ShiftSummary() {
     const changeLbp = drawerCash?.changeLbpOut ?? 0;
     const refundUsd = drawerCash?.refundUsdOutCents ?? 0;
     const refundLbp = drawerCash?.refundLbpOut ?? 0;
+    // Cash a driver handed in (WP-7). Omitting it is what made this screen
+    // disagree with `close_shift` on the real desktop: the till said $10.00
+    // expected while the command computed $19.99, and the cashier would have
+    // counted a $9.99 overage against a figure that was simply incomplete.
+    const driverRemitUsd = drawerCash?.driverRemitUsdInCents ?? 0;
+    const driverRemitLbp = drawerCash?.driverRemitLbpIn ?? 0;
 
     const openingUsd = activeShift?.openingCashUsdCents ?? 0;
     const openingLbp = activeShift?.openingCashLbp ?? 0;
 
-    const expectedUsd = openingUsd + cashUsdReceived - changeUsd - refundUsd;
-    const expectedLbp = openingLbp + cashLbpReceived - changeLbp - refundLbp;
+    const expectedUsd =
+      openingUsd + cashUsdReceived + driverRemitUsd - changeUsd - refundUsd;
+    const expectedLbp =
+      openingLbp + cashLbpReceived + driverRemitLbp - changeLbp - refundLbp;
 
     // Live variance from closing inputs
     let closingUsd = 0;
@@ -242,6 +250,8 @@ export default function ShiftSummary() {
       changeLbp,
       refundUsd,
       refundLbp,
+      driverRemitUsd,
+      driverRemitLbp,
       expectedUsd,
       expectedLbp,
       closingUsd,
@@ -282,6 +292,8 @@ export default function ShiftSummary() {
         cashLbpIn: 0,
         changeUsdOutCents: 0,
         changeLbpOut: 0,
+        driverRemitUsdInCents: 0,
+        driverRemitLbpIn: 0,
         refundUsdOutCents: 0,
         refundLbpOut: 0,
       });
@@ -700,6 +712,14 @@ export default function ShiftSummary() {
                       label={t("shift.cashRefunded")}
                       value={drawer.refundUsd > 0 ? `− ${formatUsd(drawer.refundUsd)}` : "—"}
                       tone={drawer.refundUsd > 0 ? "warn" : undefined}
+                    />
+                    {/* Its own row, so the expected figure can be explained
+                        rather than merely trusted: a cashier who finds more in
+                        the till than the sales account for needs to see that
+                        the difference is what the drivers brought in. */}
+                    <DrawerRow
+                      label={t("shift.driverRemittances")}
+                      value={formatUsd(drawer.driverRemitUsd)}
                     />
                     <DrawerRow
                       label={t("shift.expectedInDrawer")}

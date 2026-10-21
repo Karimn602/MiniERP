@@ -3,7 +3,10 @@
 // Every test asserts on PERSISTED rows, not on the command's return value
 // alone, because persistence is what later work packages must not regress.
 
-use crate::posting::{close_shift_with_pool, post_sale_with_pool, CloseShiftPayload, PostSalePayload};
+use crate::posting::{
+    close_shift_with_pool, post_sale_with_pool, CloseShiftPayload, PostSalePayload,
+    SALES_CHANNEL_COUNTER, SALES_CHANNEL_ONLINE_DELIVERY,
+};
 use crate::test_support::*;
 use crate::tests::builders::*;
 
@@ -11,6 +14,10 @@ const P_COFFEE: &str = "00000000-0000-0000-0000-0000000000c1";
 const P_WATER: &str = "00000000-0000-0000-0000-0000000000c2";
 const P_BREAD: &str = "00000000-0000-0000-0000-0000000000c3";
 const P_DELIVERY: &str = "00000000-0000-0000-0000-0000000000c4";
+/// The store's own driver, for the delivery-channel tests below. A new
+/// delivery order must name an active driver of its store and be collected by
+/// him (GZ-P1-1), so the channel tests need one on the books.
+const D_SAMI: &str = "00000000-0000-0000-0000-00000000d0c1";
 
 /// Close the fixture's own open shift, so a test can open one of its own.
 ///
@@ -38,6 +45,8 @@ async fn store_with_coffee() -> TempDb {
     let db = TempDb::new().await;
     seed_exchange_rate(&db).await;
     seed_open_shift(&db).await;
+    // Inert for every counter test, and required by the delivery-channel ones.
+    seed_driver(&db, D_SAMI, "Sami").await;
     seed_product(
         &db,
         &ProductSpec {
@@ -2024,4 +2033,724 @@ async fn repeated_lines_are_compared_as_a_multiset_not_a_set() {
 
     assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 1);
     assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 98);
+}
+
+// ============================================================================
+// GZ-WP0-08 — a restored checkout must replay the payload it was SENT
+// ============================================================================
+//
+// The register persists an open cart to localStorage, and from the first Post
+// press that cart carries its `checkoutId` — the `sale_id` below. So a cart
+// that comes back from storage still holding one is a payment whose answer
+// never arrived: the app died between the request and the response, and whether
+// the sale committed is knowable only by replaying that identity.
+//
+// WP-0 then added a restore-time revalidation that re-prices every restored
+// line against the current catalog, to stop a cart parked across a price rise
+// posting at yesterday's money (GZ-WP0-05). Applied to an unresolved checkout
+// that is a defect, not a feature, and these two tests are its proof. The
+// SAME committed sale, the SAME identity, one price rise, two outcomes:
+//
+//   * replay the frozen payload  → the original receipt comes back, nothing is
+//     written, the customer is charged once.
+//   * replay the revalidated one → CONFLICT. The sale that exists is not
+//     returned, and the one mechanism built to recover a lost response has
+//     been disabled by the one built to keep prices current.
+//
+// `lib/cartRestore.ts::revalidateRestoredCarts` is what keeps the first case
+// the one that happens: a restored cart with a `checkoutId` is frozen and not
+// repriced, and the register locks it against editing.
+
+/// Assert the backend refused this replay as a CONFLICT over the sale that
+/// already posted under the identity — the state in which the cashier holds a
+/// refusal for a sale that exists and cannot reach it.
+fn assert_conflict_over_the_committed_sale(err: &str, sale_id: &str) {
+    assert!(err.contains(sale_id), "the refusal must name the sale; got: {err}");
+    assert!(err.contains("already exists"), "got: {err}");
+    assert!(err.contains("Start a new checkout"), "got: {err}");
+}
+
+/// The same cart re-rung at a new catalog price — what the unguarded restore
+/// path handed to a retry. Only the per-unit price and the tender move; the
+/// checkout identity is the same one the committed sale posted under.
+fn repriced_replay(
+    original: &PostSalePayload,
+    new_unit_incl: i64,
+    tender: i64,
+) -> PostSalePayload {
+    let mut retry = replay_of_with_new_child_ids(original);
+    retry.lines =
+        vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(2).unit_incl(new_unit_incl).build()];
+    retry.payments = vec![cash_usd(tender)];
+    retry
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frozen_restored_checkout_replays_onto_the_sale_that_already_committed() {
+    // The sale committed; the client never saw the answer.
+    let (db, original) = one_posted_cash_sale().await;
+    assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 98, "the first post moved stock");
+
+    // The cashier reopens the register. The cart comes back frozen, so the
+    // retry carries the payload that was sent, to the cent.
+    let retry = replay_of_with_new_child_ids(&original);
+    let r = post_sale_with_pool(db.pool(), retry)
+        .await
+        .expect("a frozen restored checkout must reconcile, not conflict");
+
+    // One sale, its own receipt, and no second charge of any kind.
+    assert_eq!(r.sale_id, original.sale_id, "the committed sale is returned");
+    assert_eq!(r.receipt_number, 1, "the original receipt, not a new one");
+    assert_replay_changed_nothing(&db, &original.sale_id, 98).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revalidating_an_unresolved_checkout_would_break_its_replay() {
+    let (db, original) = one_posted_cash_sale().await;
+
+    // Coffee was CUT from $5.00 to $4.50 while the register was down. This is
+    // exactly what `revalidateRestoredLines` would write onto the restored
+    // line, and on a price cut the register's own checks wave it through — the
+    // $10.00 already in the payment box simply becomes $1.00 of change. So the
+    // request reaches the backend, and the per-line comparison is all that is
+    // left between the customer and a second charge.
+    let err = post_sale_with_pool(db.pool(), repriced_replay(&original, 450, 1000))
+        .await
+        .expect_err("a repriced replay is a conflict — which is why carts are frozen");
+    // A conflict, not a reconciliation. The first material difference the
+    // backend reaches is the header subtotal; which field it names matters far
+    // less than the fact that the identity no longer resolves to its sale.
+    assert_conflict_over_the_committed_sale(&err, &original.sale_id);
+    assert!(err.contains("different subtotal"), "got: {err}");
+
+    // A price RISE breaks the retry one step earlier and just as completely:
+    // the restored tender no longer covers the revalidated total, so the sale
+    // is refused as underpaid. Either way the identity can no longer reach the
+    // sale it names.
+    let err = post_sale_with_pool(db.pool(), repriced_replay(&original, 550, 1000))
+        .await
+        .expect_err("a revalidated rise cannot be paid for by the restored tender");
+    assert!(err.contains("Underpayment"), "got: {err}");
+
+    // And "fixing" that underpayment at the keyboard only moves the refusal
+    // back to the conflict, because the basket is still not the one that
+    // posted.
+    let err = post_sale_with_pool(db.pool(), repriced_replay(&original, 550, 1100))
+        .await
+        .expect_err("topping up the tender does not make it the same transaction");
+    assert_conflict_over_the_committed_sale(&err, &original.sale_id);
+
+    // The damage is not that the retry failed. It is that the cashier is now
+    // holding a refusal for a sale that DID post, with no way to reconcile it
+    // and every reason to ring the order up again.
+    assert_replay_changed_nothing(&db, &original.sale_id, 98).await;
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT unit_price_incl_vat_cents FROM sale_items WHERE sale_id='{}'",
+            original.sale_id
+        ))
+        .await,
+        500,
+        "the committed sale still stands at the price it was rung at"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frozen_replay_reconciles_however_many_times_the_cashier_presses_post() {
+    // A locked cart stays locked until a retry succeeds or the attempt is
+    // discarded, so Post may be pressed repeatedly. Every press must land on
+    // the same receipt.
+    let (db, original) = one_posted_cash_sale().await;
+
+    for attempt in 1..=4 {
+        let r = post_sale_with_pool(db.pool(), replay_of_with_new_child_ids(&original))
+            .await
+            .unwrap_or_else(|e| panic!("retry {attempt} must reconcile: {e}"));
+        assert_eq!(r.sale_id, original.sale_id, "retry {attempt}");
+        assert_eq!(r.receipt_number, 1, "retry {attempt}");
+    }
+
+    assert_replay_changed_nothing(&db, &original.sale_id, 98).await;
+}
+
+// ============================================================================
+// WP-1 — the refusal contract, and what a replay must never duplicate
+// ============================================================================
+//
+// `PostSaleFailure` tells the client, in one boolean, that the backend reached
+// a verdict and committed nothing. The register treats that as PROOF: it hands
+// the cart back to be edited and re-posted, rather than locking it for
+// reconciliation. So the proof had better hold.
+//
+// It rests on one structural fact — `post_sale_tx` performs `tx.commit()` as
+// its last fallible operation and returns `Ok` immediately after — and these
+// tests check the CONSEQUENCE rather than the shape: for a representative
+// refusal of each kind, nothing whatsoever is left in the database.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_kind_of_refusal_leaves_the_database_completely_untouched() {
+    // One database, several refusals in a row, each of a different kind, with
+    // the invariant re-checked after every one. If any refusal could leave a
+    // partial write, the register telling the cashier "edit it and post again"
+    // would build a second sale on top of that debris.
+    let db = store_with_coffee().await;
+
+    let checks: Vec<(&str, PostSalePayload)> = vec![
+        (
+            "more stock than exists",
+            sale_payload(
+                vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(5000).unit_incl(500).build()],
+                vec![cash_usd(2_500_000)],
+            ),
+        ),
+        (
+            "a product that is not there",
+            sale_payload(
+                vec![SaleLineBuilder::new("no-such-product", "Ghost").qty(1).unit_incl(500).build()],
+                vec![cash_usd(500)],
+            ),
+        ),
+        (
+            "tender that does not cover the total",
+            sale_payload(
+                vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(2).unit_incl(500).build()],
+                vec![cash_usd(100)],
+            ),
+        ),
+        (
+            "a sale with no value at all",
+            sale_payload(
+                vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(0).build()],
+                vec![cash_usd(0)],
+            ),
+        ),
+    ];
+
+    for (what, payload) in checks {
+        post_sale_with_pool(db.pool(), payload)
+            .await
+            .expect_err(what);
+
+        assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 0, "{what}: no sale row");
+        assert_eq!(db.count("SELECT COUNT(*) FROM sale_items").await, 0, "{what}: no line");
+        assert_eq!(db.count("SELECT COUNT(*) FROM sale_payments").await, 0, "{what}: no payment");
+        assert_eq!(
+            db.count("SELECT COUNT(*) FROM inventory_movements").await,
+            0,
+            "{what}: no stock movement"
+        );
+        assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 100, "{what}: stock untouched");
+        assert_eq!(
+            db.scalar_string("SELECT value FROM app_settings WHERE key='next_receipt_number'")
+                .await,
+            "1",
+            "{what}: no receipt number consumed"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_sale_can_be_corrected_and_posted_under_the_same_identity() {
+    // The behaviour the refusal contract licenses. The register keeps the cart
+    // editable after a proven refusal, so a corrected basket arrives under the
+    // identity that was refused — and it must post, exactly once.
+    let db = store_with_coffee().await;
+
+    let mut payload = sale_payload(
+        vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(5000).unit_incl(500).build()],
+        vec![cash_usd(2_500_000)],
+    );
+    let identity = payload.sale_id.clone();
+
+    post_sale_with_pool(db.pool(), replay_of(&payload))
+        .await
+        .expect_err("5000 units out of a 100-unit stock must be refused");
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 0);
+
+    // The quantity is fixed. Same identity, different basket — and that is NOT
+    // a conflict, because nothing ever posted under it.
+    payload.lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(2).unit_incl(500).build()];
+    payload.payments = vec![cash_usd(1000)];
+    let r = post_sale_with_pool(db.pool(), payload)
+        .await
+        .expect("a corrected basket under a refused identity must post");
+
+    assert_eq!(r.sale_id, identity);
+    assert_eq!(r.receipt_number, 1, "the refusals consumed no receipt number");
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 1);
+    assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 98);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_response_replayed_creates_no_second_money_anywhere() {
+    // WP-1 stated as an accounting assertion. The sale committed, the answer
+    // was lost, the register replays the frozen request — and every figure the
+    // shop is judged on is unchanged.
+    let (db, original) = one_posted_cash_sale().await;
+
+    let movements_before = movement_sum(&db, P_COFFEE).await;
+    let cash_before = db
+        .scalar_i64("SELECT COALESCE(SUM(amount_native_usd_cents), 0) FROM sale_payments")
+        .await;
+    let revenue_before = db
+        .scalar_i64("SELECT COALESCE(SUM(total_incl_vat_cents), 0) FROM sales WHERE status='posted'")
+        .await;
+    let vat_before = db
+        .scalar_i64("SELECT COALESCE(SUM(vat_total_cents), 0) FROM sales WHERE status='posted'")
+        .await;
+
+    // Three retries, as a worried cashier would.
+    for attempt in 1..=3 {
+        let r = post_sale_with_pool(db.pool(), replay_of_with_new_child_ids(&original))
+            .await
+            .unwrap_or_else(|e| panic!("retry {attempt}: {e}"));
+        assert_eq!(r.sale_id, original.sale_id);
+        assert_eq!(r.receipt_number, 1);
+    }
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 1, "one sale");
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sale_items WHERE sale_id='{}'",
+            original.sale_id
+        ))
+        .await,
+        1,
+        "one line"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sale_payments WHERE sale_id='{}'",
+            original.sale_id
+        ))
+        .await,
+        1,
+        "one cash receipt"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM inventory_movements WHERE related_sale_id='{}'",
+            original.sale_id
+        ))
+        .await,
+        1,
+        "one stock movement"
+    );
+    assert_eq!(movement_sum(&db, P_COFFEE).await, movements_before, "stock unchanged");
+    assert_eq!(
+        db.scalar_i64("SELECT COALESCE(SUM(amount_native_usd_cents), 0) FROM sale_payments").await,
+        cash_before,
+        "drawer unchanged"
+    );
+    assert_eq!(
+        db.scalar_i64(
+            "SELECT COALESCE(SUM(total_incl_vat_cents), 0) FROM sales WHERE status='posted'"
+        )
+        .await,
+        revenue_before,
+        "revenue unchanged"
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT COALESCE(SUM(vat_total_cents), 0) FROM sales WHERE status='posted'")
+            .await,
+        vat_before,
+        "output VAT unchanged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_reconciles_after_its_shift_has_been_closed() {
+    // The morning-after case, and the reason the register may replay with no
+    // open shift of its own. The sale committed into last night's shift, the
+    // answer was lost, and the shift has since been closed and counted. The
+    // replay still resolves on the identity, because the shift check sits
+    // AFTER the idempotency block (the WP-04 ordering).
+    let (db, original) = one_posted_cash_sale().await;
+    close_the_fixture_shift(&db).await;
+
+    let r = post_sale_with_pool(db.pool(), replay_of_with_new_child_ids(&original))
+        .await
+        .expect("a replay must resolve even once its shift is closed");
+
+    assert_eq!(r.sale_id, original.sale_id);
+    assert_eq!(r.receipt_number, 1);
+    assert_replay_changed_nothing(&db, &original.sale_id, 98).await;
+}
+
+// ============================================================================
+// WP-4 — the sales channel
+// ============================================================================
+//
+// One column recording where an order came from. The tests below are mostly
+// about what it must NOT do: it must not settle anything, must not move
+// between the two reported figures after the fact, and must not let a replay
+// re-attribute revenue.
+
+/// A sale on a named channel.
+///
+/// A COUNTER order is tendered at the till. A DELIVERY order is not: since
+/// GZ-P1-1 the backend requires a new one to name an active driver of its store
+/// and to be collected by him in full, so this builder gives the delivery
+/// channel the only shape the shop actually operates. These tests are about the
+/// channel COLUMN — attribution, immutability, replay, reconciliation — and
+/// each keeps asserting exactly what it did before.
+fn channel_sale(channel: &str) -> PostSalePayload {
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(2).unit_incl(500).build()];
+    if channel == SALES_CHANNEL_ONLINE_DELIVERY {
+        return delivery_payload(lines, D_SAMI, 0);
+    }
+    let mut p = sale_payload(lines, vec![cash_usd(1000)]);
+    p.channel = channel.to_string();
+    p
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_counter_sale_and_an_online_sale_both_post_and_are_attributed() {
+    let db = store_with_coffee().await;
+
+    let counter = channel_sale(SALES_CHANNEL_COUNTER);
+    let online = channel_sale(SALES_CHANNEL_ONLINE_DELIVERY);
+    post_sale_with_pool(db.pool(), replay_of(&counter)).await.expect("counter sale");
+    post_sale_with_pool(db.pool(), replay_of(&online)).await.expect("online sale");
+
+    assert_eq!(
+        db.scalar_string(&format!("SELECT channel FROM sales WHERE id='{}'", counter.sale_id))
+            .await,
+        "counter"
+    );
+    assert_eq!(
+        db.scalar_string(&format!("SELECT channel FROM sales WHERE id='{}'", online.sale_id))
+            .await,
+        "online_delivery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_online_order_moves_stock_and_is_vat_rated_exactly_like_a_counter_one() {
+    // The channel changes nothing about the GOODS: same inventory movement,
+    // same VAT, same snapshots — which is the premise of entering WhatsApp
+    // orders on the till rather than integrating a platform.
+    //
+    // What it does change is who holds the money. A delivery order is settled
+    // by the driver who carries it, so the tender is a `driver_collection` and
+    // no drawer figure moves (WP-6, and enforced by the backend since
+    // GZ-P1-1). That is asserted here rather than left implied.
+    let db = store_with_coffee().await;
+
+    let online = channel_sale(SALES_CHANNEL_ONLINE_DELIVERY);
+    post_sale_with_pool(db.pool(), replay_of(&online)).await.expect("post");
+
+    assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 98, "stock moved");
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM inventory_movements WHERE related_sale_id='{}'",
+            online.sale_id
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT vat_total_cents FROM sales WHERE id='{}'",
+            online.sale_id
+        ))
+        .await,
+        100,
+        "VAT charged the same way (50c per unit, twice)"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sale_payments
+              WHERE sale_id='{}' AND method='driver_collection'",
+            online.sale_id
+        ))
+        .await,
+        1,
+        "and settled by the driver who carries it, not at the till"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sale_payments
+              WHERE sale_id='{}' AND method IN ('cash_usd','cash_lbp')",
+            online.sale_id
+        ))
+        .await,
+        0,
+        "no drawer cash for an order nobody paid at the counter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unpaid_online_order_is_refused_like_any_other_unpaid_order() {
+    // THE rule that keeps the channel from becoming a payment method. Marking
+    // an order "Online" buys it no credit: no cash row is invented for it and
+    // no receivable is raised, so it is refused for being unpaid exactly as a
+    // counter order would be.
+    let db = store_with_coffee().await;
+
+    let mut online = channel_sale(SALES_CHANNEL_ONLINE_DELIVERY);
+    online.payments = vec![];
+    let err = post_sale_with_pool(db.pool(), online)
+        .await
+        .expect_err("an online order with no tender must not post");
+    assert!(err.contains("at least one payment"), "got: {err}");
+
+    let mut underpaid = channel_sale(SALES_CHANNEL_ONLINE_DELIVERY);
+    underpaid.payments = vec![cash_usd(400)];
+    let err = post_sale_with_pool(db.pool(), underpaid)
+        .await
+        .expect_err("an underpaid online order must not post");
+    assert!(err.contains("Underpayment"), "got: {err}");
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 0);
+    assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 100);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_payload_with_no_channel_field_at_all_posts_as_counter() {
+    // Backwards compatibility ON THE WIRE. What could break here is
+    // `#[serde(default)]`, not the constant behind it, so the payload is built
+    // as a pre-WP-4 client would actually send it — a JSON object with no
+    // `channel` key at all — and decoded through the real `Deserialize`.
+    let db = store_with_coffee().await;
+
+    let sale_id = uuid();
+    let item_id = uuid();
+    let payment_id = uuid();
+    let json = serde_json::json!({
+        "saleId": sale_id,
+        "storeId": STORE_ID,
+        "cashierUserId": USER_ID,
+        "deviceId": null,
+        "shiftId": SHIFT_ID,
+        "exchangeRateId": RATE_ID,
+        "exchangeRateLbpPerUsd": RATE_LBP_PER_USD,
+        "notes": null,
+        "cogsMethod": "weighted_average",
+        "discountCents": 0,
+        "allowNegativeInventory": false,
+        "lines": [{
+            "saleItemId": item_id,
+            "productId": P_COFFEE,
+            "productNameSnapshot": "Coffee",
+            "productSkuSnapshot": null,
+            "uomCodeSnapshot": "each",
+            "factorNumSnapshot": 1,
+            "factorDenSnapshot": 1,
+            "quantityInUom": 2,
+            "quantityBase": 2,
+            "unitPriceExclVatCents": 450,
+            "unitPriceInclVatCents": 500,
+            "vatRateIdSnapshot": VAT_STD_ID,
+            "vatRateBpsSnapshot": VAT_STD_BPS,
+            "lineSubtotalExclVatCents": 901,
+            "lineVatCents": 99,
+            "lineTotalInclVatCents": 1000,
+            "lineDiscountCents": 0,
+            "barcodeUsedSnapshot": null,
+            "barcodeTypeSnapshot": null,
+            "isService": false,
+        }],
+        "payments": [{
+            "paymentId": payment_id,
+            "method": "cash_usd",
+            "currency": "USD",
+            "amountNativeUsdCents": 1000,
+            "amountNativeLbp": 0,
+            "amountUsdCentsEquivalent": 1000,
+            "reference": null,
+        }],
+    });
+    assert!(json.get("channel").is_none(), "the key is genuinely absent");
+
+    let decoded: PostSalePayload =
+        serde_json::from_value(json).expect("a payload without a channel must still decode");
+    assert_eq!(decoded.channel, "counter");
+
+    post_sale_with_pool(db.pool(), decoded).await.expect("post");
+    assert_eq!(
+        db.scalar_string(&format!("SELECT channel FROM sales WHERE id='{sale_id}'")).await,
+        "counter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_channel_is_refused_before_a_receipt_number_is_consumed() {
+    // Checked in the application, not only at the CHECK constraint: a typo'd
+    // channel would otherwise drop a sale out of BOTH reported figures while
+    // still counting in the overall total, so the parts would stop summing to
+    // the whole with nothing to show why.
+    let db = store_with_coffee().await;
+
+    for bad in ["phone", "COUNTER", "", "online", "counter "] {
+        let err = post_sale_with_pool(db.pool(), channel_sale(bad))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Unknown sales channel"), "{bad}: got {err}");
+        assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 0, "{bad}: nothing written");
+        assert_eq!(
+            db.scalar_string("SELECT value FROM app_settings WHERE key='next_receipt_number'")
+                .await,
+            "1",
+            "{bad}: no receipt number consumed"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_keeps_the_original_channel_and_a_changed_one_is_a_conflict() {
+    // The channel is canonical business content, so a retry that arrives with
+    // a different channel is refused LOUDLY rather than accepted and silently
+    // ignored. Revenue cannot move between the two figures the owner reads
+    // against each other.
+    let db = store_with_coffee().await;
+    // Counter → delivery is the direction tested, because it isolates the
+    // CHANNEL comparison: the re-labelled retry carries no driver and no fee,
+    // so nothing else about it is incoherent and the conflict is the only thing
+    // that can refuse it. It also proves the ordering — the replay comparison
+    // runs before GZ-P1-1's delivery-shape rule, so a conflict is reported as a
+    // conflict rather than as a shape complaint.
+    let original = channel_sale(SALES_CHANNEL_COUNTER);
+    post_sale_with_pool(db.pool(), replay_of(&original)).await.expect("first post");
+
+    // A faithful retry reconciles.
+    let r = post_sale_with_pool(db.pool(), replay_of_with_new_child_ids(&original))
+        .await
+        .expect("a true retry must reconcile");
+    assert_eq!(r.sale_id, original.sale_id);
+    assert_eq!(r.receipt_number, 1);
+
+    // The same basket under the same identity, re-labelled, does not.
+    let mut switched = replay_of_with_new_child_ids(&original);
+    switched.channel = SALES_CHANNEL_ONLINE_DELIVERY.to_string();
+    let err = post_sale_with_pool(db.pool(), switched)
+        .await
+        .expect_err("a replay may not re-attribute the sale");
+    assert!(err.contains("different sales channel"), "got: {err}");
+
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 1);
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT channel FROM sales WHERE id='{}'",
+            original.sale_id
+        ))
+        .await,
+        "counter",
+        "the posted attribution stands"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_posted_sales_channel_cannot_be_edited_even_by_direct_sql() {
+    // Migration 001's void trigger works from a column LIST, so a column added
+    // later is one a "void" could rewrite by default. Migration 014 adds its
+    // own guard for this one, because re-attributing a posted sale moves
+    // revenue between two figures on a row that is supposed to be immutable.
+    //
+    // Run on a COUNTER sale, so migration 014's guard is the trigger under
+    // test: a posted DELIVERY row carries a driver, and moving it to the
+    // counter channel is refused first by migration 015's coherence trigger,
+    // which would make this test pass for the wrong reason.
+    let db = store_with_coffee().await;
+    let p = channel_sale(SALES_CHANNEL_COUNTER);
+    let id = p.sale_id.clone();
+    post_sale_with_pool(db.pool(), p).await.expect("post");
+
+    let err = db
+        .try_exec(&format!("UPDATE sales SET channel='online_delivery' WHERE id='{id}'"))
+        .await
+        .expect_err("re-attributing a posted sale must be rejected")
+        .to_string();
+    assert!(err.contains("channel cannot be changed"), "got: {err}");
+
+    assert_eq!(
+        db.scalar_string(&format!("SELECT channel FROM sales WHERE id='{id}'")).await,
+        "counter"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_database_refuses_an_out_of_range_channel_as_a_backstop() {
+    // The CHECK, independent of the application's own validation.
+    let db = store_with_coffee().await;
+    let p = channel_sale(SALES_CHANNEL_COUNTER);
+    let id = p.sale_id.clone();
+    post_sale_with_pool(db.pool(), p).await.expect("post");
+
+    // On a DRAFT row, so the immutability trigger is not what refuses it.
+    db.exec(&format!(
+        "INSERT INTO sales (id, store_id, receipt_number, exchange_rate_lbp_per_usd,
+                            subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+                            discount_cents, cogs_total_cents, status)
+         VALUES ('draft-ch', '{STORE_ID}', 9999, 89500, 0, 0, 0, 0, 0, 'draft')"
+    ))
+    .await;
+
+    let err = db
+        .try_exec("UPDATE sales SET channel='pigeon' WHERE id='draft-ch'")
+        .await
+        .expect_err("the CHECK must reject an out-of-range channel")
+        .to_string();
+    assert!(err.contains("CHECK constraint failed"), "got: {err}");
+
+    let _ = id;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn channel_totals_reconcile_to_the_overall_sales_total() {
+    // The reconciliation requirement, asserted in SQL rather than trusted: the
+    // sum of the per-channel figures IS the overall figure, because they are
+    // the same rows grouped two ways.
+    let db = store_with_coffee().await;
+
+    for (channel, qty) in [
+        (SALES_CHANNEL_COUNTER, 2),
+        (SALES_CHANNEL_ONLINE_DELIVERY, 3),
+        (SALES_CHANNEL_COUNTER, 1),
+        (SALES_CHANNEL_ONLINE_DELIVERY, 4),
+    ] {
+        let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(qty).unit_incl(500).build()];
+        // Each channel in the shape it is actually taken in: the counter at the
+        // till, delivery collected by the driver. The figures being reconciled
+        // are the sale TOTALS, which neither tender changes.
+        let p = if channel == SALES_CHANNEL_ONLINE_DELIVERY {
+            delivery_payload(lines, D_SAMI, 0)
+        } else {
+            let mut counter = sale_payload(lines, vec![cash_usd(500 * qty)]);
+            counter.channel = channel.to_string();
+            counter
+        };
+        post_sale_with_pool(db.pool(), p).await.expect("post");
+    }
+
+    let overall = db
+        .scalar_i64("SELECT SUM(total_incl_vat_cents) FROM sales WHERE status='posted'")
+        .await;
+    let counter = db
+        .scalar_i64(
+            "SELECT COALESCE(SUM(total_incl_vat_cents), 0) FROM sales
+              WHERE status='posted' AND channel='counter'",
+        )
+        .await;
+    let online = db
+        .scalar_i64(
+            "SELECT COALESCE(SUM(total_incl_vat_cents), 0) FROM sales
+              WHERE status='posted' AND channel='online_delivery'",
+        )
+        .await;
+
+    assert_eq!(counter, 1500, "2 + 1 units at $5.00");
+    assert_eq!(online, 3500, "3 + 4 units at $5.00");
+    assert_eq!(counter + online, overall, "the parts sum to the whole");
+
+    // And no sale escapes classification, which is what a nullable column or a
+    // third bucket would have allowed.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sales
+              WHERE status='posted' AND channel NOT IN ('counter','online_delivery')"
+        )
+        .await,
+        0
+    );
 }

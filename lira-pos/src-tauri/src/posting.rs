@@ -2352,6 +2352,42 @@ pub struct PostSalePayload {
     pub exchange_rate_lbp_per_usd: i64,
 
     pub notes: Option<String>,
+    /// Where the order came from: `"counter"` or `"online_delivery"`.
+    ///
+    /// Defaulted so a client that predates WP-4 keeps working, and so the
+    /// default matches the column's: an unstated channel is a counter sale,
+    /// which is what every sale was before the control existed.
+    ///
+    /// NOT a payment method. It says nothing about how the order was settled,
+    /// and `post_sale` invents no tender for it — an online order with no
+    /// payment row is refused for being unpaid, exactly like a counter one.
+    #[serde(default = "default_channel")]
+    pub channel: String,
+
+    /// The shop's own driver who carried this order (WP-6).
+    ///
+    /// MANDATORY for a sale tendered `driver_collection`, and refused on a
+    /// counter sale — a receivable has to be owed by somebody, and a courier
+    /// booked against a walk-in receipt describes nothing that happened.
+    /// Optional in the type because a counter sale has none, and because a
+    /// payload from a client that predates WP-6 must keep working.
+    ///
+    /// A delivery order may name a driver WITHOUT a `driver_collection`
+    /// tender: a customer who already paid by card still has his food carried,
+    /// and the shop still wants to know who took it and what the charge was.
+    /// That order raises no receivable, because nobody is holding its money.
+    #[serde(default)]
+    pub driver_id: Option<String>,
+
+    /// What the customer paid the driver for the delivery itself, in USD cents.
+    ///
+    /// NOT Greaz revenue, NOT VAT-rated, NOT part of any sale total, and NOT in
+    /// the driver's receivable — he keeps it. Recorded so the shop can say what
+    /// the customer's total payment was and hand its accountant a real figure.
+    /// Migration 015 states the open tax question in full.
+    #[serde(default)]
+    pub delivery_fee_cents: i64,
+
     pub cogs_method: String,
     // Sale-level discount in USD cents (incl-VAT). JS allocates this
     // proportionally across lines and sends post-discount line values.
@@ -2431,6 +2467,60 @@ pub struct PostSaleResult {
 }
 
 // ============================================================================
+// The REFUSAL contract (P1-A / P1-B)
+// ============================================================================
+//
+// A client that has lost the answer to a checkout has to decide one thing:
+// might the sale have committed? Getting that wrong in either direction is a
+// financial error — assume committed when it was not and the customer leaves
+// unbilled; assume not committed when it was and they are charged twice.
+//
+// The register used to decide it by reading the exception's TEXT, which is no
+// basis for financial certainty: the message is a human sentence, it is
+// translated nowhere and stable nowhere, and an IPC-layer failure (the window
+// torn down, a payload that would not deserialize, a backend that never
+// answered) arrives looking much like a refusal the backend actually reasoned
+// its way to.
+//
+// So the backend states it instead. `post_sale` returns this struct as its
+// error, and `refused: true` is a PROOF, not a hint:
+//
+//   * `post_sale_tx` performs `tx.commit()` as its last fallible operation and
+//     returns `Ok` immediately after, with no further work that can fail. So
+//     every `Err` it can produce is raised either before the commit or BY the
+//     commit, and in both cases the transaction is rolled back and nothing is
+//     written. The same holds for `prepare_sale`, which touches no database.
+//
+//   * Therefore: if this value reaches the client, the sale did NOT commit.
+//
+// A rejection that is NOT this shape carries no such proof — nobody reached a
+// verdict, or the verdict was lost on the way back — and the client must treat
+// it as an UNKNOWN outcome and reconcile on the checkout identity. That rule
+// lives in `lib/postAttempt.ts::classifyPostFailure`, which is the only place
+// allowed to read it.
+//
+// Note what this does NOT claim. It says nothing about a sale whose commit
+// succeeded while the process died before answering: that produces no error
+// value at all, so it is correctly unknown.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostSaleFailure {
+    /// Always `true`. Its PRESENCE is the contract: the backend reached a
+    /// verdict and committed nothing.
+    pub refused: bool,
+    /// The operator-facing reason, unchanged from the internal error.
+    pub message: String,
+}
+
+impl PostSaleFailure {
+    /// The one constructor. Every refusal `post_sale` can return comes through
+    /// here, which is what makes the flag's presence meaningful.
+    fn refused(message: String) -> Self {
+        Self { refused: true, message }
+    }
+}
+
+// ============================================================================
 // Helpers — sale
 // ============================================================================
 
@@ -2472,6 +2562,30 @@ async fn next_receipt_number(
 // customer's money. Content is compared only to detect the opposite mistake —
 // one identity reused for a materially different transaction.
 
+/// The channel a sale is attributed to when the client does not say.
+fn default_channel() -> String {
+    SALES_CHANNEL_COUNTER.to_string()
+}
+
+pub const SALES_CHANNEL_COUNTER: &str = "counter";
+pub const SALES_CHANNEL_ONLINE_DELIVERY: &str = "online_delivery";
+
+/// Validate the channel, in the application rather than only at the CHECK.
+///
+/// The column's CHECK is the backstop and would reject a bad value anyway —
+/// but it would do so after a receipt number had been consumed, as an opaque
+/// constraint error. Checking here fails the sale before anything is written
+/// and says what the permitted values are.
+fn validate_channel(channel: &str) -> Result<(), String> {
+    match channel {
+        SALES_CHANNEL_COUNTER | SALES_CHANNEL_ONLINE_DELIVERY => Ok(()),
+        other => Err(format!(
+            "Unknown sales channel '{other}'. Expected '{SALES_CHANNEL_COUNTER}' or \
+             '{SALES_CHANNEL_ONLINE_DELIVERY}'."
+        )),
+    }
+}
+
 /// The canonical business content of a sale: everything that decides WHAT
 /// transaction was rung up, in a form that compares equal for a true retry and
 /// unequal for anything materially different.
@@ -2497,6 +2611,22 @@ struct CanonicalSale {
     exchange_rate_lbp_per_usd: i64,
     cogs_method: String,
     notes: Option<String>,
+    /// Included DELIBERATELY, so a replay cannot re-attribute a sale.
+    ///
+    /// The channel is a reporting dimension the owner reads Counter against
+    /// Online on, so it is business content, not request noise. Comparing it
+    /// means a retry that arrives with a different channel is refused as a
+    /// CONFLICT — loudly — rather than accepted and silently ignored, which is
+    /// what leaving it out would have meant.
+    channel: String,
+    /// Included for the same reason as `channel`, and with more at stake: the
+    /// driver is WHO OWES the shop the food money. A retry that arrived naming
+    /// a different driver would otherwise be accepted and silently ignored,
+    /// leaving the receivable on the first man's balance while the screen —
+    /// and the cashier — believed it had moved. It is refused as a conflict.
+    driver_id: Option<String>,
+    /// Likewise: what the shop believes the customer was charged for delivery.
+    delivery_fee_cents: i64,
     subtotal_excl_vat_cents: i64,
     vat_total_cents: i64,
     total_incl_vat_cents: i64,
@@ -2579,6 +2709,9 @@ impl CanonicalSale {
             exchange_rate_lbp_per_usd: payload.exchange_rate_lbp_per_usd,
             cogs_method: payload.cogs_method.clone(),
             notes: payload.notes.clone(),
+            channel: payload.channel.clone(),
+            driver_id: payload.driver_id.clone(),
+            delivery_fee_cents: payload.delivery_fee_cents,
             subtotal_excl_vat_cents: subtotal,
             vat_total_cents: vat_total,
             total_incl_vat_cents: total,
@@ -2609,7 +2742,8 @@ async fn load_sale_by_identity(
 ) -> Result<Option<PostedSale>, String> {
     let header = sqlx::query(
         "SELECT store_id, shift_id, cashier_user_id, device_id,
-                receipt_number, posted_at, status, notes,
+                receipt_number, posted_at, status, notes, channel,
+                driver_id, delivery_fee_cents,
                 exchange_rate_id, exchange_rate_lbp_per_usd, cogs_method,
                 subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents, discount_cents
            FROM sales WHERE id = ?",
@@ -2712,6 +2846,15 @@ async fn load_sale_by_identity(
                 .map_err(d("exchange_rate"))?,
             cogs_method: row.try_get("cogs_method").map_err(d("cogs_method"))?,
             notes: row.try_get("notes").map_err(d("notes"))?,
+            // `unwrap_or_default` is wrong here and a plain `try_get` is right:
+            // the column is NOT NULL with a default, so every row has a value,
+            // and a decode failure is a real fault rather than something to
+            // paper over with an empty string that would never compare equal.
+            channel: row.try_get("channel").map_err(d("channel"))?,
+            driver_id: row.try_get("driver_id").map_err(d("driver_id"))?,
+            delivery_fee_cents: row
+                .try_get("delivery_fee_cents")
+                .map_err(d("delivery_fee_cents"))?,
             subtotal_excl_vat_cents: row
                 .try_get("subtotal_excl_vat_cents")
                 .map_err(d("subtotal"))?,
@@ -2754,6 +2897,15 @@ fn sale_replay_matches_existing(
     compare!("shift", shift_id);
     compare!("cashier", cashier_user_id);
     compare!("device", device_id);
+
+    // --- Where the order came from. Compared, so a retry cannot quietly
+    // --- re-attribute revenue between the Counter and Online figures.
+    compare!("sales channel", channel);
+
+    // --- Who carried it, and what the delivery was charged at. A replay that
+    // --- disagrees about either is a different delivery, not this one.
+    compare!("delivery driver", driver_id);
+    compare!("delivery fee", delivery_fee_cents);
 
     // --- Monetary context locked at sale time. ---
     compare!("exchange rate", exchange_rate_id);
@@ -2935,7 +3087,7 @@ pub(crate) fn validate_line_financials(index: usize, line: &PostSaleLine) -> Res
 // ============================================================================
 
 /// Every `sale_payments.method` the schema's CHECK constraint allows.
-pub(crate) const PAYMENT_METHODS: [&str; 8] = [
+pub(crate) const PAYMENT_METHODS: [&str; 9] = [
     "cash_usd",
     "cash_lbp",
     "card_usd",
@@ -2944,7 +3096,30 @@ pub(crate) const PAYMENT_METHODS: [&str; 8] = [
     "wallet",
     "store_credit",
     "other",
+    // WP-6. A delivery order the shop's own driver collects for: the food
+    // money is Greaz's, it settles the sale in full, and it is in the driver's
+    // pocket rather than the till. See `DRIVER_COLLECTION` below.
+    DRIVER_COLLECTION,
 ];
+
+/// The tender that raises a driver receivable instead of taking money in.
+///
+/// Named rather than spelled out at each use, because three separate rules key
+/// on it — the mandatory driver, the collection ledger row, and the refund leg
+/// that credits the driver back — and a typo in any one of them would be a
+/// silent hole rather than a compile error.
+pub(crate) const DRIVER_COLLECTION: &str = "driver_collection";
+
+/// How a client-supplied approval string is filed on a credit memo (GZ-P2-2).
+///
+/// It names the claim and names its limit, in the row itself, because the row
+/// outlives the conversation: this build has no manager authentication, so the
+/// string authorised nothing and the note must not suggest otherwise. When an
+/// authenticated manager, server-side role enforcement and an audit row
+/// naming them arrive together, THAT change replaces this prefix with a
+/// reference to the audit row — and not before.
+pub(crate) const UNVERIFIED_APPROVAL_PREFIX: &str =
+    "[Unverified approval claim - typed at the till, authenticated by nothing, authorising nothing]";
 
 /// Whether a tender method puts money in, or takes money out of, the physical
 /// cash drawer. This is the ONE definition of "cash" in the backend: the change
@@ -2954,8 +3129,26 @@ pub(crate) fn is_cash_method(method: &str) -> bool {
     method == "cash_usd" || method == "cash_lbp"
 }
 
+/// Whether a tender hands the shop's money to a driver to carry.
+///
+/// `DRIVER_COLLECTION` is deliberately NOT cash. That one fact is what keeps
+/// the drawer honest for the whole feature: `close_shift`'s expected-cash
+/// figure, `post_sale`'s change rules and `post_credit_memo`'s
+/// drawer-can-fund-it guard all derive from `is_cash_method`, so a delivery
+/// order adds nothing to the till at posting and a refund of one takes nothing
+/// out of it. The money reaches the drawer later, as a remittance, and that is
+/// the only event that should ever look like cash arriving.
+pub(crate) fn is_driver_collection(method: &str) -> bool {
+    method == DRIVER_COLLECTION
+}
+
 /// The currency a method's name commits it to, if it names one at all.
-/// `bank_transfer`, `wallet`, `store_credit` and `other` may be either.
+///
+/// `bank_transfer`, `wallet`, `store_credit`, `other` and `driver_collection`
+/// may be either. A driver genuinely collects in whichever currency the
+/// customer pays in, and a Lebanese customer pays in both, so pinning it to
+/// one would make the honest row unwritable. The equivalence is still derived
+/// from the sale's own locked rate like every other lira tender.
 pub(crate) fn method_currency(method: &str) -> Option<&'static str> {
     match method {
         "cash_usd" | "card_usd" => Some("USD"),
@@ -3035,6 +3228,43 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
     }
     if payload.exchange_rate_lbp_per_usd <= 0 {
         return Err("Exchange rate must be positive.".into());
+    }
+    // Before anything is written, and in particular before a receipt number is
+    // consumed, so a bad channel costs the sequence nothing (WP-4).
+    validate_channel(&payload.channel)?;
+
+    // ---- Delivery, the driver, and his fee (WP-6) ----
+    //
+    // Here rather than in the transaction, for the same reason as the channel:
+    // an incoherent delivery order should cost the receipt sequence nothing.
+    // Migration 015 states the same three rules as triggers, so they hold for
+    // any writer; these produce the message a cashier can act on.
+    if payload.delivery_fee_cents < 0 {
+        return Err("A delivery fee cannot be negative.".into());
+    }
+    if payload.delivery_fee_cents > 0 && payload.driver_id.is_none() {
+        return Err(
+            "A delivery fee needs the driver who collected it. Choose the driver, or clear the fee."
+                .into(),
+        );
+    }
+    if payload.driver_id.is_some() && payload.channel != "online_delivery" {
+        return Err(
+            "Only a delivery order can name a driver. Set the order channel to WhatsApp /              Delivery first."
+                .into(),
+        );
+    }
+    // The receivable has to be owed by a named person. Without this a
+    // `driver_collection` tender would settle a sale against nobody: the money
+    // would leave the shop in the food, the sale would read as paid, and no
+    // balance anywhere would say who was holding it.
+    if payload.payments.iter().any(|p| is_driver_collection(&p.method))
+        && payload.driver_id.is_none()
+    {
+        return Err(
+            "A driver collection needs the driver who took the order. Choose the driver before              confirming."
+                .into(),
+        );
     }
 
     let cogs_method = match payload.cogs_method.as_str() {
@@ -3289,12 +3519,15 @@ pub async fn post_sale(
     app: tauri::AppHandle,
     state: State<'_, DbState>,
     payload: PostSalePayload,
-) -> Result<PostSaleResult, String> {
-    let prepared = prepare_sale(&payload)?;
+) -> Result<PostSaleResult, PostSaleFailure> {
+    // Every arm is wrapped at THIS boundary and nowhere deeper, so the internal
+    // functions keep their plain `String` errors and the test seam below keeps
+    // its signature. See `PostSaleFailure` for why wrapping here is sound.
+    let prepared = prepare_sale(&payload).map_err(PostSaleFailure::refused)?;
 
     // ---- Open transaction ----
-    let pool = pool(&app, &state).await?;
-    post_sale_tx(&pool, payload, prepared).await
+    let pool = pool(&app, &state).await.map_err(PostSaleFailure::refused)?;
+    post_sale_tx(&pool, payload, prepared).await.map_err(PostSaleFailure::refused)
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).
@@ -3433,6 +3666,117 @@ pub(crate) async fn post_sale_tx(
             "This sale is not attached to a shift. Open a shift before taking payment.".to_string()
         })?;
     assert_shift_is_open(&mut tx, shift_id, &payload.store_id).await?;
+
+    // ---- The driver is THIS store's driver, and still on the books (WP-6) ----
+    //
+    // The foreign key only proves the driver exists somewhere. Which store he
+    // belongs to decides whose receivable the collection lands on, and an
+    // inactive driver is one the shop has stopped giving orders to — handing him
+    // the till's money would be the thing retiring him was meant to prevent.
+    //
+    // Deliberately after the idempotency block, like the shift check and for the
+    // same reason: a retry of a sale that already posted must still reconcile to
+    // its receipt after the driver who carried it has been retired. And before
+    // the receipt number, so a bad driver costs the sequence nothing.
+    //
+    // The collection amount is NOT computed here. It is the sum of the
+    // `driver_collection` legs, taken below from the rows actually written.
+    if let Some(driver_id) = payload.driver_id.as_deref() {
+        let row = sqlx::query("SELECT store_id, is_active, name FROM drivers WHERE id = ?")
+            .bind(driver_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("read driver {driver_id}: {e}"))?
+            .ok_or_else(|| format!("Driver {driver_id} does not exist."))?;
+        let driver_store: String = row
+            .try_get("store_id")
+            .map_err(|e| format!("decode driver store_id: {e}"))?;
+        let is_active: i64 = row
+            .try_get("is_active")
+            .map_err(|e| format!("decode driver is_active: {e}"))?;
+        let name: String = row.try_get("name").map_err(|e| format!("decode driver name: {e}"))?;
+        if driver_store != payload.store_id {
+            return Err(format!(
+                "Driver {name} is not a driver of store {}.",
+                payload.store_id
+            ));
+        }
+        if is_active == 0 {
+            return Err(format!(
+                "Driver {name} is no longer active. Choose a current driver, or reactivate him                  before assigning the order."
+            ));
+        }
+    }
+
+    // ---- A NEW delivery order has ONE shape, and this is where it is decided ----
+    //
+    // WP-6 validated COHERENCE and deliberately left WORKFLOW to the register:
+    // `post_sale` accepted a delivery order part-settled at the till, and the
+    // gap was documented as safe "because no cashier-facing path reaches the
+    // permissive side". That is an argument about one screen, not about the
+    // data. This function is the authoritative boundary — it is also reached by
+    // a replayed payload, a future screen, an import, a script and a second
+    // terminal — so the shape it accepts is the shape the database can end up
+    // holding, and two of those shapes are financially incoherent for Greaz:
+    //
+    //   * SETTLED AT THE TILL. The confirmed process is that the driver
+    //     collects food-plus-fee from the customer, keeps the fee and brings
+    //     the food money back. A cash leg on a delivery order therefore makes
+    //     the drawer expect money that is in a driver's pocket, and a card leg
+    //     is a settlement route nobody has reviewed, priced or reconciled.
+    //   * NOBODY CARRYING IT. With no fee and no `driver_collection` leg, none
+    //     of WP-6's three coherence rules had anything to object to, so a
+    //     delivery order could post with cashier cash and no driver at all:
+    //     food off the shelf, and no balance anywhere saying who owes for it.
+    //
+    // So the rule is now stated where it is true: a NEW delivery sale names an
+    // active driver of this store (proven just above), and the food money is
+    // collected by HIM, in full.
+    //
+    // ORDERING, and it is load bearing in both directions — the same reasoning
+    // as the shift and driver checks above. It is AFTER the idempotency
+    // resolution, so a row written before this rule existed still replays to
+    // its own receipt instead of handing the cashier a failure for money that
+    // is already banked. It is BEFORE `next_receipt_number`, so a refusal costs
+    // the sequence nothing and leaves no draft behind.
+    if payload.channel == SALES_CHANNEL_ONLINE_DELIVERY {
+        let driver_named =
+            matches!(payload.driver_id.as_deref().map(str::trim), Some(d) if !d.is_empty());
+        if !driver_named {
+            return Err(
+                "A delivery order must name the driver who carries it. Choose the driver, or ring                  it up as a counter sale."
+                    .into(),
+            );
+        }
+        if let Some(leg) = payload.payments.iter().find(|p| !is_driver_collection(&p.method)) {
+            return Err(format!(
+                "A delivery order is collected by the driver, not at the till. This one is \
+                 tendered \"{}\": record the food money as the driver's collection, or ring it up \
+                 as a counter sale.",
+                leg.method
+            ));
+        }
+        // Defence in depth. With every leg a collection, the existing
+        // underpayment rule already forces the sum up to the total and the
+        // non-cash-over-collection rule already forces it down to the total, so
+        // this can only trip if one of those moves. It is stated anyway, because
+        // the figure it guards is the RECEIVABLE: too little understates what
+        // left the shop, and too much would put the driver's own delivery fee
+        // onto his balance as if it were the shop's money.
+        let collected: i64 = payload
+            .payments
+            .iter()
+            .filter(|p| is_driver_collection(&p.method))
+            .map(|p| p.amount_usd_cents_equivalent)
+            .sum();
+        if collected != total {
+            return Err(format!(
+                "The driver collects the food total exactly. This order is {total} cents of food \
+                 and the collection is {collected} cents — the delivery fee is his own and is not \
+                 part of what he owes."
+            ));
+        }
+    }
 
     let receipt_number = next_receipt_number(&mut tx, &payload.store_id).await?;
     let now = chrono::Utc::now()
@@ -3646,8 +3990,9 @@ pub(crate) async fn post_sale_tx(
              exchange_rate_lbp_per_usd, exchange_rate_id,
              subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
              discount_cents, cogs_total_cents, cogs_method,
-             sale_type, status, posted_at, notes
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal', 'draft', NULL, ?)"#,
+             sale_type, status, posted_at, notes, channel,
+             driver_id, delivery_fee_cents
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'normal', 'draft', NULL, ?, ?, ?, ?)"#,
     )
     .bind(&payload.sale_id)
     .bind(&payload.store_id)
@@ -3664,6 +4009,9 @@ pub(crate) async fn post_sale_tx(
     .bind(cogs_total)
     .bind(cogs_method)
     .bind(&payload.notes)
+    .bind(&payload.channel)
+    .bind(&payload.driver_id)
+    .bind(payload.delivery_fee_cents)
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("insert sale: {e}"))?;
@@ -3853,6 +4201,70 @@ pub(crate) async fn post_sale_tx(
              transaction wrote.",
             payload.sale_id
         ));
+    }
+
+    // ---- The driver's receivable (WP-6) ----
+    //
+    // The sale is settled but the money is not here: it is in the driver's
+    // pocket, and the shop's claim is on him from now on. This row IS that
+    // claim, and it commits in the SAME transaction as the sale, its lines, its
+    // movements, its stock and its tender. A failure anywhere rolls back the
+    // receipt number with everything else, so there is no reachable state in
+    // which the food left the shelf, the receipt exists, and nobody owes for it
+    // — nor one in which a balance says a driver owes for an order that was
+    // never posted. That is the "posting failure does not create orphan
+    // balances" requirement, and it is structural rather than checked.
+    //
+    // THE AMOUNT IS THE TENDER, NOT THE TOTAL. It is the sum of the
+    // `driver_collection` legs, which is what the driver is actually carrying.
+    // On an ordinary delivery order that equals the sale total; on a part-prepaid
+    // one it is only the part he collects, and taking the total there would put
+    // money the shop already banked onto his balance.
+    //
+    // The DELIVERY FEE IS NOT IN IT. He keeps the fee; the customer pays it to
+    // him directly. Adding it would make the shop's books claim a right to
+    // money it has agreed is his.
+    //
+    // Written only when there is something to owe. A delivery order a customer
+    // prepaid by card has a driver and a fee and raises no receivable, because
+    // nobody is holding the shop's money — and a zero row would be refused by
+    // the sign-discipline trigger anyway.
+    let driver_collection_cents: i64 = payload
+        .payments
+        .iter()
+        .filter(|p| is_driver_collection(&p.method))
+        .try_fold(0i64, |acc, p| acc.checked_add(p.amount_usd_cents_equivalent))
+        .ok_or_else(|| "Driver collection total overflows.".to_string())?;
+
+    if driver_collection_cents > 0 {
+        // Guaranteed by `prepare_sale`, which refuses a `driver_collection`
+        // tender with no driver. Stated rather than unwrapped so the invariant
+        // is readable here, where the row that depends on it is written.
+        let driver_id = payload.driver_id.as_deref().ok_or_else(|| {
+            "A driver collection needs the driver who took the order.".to_string()
+        })?;
+        sqlx::query(
+            r#"INSERT INTO driver_ledger (
+                 id, store_id, driver_id, entry_type, amount_cents, entry_date,
+                 notes, related_sale_id, shift_id, created_by_user_id, device_id, posted_at
+               ) VALUES (?, ?, ?, 'collection', ?, ?, NULL, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&payload.store_id)
+        .bind(driver_id)
+        .bind(driver_collection_cents)
+        // The sale's own date, so the ledger reads in the order the shop lived
+        // it. `now` is RFC3339 UTC and its first ten characters are the date,
+        // the same slice `post_purchase` and the shift commands take.
+        .bind(&now[..10])
+        .bind(&payload.sale_id)
+        .bind(shift_id)
+        .bind(&payload.cashier_user_id)
+        .bind(&payload.device_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert driver_ledger collection: {e}"))?;
     }
 
     // ---- The shift is still open, now that the sale is written (GZ-HI-03) ----
@@ -4077,6 +4489,15 @@ pub(crate) struct DrawerCash {
     pub refund_usd_out_cents: i64,
     /// The same, in whole lira.
     pub refund_lbp_out: i64,
+    /// Cash a DRIVER handed back during this shift, in USD cents (WP-7).
+    ///
+    /// The NATIVE amount, not the USD equivalent: this figure is compared
+    /// against physical dollars in a drawer, and converting a lira remittance
+    /// into it would make the till expect dollars nobody put there. The lira
+    /// term below is the lira half of the same row.
+    pub driver_remit_usd_in_cents: i64,
+    /// The same, in whole lira.
+    pub driver_remit_lbp_in: i64,
 }
 
 impl DrawerCash {
@@ -4085,6 +4506,7 @@ impl DrawerCash {
     pub(crate) fn expected_usd_cents(&self, opening_cash_usd_cents: i64) -> Result<i64, String> {
         opening_cash_usd_cents
             .checked_add(self.cash_usd_in_cents)
+            .and_then(|v| v.checked_add(self.driver_remit_usd_in_cents))
             .and_then(|v| v.checked_sub(self.change_usd_out_cents))
             .and_then(|v| v.checked_sub(self.refund_usd_out_cents))
             .ok_or_else(|| "Expected USD drawer cash overflows.".to_string())
@@ -4094,6 +4516,7 @@ impl DrawerCash {
     pub(crate) fn expected_lbp(&self, opening_cash_lbp: i64) -> Result<i64, String> {
         opening_cash_lbp
             .checked_add(self.cash_lbp_in)
+            .and_then(|v| v.checked_add(self.driver_remit_lbp_in))
             .and_then(|v| v.checked_sub(self.change_lbp_out))
             .and_then(|v| v.checked_sub(self.refund_lbp_out))
             .ok_or_else(|| "Expected LBP drawer cash overflows.".to_string())
@@ -4149,8 +4572,35 @@ async fn drawer_cash_for_shift(
     .await
     .map_err(|e| format!("aggregate drawer refunds for shift {shift_id}: {e}"))?;
 
+    // Cash a driver handed back during this shift (WP-7). A third statement,
+    // for the same reason the refunds are a second one: one shift can hold many
+    // tenders, many refund legs and many remittances, and joining them would
+    // multiply each against the others. All three are plain sums over one shift.
+    //
+    // The NATIVE columns, so dollars stay dollars and lira stay lira. The row's
+    // `amount_cents` is the USD equivalent and is what the driver's BALANCE
+    // moves by; the drawer holds the notes that actually arrived.
+    let remittances = sqlx::query(
+        "SELECT
+           COALESCE(SUM(received_native_usd_cents), 0) AS remit_usd_in,
+           COALESCE(SUM(received_native_lbp), 0)       AS remit_lbp_in
+         FROM driver_ledger
+        WHERE store_id = ?
+          AND shift_id = ?
+          AND entry_type = 'remittance'",
+    )
+    .bind(store_id)
+    .bind(shift_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("aggregate driver remittances for shift {shift_id}: {e}"))?;
+
     let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
     Ok(DrawerCash {
+        driver_remit_usd_in_cents: remittances
+            .try_get("remit_usd_in")
+            .map_err(d("remit_usd_in"))?,
+        driver_remit_lbp_in: remittances.try_get("remit_lbp_in").map_err(d("remit_lbp_in"))?,
         cash_usd_in_cents: row.try_get("cash_usd_in").map_err(d("cash_usd_in"))?,
         cash_lbp_in: row.try_get("cash_lbp_in").map_err(d("cash_lbp_in"))?,
         change_usd_out_cents: row.try_get("change_usd_out").map_err(d("change_usd_out"))?,
@@ -4470,7 +4920,7 @@ pub(crate) async fn close_shift_tx(
 /// store-credit refund would be a liability with no row recording it, no
 /// balance to spend it against and no way to reconcile it. A sale paid that way
 /// simply cannot be refunded through it.
-pub(crate) const REFUND_METHODS: [&str; 7] = [
+pub(crate) const REFUND_METHODS: [&str; 8] = [
     "cash_usd",
     "cash_lbp",
     "card_usd",
@@ -4478,6 +4928,17 @@ pub(crate) const REFUND_METHODS: [&str; 7] = [
     "bank_transfer",
     "wallet",
     "other",
+    // WP-6. A return on a delivery order the driver collected for goes back
+    // the way it came: against the DRIVER's balance, because he is the one
+    // holding the money being refunded.
+    //
+    // Without this method the order would have been unrefundable, and the only
+    // way to satisfy a customer would have been a cash refund — handing money
+    // out of a drawer that never received any, while the receivable stayed on
+    // the driver's balance in full. The existing cap does the rest: a memo may
+    // refund only a `(method, currency)` pair the sale actually took, so this
+    // leg is available on a driver-collected sale and on no other.
+    DRIVER_COLLECTION,
 ];
 
 #[derive(Debug, Deserialize)]
@@ -4512,6 +4973,44 @@ pub struct PostCreditMemoPayload {
     #[serde(default)]
     pub exchange_rate_lbp_per_usd: Option<i64>,
 
+    /// A note recording who decided a driver-collected order should be
+    /// refunded out of the drawer.
+    ///
+    /// **THIS IS NOT AUTHORIZATION, AND IT NO LONGER UNLOCKS ANYTHING.**
+    ///
+    /// It was briefly treated as sufficient to permit the exceptional
+    /// drawer-funded refund path, and that was wrong. This application has no
+    /// authentication and no permission enforcement whatsoever: `users.role`
+    /// exists in the schema with `('owner','manager','cashier')` and is read by
+    /// nothing, there is no login, no session and no role check anywhere in
+    /// Rust or TypeScript, and `activeContext` simply picks the first `owner`
+    /// row at boot. So a free-text string on a payload is something the cashier
+    /// types themselves — it proves no manager was present, and accepting it as
+    /// proof would let anyone at the till pay money out of the drawer against a
+    /// receipt the till never collected.
+    ///
+    /// The exceptional path is therefore DISABLED rather than guarded, and the
+    /// field is kept only so the sentence is recorded on the memo if a caller
+    /// sends one. When a real authorization workflow exists — an authenticated
+    /// manager, server-side role enforcement, and an audit row naming them —
+    /// the path can be re-enabled against THAT, in the same change.
+    ///
+    /// When a delivery order's food money is still in the driver's pocket, the
+    /// refund reduces what he owes and needs no decision — the payer is
+    /// determinable. Once he has remitted it the cash is in the till, the payer
+    /// is the drawer, and `driver_ledger` rows are immutable, so crediting him
+    /// again would assert the shop owes money it never took from him.
+    ///
+    /// Greaz allocates remittances at DRIVER level, not per invoice (the same
+    /// model `supplier_ledger` uses for payments), so which particular order's
+    /// money reached the till is genuinely not determinable. That is exactly
+    /// the case the requirement says to block rather than guess: posting stops,
+    /// and a human records why it is right to pay this one out of the till.
+    ///
+    /// Free text, and non-empty is the whole test. It is persisted on the memo,
+    /// so the decision is auditable beside the money it moved.
+    #[serde(default)]
+    pub manager_approval: Option<String>,
     pub lines: Vec<PostCreditMemoLine>,
     pub refunds: Vec<PostCreditMemoRefund>,
 }
@@ -5168,7 +5667,7 @@ pub(crate) async fn post_credit_memo_tx(
 
     // ---- The original sale: this store's, posted, and an actual sale ----
     let sale_row = sqlx::query(
-        "SELECT sale_type, status, receipt_number,
+        "SELECT sale_type, status, receipt_number, driver_id,
                 exchange_rate_id, exchange_rate_lbp_per_usd
            FROM sales WHERE id = ? AND store_id = ?",
     )
@@ -5188,6 +5687,10 @@ pub(crate) async fn post_credit_memo_tx(
     let sale_type: String = sale_row.try_get("sale_type").map_err(d("sale_type"))?;
     let sale_status: String = sale_row.try_get("status").map_err(d("status"))?;
     let receipt_number: i64 = sale_row.try_get("receipt_number").map_err(d("receipt_number"))?;
+    // Whose balance a driver-collection refund leg credits. Read from the SALE,
+    // never from the payload: a refund settles the transaction that happened,
+    // against the person who actually collected for it.
+    let sale_driver_id: Option<String> = sale_row.try_get("driver_id").map_err(d("driver_id"))?;
     let sale_rate_id: Option<String> =
         sale_row.try_get("exchange_rate_id").map_err(d("exchange_rate_id"))?;
     // NOT NULL and CHECK (> 0) since migration 001.
@@ -5618,6 +6121,46 @@ pub(crate) async fn post_credit_memo_tx(
     //
     // Cumulative across every posted memo of this sale, so three refunds of $40
     // against an $80 cash tender cannot each pass a per-memo check.
+    // ---- WP-7 SS5: WHO ACTUALLY PAYS A REFUND ON A DELIVERY ORDER ----
+    //
+    // A driver-collected order was settled by the driver taking the food money.
+    // A refund of it has two possible sources, and they are different pots:
+    //
+    //   A. HE STILL HOLDS IT. The refund reduces what he owes. Determinable,
+    //      automatic, and bounded by his outstanding balance.
+    //   B. HE HAS REMITTED IT. The cash is in the drawer, so the drawer pays.
+    //
+    // Which applies is read from his balance, inside this transaction.
+    // Remittances are allocated at DRIVER level and never per invoice - the
+    // model `supplier_ledger` uses for payments - so once his balance is below
+    // the refund it is genuinely not determinable whether THIS order's notes
+    // are the ones in the till. That is the case the requirement says to block
+    // rather than guess.
+    //
+    // `driver_tender_net` is the shared basis both sources draw on: what the
+    // driver collected for THIS receipt. A cash substitution and a driver
+    // credit are one obligation paid from different pots, so they are capped
+    // together against it and cannot double up.
+    let driver_tender_net: i64 = sqlx::query(
+        "SELECT COALESCE(SUM(amount_usd_cents_equivalent), 0) AS net
+           FROM sale_payments
+          WHERE sale_id = ? AND store_id = ? AND method = ?",
+    )
+    .bind(&payload.original_sale_id)
+    .bind(&payload.store_id)
+    .bind(DRIVER_COLLECTION)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| format!("read driver tender: {e}"))?
+    .try_get("net")
+    .map_err(d("driver tender net"))?;
+
+    let manager_approval = payload
+        .manager_approval
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+
     let mut refund_groups: Vec<(String, String, i64)> = Vec::new();
     for r in &payload.refunds {
         let native = if r.currency == "USD" {
@@ -5657,7 +6200,38 @@ pub(crate) async fn post_credit_memo_tx(
         .try_get("net")
         .map_err(d("net original tender"))?;
 
-        if available <= 0 {
+        // THE DRAWER-FUNDED REFUND PATH IS DISABLED (WP-7 item 6).
+        //
+        // Economically it is sound: once a driver has remitted, the food money
+        // IS in the till, so the till is the honest payer and a cash refund
+        // would reverse the right cash movement. It was implemented that way,
+        // gated on a `manager_approval` string.
+        //
+        // That gate is not a gate. There is no authentication in this
+        // application and no permission enforcement of any kind — `users.role`
+        // is schema-only, nothing reads it, and the active user is whichever
+        // `owner` row sorts first at boot. So the "approval" is a sentence the
+        // cashier types, and treating it as authorization would mean anyone at
+        // the till could hand money out of the drawer against a receipt the
+        // drawer never collected, with an audit trail that says a manager
+        // agreed. That is worse than not having the feature: it manufactures
+        // the appearance of control.
+        //
+        // So the path is refused unconditionally until a real workflow exists
+        // (an authenticated manager, server-side role enforcement, and an audit
+        // row naming them). `substituting` is kept as an explicit `false` so the
+        // cap logic below reads the same either way and re-enabling it is one
+        // honest condition rather than a rewrite.
+        let substituting = false;
+
+        // Case B. Blocked, with the reason and both honest options named.
+        if available <= 0 && driver_tender_net > 0 {
+            return Err(format!(
+                "Receipt #{receipt_number} was collected by a driver, not at the till. If he is still holding the money, refund it through the driver. If he has already handed it in, this release cannot refund it here: record the refund as a signed-off driver adjustment and pay the customer outside the till."
+            ));
+        }
+
+        if available <= 0 && !substituting {
             return Err(format!(
                 "Receipt #{receipt_number} took no {method} ({currency}) payment, so it cannot be \
                  refunded that way. A refund may only return money through a method the sale used."
@@ -5682,6 +6256,29 @@ pub(crate) async fn post_credit_memo_tx(
         .try_get("refunded")
         .map_err(d("refunded to date"))?;
 
+        // The substitution draws on the DRIVER's tender for this receipt, and
+        // shares that basis with any driver-credit refunds already made against
+        // it. Counting them separately would let one order be refunded twice.
+        let (available, already) = if substituting {
+            let credited: i64 = sqlx::query(
+                "SELECT COALESCE(SUM(r.amount_usd_cents_equivalent), 0) AS refunded
+                   FROM sales_credit_memo_refunds r
+                   JOIN sales_credit_memos m ON m.id = r.credit_memo_id
+                  WHERE m.original_sale_id = ? AND m.status = 'posted'
+                    AND r.method IN (?, 'cash_usd')",
+            )
+            .bind(&payload.original_sale_id)
+            .bind(DRIVER_COLLECTION)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| format!("read driver-substituted refunds: {e}"))?
+            .try_get("refunded")
+            .map_err(d("driver substituted refunds"))?;
+            (driver_tender_net, credited)
+        } else {
+            (available, already)
+        };
+
         let cumulative = already
             .checked_add(*requested_native)
             .ok_or_else(|| "Refund amount overflows.".to_string())?;
@@ -5690,6 +6287,45 @@ pub(crate) async fn post_credit_memo_tx(
                 "Refund through {method} ({currency}) would total {cumulative} against the \
                  {available} receipt #{receipt_number} took that way ({already} already \
                  refunded). A method can give back only what it collected."
+            ));
+        }
+    }
+
+    // ---- Case A: a driver credit is bounded by what he STILL HOLDS ----
+    //
+    // `trg_driver_ledger_no_automatic_negative` (migration 016) is the engine's
+    // backstop for this; here it produces the sentence an operator can act on,
+    // and it produces it before anything is written.
+    //
+    // Crediting a driver more than he is holding would assert the shop owes him
+    // money it never took from him. The ledger is append-only, so such a row
+    // could never be removed - only offset by an entry that misstates
+    // something else. So the honest answer is to refuse and name the amount
+    // that has already reached the till.
+    let driver_credit_requested: i64 = payload
+        .refunds
+        .iter()
+        .filter(|r| is_driver_collection(&r.method))
+        .try_fold(0i64, |acc, r| {
+            let usd = if r.currency == "USD" {
+                Ok(r.amount_native_usd_cents)
+            } else {
+                lbp_to_usd_cents(r.amount_native_lbp, locked_rate)
+            }?;
+            acc.checked_add(usd).ok_or_else(|| "Driver refund total overflows.".to_string())
+        })?;
+
+    if driver_credit_requested > 0 {
+        let driver_id = sale_driver_id.as_deref().ok_or_else(|| {
+            format!(
+                "Receipt #{receipt_number} was collected by a driver, but no driver is recorded against it. This return cannot credit a driver balance."
+            )
+        })?;
+        let outstanding = current_driver_balance(&mut tx, driver_id).await?;
+        if driver_credit_requested > outstanding {
+            let remitted = driver_credit_requested - outstanding.max(0);
+            return Err(format!(
+                "This return would credit {driver_credit_requested} cents back to the driver, but he is only holding {outstanding}. About {remitted} cents of it has already been handed in to the till, and this release cannot refund that part here: record it as a signed-off driver adjustment and pay the customer outside the till."
             ));
         }
     }
@@ -5757,6 +6393,28 @@ pub(crate) async fn post_credit_memo_tx(
     // Everything above this line is a read. The writes begin here.
     // ========================================================================
 
+    // Fold a recorded approval CLAIM into the memo's notes. Appended rather
+    // than replacing, so an operator note is never overwritten by it.
+    //
+    // THE WORDING IS THE POINT (GZ-P2-2). This used to read "[Manager
+    // decision] ...", which states in an immutable financial document that a
+    // person with authority decided something — when all that happened is that
+    // somebody typed into a box. Nothing in this build can authenticate a
+    // manager: `users.role` is read by nothing, there is no login and no
+    // session, and the drawer-funded refund path is refused unconditionally
+    // because of it. An auditor reading the memo later cannot tell a typed
+    // sentence from a verified decision, and a figure dressed as a control is
+    // worse than no control: it manufactures the appearance of one.
+    //
+    // The field is still accepted and still recorded — the operator's words are
+    // worth keeping, and refusing a customer's refund over a note would be a
+    // cure worse than the disease — but it is recorded as what it is.
+    let memo_notes: Option<String> = match (payload.notes.as_deref(), manager_approval) {
+        (Some(n), Some(a)) => Some(format!("{n}\n{UNVERIFIED_APPROVAL_PREFIX} {a}")),
+        (None, Some(a)) => Some(format!("{UNVERIFIED_APPROVAL_PREFIX} {a}")),
+        (n, None) => n.map(str::to_string),
+    };
+
     let credit_memo_number = next_credit_memo_number(&mut tx, &payload.store_id).await?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -5792,7 +6450,11 @@ pub(crate) async fn post_credit_memo_tx(
     .bind(header_total)
     .bind(header_cogs_reversed)
     .bind(refund_total)
-    .bind(&payload.notes)
+    // The manager decision is persisted ON THE MEMO, so the reason for paying a
+    // driver-collected order out of the till sits beside the money it moved
+    // rather than in a log nobody reads. A posted memo takes no UPDATE
+    // (migration 011), so this is the only chance to record it.
+    .bind(memo_notes.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("insert credit memo: {e}"))?;
@@ -6012,6 +6674,74 @@ pub(crate) async fn post_credit_memo_tx(
         .map_err(|e| format!("insert credit memo refund: {e}"))?;
     }
 
+    // ---- Credit the driver for what came back (WP-6) ----
+    //
+    // A refund leg tendered `driver_collection` reduces what the DRIVER owes,
+    // because he is holding the money being given back. He hands over less, and
+    // the customer is settled by him out of the same cash — which is how the
+    // real transaction unwinds, and why no drawer figure moves.
+    //
+    // In the same transaction as the memo, its lines, its restock movements and
+    // its refund legs, so a return either credits the driver and reverses the
+    // stock or does neither. The cap is already proven above: this method was
+    // only available because the sale took it, and the cumulative per-method
+    // tender cap means the credits across every memo of a sale can never exceed
+    // what the driver collected for it. So a driver's balance cannot be driven
+    // negative by returns.
+    //
+    // Deliberately NOT "do not silently alter driver liabilities": this is the
+    // opposite of silent. The memo is the correction document, the ledger row
+    // names it in `related_credit_memo_id`, and the alternative — leaving the
+    // receivable untouched — would mean the shop still claiming food money from
+    // a driver for food that came back.
+    let driver_refund_cents: i64 = payload
+        .refunds
+        .iter()
+        .filter(|r| is_driver_collection(&r.method))
+        .try_fold(0i64, |acc, r| {
+            let usd = if r.currency == "USD" {
+                Ok(r.amount_native_usd_cents)
+            } else {
+                lbp_to_usd_cents(r.amount_native_lbp, locked_rate)
+            }?;
+            acc.checked_add(usd)
+                .ok_or_else(|| "Driver refund total overflows.".to_string())
+        })?;
+
+    if driver_refund_cents > 0 {
+        // The sale took a `driver_collection` tender, and `prepare_sale` cannot
+        // write one without a driver, so the sale has one. A sale old enough to
+        // predate WP-6 cannot have taken the method at all.
+        let driver_id = sale_driver_id.as_deref().ok_or_else(|| {
+            format!(
+                "Receipt #{receipt_number} was collected by a driver, but no driver is recorded                  against it. This return cannot credit a driver balance."
+            )
+        })?;
+        sqlx::query(
+            r#"INSERT INTO driver_ledger (
+                 id, store_id, driver_id, entry_type, amount_cents, entry_date,
+                 notes, related_credit_memo_id, shift_id,
+                 created_by_user_id, device_id, posted_at
+               ) VALUES (?, ?, ?, 'return_credit', ?, ?, NULL, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&payload.store_id)
+        .bind(driver_id)
+        // NEGATIVE: the direction is the backend's, as `post_supplier_payment`
+        // established. A return reduces what he owes; the sign-discipline
+        // trigger refuses this row written any other way.
+        .bind(-driver_refund_cents)
+        .bind(&now[..10])
+        .bind(&payload.credit_memo_id)
+        .bind(shift_id)
+        .bind(&payload.cashier_user_id)
+        .bind(&payload.device_id)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("insert driver_ledger return credit: {e}"))?;
+    }
+
     sqlx::query(
         r#"UPDATE sales_credit_memos
               SET status = 'posted', posted_at = ?
@@ -6046,5 +6776,623 @@ pub(crate) async fn post_credit_memo_tx(
         total_incl_vat_cents: header_total,
         cogs_reversed_cents: header_cogs_reversed,
         refund_total_usd_cents: refund_total,
+    })
+}
+
+// ============================================================================
+// Driver settlements (WP-6)
+// ============================================================================
+//
+// A driver hands the shop back the food money he collected. That is ALL this
+// command does, and the list of things it is not is as important as what it is:
+//
+//   * it is NOT a sale. No `sales` row, no receipt number, no VAT, no
+//     inventory, no revenue. The revenue was recognised when the order posted;
+//     booking it again here would double every delivery in the books. The
+//     requirement says so explicitly and the design makes it unreachable —
+//     there is no code path from here into `sales`.
+//   * it is NOT a supplier payment pointed the other way. The shop is the
+//     creditor here, not the debtor, so the sign convention is inverted and
+//     the over-settlement rule protects a different party.
+//   * it is NOT a drawer event, in this release. See the note at the end of
+//     migration 015: expected drawer cash has one definition, `close_shift`
+//     has already reconciled closed shifts against it, and adding a new source
+//     of cash to it silently would change what a posted variance means. The
+//     currency and amount that physically arrived ARE recorded, so the figure
+//     is there the moment that decision is taken.
+//
+// Everything structural is borrowed from `post_supplier_payment`, deliberately:
+// the identity-based idempotency, the balance read inside the writing
+// transaction, the magnitude-plus-backend-sign convention, and the refusal to
+// create a balance on the wrong side of zero. That command's reasoning applies
+// here almost word for word, so the shape is reused rather than reinvented.
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostDriverRemittancePayload {
+    /// The REMITTANCE IDENTITY, minted once by the caller and reused by every
+    /// retry of the same remittance.
+    ///
+    /// This is what makes "duplicate settlement submission" impossible rather
+    /// than merely unlikely: a lost answer is retried under the same id and
+    /// reconciles to the row that posted. Two genuinely separate hand-overs of
+    /// the same amount on the same day are two identities and two rows, which
+    /// is correct — a driver really can pay $50 twice.
+    pub ledger_entry_id: String,
+
+    pub store_id: String,
+    pub driver_id: String,
+
+    /// `"remittance"` (cash came back) or `"adjustment"` (a signed-off
+    /// correction). A `collection` or `return_credit` cannot be posted here:
+    /// those are consequences of a sale or a return and are written by the
+    /// commands that post those documents, in the same transaction, so a
+    /// balance can never disagree with the receipts behind it.
+    pub entry_type: String,
+
+    /// Document date the user typed, local `YYYY-MM-DD`.
+    pub entry_date: String,
+
+    /// Required, and required to be non-empty, for an `adjustment`.
+    pub notes: Option<String>,
+
+    /// What the driver handed over, and in which currency. Required for a
+    /// remittance; forbidden on an adjustment, which moves no cash.
+    pub received_currency: Option<String>,
+    #[serde(default)]
+    pub received_native_usd_cents: i64,
+    #[serde(default)]
+    pub received_native_lbp: i64,
+
+    /// The rate a LIRA remittance is converted at. Required for one, and
+    /// proven against the `exchange_rates` row inside the transaction before
+    /// anything is written — exactly as `post_sale` proves a sale's locked
+    /// rate. Forbidden on a USD remittance, which needs no conversion.
+    pub exchange_rate_id: Option<String>,
+    pub exchange_rate_lbp_per_usd: Option<i64>,
+
+    /// An `adjustment`'s direction, and the ONLY place a caller may choose a
+    /// sign. `"increase"` means the driver owes more.
+    pub direction: Option<String>,
+
+    /// An adjustment's magnitude in USD cents, always positive. Ignored for a
+    /// remittance, whose amount is derived from the cash that arrived.
+    #[serde(default)]
+    pub amount_magnitude_cents: i64,
+
+    pub reference: Option<String>,
+    pub shift_id: Option<String>,
+    pub created_by_user_id: Option<String>,
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostDriverRemittanceResult {
+    pub ledger_entry_id: String,
+    pub posted_at: String,
+    /// The driver's balance after this entry, read inside the same transaction
+    /// that wrote it. The caller never has to follow up with a SELECT that
+    /// could observe a different state than the one this command committed.
+    pub new_balance_cents: i64,
+    /// What the row actually records: negative for a remittance.
+    pub amount_cents: i64,
+}
+
+/// The canonical content of a driver-ledger entry, for replay comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanonicalDriverEntry {
+    store_id: String,
+    driver_id: String,
+    entry_type: String,
+    amount_cents: i64,
+    entry_date: String,
+    received_currency: Option<String>,
+    received_native_usd_cents: i64,
+    received_native_lbp: i64,
+    reference: Option<String>,
+    notes: Option<String>,
+    // ---- Persisted ATTRIBUTION, compared too (GZ-P2-1) ----
+    //
+    // These five were outside the comparison, so a replay arriving with any of
+    // them changed was accepted as faithful and the caller was told its own
+    // claim had posted — while the row went on naming the first set.
+    //
+    // `shift_id` is the one with money attached: it is a term in expected
+    // drawer cash, so a retry that believed it had moved the hand-over to
+    // another shift would leave the cash expected in the first till and a
+    // screen saying otherwise. The rate row decides which rate a reader
+    // believes converted a lira hand-over. The user and the device ARE the
+    // audit trail, which is exactly why nothing downstream would ever have
+    // noticed them drift.
+    shift_id: Option<String>,
+    exchange_rate_id: Option<String>,
+    exchange_rate_lbp_per_usd: Option<i64>,
+    created_by_user_id: Option<String>,
+    device_id: Option<String>,
+}
+
+struct PostedDriverEntry {
+    posted_at: String,
+    canonical: CanonicalDriverEntry,
+}
+
+/// Validate the payload and DERIVE the signed amount. Pure: no database.
+///
+/// The returned amount is what gets written. The payload's own magnitude is
+/// never written for a remittance — the cash that arrived decides the figure.
+fn validate_driver_remittance_payload(
+    payload: &PostDriverRemittancePayload,
+) -> Result<i64, String> {
+    if payload.ledger_entry_id.trim().is_empty() {
+        return Err("A remittance needs an identity.".into());
+    }
+    if payload.driver_id.trim().is_empty() {
+        return Err("A remittance needs a driver.".into());
+    }
+    if payload.entry_date.trim().is_empty() {
+        return Err("A remittance needs a date.".into());
+    }
+
+    match payload.entry_type.as_str() {
+        "remittance" => {
+            // ---- The cash that physically changed hands ----
+            //
+            // Same shape as a sale tender and for the same reason: the unit is
+            // currency-dependent, so each currency keeps its own column and
+            // exactly one of them is meaningful (`lib/money.ts`).
+            let currency = payload
+                .received_currency
+                .as_deref()
+                .ok_or("A remittance must say which currency the driver handed over.")?;
+            let usd_ok = payload.received_native_usd_cents > 0
+                && currency == "USD"
+                && payload.received_native_lbp == 0;
+            let lbp_ok = payload.received_native_lbp > 0
+                && currency == "LBP"
+                && payload.received_native_usd_cents == 0;
+            if !(usd_ok || lbp_ok) {
+                return Err(
+                    "A remittance records one positive amount, in the currency it was handed \
+                     over in."
+                        .into(),
+                );
+            }
+
+            // ---- The USD equivalent is DERIVED, never declared ----
+            let magnitude = if currency == "USD" {
+                if payload.exchange_rate_id.is_some() || payload.exchange_rate_lbp_per_usd.is_some()
+                {
+                    // Refused rather than ignored: a dollar remittance carrying
+                    // a rate means the screen that produced it believed a
+                    // conversion was happening, and a reader of the row would
+                    // have to guess which figure the rate applied to.
+                    return Err(
+                        "A remittance in dollars needs no exchange rate. Clear the rate, or \
+                         record the amount in lira."
+                            .into(),
+                    );
+                }
+                payload.received_native_usd_cents
+            } else {
+                let rate = payload
+                    .exchange_rate_lbp_per_usd
+                    .ok_or("A remittance in lira must say what rate converts it.")?;
+                if payload.exchange_rate_id.as_deref().unwrap_or("").trim().is_empty() {
+                    return Err("A remittance in lira must name the exchange rate on record.".into());
+                }
+                if rate <= 0 {
+                    return Err("Exchange rate must be positive.".into());
+                }
+                lbp_to_usd_cents(payload.received_native_lbp, rate)?
+            };
+            if magnitude <= 0 {
+                return Err(
+                    "That amount of lira converts to less than a cent. Record a larger \
+                     remittance."
+                        .into(),
+                );
+            }
+            // A remittance is cash INTO THE DRAWER (WP-7), so it has to land
+            // in a shift. Checked here so a payload with no shift costs
+            // nothing, and again inside the transaction against the shift's
+            // store and open status — migration 016 is the backstop.
+            if payload.shift_id.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(
+                    "A driver remittance is cash into the drawer. Open a shift before taking it."
+                        .into(),
+                );
+            }
+            // NEGATIVE: a remittance pays the balance down. The direction is
+            // the backend's, so a caller that sends the wrong sign — or sends
+            // none — still reduces what the driver owes instead of adding to
+            // it. The ledger is append-only, so a row written the wrong way
+            // round could never be corrected, only offset.
+            Ok(-magnitude)
+        }
+        "adjustment" => {
+            if payload.received_currency.is_some()
+                || payload.received_native_usd_cents != 0
+                || payload.received_native_lbp != 0
+            {
+                return Err(
+                    "An adjustment moves no cash. Record a remittance if the driver handed money \
+                     over."
+                        .into(),
+                );
+            }
+            if payload.exchange_rate_id.is_some() || payload.exchange_rate_lbp_per_usd.is_some() {
+                return Err("An adjustment converts nothing and needs no exchange rate.".into());
+            }
+            if payload.amount_magnitude_cents <= 0 {
+                return Err("An adjustment needs a positive amount and a direction.".into());
+            }
+            // An adjustment is the one bidirectional instrument, so it is the
+            // one place a caller chooses the sign — explicitly, by naming a
+            // direction rather than by the sign of a number, which is how a
+            // negative that was meant to be positive gets posted.
+            match payload.direction.as_deref() {
+                Some("increase") => Ok(payload.amount_magnitude_cents),
+                Some("decrease") => Ok(-payload.amount_magnitude_cents),
+                _ => Err(
+                    "An adjustment must say whether it increases or decreases what the driver \
+                     owes."
+                        .into(),
+                ),
+            }
+        }
+        "collection" | "return_credit" => Err(format!(
+            "A '{}' entry is written by the sale or the return it belongs to, in the same \
+             transaction, and cannot be posted on its own.",
+            payload.entry_type
+        )),
+        other => Err(format!("Invalid driver ledger entry type: {other}")),
+    }
+}
+
+/// The driver's outstanding balance: `SUM(amount_cents)`, read in the caller's
+/// transaction. Positive means he owes the shop.
+async fn current_driver_balance(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    driver_id: &str,
+) -> Result<i64, String> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS balance FROM driver_ledger WHERE driver_id = ?",
+    )
+    .bind(driver_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("read driver balance for {driver_id}: {e}"))?;
+    row.try_get("balance").map_err(|e| format!("decode driver balance: {e}"))
+}
+
+async fn load_driver_entry_by_identity(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    entry_id: &str,
+) -> Result<Option<PostedDriverEntry>, String> {
+    let row = sqlx::query(
+        "SELECT store_id, driver_id, entry_type, amount_cents, entry_date,
+                received_currency, received_native_usd_cents, received_native_lbp,
+                reference, notes, posted_at,
+                shift_id, exchange_rate_id, exchange_rate_lbp_per_usd,
+                created_by_user_id, device_id
+           FROM driver_ledger WHERE id = ?",
+    )
+    .bind(entry_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("read driver ledger entry {entry_id}: {e}"))?;
+
+    let Some(row) = row else { return Ok(None) };
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+    Ok(Some(PostedDriverEntry {
+        posted_at: row.try_get("posted_at").map_err(d("posted_at"))?,
+        canonical: CanonicalDriverEntry {
+            store_id: row.try_get("store_id").map_err(d("store_id"))?,
+            driver_id: row.try_get("driver_id").map_err(d("driver_id"))?,
+            entry_type: row.try_get("entry_type").map_err(d("entry_type"))?,
+            amount_cents: row.try_get("amount_cents").map_err(d("amount_cents"))?,
+            entry_date: row.try_get("entry_date").map_err(d("entry_date"))?,
+            received_currency: row.try_get("received_currency").map_err(d("received_currency"))?,
+            received_native_usd_cents: row
+                .try_get("received_native_usd_cents")
+                .map_err(d("received_native_usd_cents"))?,
+            received_native_lbp: row
+                .try_get("received_native_lbp")
+                .map_err(d("received_native_lbp"))?,
+            reference: row.try_get("reference").map_err(d("reference"))?,
+            notes: row.try_get("notes").map_err(d("notes"))?,
+            shift_id: row.try_get("shift_id").map_err(d("shift_id"))?,
+            exchange_rate_id: row.try_get("exchange_rate_id").map_err(d("exchange_rate_id"))?,
+            exchange_rate_lbp_per_usd: row
+                .try_get("exchange_rate_lbp_per_usd")
+                .map_err(d("exchange_rate_lbp_per_usd"))?,
+            created_by_user_id: row
+                .try_get("created_by_user_id")
+                .map_err(d("created_by_user_id"))?,
+            device_id: row.try_get("device_id").map_err(d("device_id"))?,
+        },
+    }))
+}
+
+fn driver_entry_replay_difference(
+    posted: &CanonicalDriverEntry,
+    replayed: &CanonicalDriverEntry,
+) -> Option<(&'static str, String, String)> {
+    macro_rules! compare {
+        ($what:literal, $field:ident) => {
+            if posted.$field != replayed.$field {
+                return Some((
+                    $what,
+                    format!("{:?}", posted.$field),
+                    format!("{:?}", replayed.$field),
+                ));
+            }
+        };
+    }
+    compare!("store", store_id);
+    compare!("driver", driver_id);
+    compare!("entry type", entry_type);
+    compare!("amount", amount_cents);
+    compare!("date", entry_date);
+    compare!("currency received", received_currency);
+    compare!("dollars received", received_native_usd_cents);
+    compare!("lira received", received_native_lbp);
+    compare!("reference", reference);
+    compare!("notes", notes);
+    // The persisted attribution (GZ-P2-1). A retry that moves any of these is a
+    // CONFLICT, not a reconciliation: the row it would be reconciled to says
+    // something different about where the cash landed, which rate converted it,
+    // and who recorded it.
+    compare!("shift", shift_id);
+    compare!("exchange rate", exchange_rate_id);
+    compare!("exchange rate value", exchange_rate_lbp_per_usd);
+    compare!("recorded-by user", created_by_user_id);
+    compare!("device", device_id);
+    None
+}
+
+/// Record a driver handing money back, or a signed-off correction to what he
+/// owes. Writes exactly one `driver_ledger` row, inside one transaction.
+#[tauri::command]
+pub async fn post_driver_remittance(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    payload: PostDriverRemittancePayload,
+) -> Result<PostDriverRemittanceResult, String> {
+    let amount_cents = validate_driver_remittance_payload(&payload)?;
+    let pool = pool(&app, &state).await?;
+    post_driver_remittance_tx(&pool, payload, amount_cents).await
+}
+
+/// Validate-then-post against an already-resolved pool (test seam).
+#[cfg(test)]
+pub(crate) async fn post_driver_remittance_with_pool(
+    pool: &SqlitePool,
+    payload: PostDriverRemittancePayload,
+) -> Result<PostDriverRemittanceResult, String> {
+    let amount_cents = validate_driver_remittance_payload(&payload)?;
+    post_driver_remittance_tx(pool, payload, amount_cents).await
+}
+
+pub(crate) async fn post_driver_remittance_tx(
+    pool: &SqlitePool,
+    payload: PostDriverRemittancePayload,
+    amount_cents: i64,
+) -> Result<PostDriverRemittanceResult, String> {
+    let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+
+    let replayed = CanonicalDriverEntry {
+        store_id: payload.store_id.clone(),
+        driver_id: payload.driver_id.clone(),
+        entry_type: payload.entry_type.clone(),
+        amount_cents,
+        entry_date: payload.entry_date.clone(),
+        received_currency: payload.received_currency.clone(),
+        received_native_usd_cents: payload.received_native_usd_cents,
+        received_native_lbp: payload.received_native_lbp,
+        reference: payload.reference.clone(),
+        notes: payload.notes.clone(),
+        shift_id: payload.shift_id.clone(),
+        exchange_rate_id: payload.exchange_rate_id.clone(),
+        exchange_rate_lbp_per_usd: payload.exchange_rate_lbp_per_usd,
+        created_by_user_id: payload.created_by_user_id.clone(),
+        device_id: payload.device_id.clone(),
+    };
+
+    // ---- Idempotency: has this remittance identity already posted? ----
+    //
+    // Before anything is written, and in particular before the over-settlement
+    // check below — which a replay would fail, because the balance it would be
+    // tested against already includes this very remittance. The retry case is
+    // the one that matters: the cash is in the till, the ledger already says
+    // so, and the caller needs to be told which entry it was rather than handed
+    // a second one or an error about a balance it already paid down.
+    if let Some(existing) =
+        load_driver_entry_by_identity(&mut tx, &payload.ledger_entry_id).await?
+    {
+        if let Some((what, was, now_)) =
+            driver_entry_replay_difference(&existing.canonical, &replayed)
+        {
+            return Err(format!(
+                "Driver ledger entry {} already exists with a different {}: posted {}, \
+                 replayed {}. Record a new entry instead of reusing this one.",
+                payload.ledger_entry_id, what, was, now_
+            ));
+        }
+        let new_balance = current_driver_balance(&mut tx, &payload.driver_id).await?;
+        // Nothing was written; end the transaction without a commit.
+        tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
+        return Ok(PostDriverRemittanceResult {
+            ledger_entry_id: payload.ledger_entry_id,
+            posted_at: existing.posted_at,
+            new_balance_cents: new_balance,
+            amount_cents: existing.canonical.amount_cents,
+        });
+    }
+
+    // ---- The driver is this store's driver ----
+    //
+    // The foreign key only proves he exists somewhere. Which store's books the
+    // entry lands in decides whose receivable it reduces, so it is checked
+    // rather than assumed — migration 015's sign-discipline trigger enforces
+    // the same thing against any other writer.
+    //
+    // An INACTIVE driver may still remit, unlike posting a new sale to him: a
+    // driver who has left still owes what he collected, and the shop must be
+    // able to record him paying it back. Retiring him stops new orders, not
+    // settlement of old ones.
+    let driver_row = sqlx::query("SELECT store_id, name FROM drivers WHERE id = ?")
+        .bind(&payload.driver_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read driver {}: {e}", payload.driver_id))?
+        .ok_or_else(|| format!("Driver {} does not exist.", payload.driver_id))?;
+    let driver_store: String = driver_row
+        .try_get("store_id")
+        .map_err(|e| format!("decode driver store_id: {e}"))?;
+    let driver_name: String = driver_row
+        .try_get("name")
+        .map_err(|e| format!("decode driver name: {e}"))?;
+    if driver_store != payload.store_id {
+        return Err(format!(
+            "{driver_name} is not a driver of store {}.",
+            payload.store_id
+        ));
+    }
+
+    // ---- A lira remittance's rate is the DATABASE's, not the payload's ----
+    //
+    // `validate_driver_remittance_payload` already converted the lira at the
+    // declared rate. Proving the declared rate IS the stored one is what makes
+    // the persisted `amount_cents` an equivalent at a rate on record rather
+    // than at a number the client chose.
+    if let (Some(rate_id), Some(declared)) = (
+        payload.exchange_rate_id.as_deref(),
+        payload.exchange_rate_lbp_per_usd,
+    ) {
+        let row = sqlx::query(
+            "SELECT rate_lbp_per_usd FROM exchange_rates WHERE id = ? AND store_id = ?",
+        )
+        .bind(rate_id)
+        .bind(&payload.store_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read exchange rate {rate_id}: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "Exchange rate {rate_id} is not a rate of store {}.",
+                payload.store_id
+            )
+        })?;
+        let stored: i64 = row
+            .try_get("rate_lbp_per_usd")
+            .map_err(|e| format!("decode rate_lbp_per_usd: {e}"))?;
+        if stored != declared {
+            return Err(format!(
+                "Exchange rate mismatch: rate {rate_id} is {stored} LBP/USD, but this remittance \
+                 declares {declared} LBP/USD. Reload the screen so it uses the rate on record."
+            ));
+        }
+    }
+
+    // ---- The shift is an OPEN shift of this store (WP-7) ----
+    //
+    // A remittance increases the expected drawer cash of the shift it names, so
+    // it must name a shift that is open and belongs to this store — otherwise
+    // the cash would be expected in a till nobody is counting, or in another
+    // branch's.
+    //
+    // Checked INSIDE the transaction that writes the row, and AFTER the
+    // idempotency resolution above: a retry of a remittance that already
+    // posted must still reconcile to its entry once that shift has been closed
+    // and counted. That is the WP-04 ordering, for the same reason.
+    //
+    // An `adjustment` is deliberately NOT shift-scoped: it moves no cash, and a
+    // manager may sign one off outside trading hours.
+    if payload.entry_type == "remittance" {
+        let shift_id = payload.shift_id.as_deref().unwrap_or("").trim();
+        assert_shift_is_open(&mut tx, shift_id, &payload.store_id).await?;
+    }
+
+    // ---- A remittance cannot exceed what the driver owes ----
+    //
+    // Greaz models no driver advance and no payable to a driver: there is no
+    // document that would ever draw such a balance back down. A remittance that
+    // overshot would leave the shop owing its driver money, as an asset in
+    // reverse, and ledger rows are immutable — it could never be unwound, only
+    // offset by an entry that misstates something else.
+    //
+    // The balance is read HERE, inside the transaction that writes the row,
+    // never from a figure the screen last rendered. Two remittances racing
+    // against one balance cannot both commit: SQLite admits one write
+    // transaction at a time, so the second either sees the first's row in this
+    // sum or cannot commit at all. That is what makes "prevent over-settlement"
+    // and "prevent duplicate settlement" true under concurrency rather than
+    // true in the common case.
+    //
+    // A negative balance stays reachable through the one explicitly-signed
+    // instrument — an `adjustment` somebody signed off, with a reason — which
+    // is a decision a human made. An over-remittance is a typo.
+    if payload.entry_type == "remittance" {
+        let outstanding = current_driver_balance(&mut tx, &payload.driver_id).await?;
+        let paying = -amount_cents; // positive: a remittance is a decrease
+        if outstanding <= 0 {
+            return Err(format!(
+                "{driver_name} has nothing outstanding to hand over — his balance is {outstanding} \
+                 cents. Record an adjustment if the shop owes him."
+            ));
+        }
+        if paying > outstanding {
+            return Err(format!(
+                "A remittance of {paying} cents is more than the {outstanding} cents \
+                 {driver_name} is holding. Record the amount outstanding or less — the shop does \
+                 not carry driver advances."
+            ));
+        }
+    }
+
+    sqlx::query(
+        r#"INSERT INTO driver_ledger (
+             id, store_id, driver_id, entry_type, amount_cents, entry_date, notes,
+             received_currency, received_native_usd_cents, received_native_lbp,
+             exchange_rate_id, exchange_rate_lbp_per_usd,
+             reference, shift_id, created_by_user_id, device_id, posted_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(&payload.ledger_entry_id)
+    .bind(&payload.store_id)
+    .bind(&payload.driver_id)
+    .bind(&payload.entry_type)
+    // The DERIVED amount. The payload's own magnitude is never written.
+    .bind(amount_cents)
+    .bind(&payload.entry_date)
+    .bind(&payload.notes)
+    .bind(&payload.received_currency)
+    .bind(payload.received_native_usd_cents)
+    .bind(payload.received_native_lbp)
+    .bind(&payload.exchange_rate_id)
+    .bind(payload.exchange_rate_lbp_per_usd)
+    .bind(&payload.reference)
+    .bind(&payload.shift_id)
+    .bind(&payload.created_by_user_id)
+    .bind(&payload.device_id)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("insert driver_ledger: {e}"))?;
+
+    let new_balance = current_driver_balance(&mut tx, &payload.driver_id).await?;
+
+    tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+
+    Ok(PostDriverRemittanceResult {
+        ledger_entry_id: payload.ledger_entry_id,
+        posted_at: now,
+        new_balance_cents: new_balance,
+        amount_cents,
     })
 }

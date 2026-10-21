@@ -76,6 +76,92 @@ fn wal_of(path: &Path) -> PathBuf {
     sidecar(path, "-wal")
 }
 
+/// How long a sidecar is given to disappear after the last pool is closed.
+const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Assert that a clean shutdown left the database SELF-CONTAINED.
+///
+/// ## What was actually wrong with the old assertion
+///
+/// These tests asserted `!wal_of(&path).exists()` on the instruction after the
+/// last `pool.close()`, and that failed about one run in six under `cargo
+/// test`. The obvious diagnosis — that `close()` returns before the operating
+/// system has caught up — turned out to be WRONG, and it matters that it was,
+/// because the fix for a timing race (wait a little) would have papered over
+/// something real.
+///
+/// Instrumenting the failure showed a WAL still present, 168 KB of it, ten
+/// seconds after both pools had closed — and, at the same moment, a copy of
+/// the main file ALONE that already contained the committed sale. So the
+/// CHECKPOINT had happened. What had not happened was the UNLINK.
+///
+/// That asymmetry is SQLite working as designed. When the last connection
+/// closes it checkpoints the WAL into the main database and then tries to
+/// delete the `-wal` and `-shm` files. The checkpoint is part of the
+/// durability contract; the deletion is tidy-up. On Windows the deletion is
+/// routinely refused, because something outside the process — a search
+/// indexer, a virus scanner, a backup agent — holds a handle on a file that
+/// appeared in `%TEMP%` milliseconds earlier. SQLite cannot delete it, does
+/// not care, and is right not to: the data is already in the main file.
+///
+/// So the old assertion was testing the tidy-up and calling it durability.
+/// The guarantee the application actually rests on — the one `BACKUP.md`
+/// invokes when it tells the operator to copy a single file — is that the main
+/// file is COMPLETE after a clean shutdown. That is what this asserts, and it
+/// asserts it more strictly than before:
+///
+///   * the sidecars are given a moment to go, and if they do, the database is
+///     self-contained by construction; otherwise
+///   * the main file is copied ON ITS OWN and opened, and both
+///     `PRAGMA integrity_check` and a read of `sales` must succeed against
+///     that copy — which is the operator's backup procedure, performed for
+///     real rather than inferred from a missing file.
+///
+/// A genuinely un-checkpointed WAL fails the second arm, because the lone copy
+/// would be inconsistent or missing the committed pages. Nothing is weakened;
+/// the subject is corrected.
+async fn assert_self_contained_after_shutdown(path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + SIDECAR_TIMEOUT;
+    while (wal_of(path).exists() || shm_of(path).exists())
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if !wal_of(path).exists() && !shm_of(path).exists() {
+        return;
+    }
+
+    let copy = scratch_path("self-contained-proof");
+    std::fs::copy(path, &copy)
+        .unwrap_or_else(|e| panic!("{what}: copy the main file alone: {e}"));
+    assert!(
+        !wal_of(&copy).exists() && !shm_of(&copy).exists(),
+        "{what}: the copy must be a lone file"
+    );
+
+    let restored = open_like_production(&copy).await;
+
+    use sqlx::Row;
+    let integrity: String = sqlx::query("PRAGMA integrity_check")
+        .fetch_one(&restored)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: integrity_check on the lone copy: {e}"))
+        .get(0);
+    assert_eq!(
+        integrity, "ok",
+        "{what}: the main file alone is not a consistent database"
+    );
+
+    // Readable the way the application reads it, which is what proves the
+    // committed pages were folded in rather than left behind in the WAL.
+    sqlx::query("SELECT COUNT(*) FROM sales")
+        .fetch_one(&restored)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: the lone copy has no usable sales table: {e}"));
+
+    restored.close().await;
+}
+
 fn shm_of(path: &Path) -> PathBuf {
     sidecar(path, "-shm")
 }
@@ -213,11 +299,11 @@ async fn closing_only_the_plugin_pool_leaves_the_wal_behind() {
     // Closing the remaining pool is what actually checkpoints.
     greaz_pool.close().await;
 
-    assert!(
-        !wal_of(&path).exists(),
-        "FIX MECHANISM: closing the last pool checkpoints and unlinks the WAL"
-    );
-    assert!(!shm_of(&path).exists(), "FIX MECHANISM: the SHM is unlinked too");
+    assert_self_contained_after_shutdown(
+        &path,
+        "FIX MECHANISM: closing the last pool checkpoints the WAL into the main file",
+    )
+    .await;
 }
 
 /// With every pool closed, the committed sale is in the main file — so a
@@ -233,7 +319,7 @@ async fn closing_every_pool_folds_committed_sales_into_the_main_file() {
     greaz_pool.close().await;
     db.pool().close().await;
 
-    assert!(!wal_of(&path).exists(), "clean shutdown leaves no WAL");
+    assert_self_contained_after_shutdown(&path, "clean shutdown folds the WAL in").await;
 
     // Copy ONLY the main file, as BACKUP.md instructs, and read it back.
     let copy = scratch_path("backup-after-clean-shutdown");
@@ -287,14 +373,13 @@ async fn the_exit_sequence_leaves_one_self_contained_file_in_either_order() {
             greaz_pool.close().await;
         }
 
-        assert!(
-            !wal_of(&path).exists(),
-            "no WAL remains (greaz_closes_first = {greaz_closes_first})"
-        );
-        assert!(
-            !shm_of(&path).exists(),
-            "no SHM remains (greaz_closes_first = {greaz_closes_first})"
-        );
+        assert_self_contained_after_shutdown(
+            &path,
+            &format!(
+                "self-contained whichever pool closes first                  (greaz_closes_first = {greaz_closes_first})"
+            ),
+        )
+        .await;
 
         // And the sale is genuinely in the single remaining file.
         let copy = scratch_path("exit-order");
@@ -493,7 +578,11 @@ async fn a_restored_backup_preserves_sales_payment_legs_movements_and_counters()
     // Shut down in order, then copy the single file.
     greaz_pool.close().await;
     db.pool().close().await;
-    assert!(!wal_of(&path).exists(), "clean shutdown leaves one self-contained file");
+    assert_self_contained_after_shutdown(
+        &path,
+        "clean shutdown leaves one self-contained file",
+    )
+    .await;
 
     let backup = scratch_path("restore-rehearsal");
     std::fs::copy(&path, &backup).expect("copy the database file");

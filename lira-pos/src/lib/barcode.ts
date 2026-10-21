@@ -78,3 +78,68 @@ export function isValidEan13(raw: string): boolean {
 
   return calculatedCheckDigit === checkDigit;
 }
+
+
+// ---------------------------------------------------------------------------
+// Which barcode a FORM may refuse (GZ-WP2-A)
+// ---------------------------------------------------------------------------
+
+/**
+ * Does the EAN-13 checksum apply to this input, and does it fail?
+ *
+ * Scoped to 13 pure digits on purpose: a shop's own internal codes, supplier
+ * references and shelf labels are not EAN-13 and must not be measured against
+ * its checksum.
+ */
+export function failsEan13Checksum(raw: string): boolean {
+  const code = raw.trim();
+  return code.length === 13 && /^\d+$/.test(code) && !isValidEan13(code);
+}
+
+/**
+ * The reason a product form must refuse to save, or `null` to let it through.
+ *
+ * ## Why this is a function and not two lines in the page
+ *
+ * The Products form validated its barcode box on EVERY save, including an
+ * UPDATE — which does not submit the barcode at all. `productsRepo.save` has
+ * no `barcode` field in update mode, and the form shows `BarcodeManager`
+ * rather than an input there, so the value being judged was simply the
+ * existing primary barcode, pre-filled for display.
+ *
+ * Plenty of real shelf stock carries a printed code that fails the modern
+ * EAN-13 checksum — a mis-keyed label, a re-used internal code, a supplier's
+ * own numbering. Those products exist and are perfectly sellable. The form
+ * made them UNEDITABLE: a cashier could not fix a typo in the name or put the
+ * price up, because saving was refused over a field the save would not have
+ * written, and the only way out was to change a barcode that was working fine.
+ *
+ * So the rule is scoped to what is actually being submitted. A barcode is
+ * refused when the form will WRITE it — on create — and a new or changed
+ * barcode is validated where it is genuinely entered, in
+ * `BarcodeManager.handleAdd`. Nothing here rewrites or removes a historical
+ * code; the form has no authority to, and silently "fixing" a barcode would
+ * break every scan of the goods already on the shelf.
+ */
+export function productFormBarcodeError(
+  mode: "new" | "edit",
+  barcode: string,
+  isService: boolean,
+): "required" | "badEan13" | null {
+  const code = barcode.trim();
+
+  // On an UPDATE the barcode is not part of the payload, so the form has
+  // nothing to validate and no standing to refuse. Barcodes are managed
+  // separately, with their own validation at the point of entry.
+  if (mode === "edit") return null;
+
+  // A stocked product must be scannable to be sold at the till. A service has
+  // nothing to scan.
+  if (!isService && !code) return "required";
+
+  // An empty box is a product with no barcode, which is allowed for a service
+  // and already refused above for goods.
+  if (!code) return null;
+
+  return failsEan13Checksum(code) ? "badEan13" : null;
+}

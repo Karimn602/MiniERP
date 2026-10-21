@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { query } from "../client";
 import { newId } from "../../lib/ids";
+import { normalizeCategoryId } from "../../lib/menuCategories";
+import { assertVatRateChosen } from "../../lib/catalogDefaults";
 import { barcodesRepo } from "./barcodes";
 import type {
   BarcodeScanResult,
@@ -76,6 +78,8 @@ interface ProductRow {
   reorder_point: number | null;
   is_active: number;
   is_service: number;
+  category: string | null;
+  icon: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -140,6 +144,13 @@ export type ProductSaveArgs = {
   priceInclVatCents: number;
   reorderPoint: number | null;
   isService: boolean;
+  /**
+   * Menu section id, already normalised. Optional, and omitting it means
+   * uncategorised — which keeps every existing caller valid.
+   */
+  category?: string | null;
+  /** Optional decorative glyph for the tile. */
+  icon?: string | null;
   /** Create defaults to active; an update states it. */
   isActive?: boolean;
   baseUomCode: string;
@@ -171,6 +182,11 @@ function rowToProduct(r: ProductRow): Product {
     reorderPoint: r.reorder_point,
     isActive: r.is_active === 1,
     isService: r.is_service === 1,
+    // `?? null` rather than a bare read: a product row selected by an older
+    // query, or decoded from a database still at migration 012, has no such
+    // key at all, and `undefined` would travel into the UI as a category id.
+    category: r.category ?? null,
+    icon: r.icon ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -393,6 +409,10 @@ export const productsRepo = {
    * has to reason about a partially-applied edit.
    */
   async save(args: ProductSaveArgs): Promise<ProductWithUoms> {
+    // Every catalog write passes here — the Products form AND the spreadsheet
+    // importer — so this is where "a VAT rate is chosen, never defaulted"
+    // becomes a rule rather than a habit of one screen (GZ-WP0-01).
+    assertVatRateChosen(args.vatRateId);
     const productId =
       args.mode === "create" ? newId() : (args.productId ?? "");
     if (args.mode === "update" && !productId) {
@@ -414,6 +434,11 @@ export const productsRepo = {
           priceInclVatCents: args.priceInclVatCents,
           reorderPoint: args.reorderPoint,
           isService: args.isService,
+          // Normalised at the one boundary that writes a category, so a hand
+          // -typed or imported value cannot split the grid into "Drinks" and
+          // "drinks". The backend stores blank as NULL.
+          category: normalizeCategoryId(args.category),
+          icon: args.icon?.trim() || null,
           isActive: args.isActive ?? true,
           baseUomCode: args.baseUomCode,
           saleUomCode: args.saleUomCode,

@@ -90,6 +90,36 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/012_database_inventory_hardening.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 13,
+            description: "menu_presentation",
+            sql: include_str!("../../src/db/migrations/013_menu_presentation.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 14,
+            description: "sales_channel",
+            sql: include_str!("../../src/db/migrations/014_sales_channel.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 15,
+            description: "driver_collection",
+            sql: include_str!("../../src/db/migrations/015_driver_collection.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 16,
+            description: "driver_cash_discipline",
+            sql: include_str!("../../src/db/migrations/016_driver_cash_discipline.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 17,
+            description: "driver_source_integrity",
+            sql: include_str!("../../src/db/migrations/017_driver_source_integrity.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -142,6 +172,7 @@ pub fn run() {
             posting::post_purchase,
             posting::post_adjustment,
             posting::post_supplier_payment,
+            posting::post_driver_remittance,
             posting::post_sale,
             posting::post_credit_memo,
             posting::open_shift,

@@ -19,11 +19,14 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 import { setTestDb } from "../helpers/mockClient";
 import {
   createSqlTestDb,
+  insertDriverLedgerEntry,
   insertSale,
   resetIds,
+  seedDriver,
   seedExchangeRate,
   seedProduct,
   seedShift,
+  RATE_ID,
   RATE_LBP_PER_USD,
   STORE_ID,
   USER_ID,
@@ -403,8 +406,9 @@ describe("getDrawerExpectation", () => {
       ],
     });
 
-    // Since WP-06 the figure also carries the cash-refund terms, which are
-    // zero here because this shift has no credit memos.
+    // Since WP-06 the figure also carries the cash-refund terms, and since
+    // WP-7 the driver hand-over terms. All four are zero here: this shift has
+    // no credit memos and no driver remittances.
     expect(await shiftsRepo.getDrawerExpectation(SHIFT_A, STORE_ID)).toEqual({
       cashUsdInCents: 0,
       cashLbpIn: 0,
@@ -412,7 +416,81 @@ describe("getDrawerExpectation", () => {
       changeLbpOut: 0,
       refundUsdOutCents: 0,
       refundLbpOut: 0,
+      driverRemitUsdInCents: 0,
+      driverRemitLbpIn: 0,
     });
+  });
+
+  it("counts driver hand-overs into the expected drawer cash (WP-7)", async () => {
+    // The defect this closes was found on the real desktop: `close_shift`
+    // counted a driver's hand-over into expected cash and this read model did
+    // not, so the Shift Summary showed $10.00 while the command computed
+    // $19.99. A cashier counting the till would have reported a $9.99 overage
+    // against a figure that was simply incomplete.
+    //
+    // The NATIVE amounts are what the drawer holds, so dollars and lira are
+    // counted in their own units and a lira hand-over adds no dollars.
+    seedShift(db, { id: SHIFT_A, openingUsdCents: 0 });
+    seedDriver(db, "drv-walk", "Ali");
+    insertDriverLedgerEntry(db, {
+      driverId: "drv-walk",
+      entryType: "remittance",
+      amountCents: -1_500,
+      entryDate: "2026-10-21",
+      postedAt: "2026-10-21T18:00:00.000Z",
+      receivedCurrency: "USD",
+      receivedNativeUsdCents: 1_500,
+      shiftId: SHIFT_A,
+    });
+    insertDriverLedgerEntry(db, {
+      driverId: "drv-walk",
+      entryType: "remittance",
+      amountCents: -1_000,
+      entryDate: "2026-10-21",
+      postedAt: "2026-10-21T18:30:00.000Z",
+      receivedCurrency: "LBP",
+      receivedNativeLbp: 895_000,
+      exchangeRateId: RATE_ID,
+      exchangeRateLbpPerUsd: RATE_LBP_PER_USD,
+      shiftId: SHIFT_A,
+    });
+
+    const drawer = await shiftsRepo.getDrawerExpectation(SHIFT_A, STORE_ID);
+    expect(drawer.driverRemitUsdInCents).toBe(1_500);
+    expect(drawer.driverRemitLbpIn).toBe(895_000);
+    // And the sale-tender terms are untouched by them.
+    expect(drawer.cashUsdInCents).toBe(0);
+    expect(drawer.refundUsdOutCents).toBe(0);
+  });
+
+  it("does not count a driver hand-over from ANOTHER shift", async () => {
+    // Staged in the order a real shop reaches it, because a store may hold only
+    // one OPEN shift (migration 009) and a remittance may only be WRITTEN into
+    // an open one (migration 017): the hand-over landed in shift B while B was
+    // trading, B was closed and counted, and A opened after it.
+    seedShift(db, { id: SHIFT_B, openingUsdCents: 0 });
+    seedDriver(db, "drv-walk", "Ali");
+    insertDriverLedgerEntry(db, {
+      driverId: "drv-walk",
+      entryType: "remittance",
+      amountCents: -1_500,
+      entryDate: "2026-10-21",
+      postedAt: "2026-10-21T18:00:00.000Z",
+      receivedCurrency: "USD",
+      receivedNativeUsdCents: 1_500,
+      shiftId: SHIFT_B,
+    });
+    db.exec(
+      `UPDATE shifts
+          SET status = 'closed',
+              closed_at = '2026-10-21T19:00:00.000Z',
+              closed_by_user_id = opened_by_user_id
+        WHERE id = '${SHIFT_B}'`,
+    );
+    seedShift(db, { id: SHIFT_A, openingUsdCents: 0 });
+
+    const drawer = await shiftsRepo.getDrawerExpectation(SHIFT_A, STORE_ID);
+    expect(drawer.driverRemitUsdInCents).toBe(0);
   });
 
   it("returns zeros for a shift that has taken nothing", async () => {
@@ -424,6 +502,8 @@ describe("getDrawerExpectation", () => {
       changeLbpOut: 0,
       refundUsdOutCents: 0,
       refundLbpOut: 0,
+      driverRemitUsdInCents: 0,
+      driverRemitLbpIn: 0,
     });
   });
 });

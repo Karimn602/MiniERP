@@ -19,6 +19,12 @@
 import type { ProductWithUoms } from "../db/types";
 import { computeSaleLineMath } from "./saleMath";
 import type { UsdCents } from "./money";
+import {
+  MENU_CATEGORIES,
+  UNCATEGORIZED_ID,
+  categoryOrder,
+  resolveCategory,
+} from "./menuCategories";
 
 /**
  * May this product be offered as a menu tile?
@@ -105,9 +111,19 @@ export function filterMenu(
  * left alone.
  */
 export function sortMenu(products: ProductWithUoms[]): ProductWithUoms[] {
-  return products
-    .slice()
-    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  // Section first, then name within it. On the "All" chip — the view the
+  // cashier spends the day on — that groups burgers together, then wraps, then
+  // sides, which is how a menu board reads and how an order is called. A flat
+  // alphabetical list interleaved them, so "Cheese Fries" sat between two
+  // burgers and the eye had to search rather than scan.
+  //
+  // Ties fall back to the name comparison that was here before, so a shop that
+  // has categorised nothing gets exactly the previous ordering.
+  return products.slice().sort((a, b) => {
+    const section = categoryOrder(a.category) - categoryOrder(b.category);
+    if (section !== 0) return section;
+    return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -128,23 +144,29 @@ export const MENU_GROUP_OUT_OF_STOCK = "out-of-stock";
 /**
  * The chips to show above the grid.
  *
- * THIS IS NOT "Burgers / Wraps / Drinks", and it cannot be yet. `products` has
- * no category, group or department column — the only `category` in the whole
- * schema is `units_of_measure.category` (count/weight/volume/length), which
- * classifies units, not food. Real menu sections need one nullable `category`
- * column plus a field on the Products page, which is a migration, and migrations
- * are out of scope for a visual pass. Inventing them in localStorage instead
- * would scatter master data per-device, so that was rejected too.
+ * Now the real menu sections, which migration 013 made possible by adding
+ * `products.category`. The seam this function was written around is the one it
+ * now uses: the shape of the return value has not changed, so the chip row,
+ * the filtering and the grid needed nothing.
  *
- * What this returns is therefore an honest grouping over data that DOES exist,
- * and it earns its place on a burger till: "All", plus "Out of stock" when
- * something has actually run out — the question a cashier asks the screen most
- * often after "how much". When nothing is out, there is one group and the caller
- * hides the row rather than showing a lone chip that filters nothing.
+ * Three rules worth stating, because each is a decision:
  *
- * The shape is the seam: the day a `category` column lands, this function grows
- * one chip per distinct value and the chip row, the filtering and the grid all
- * work unchanged.
+ *   * A section appears ONLY if something in the menu is in it. A burger till
+ *     that sells no wraps does not show a Wraps chip that filters to an empty
+ *     grid, and a shop that has categorised nothing sees no section chips at
+ *     all rather than a lone "Uncategorised".
+ *
+ *   * Sections come in MENU order, from `MENU_CATEGORIES` — the order a
+ *     customer reads a board, mains before extras before drinks — not
+ *     alphabetical and not by count. Uncategorised is last, always, because it
+ *     is a holding pen rather than a section.
+ *
+ *   * "Out of stock" stays, and stays AFTER the sections. It answers a
+ *     different question from "where is this on the menu" ("what can I not
+ *     sell right now"), and WP-3 was not a licence to remove it.
+ *
+ * `All` is always first and always counts the whole sellable menu, so there is
+ * always a way back to everything.
  */
 export function deriveMenuGroups(
   products: ProductWithUoms[],
@@ -153,6 +175,34 @@ export function deriveMenuGroups(
   const groups: MenuGroup[] = [
     { id: MENU_GROUP_ALL, labelKey: "pos.groupAll", count: products.length },
   ];
+
+  // Counted by RESOLVED section, so a product whose category was hand-edited
+  // to something unknown is counted under Uncategorised — the same bucket the
+  // grid will show it in. Counting the raw column instead would produce a chip
+  // whose number did not match the tiles behind it.
+  const counts = new Map<string, number>();
+  for (const p of products) {
+    const id = resolveCategory(p.category).id;
+    counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+
+  // A menu whose only "section" is Uncategorised has no sections to choose
+  // between, so it gets none — a lone "Other" chip beside "All" would filter
+  // to the identical grid. This is also what keeps a catalogue that predates
+  // migration 013 looking exactly as it did.
+  const sectioned = MENU_CATEGORIES.filter((c) => (counts.get(c.id) ?? 0) > 0);
+  const onlyUncategorized =
+    sectioned.length === 1 && sectioned[0].id === UNCATEGORIZED_ID;
+
+  if (!onlyUncategorized) {
+    for (const category of sectioned) {
+      groups.push({
+        id: category.id,
+        labelKey: category.labelKey,
+        count: counts.get(category.id) ?? 0,
+      });
+    }
+  }
 
   const outCount = products.filter((p) => isMenuOutOfStock(p, allowNegativeInventory)).length;
   if (outCount > 0) {
@@ -179,5 +229,13 @@ export function filterMenuByGroup(
   if (groupId === MENU_GROUP_OUT_OF_STOCK) {
     return products.filter((p) => isMenuOutOfStock(p, allowNegativeInventory));
   }
+  if (groupId === MENU_GROUP_ALL) return products;
+
+  // Matched on the RESOLVED section, so the tiles behind a chip are exactly
+  // the ones it counted. An unknown group id still falls through to the whole
+  // menu below rather than to an empty grid.
+  const known = MENU_CATEGORIES.some((c) => c.id === groupId);
+  if (known) return products.filter((p) => resolveCategory(p.category).id === groupId);
+
   return products;
 }

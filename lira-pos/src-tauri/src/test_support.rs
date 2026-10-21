@@ -558,6 +558,51 @@ pub async fn seed_supplier_in_store(db: &TempDb, id: &str, name: &str, store_id:
         .expect("seed supplier");
 }
 
+/// A driver, the shop's own, active (WP-6).
+pub async fn seed_driver(db: &TempDb, id: &str, name: &str) {
+    seed_driver_in_store(db, id, name, STORE_ID, true).await;
+}
+
+/// An inactive driver — one the shop has stopped giving orders to. A new
+/// delivery order may not be assigned to him; he may still remit what he is
+/// already holding.
+pub async fn seed_inactive_driver(db: &TempDb, id: &str, name: &str) {
+    seed_driver_in_store(db, id, name, STORE_ID, false).await;
+}
+
+/// A driver owned by a NAMED store. `post_sale` and `post_driver_remittance`
+/// both prove the store they are writing for owns the driver, so a test needs
+/// a way to create the mismatch — the same reason
+/// `seed_supplier_in_store` exists.
+pub async fn seed_driver_in_store(
+    db: &TempDb,
+    id: &str,
+    name: &str,
+    store_id: &str,
+    is_active: bool,
+) {
+    sqlx::query("INSERT INTO drivers (id, store_id, name, is_active) VALUES (?, ?, ?, ?)")
+        .bind(id)
+        .bind(store_id)
+        .bind(name)
+        .bind(if is_active { 1 } else { 0 })
+        .execute(db.pool())
+        .await
+        .expect("seed driver");
+}
+
+/// A driver's balance, straight from the view the UI reads. Positive means he
+/// owes the shop.
+pub async fn driver_balance(db: &TempDb, driver_id: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT outstanding_cents FROM driver_balances WHERE driver_id = ?",
+    )
+    .bind(driver_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("read driver balance")
+}
+
 /// A second store, for the cross-store scoping tests. Migration 001 seeds one
 /// store (`STORE_ID`); a second one is not seed data because Greaz is
 /// single-store in practice, but the scoping rules are written in terms of the

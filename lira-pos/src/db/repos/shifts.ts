@@ -109,6 +109,16 @@ export interface ShiftDrawerExpectation {
   /** Cash handed back on this shift's posted credit memos (WP-06). */
   refundUsdOutCents: number;
   refundLbpOut: number;
+  /**
+   * Cash a DRIVER handed in during this shift (WP-7).
+   *
+   * The NATIVE amount, not the USD equivalent: this figure is compared against
+   * physical dollars in a drawer, and converting a lira hand-over into it would
+   * make the till expect notes nobody put there. The lira term below is the
+   * lira half of the same rows.
+   */
+  driverRemitUsdInCents: number;
+  driverRemitLbpIn: number;
 }
 
 /**
@@ -304,12 +314,16 @@ export const shiftsRepo = {
       refund_usd_out: number;
       refund_lbp_out: number;
     }
+    interface RemitRow {
+      remit_usd_in: number;
+      remit_lbp_in: number;
+    }
 
     // Two statements, not a join: one sale can carry several tenders and one
     // return several refund legs, so joining them would multiply each against
     // the other. `posting.rs::drawer_cash_for_shift` is shaped the same way,
     // and for the same reason.
-    const [tenderRows, refundRows] = await Promise.all([
+    const [tenderRows, refundRows, remitRows] = await Promise.all([
       query<TenderRow>(
         `SELECT
            COALESCE(SUM(CASE WHEN sp.method = 'cash_usd'
@@ -340,6 +354,19 @@ export const shiftsRepo = {
            AND m.status = 'posted'`,
         [storeId, shiftId],
       ),
+      // A third statement, for the same reason the refunds are a second one:
+      // one shift can hold many tenders, many refund legs and many hand-overs,
+      // and joining them would multiply each against the others.
+      query<RemitRow>(
+        `SELECT
+           COALESCE(SUM(received_native_usd_cents), 0) AS remit_usd_in,
+           COALESCE(SUM(received_native_lbp), 0)       AS remit_lbp_in
+         FROM driver_ledger
+         WHERE store_id = ?
+           AND shift_id = ?
+           AND entry_type = 'remittance'`,
+        [storeId, shiftId],
+      ),
     ]);
 
     const t = tenderRows[0] ?? {
@@ -349,6 +376,7 @@ export const shiftsRepo = {
       change_lbp_out: 0,
     };
     const r = refundRows[0] ?? { refund_usd_out: 0, refund_lbp_out: 0 };
+    const d = remitRows[0] ?? { remit_usd_in: 0, remit_lbp_in: 0 };
 
     return {
       cashUsdInCents: t.cash_usd_in,
@@ -357,6 +385,8 @@ export const shiftsRepo = {
       changeLbpOut: t.change_lbp_out,
       refundUsdOutCents: r.refund_usd_out,
       refundLbpOut: r.refund_lbp_out,
+      driverRemitUsdInCents: d.remit_usd_in,
+      driverRemitLbpIn: d.remit_lbp_in,
     };
   },
 

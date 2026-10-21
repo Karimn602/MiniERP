@@ -43,6 +43,7 @@
  * dollars happens at the presentation boundary and nowhere earlier.
  */
 import { query } from "../client";
+import type { DriverSettlementRow } from "../../lib/driverCollection";
 
 export interface DailySalesRow {
   localDate: string;
@@ -363,6 +364,269 @@ export const reportsRepo = {
   },
 
   // purchases.purchase_date is local YYYY-MM-DD — filter directly.
+  /**
+   * Sales by CHANNEL over a period — counts, gross, and refunds (WP-4).
+   *
+   * ## Why gross and refunds come from one query each, side by side
+   *
+   * A return is its own document (`sales_credit_memos`), and the sale it
+   * reverses stands exactly as posted — so a channel's refunds cannot be read
+   * off `sales` at all. They are summed from the memos that point at that
+   * channel's sales, which is also what attributes a refund to the channel of
+   * the ORDER it reverses rather than to wherever the customer happened to
+   * bring it back. An online order refunded at the counter is still an online
+   * order going wrong.
+   *
+   * Both halves are aggregated BY channel in SQL and then combined in
+   * `buildChannelMix`, whose totals are summed from these same rows. That is
+   * deliberate: reading the overall total from a separate query over `sales`
+   * is exactly how a channel report comes to disagree with the sales report
+   * printed beside it. The parts here cannot fail to add up to the whole,
+   * because the whole is the sum of the parts.
+   *
+   * `status = 'posted'` on both sides, and no `sale_type` filter — matching
+   * every other financial read model in the application (see the note on
+   * returns in CLAUDE.md).
+   */
+  async salesByChannel(args: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+  }): Promise<
+    { channel: string; orderCount: number; grossInclVatCents: number; refundedInclVatCents: number }[]
+  > {
+    interface GrossRow {
+      channel: string;
+      order_count: number;
+      gross_incl_vat_cents: number;
+    }
+    interface RefundRow {
+      channel: string;
+      refunded_incl_vat_cents: number;
+    }
+
+    const [gross, refunds] = await Promise.all([
+      query<GrossRow>(
+        `SELECT
+           channel,
+           COUNT(*) AS order_count,
+           COALESCE(SUM(total_incl_vat_cents), 0) AS gross_incl_vat_cents
+         FROM sales
+         WHERE store_id = ?
+           AND status = 'posted'
+           AND posted_at >= ?
+           AND posted_at <= ?
+         GROUP BY channel`,
+        [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+      ),
+      // Attributed to the channel of the ORIGINAL sale, and dated by the
+      // MEMO's own posting time — a refund belongs to the period it was given
+      // in, which is the period whose drawer and whose VAT return it affects.
+      query<RefundRow>(
+        `SELECT
+           s.channel AS channel,
+           COALESCE(SUM(m.total_incl_vat_cents), 0) AS refunded_incl_vat_cents
+         FROM sales_credit_memos m
+         JOIN sales s ON s.id = m.original_sale_id
+         WHERE m.store_id = ?
+           AND m.status = 'posted'
+           AND m.posted_at >= ?
+           AND m.posted_at <= ?
+         GROUP BY s.channel`,
+        [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+      ),
+    ]);
+
+    const refundByChannel = new Map(
+      refunds.map((r) => [r.channel, r.refunded_incl_vat_cents]),
+    );
+
+    // Every channel that appears on either side gets a row, so a period with
+    // refunds but no new sales in a channel is still reported rather than
+    // dropped.
+    const channels = new Set<string>([
+      ...gross.map((r) => r.channel),
+      ...refunds.map((r) => r.channel),
+    ]);
+
+    return [...channels].map((channel) => {
+      const g = gross.find((r) => r.channel === channel);
+      return {
+        channel,
+        orderCount: g?.order_count ?? 0,
+        grossInclVatCents: g?.gross_incl_vat_cents ?? 0,
+        refundedInclVatCents: refundByChannel.get(channel) ?? 0,
+      };
+    });
+  },
+
+  /**
+   * The driver report (WP-6): what each driver collected, remitted and still
+   * owes, plus the delivery charges he kept over the period.
+   *
+   * ## What is over the PERIOD and what is not, and why they differ
+   *
+   * `outstandingCents` and the three movement figures come from
+   * `driver_balances`, which is LIFETIME — and deliberately so. A balance is
+   * not a period quantity: a driver who collected in March and settles in
+   * April owes nothing, and a report that showed only April's rows would say
+   * he owed the shop money he had already handed over. "What is in his pocket
+   * right now" is the question the owner is actually asking.
+   *
+   * `deliveryFeesCents` and `orderCount` ARE over the period, because those
+   * are flow: how much delivery work he did this week, and what the customers
+   * paid him for it. The fee is not in the balance at all — he keeps it — so
+   * mixing the two timeframes in one row cannot make either figure wrong, and
+   * the column headings say which is which.
+   *
+   * The fees are read from `sales.delivery_fee_cents`, which is NOT part of any
+   * sale total, so nothing here can leak a delivery charge into a revenue
+   * figure. It is reported so the owner can see what his drivers are charging
+   * and hand his accountant a real number — the tax treatment is still an open
+   * question (migration 015).
+   *
+   * Every driver with a balance is included even if he carried nothing this
+   * period, and every driver who carried something is included even at a zero
+   * balance. A balance missing from its own report is how a shop's money goes
+   * astray.
+   */
+  async driverSettlements(args: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+    includeInactive?: boolean;
+  }): Promise<DriverSettlementRow[]> {
+    interface BalanceRow {
+      driver_id: string;
+      driver_name: string;
+      is_active: number;
+      outstanding_cents: number;
+      collected_cents: number;
+      remitted_cents: number;
+      return_credit_cents: number;
+      adjustment_cents: number;
+      last_activity_at: string | null;
+    }
+    interface PeriodRow {
+      driver_id: string;
+      order_count: number;
+      delivery_fees_cents: number;
+    }
+
+    const [balances, period] = await Promise.all([
+      query<BalanceRow>(
+        `SELECT driver_id, driver_name, is_active, outstanding_cents,
+                collected_cents, remitted_cents, return_credit_cents,
+                adjustment_cents, last_activity_at
+           FROM driver_balances
+          WHERE store_id = ?
+          ORDER BY outstanding_cents DESC, driver_name`,
+        [args.storeId],
+      ),
+      // Delivery work done IN the period. Grouped from `sales`, so the order
+      // count here is the same count the channel report gives for delivery.
+      query<PeriodRow>(
+        `SELECT driver_id,
+                COUNT(*) AS order_count,
+                COALESCE(SUM(delivery_fee_cents), 0) AS delivery_fees_cents
+           FROM sales
+          WHERE store_id = ?
+            AND status = 'posted'
+            AND driver_id IS NOT NULL
+            AND posted_at >= ?
+            AND posted_at <= ?
+          GROUP BY driver_id`,
+        [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+      ),
+    ]);
+
+    const periodByDriver = new Map(period.map((r) => [r.driver_id, r]));
+
+    return balances
+      .filter(
+        (b) =>
+          args.includeInactive ||
+          b.is_active === 1 ||
+          b.outstanding_cents !== 0 ||
+          periodByDriver.has(b.driver_id),
+      )
+      .map((b) => {
+        const p = periodByDriver.get(b.driver_id);
+        return {
+          driverId: b.driver_id,
+          driverName: b.driver_name,
+          isActive: b.is_active === 1,
+          orderCount: p?.order_count ?? 0,
+          collectedCents: b.collected_cents,
+          remittedCents: b.remitted_cents,
+          returnCreditCents: b.return_credit_cents,
+          adjustmentCents: b.adjustment_cents,
+          outstandingCents: b.outstanding_cents,
+          deliveryFeesCents: p?.delivery_fees_cents ?? 0,
+          lastActivityAt: b.last_activity_at,
+        };
+      });
+  },
+
+  /**
+   * Driver remittances received over a period — the cash that actually came
+   * back, in the currency it came back in.
+   *
+   * These are NOT sales and must never be added to one. They are the
+   * settlement side of revenue that was already recognised when the delivery
+   * order posted, so a report that summed them alongside sales would count
+   * every delivery twice. Kept as its own series for exactly that reason —
+   * the same separation the returns series has from the sales series.
+   */
+  async driverRemittances(args: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+  }): Promise<{
+    driverId: string;
+    driverName: string;
+    remittanceCount: number;
+    usdCents: number;
+    lbp: number;
+    totalUsdEquivalentCents: number;
+  }[]> {
+    interface Row {
+      driver_id: string;
+      driver_name: string;
+      remittance_count: number;
+      usd_cents: number;
+      lbp: number;
+      total_usd_equivalent_cents: number;
+    }
+    const rows = await query<Row>(
+      `SELECT l.driver_id AS driver_id,
+              d.name      AS driver_name,
+              COUNT(*)    AS remittance_count,
+              COALESCE(SUM(l.received_native_usd_cents), 0) AS usd_cents,
+              COALESCE(SUM(l.received_native_lbp), 0)       AS lbp,
+              -- Stored negative (a remittance pays the balance down), so the
+              -- magnitude is negated once, here, rather than at each caller.
+              COALESCE(SUM(-l.amount_cents), 0) AS total_usd_equivalent_cents
+         FROM driver_ledger l
+         JOIN drivers d ON d.id = l.driver_id
+        WHERE l.store_id = ?
+          AND l.entry_type = 'remittance'
+          AND l.posted_at >= ?
+          AND l.posted_at <= ?
+        GROUP BY l.driver_id, d.name
+        ORDER BY total_usd_equivalent_cents DESC, d.name`,
+      [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+    );
+    return rows.map((r) => ({
+      driverId: r.driver_id,
+      driverName: r.driver_name,
+      remittanceCount: r.remittance_count,
+      usdCents: r.usd_cents,
+      lbp: r.lbp,
+      totalUsdEquivalentCents: r.total_usd_equivalent_cents,
+    }));
+  },
+
   async dailyPurchases(args: {
     storeId: string;
     dateFrom: string;

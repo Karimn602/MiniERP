@@ -14,6 +14,12 @@ import { PageHeader } from "../components/ui/PageHeader";
 import { StatCard } from "../components/ui/StatCard";
 import { EmptyState } from "../components/ui/EmptyState";
 import { formatUsd } from "../lib/money";
+import {
+  SALES_CHANNEL_OPTIONS,
+  buildChannelMix,
+  shareBps,
+} from "../lib/salesChannel";
+import { summariseDrivers, type DriverSettlementRow } from "../lib/driverCollection";
 import { todayLocalDate, formatPrettyDate } from "../lib/dates";
 import {
   formatMargin,
@@ -43,26 +49,39 @@ export default function LocalReports() {
   const [productSales, setProductSales] = useState<ProductSalesRow[]>([]);
   const [productReturns, setProductReturns] = useState<ProductReturnsRow[]>([]);
   const [dailyPurchases, setDailyPurchases] = useState<DailyPurchasesRow[]>([]);
+  const [channelRows, setChannelRows] = useState<
+    { channel: string; orderCount: number; grossInclVatCents: number; refundedInclVatCents: number }[]
+  >([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [driverRows, setDriverRows] = useState<DriverSettlementRow[]>([]);
+  const [remittanceRows, setRemittanceRows] = useState<
+    Awaited<ReturnType<typeof reportsRepo.driverRemittances>>
+  >([]);
 
   const loadReports = useCallback(async () => {
     if (!storeId) return;
     setLoading(true);
     setLoadError(null);
     try {
-      const [ds, dr, ps, pr, dp] = await Promise.all([
+      const [ds, dr, ps, pr, dp, ch, drv, rem] = await Promise.all([
         reportsRepo.dailySales({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.dailyReturns({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.productSales({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.productReturns({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.dailyPurchases({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
+        reportsRepo.salesByChannel({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
+        reportsRepo.driverSettlements({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
+        reportsRepo.driverRemittances({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
       ]);
       setDailySales(ds);
       setDailyReturns(dr);
       setProductSales(ps);
       setProductReturns(pr);
       setDailyPurchases(dp);
+      setChannelRows(ch);
+      setDriverRows(drv);
+      setRemittanceRows(rem);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -88,6 +107,27 @@ export default function LocalReports() {
     dailySales,
     dailyReturns,
   ]);
+
+  // The channel mix, over the SAME period as every other figure on the page.
+  // Its totals are summed from the per-channel rows, so the breakdown cannot
+  // disagree with itself — and because the rows come from `sales` filtered the
+  // same way `dailySales` filters it, the channel gross reconciles to the
+  // period's gross sales above.
+  const channelMix = useMemo(() => buildChannelMix(channelRows), [channelRows]);
+
+  // The driver figures. `summariseDrivers` re-derives each balance from its own
+  // movements and NAMES any row that disagrees, so the report cannot quietly
+  // print a balance that its own columns do not add up to.
+  const driverTotals = useMemo(() => summariseDrivers(driverRows), [driverRows]);
+
+  // Cash that came back from drivers over the period. Kept as its OWN figure
+  // and never added to sales: the revenue was recognised when the delivery
+  // order posted, so summing these alongside it would count every delivery
+  // twice. Same separation the returns series has from the sales series.
+  const remittedTotalCents = useMemo(
+    () => remittanceRows.reduce((sum, r) => sum + r.totalUsdEquivalentCents, 0),
+    [remittanceRows],
+  );
 
   const purchasesTotal = useMemo(
     () => dailyPurchases.reduce((s, r) => s + r.totalInclVatCents, 0),
@@ -196,6 +236,211 @@ export default function LocalReports() {
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard label={t("localReports.statPurchases")} value={formatUsd(purchasesTotal)} />
       </div>
+
+      {/* ORDERS BY CHANNEL (WP-4).
+          Four figures the owner asked for — counter and online order counts and
+          revenue — plus the two shares. Gross and net are BOTH shown: returns
+          are a visible subtraction here exactly as they are in the cards above,
+          so "revenue" is never a number that quietly changed meaning.
+
+          The note at the foot is not decoration. The single most likely
+          misreading of this panel is that an online order was settled by the
+          platform, and it was not: the channel records where the order came
+          from and nothing about how it was paid. */}
+      <Card>
+        <CardHeader title={t("channel.reportTitle")} />
+
+        {channelMix.totalOrders === 0 && channelMix.totalRefundedInclVatCents === 0 ? (
+          <p className="text-sm text-fg-muted">{t("channel.noOrders")}</p>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-line text-start text-xs uppercase text-fg-muted">
+                    <th className="py-2 pe-3 font-semibold">{t("channel.groupLabel")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("channel.orders")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("channel.grossRevenue")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("channel.refunds")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("channel.netRevenue")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("channel.shareOfOrders")}</th>
+                    <th className="py-2 text-end font-semibold">{t("channel.shareOfRevenue")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {channelMix.byChannel.map((c) => {
+                    const orderShare = shareBps(c.orderCount, channelMix.totalOrders);
+                    const revenueShare = shareBps(
+                      c.netInclVatCents,
+                      channelMix.totalNetInclVatCents,
+                    );
+                    const label =
+                      SALES_CHANNEL_OPTIONS.find((o) => o.id === c.channel)?.labelKey ??
+                      "channel.counter";
+                    return (
+                      <tr key={c.channel} className="border-b border-line/60">
+                        <td className="py-2 pe-3 font-semibold text-fg">{t(label)}</td>
+                        <td className="py-2 pe-3 text-end tabular-nums">{c.orderCount}</td>
+                        <td className="py-2 pe-3 text-end tabular-nums">
+                          {formatUsd(c.grossInclVatCents)}
+                        </td>
+                        <td className="py-2 pe-3 text-end tabular-nums">
+                          {c.refundedInclVatCents > 0
+                            ? `-${formatUsd(c.refundedInclVatCents)}`
+                            : formatUsd(0)}
+                        </td>
+                        <td className="py-2 pe-3 text-end font-semibold tabular-nums">
+                          {formatUsd(c.netInclVatCents)}
+                        </td>
+                        <td className="py-2 pe-3 text-end tabular-nums">
+                          {orderShare === null ? "—" : `${(orderShare / 100).toFixed(1)}%`}
+                        </td>
+                        <td className="py-2 text-end tabular-nums">
+                          {revenueShare === null ? "—" : `${(revenueShare / 100).toFixed(1)}%`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+                <tfoot>
+                  <tr className="font-semibold text-fg">
+                    <td className="py-2 pe-3">{t("channel.total")}</td>
+                    <td className="py-2 pe-3 text-end tabular-nums">{channelMix.totalOrders}</td>
+                    <td className="py-2 pe-3 text-end tabular-nums">
+                      {formatUsd(channelMix.totalGrossInclVatCents)}
+                    </td>
+                    <td className="py-2 pe-3 text-end tabular-nums">
+                      {channelMix.totalRefundedInclVatCents > 0
+                        ? `-${formatUsd(channelMix.totalRefundedInclVatCents)}`
+                        : formatUsd(0)}
+                    </td>
+                    <td className="py-2 pe-3 text-end tabular-nums">
+                      {formatUsd(channelMix.totalNetInclVatCents)}
+                    </td>
+                    <td className="py-2 pe-3 text-end">—</td>
+                    <td className="py-2 text-end">—</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+
+          </>
+        )}
+
+        {/* ALWAYS shown, including on an empty period. The single most likely
+            misreading of this panel is that an online order was settled by the
+            platform, and it was not — and an empty panel is exactly when
+            someone is working out what the feature means. */}
+        <p className="mt-3 text-[11px] leading-snug text-fg-muted">
+          {t("channel.notAPaymentMethod")}
+        </p>
+      </Card>
+
+      {/* DRIVERS (WP-6).
+          Two different timeframes on purpose, and the headings say which is
+          which. The delivery work and the charges are OVER THE PERIOD —
+          that is flow. The balances are LIFETIME, because a balance is not a
+          period quantity: a driver who collected in March and settled in April
+          owes nothing, and a report showing only April would claim he was
+          still holding the money. "What is in his pocket right now" is the
+          question being asked.
+
+          `deliveryFeesCents` is the driver's own income and is in NO figure
+          above — not in gross sales, not in the channel mix, not in his
+          balance. It is reported so the owner can see what his drivers charge
+          and hand his accountant a real number; the tax treatment is still an
+          open question (migration 015). */}
+      <Card>
+        <CardHeader title={t("drivers.reportTitle")} subtitle={t("drivers.reportSubtitle")} />
+
+        {driverTotals.rows.length === 0 ? (
+          <p className="text-sm text-fg-muted">{t("drivers.reportEmpty")}</p>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-line text-xs uppercase text-fg-muted">
+                    <th className="py-2 pe-3 text-start font-semibold">{t("drivers.colDriver")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("drivers.colOrders")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("drivers.colFees")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("drivers.colCollected")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("drivers.colRemitted")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("drivers.colReturns")}</th>
+                    <th className="py-2 text-end font-semibold">{t("drivers.colOutstanding")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {driverTotals.rows.map((r) => (
+                    <tr key={r.driverId} className="border-b border-line/60">
+                      <td className="py-2 pe-3">{r.driverName}</td>
+                      <td className="py-2 pe-3 text-end tabular-nums">{r.orderCount}</td>
+                      <td className="py-2 pe-3 text-end tabular-nums">
+                        {formatUsd(r.deliveryFeesCents)}
+                      </td>
+                      <td className="py-2 pe-3 text-end tabular-nums">
+                        {formatUsd(r.collectedCents)}
+                      </td>
+                      <td className="py-2 pe-3 text-end tabular-nums">
+                        {formatUsd(r.remittedCents)}
+                      </td>
+                      <td className="py-2 pe-3 text-end tabular-nums">
+                        {formatUsd(r.returnCreditCents)}
+                      </td>
+                      <td className="py-2 text-end font-semibold tabular-nums">
+                        {formatUsd(r.outstandingCents)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="font-semibold">
+                    <td className="py-2 pe-3">{t("common.total")}</td>
+                    <td className="py-2 pe-3 text-end tabular-nums">{driverTotals.orderCount}</td>
+                    <td className="py-2 pe-3 text-end tabular-nums">
+                      {formatUsd(driverTotals.deliveryFeesCents)}
+                    </td>
+                    <td className="py-2 pe-3 text-end tabular-nums">
+                      {formatUsd(driverTotals.collectedCents)}
+                    </td>
+                    <td className="py-2 pe-3 text-end tabular-nums">
+                      {formatUsd(driverTotals.remittedCents)}
+                    </td>
+                    <td className="py-2 pe-3 text-end tabular-nums">
+                      {formatUsd(driverTotals.returnCreditCents)}
+                    </td>
+                    <td className="py-2 text-end tabular-nums">
+                      {formatUsd(driverTotals.outstandingCents)}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+
+            {driverTotals.unreconciled.length > 0 && (
+              <p className="mt-2 text-xs font-bold text-danger">
+                {t("drivers.unreconciled", {
+                  n: String(driverTotals.unreconciled.length),
+                })}
+              </p>
+            )}
+
+            {/* Cash in from drivers, over the period, as its own figure. */}
+            <p className="mt-3 text-sm text-fg">
+              {t("drivers.remittedInPeriod", {
+                amount: formatUsd(remittedTotalCents),
+                n: String(remittanceRows.reduce((s, r) => s + r.remittanceCount, 0)),
+              })}
+            </p>
+          </>
+        )}
+
+        {/* ALWAYS shown, including on an empty period — which is exactly when
+            someone is working out what these figures mean. */}
+        <p className="mt-3 text-[11px] leading-snug text-fg-muted">
+          {t("drivers.reportNote")}
+        </p>
+      </Card>
 
       {/* Daily Sales */}
       <Card>

@@ -6,7 +6,7 @@
 // against explicit expected numbers; the builders only remove boilerplate.
 
 use crate::posting::{
-    add_vat, lbp_to_usd_cents, PostAdjustmentLine, PostAdjustmentPayload, PostCreditMemoLine,
+    add_vat, SALES_CHANNEL_COUNTER, lbp_to_usd_cents, PostAdjustmentLine, PostAdjustmentPayload, PostCreditMemoLine,
     PostCreditMemoPayload, PostCreditMemoRefund, PostPurchaseLine, PostPurchasePayload,
     PostSaleLine, PostSalePayload, PostSalePayment, PostSupplierPaymentPayload,
 };
@@ -236,12 +236,63 @@ pub fn sale_payload(lines: Vec<PostSaleLine>, payments: Vec<PostSalePayment>) ->
         exchange_rate_id: RATE_ID.to_string(),
         exchange_rate_lbp_per_usd: RATE_LBP_PER_USD,
         notes: None,
+        // Counter is the default channel, and every pre-WP-4 test is a counter
+        // sale: the control did not exist when they were written.
+        channel: SALES_CHANNEL_COUNTER.to_string(),
+        // No driver and no delivery fee by default: a counter sale has neither,
+        // and every pre-WP-6 test is a counter sale.
+        driver_id: None,
+        delivery_fee_cents: 0,
         cogs_method: "weighted_average".to_string(),
         discount_cents: 0,
         allow_negative_inventory: false,
         lines,
         payments,
     }
+}
+
+/// A `driver_collection` tender in USD: the shop's own driver carries the food
+/// and collects for it. Non-cash, so it adds nothing to the drawer, and it
+/// raises a receivable against the driver instead (WP-6).
+pub fn driver_collection_usd(cents: i64) -> PostSalePayment {
+    PostSalePayment {
+        payment_id: uuid(),
+        method: crate::posting::DRIVER_COLLECTION.to_string(),
+        currency: "USD".to_string(),
+        amount_native_usd_cents: cents,
+        amount_native_lbp: 0,
+        amount_usd_cents_equivalent: cents,
+        reference: None,
+    }
+}
+
+/// The same, collected in lira. The USD equivalent is derived at the fixture
+/// rate exactly as the backend derives it.
+pub fn driver_collection_lbp(lbp: i64) -> PostSalePayment {
+    PostSalePayment {
+        payment_id: uuid(),
+        method: crate::posting::DRIVER_COLLECTION.to_string(),
+        currency: "LBP".to_string(),
+        amount_native_usd_cents: 0,
+        amount_native_lbp: lbp,
+        amount_usd_cents_equivalent: lbp_to_usd_cents(lbp, RATE_LBP_PER_USD).unwrap(),
+        reference: None,
+    }
+}
+
+/// A delivery order: the WhatsApp channel, a named driver, and a fee the
+/// customer pays HIM. The food is tendered `driver_collection`.
+pub fn delivery_payload(
+    lines: Vec<PostSaleLine>,
+    driver_id: &str,
+    delivery_fee_cents: i64,
+) -> PostSalePayload {
+    let total = lines_total(&lines);
+    let mut p = sale_payload(lines, vec![driver_collection_usd(total)]);
+    p.channel = crate::posting::SALES_CHANNEL_ONLINE_DELIVERY.to_string();
+    p.driver_id = Some(driver_id.to_string());
+    p.delivery_fee_cents = delivery_fee_cents;
+    p
 }
 
 /// Total incl-VAT of a set of built lines — what the customer owes.
@@ -263,6 +314,9 @@ pub fn replay_of(p: &PostSalePayload) -> PostSalePayload {
         exchange_rate_id: p.exchange_rate_id.clone(),
         exchange_rate_lbp_per_usd: p.exchange_rate_lbp_per_usd,
         notes: p.notes.clone(),
+        channel: p.channel.clone(),
+        driver_id: p.driver_id.clone(),
+        delivery_fee_cents: p.delivery_fee_cents,
         cogs_method: p.cogs_method.clone(),
         discount_cents: p.discount_cents,
         allow_negative_inventory: p.allow_negative_inventory,
@@ -356,8 +410,10 @@ pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePaylo
            exchange_rate_lbp_per_usd, exchange_rate_id,
            subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
            discount_cents, cogs_total_cents, cogs_method,
-           sale_type, status, posted_at, notes
-         ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 'normal', 'draft', NULL, ?)",
+           sale_type, status, posted_at, notes,
+           channel, driver_id, delivery_fee_cents
+         ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 'normal', 'draft', NULL, ?,
+                   ?, ?, ?)",
     )
     .bind(&payload.sale_id)
     .bind(&payload.store_id)
@@ -371,6 +427,12 @@ pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePaylo
     .bind(payload.discount_cents)
     .bind(&payload.cogs_method)
     .bind(&payload.notes)
+    // The attribution a historical row carried. Bound from the payload rather
+    // than defaulted, so a seeded delivery order is a delivery order — which is
+    // what a replay of one is compared against (`CanonicalSale`).
+    .bind(&payload.channel)
+    .bind(&payload.driver_id)
+    .bind(payload.delivery_fee_cents)
     .execute(db.pool())
     .await
     .expect("seed historical sale header");
@@ -969,6 +1031,9 @@ pub fn credit_memo_payload(
         // sale's rate. The tests that care send a declared value explicitly.
         exchange_rate_id: None,
         exchange_rate_lbp_per_usd: None,
+        // No manager decision by default (WP-7). A refund that needs one is
+        // refused, and the tests that exercise that path set it explicitly.
+        manager_approval: None,
         lines,
         refunds,
     }
@@ -988,6 +1053,7 @@ pub fn replay_of_credit_memo(p: &PostCreditMemoPayload) -> PostCreditMemoPayload
         notes: p.notes.clone(),
         exchange_rate_id: p.exchange_rate_id.clone(),
         exchange_rate_lbp_per_usd: p.exchange_rate_lbp_per_usd,
+        manager_approval: p.manager_approval.clone(),
         lines: p.lines.iter().map(clone_credit_memo_line).collect(),
         refunds: p.refunds.iter().map(clone_credit_memo_refund).collect(),
     }

@@ -119,6 +119,16 @@ fn is_unique_violation(message: &str, needle: &str) -> bool {
 // save_product
 // ============================================================================
 
+/// A blank or whitespace-only presentational field is stored as NULL.
+///
+/// The UI's "no category" is an empty select value, and persisting `""` would
+/// make an uncategorised product a product in a section named nothing — which
+/// `resolveCategory` would bucket correctly but every `GROUP BY` and every
+/// `WHERE category IS NULL` would not. One representation of absence.
+fn blank_to_none(v: &Option<String>) -> Option<String> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveProductPayload {
@@ -140,6 +150,19 @@ pub struct SaveProductPayload {
     pub reorder_point: Option<i64>,
     pub is_service: bool,
     pub is_active: bool,
+    /// Menu section id, already normalised by the caller
+    /// (`lib/menuCategories.ts::normalizeCategoryId`). `None` means
+    /// uncategorised, which every product was until migration 013 and which
+    /// stays permanently valid.
+    ///
+    /// Presentational: no posting command reads it, it is snapshotted onto no
+    /// sale line, and it enters no canonical comparison. A product's section is
+    /// not part of what was sold.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Short decorative glyph for the menu tile. Never parsed or matched on.
+    #[serde(default)]
+    pub icon: Option<String>,
 
     // ---- The UoM configuration the Products page edits as one unit. ----
     /// The stocking unit. On an update it is informational: a product's base
@@ -177,6 +200,17 @@ pub(crate) fn validate_save_product(payload: &SaveProductPayload) -> Result<(), 
     }
     if payload.name.trim().is_empty() {
         return Err("A product needs a name.".into());
+    }
+    // A VAT rate is CHOSEN, never defaulted (GZ-WP0-01). The frontend form
+    // leaves it empty until the operator picks one; this is the backstop for
+    // every other caller, present and future. Without it an empty id reaches
+    // the `vat_rate_id REFERENCES vat_rates(id)` foreign key and the operator
+    // is shown a SQLite error instead of a sentence they can act on.
+    //
+    // Additive and non-breaking: every existing caller already sends a real
+    // id, because `products.vat_rate_id` is NOT NULL and always has been.
+    if payload.vat_rate_id.trim().is_empty() {
+        return Err("A product needs a VAT rate. Choose one explicitly — it is not defaulted, because a product saved as exempt charges no VAT and every sale of it snapshots that permanently.".into());
     }
     if payload.vat_pricing_mode != "inclusive" && payload.vat_pricing_mode != "exclusive" {
         return Err(format!(
@@ -285,8 +319,9 @@ pub(crate) async fn save_product_tx(
                  avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
                  avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
                  quantity_on_hand, reorder_point,
-                 is_active, is_service
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?)"#,
+                 is_active, is_service,
+                 category, icon
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?)"#,
         )
         .bind(&payload.product_id)
         .bind(&payload.store_id)
@@ -300,6 +335,8 @@ pub(crate) async fn save_product_tx(
         .bind(payload.reorder_point)
         .bind(i64::from(payload.is_active))
         .bind(i64::from(payload.is_service))
+        .bind(blank_to_none(&payload.category))
+        .bind(blank_to_none(&payload.icon))
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -441,7 +478,9 @@ pub(crate) async fn save_product_tx(
                       price_incl_vat_cents = ?,
                       reorder_point = ?,
                       is_service = ?,
-                      is_active = ?
+                      is_active = ?,
+                      category = ?,
+                      icon = ?
                 WHERE id = ? AND store_id = ?"#,
         )
         .bind(&payload.sku)
@@ -454,6 +493,8 @@ pub(crate) async fn save_product_tx(
         .bind(payload.reorder_point)
         .bind(i64::from(payload.is_service))
         .bind(i64::from(payload.is_active))
+        .bind(blank_to_none(&payload.category))
+        .bind(blank_to_none(&payload.icon))
         .bind(&payload.product_id)
         .bind(&payload.store_id)
         .execute(&mut *tx)

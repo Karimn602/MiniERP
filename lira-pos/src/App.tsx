@@ -12,6 +12,7 @@ import Products from "./pages/Products";
 import Inventory from "./pages/Inventory";
 import Purchases from "./pages/Purchases";
 import Suppliers from "./pages/Suppliers";
+import Drivers from "./pages/Drivers";
 import ExchangeRate from "./pages/ExchangeRate";
 import ShiftSummary from "./pages/ShiftSummary";
 import SalesHistory from "./pages/SalesHistory";
@@ -81,6 +82,7 @@ export default function App() {
               <Route path="purchases" element={<Purchases />} />
 
               <Route path="suppliers" element={<Suppliers />} />
+              <Route path="drivers" element={<Drivers />} />
               <Route path="suppliers/:id" element={<SupplierDetail />} />
 
               <Route path="exchange-rate" element={<ExchangeRate />} />
