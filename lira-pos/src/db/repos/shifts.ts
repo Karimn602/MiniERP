@@ -146,6 +146,59 @@ export interface ShiftRefundRow {
   amountUsdCentsEquivalent: number;
 }
 
+
+// ---------- Shift history (WP-A1) ----------
+
+/**
+ * One row of the shift-history list: the shift as it was RECORDED, plus the
+ * names of the people who opened and closed it.
+ *
+ * `shift` is the stored row and nothing else. In particular
+ * `expectedCashUsdCents`, `closingCash*` and `variance*` are the figures
+ * `close_shift` computed INSIDE the closing transaction and wrote once; this
+ * repo never recomputes them, and migration 009's
+ * `trg_shifts_no_update_after_close` means nothing else can either. A closed
+ * shift's reconciliation is a historical statement about a drawer that was
+ * counted on a particular evening, not a figure that should move because
+ * something was posted, corrected or re-rated afterwards.
+ *
+ * The names are resolved by JOIN rather than stored: `users.full_name` is
+ * master data and a shift records the user ID. A cashier renamed since will
+ * show under the new name, which is the right answer for "who was on the
+ * till" — it is the same person.
+ */
+export interface ShiftHistoryRow {
+  shift: Shift;
+  openedByName: string | null;
+  closedByName: string | null;
+}
+
+/**
+ * Everything the history detail view shows for ONE shift, read once.
+ *
+ * Deliberately assembled from the SAME shift-scoped accessors the live Current
+ * Shift view uses, rather than from a second set of history queries. Two
+ * query paths for one set of figures is how a screen comes to disagree with
+ * itself — which is exactly the defect WP-7 found between `ShiftSummary` and
+ * `close_shift` — so there is one definition per figure and the only
+ * difference between a live shift and a closed one is which `shiftId` is
+ * passed.
+ *
+ * Every figure here is derived from amounts PERSISTED in each row's own
+ * currency: native cash in `sale_payments` / `sales_credit_memo_refunds` /
+ * `driver_ledger`, and USD equivalents that were computed at the rate the
+ * document locked. No current exchange rate is read anywhere in this file, so
+ * a historical shift cannot be re-stated by today's rate.
+ */
+export interface ShiftHistoryDetail {
+  row: ShiftHistoryRow;
+  sales: ShiftSalesSummary;
+  payments: ShiftPaymentRow[];
+  refunds: ShiftRefundSummary;
+  refundRows: ShiftRefundRow[];
+  drawer: ShiftDrawerExpectation;
+}
+
 // ---------- Repo ----------
 
 export const shiftsRepo = {
@@ -194,6 +247,139 @@ export const shiftsRepo = {
         notes: args.notes ?? null,
       },
     });
+  },
+
+
+  /**
+   * The store's shifts, most recent first — the SHIFT HISTORY list (WP-A1).
+   *
+   * Why this exists: until now the Shift screen could show the open shift or
+   * the form to open one, and nothing else. The moment a shift was closed its
+   * entire reconciliation — the counted cash, the expected cash, the variance
+   * the cashier was held to — left the visible application. The figures were
+   * never lost (they are columns on `shifts`, immutable since migration 009),
+   * but a figure nobody can read is not an audit trail.
+   *
+   * Read-only by construction: this method SELECTs, and a closed shift cannot
+   * be written by anything anyway. There is no "edit shift" path to guard.
+   *
+   * `status` defaults to every state rather than to `'closed'`: the open shift
+   * belongs in its own history as today's row, and a `'voided'` one (the third
+   * value the CHECK allows, which nothing writes today) must not vanish from a
+   * list whose purpose is accountability.
+   *
+   * Date filtering is on the LOCAL calendar date a shift was OPENED, via
+   * `date(opened_at, 'localtime')` — the convention `reports.ts` and
+   * `shiftSummary.ts` already use, and the one `lib/dates.ts` argues for: a
+   * shift that opened at 00:30 Beirut belongs to that day in Beirut. Opened
+   * rather than closed, because that is the day the shift is remembered by,
+   * and an overnight shift would otherwise appear on the next day's list and
+   * be absent from its own.
+   */
+  async listHistory(args: {
+    storeId: string;
+    /** Inclusive local-date lower bound (YYYY-MM-DD). */
+    fromDate?: string;
+    /** Inclusive local-date upper bound (YYYY-MM-DD). */
+    toDate?: string;
+    status?: ShiftStatus;
+    limit?: number;
+  }): Promise<ShiftHistoryRow[]> {
+    interface Row extends ShiftRow {
+      opened_by_name: string | null;
+      closed_by_name: string | null;
+    }
+
+    const where: string[] = ["s.store_id = ?"];
+    const params: unknown[] = [args.storeId];
+    if (args.status) {
+      where.push("s.status = ?");
+      params.push(args.status);
+    }
+    if (args.fromDate) {
+      where.push("date(s.opened_at, 'localtime') >= ?");
+      params.push(args.fromDate);
+    }
+    if (args.toDate) {
+      where.push("date(s.opened_at, 'localtime') <= ?");
+      params.push(args.toDate);
+    }
+    params.push(args.limit ?? 100);
+
+    const rows = await query<Row>(
+      `SELECT s.*,
+              uo.full_name AS opened_by_name,
+              uc.full_name AS closed_by_name
+         FROM shifts s
+         LEFT JOIN users uo ON uo.id = s.opened_by_user_id
+         LEFT JOIN users uc ON uc.id = s.closed_by_user_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY s.opened_at DESC
+        LIMIT ?`,
+      params,
+    );
+
+    return rows.map((r) => ({
+      shift: toShift(r),
+      openedByName: r.opened_by_name,
+      closedByName: r.closed_by_name,
+    }));
+  },
+
+  /** One shift by id, with the names, or null. Scoped to its store. */
+  async findHistoryRow(
+    shiftId: string,
+    storeId: string,
+  ): Promise<ShiftHistoryRow | null> {
+    interface Row extends ShiftRow {
+      opened_by_name: string | null;
+      closed_by_name: string | null;
+    }
+    const rows = await query<Row>(
+      `SELECT s.*,
+              uo.full_name AS opened_by_name,
+              uc.full_name AS closed_by_name
+         FROM shifts s
+         LEFT JOIN users uo ON uo.id = s.opened_by_user_id
+         LEFT JOIN users uc ON uc.id = s.closed_by_user_id
+        WHERE s.id = ? AND s.store_id = ?
+        LIMIT 1`,
+      [shiftId, storeId],
+    );
+    const r = rows[0];
+    return r
+      ? {
+          shift: toShift(r),
+          openedByName: r.opened_by_name,
+          closedByName: r.closed_by_name,
+        }
+      : null;
+  },
+
+  /**
+   * Everything one shift's detail view shows, in one call (WP-A1).
+   *
+   * Composed from the EXISTING shift-scoped accessors — the same five the live
+   * Current Shift view calls — so a closed shift and an open one are read by
+   * one set of definitions. Nothing here is history-specific arithmetic; the
+   * only difference is the id.
+   */
+  async getHistoryDetail(
+    shiftId: string,
+    storeId: string,
+  ): Promise<ShiftHistoryDetail | null> {
+    const row = await this.findHistoryRow(shiftId, storeId);
+    if (!row) return null;
+
+    const [sales, payments, refunds, refundRows, drawer] = await Promise.all([
+      this.getSalesSummary(shiftId, storeId),
+      this.getPaymentBreakdown(shiftId, storeId),
+      this.getRefundSummary(shiftId, storeId),
+      this.getRefundBreakdown(shiftId, storeId),
+      this.getDrawerExpectation(shiftId, storeId),
+    ]);
+
+    return { row, sales, payments, refunds, refundRows, drawer };
   },
 
   async getSalesSummary(

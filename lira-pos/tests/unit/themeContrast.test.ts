@@ -405,7 +405,10 @@ const COMBOS: Combo[] = [
   {
     where: "menu tile price, squat layout (the 1366x768 till)",
     file: "components/pos/MenuTile.tsx",
-    proof: "text-brand-ink squat:text-[22px]",
+    // WP-A6 split the price into an in-stock and an out-of-stock colour, so
+    // the proof is now the conditional that carries the in-stock one. The
+    // pairing under test is unchanged: brand-ink on tile.
+    proof: 'squat:text-[22px]",',
     fg: "brand-ink",
     bg: "tile",
     // Impact at 22px/400. This does NOT qualify as large text, which is why
@@ -416,7 +419,7 @@ const COMBOS: Combo[] = [
   {
     where: "menu tile price, full layout",
     file: "components/pos/MenuTile.tsx",
-    proof: "text-[24px] leading-none text-brand-ink",
+    proof: 'outOfStock ? "text-fg-muted line-through" : "text-brand-ink",',
     fg: "brand-ink",
     bg: "tile",
     px: 24,

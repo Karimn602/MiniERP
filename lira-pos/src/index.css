@@ -472,11 +472,16 @@ body {
 /* ===========================================================================
    PRINT — appearance-independent, by construction.
 
-   A receipt and a credit memo are legal-ish documents on thermal paper. They
-   must come out black on white whichever appearance the cashier happens to be
-   looking at, and the print components are full of `text-slate-*` classes that
-   now resolve through the themed ramp — so on Midnight they would print white
-   on white.
+   A receipt and a credit memo are legal-ish documents on thermal paper, and a
+   kitchen ticket is read across a hot room. All three must come out black on
+   white whichever appearance the cashier happens to be looking at, and the
+   print components are full of `text-slate-*` classes that now resolve through
+   the themed ramp — so on Midnight they would print white on white.
+
+   Exactly ONE of these roots is ever in the document at a time: the rules
+   below reveal whichever is present, so two mounted roots would print two
+   documents. `PosRegister` mounts the one the operator asked for, and the
+   shift report is mounted only while a shift's detail is open.
 
    The fix is to pin the variables back to their Classic values INSIDE the
    print root, rather than to hunt every class in those components. The reset
@@ -490,6 +495,14 @@ body {
   #receipt-print-root *,
   #receipt-print,
   #receipt-print *,
+  #kitchen-ticket-print-root,
+  #kitchen-ticket-print-root *,
+  #kitchen-ticket-print,
+  #kitchen-ticket-print *,
+  #shift-report-print-root,
+  #shift-report-print-root *,
+  #shift-report-print,
+  #shift-report-print *,
   #credit-memo-print-root,
   #credit-memo-print-root *,
   #credit-memo-print,
@@ -498,6 +511,10 @@ body {
   }
   #receipt-print-root,
   #receipt-print,
+  #kitchen-ticket-print-root,
+  #kitchen-ticket-print,
+  #shift-report-print-root,
+  #shift-report-print,
   #credit-memo-print-root,
   #credit-memo-print {
     --greaz-fg: 0 0 0;
@@ -538,6 +555,8 @@ body {
     --greaz-info-line: 186 230 253;
   }
   #receipt-print,
+  #kitchen-ticket-print,
+  #shift-report-print,
   #credit-memo-print {
     position: fixed;
     top: 0;

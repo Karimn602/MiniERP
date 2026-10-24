@@ -1,11 +1,16 @@
 // Layer C — migrations against a virgin temporary database.
 
 use crate::cost::{cents_to_microcents, COST_SCALE};
+// Migration 018's upgrade tests post a real sale against the upgraded schema,
+// which is the only way to prove the posting command works on an UPGRADED
+// database rather than only on a fresh one.
+use crate::posting::post_sale_with_pool;
 use crate::test_support::{
-    app_migrator, assert_not_production_db, driver_balance, latest_migration_version,
-    migration_count, seed_driver, seed_driver_in_store, seed_store, TempDb, RATE_ID, STORE_ID,
-    USER_ID, VAT_STD_ID,
+    activate_demo_catalogue, app_migrator, assert_not_production_db, driver_balance,
+    latest_migration_version, migration_count, seed_driver, seed_driver_in_store, seed_product,
+    seed_store, ProductSpec, TempDb, RATE_ID, STORE_ID, USER_ID, VAT_STD_ID,
 };
+use crate::tests::builders::{cash_usd, lines_total, sale_payload, SaleLineBuilder};
 use sqlx::Row;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -149,14 +154,17 @@ async fn seed_data_required_by_the_posting_commands_is_present() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn temp_databases_are_isolated_and_removed_on_drop() {
-    let path = {
-        let db = TempDb::new().await;
-        let p = db.path().to_path_buf();
-        assert!(p.exists(), "the database file should exist while in use");
-        p
-    };
-    assert!(!path.exists(), "the database file must be deleted when the guard drops");
+async fn temp_databases_are_isolated_and_removed_after_awaited_cleanup() {
+    let db = TempDb::new().await;
+    let path = db.path().to_path_buf();
+    assert!(path.exists(), "the database file should exist while in use");
+
+    db.cleanup().await.expect("close and remove the TempDb");
+
+    assert!(
+        !path.exists(),
+        "the database file must be deleted after cleanup has awaited pool closure"
+    );
 }
 
 #[test]
@@ -2102,6 +2110,31 @@ async fn populated_at_schema_version(version: i64) -> TempDb {
         .await
         .expect("seed sale");
 
+        // A LINE, while the sale is still a draft — migration 012 refuses a
+        // child added to a posted document. Sales with no lines were a gap in
+        // this fixture: a rebuild or an ALTER on `sale_items` had no historical
+        // row to damage, so "history stands" was vacuously true for that table.
+        sqlx::query(
+            "INSERT INTO sale_items (
+               id, sale_id, store_id, product_id,
+               product_name_snapshot, product_sku_snapshot,
+               vat_rate_id_snapshot, vat_rate_bps_snapshot,
+               quantity, unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+               line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+               quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot,
+               created_at
+             ) VALUES (?, ?, ?, 'prod-v14', 'Legacy Burger', 'SKU-V14', ?, 1100,
+                       1, 901, 1000, 901, 99, 1000, 1, 'each', 1, 1,
+                       '2026-03-01T10:00:00.000Z')",
+        )
+        .bind(format!("item-{sale_id}"))
+        .bind(sale_id)
+        .bind(STORE_ID)
+        .bind(VAT_STD_ID)
+        .execute(db.pool())
+        .await
+        .expect("seed sale item");
+
         sqlx::query(
             "INSERT INTO sale_payments (id, sale_id, store_id, method, currency,
                                         amount_native_usd_cents, amount_usd_cents_equivalent,
@@ -2125,6 +2158,18 @@ async fn populated_at_schema_version(version: i64) -> TempDb {
             .await
             .expect("promote sale");
     }
+
+    // The receipt counter, advanced past the two receipts above.
+    //
+    // `next_receipt_number` lives in `app_settings`, not in `MAX(receipt_number)`
+    // (`posting.rs`), so a fixture that wrote receipts 1 and 2 without moving
+    // the counter leaves a database no real installation could be in — and the
+    // next real post would collide with its own history on
+    // `ux_sales_store_receipt`.
+    sqlx::query("UPDATE app_settings SET value = '3' WHERE key = 'next_receipt_number'")
+        .execute(db.pool())
+        .await
+        .expect("advance the receipt counter past the seeded history");
 
     // A posted credit memo with a refund leg — the other rebuilt table.
     sqlx::query(
@@ -2824,5 +2869,759 @@ async fn a_fresh_database_carries_both_017_guards() {
     assert!(
         sql.contains("status") && sql.contains("'open'"),
         "the fresh database must have the OPEN-shift form of the guard, got: {sql}"
+    );
+}
+
+// ============================================================================
+// Migration 018 — the kitchen-note column, on a database that already trades
+// ============================================================================
+//
+// The smallest migration in the project: one nullable column with two CHECK
+// constraints. Small is not the same as safe, and the three things that could
+// go wrong are all invisible on an empty database:
+//
+//   * the column could be added in a way that rewrites or re-types existing
+//     `sale_items` rows — a table of IMMUTABLE posted documents;
+//   * the CHECKs could be written so that an existing row fails them, which on
+//     SQLite would not fail the migration but would make every later UPDATE of
+//     that row impossible;
+//   * `post_sale` could stop working against a database upgraded rather than
+//     created fresh, which is every real installation.
+//
+// So these upgrade a POPULATED database — the same `populated_at_schema_version`
+// books the 017 tests use, with their posted sales, their lines, their memo and
+// their supplier ledger — through the real sqlx runner.
+
+#[tokio::test]
+async fn migration_018_upgrades_a_populated_v17_database_and_keeps_its_lines() {
+    let db = populated_at_schema_version(17).await;
+
+    let before = snapshot(&db, "sale_items").await;
+    assert!(!before.is_empty(), "the fixture must actually hold posted lines");
+
+    db.migrate_again().await.expect("018 must apply to a populated v17 database");
+
+    // Every posted line stands, and reads NULL in the new column.
+    //
+    // `snapshot` digests whatever columns the table HAS, so after the upgrade
+    // each row's digest is its old digest plus the new column — which makes
+    // this one assertion prove both halves at once: no historical value moved,
+    // and "no instruction" is the state of all history.
+    assert_eq!(
+        snapshot(&db, "sale_items").await,
+        before.iter().map(|d| format!("{d}|<NULL>")).collect::<Vec<_>>(),
+        "018 must append a NULL column and rewrite nothing"
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM sale_items WHERE kitchen_note IS NOT NULL").await,
+        0
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
+}
+
+#[tokio::test]
+async fn migration_018_upgrades_a_populated_v14_database_too() {
+    // The previous RELEASE's shape, four migrations back. A shop that skipped
+    // the WP-6/WP-7 round upgrades straight through to 018, and the chain has
+    // to carry it — 015's table rebuilds included, since those touch
+    // `sale_payments` on a database whose `sale_items` is about to gain a
+    // column.
+    let db = populated_at_schema_version(14).await;
+    let before = snapshot(&db, "sale_items").await;
+
+    db.migrate_again().await.expect("the whole chain must apply to a populated v14 database");
+
+    assert_eq!(
+        snapshot(&db, "sale_items").await,
+        before.iter().map(|d| format!("{d}|<NULL>")).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
+}
+
+#[tokio::test]
+async fn an_upgraded_database_accepts_a_noted_sale_exactly_like_a_fresh_one() {
+    // The claim a column migration most needs to prove: the posting command
+    // works against the UPGRADED schema, not only the fresh one. Every real
+    // installation is the upgraded case.
+    let db = populated_at_schema_version(17).await;
+    db.migrate_again().await.expect("upgrade");
+
+    // The fixture's product carries no `product_uoms` row — it was written to
+    // exercise a rebuild, not a sale — and `post_sale` resolves the selling
+    // unit from that table and refuses a payload without one (GP-A02). So the
+    // conversion is given to it here, which is the only thing this test adds
+    // to the fixture.
+    sqlx::query(
+        "INSERT INTO product_uoms (
+           id, store_id, product_id, uom_code, factor_num, factor_den,
+           is_base, is_default_sale_uom, is_default_purchase_uom, is_active
+         ) VALUES ('uom-v14-each', ?, 'prod-v14', 'each', 1, 1, 1, 1, 1, 1)",
+    )
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await
+    .expect("seed the product's selling unit");
+
+    let lines = vec![SaleLineBuilder::new("prod-v14", "Legacy Burger")
+        .qty(1)
+        .unit_incl(1_000)
+        .note("No pickles")
+        .build()];
+    let total = lines_total(&lines);
+    let mut payload = sale_payload(lines, vec![cash_usd(total)]);
+    payload.store_id = STORE_ID.to_string();
+    payload.shift_id = Some("shift-v14".to_string());
+    payload.exchange_rate_id = "rate-v14".to_string();
+    payload.exchange_rate_lbp_per_usd = 89_500;
+    let sale_id = payload.sale_id.clone();
+
+    post_sale_with_pool(db.pool(), payload).await.expect("a noted sale posts after the upgrade");
+
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT kitchen_note FROM sale_items WHERE sale_id='{sale_id}'"
+        ))
+        .await,
+        "No pickles"
+    );
+}
+
+#[tokio::test]
+async fn migration_018_is_idempotent_through_the_real_runner() {
+    let db = populated_at_schema_version(17).await;
+    db.migrate_again().await.expect("first upgrade");
+    let after_first = snapshot(&db, "sale_items").await;
+
+    // Running the migrator again must be a no-op. `ALTER TABLE ADD COLUMN` is
+    // NOT idempotent on its own — a second application would fail with
+    // "duplicate column name" — so what is being proved here is that sqlx's
+    // version table stops it, which is the mechanism every migration in this
+    // project relies on.
+    db.migrate_again().await.expect("re-running the migrator is a no-op");
+
+    assert_eq!(snapshot(&db, "sale_items").await, after_first);
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_and_an_upgraded_database_agree_on_the_column() {
+    // Two shops, one installed today and one upgraded, must have the same
+    // schema — including the CHECK constraints, which are what keep a blank
+    // note from becoming a second way of saying "none".
+    let fresh = TempDb::new().await;
+    let upgraded = populated_at_schema_version(17).await;
+    upgraded.migrate_again().await.expect("upgrade");
+
+    let fresh_sql: String =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='sale_items'")
+            .fetch_one(fresh.pool())
+            .await
+            .expect("fresh schema");
+    let upgraded_sql: String =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='sale_items'")
+            .fetch_one(upgraded.pool())
+            .await
+            .expect("upgraded schema");
+
+    // The two statements are not textually identical — a fresh table declares
+    // the column inline and an upgraded one carries it as an appended
+    // definition — so what is compared is that BOTH carry the column and BOTH
+    // carry its two constraints.
+    for sql in [&fresh_sql, &upgraded_sql] {
+        assert!(sql.contains("kitchen_note"), "missing the column: {sql}");
+        assert!(sql.contains("TRIM(kitchen_note)"), "missing the blank guard: {sql}");
+        assert!(sql.contains("length(kitchen_note)"), "missing the length guard: {sql}");
+    }
+}
+
+
+// ===========================================================================
+// Migration 019 — retiring the v3 demonstration catalogue SAFELY
+// ===========================================================================
+//
+// Migration 003 inserts three sellable products into EVERY database the
+// application creates, because it was written as a development convenience
+// and a migration is not a development convenience. A restaurant opening
+// Greaz for the first time was handed bottled water, coffee and a wholesale
+// drum of olive oil, on the register's menu grid, scannable and rung up.
+//
+// 003 has shipped, so it cannot be edited: its checksum is recorded in every
+// database that ever applied it. 019 corrects the state instead — and the
+// whole risk of doing that is deactivating a row a SHOP has adopted. These
+// tests are mostly about the rows 019 must REFUSE to touch.
+//
+// The predicate is "conclusively an untouched original seed row": the id and
+// the SKU as one pairing, every mutable product column still at its seeded
+// value, the barcode and UoM child sets exactly as seeded (count plus
+// full-column match, so nothing added, deleted or modified), `updated_at`
+// still equal to `created_at`, and no reference from any financial document.
+
+/// The ids migration 003 seeds. Stated here so a failure names the row.
+const DEMO_D1: &str = "00000000-0000-0000-0000-0000000000d1";
+const DEMO_D2: &str = "00000000-0000-0000-0000-0000000000d2";
+const DEMO_D3: &str = "00000000-0000-0000-0000-0000000000d3";
+
+/// Is this demonstration product still sellable?
+async fn demo_is_active(db: &TempDb, id: &str) -> bool {
+    db.count(&format!(
+        "SELECT COUNT(*) FROM products WHERE id = '{id}' AND is_active = 1"
+    ))
+    .await
+        == 1
+}
+
+/// A v18 database, then whatever the test does to it, then the upgrade to 19.
+async fn v18_then(mutate: &str) -> TempDb {
+    let db = TempDb::at_schema_version(18).await;
+    if !mutate.is_empty() {
+        db.exec(mutate).await;
+    }
+    db.migrate_again()
+        .await
+        .expect("migration 019 must apply to a v18 database");
+    db
+}
+
+/// An edit of one demo product must leave THAT product active, and must not
+/// save the other two from retirement.
+async fn only_this_one_survives(mutate: &str, survivor: &str) {
+    let db = v18_then(mutate).await;
+    assert!(
+        demo_is_active(&db, survivor).await,
+        "an edited demonstration product belongs to the shop and must stay active"
+    );
+    let others = [DEMO_D1, DEMO_D2, DEMO_D3]
+        .into_iter()
+        .filter(|id| *id != survivor);
+    for id in others {
+        assert!(
+            !demo_is_active(&db, id).await,
+            "the untouched demonstration products should still have been retired"
+        );
+    }
+}
+
+// --- The baseline ----------------------------------------------------------
+
+/// THE ASSERTION THE PRODUCT OWNER ASKED FOR: a virgin production database,
+/// fully migrated, offers nothing sellable at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virgin_production_database_has_no_sellable_demo_catalogue() {
+    let db = TempDb::new().await;
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE is_active = 1").await,
+        0,
+        "initialising the application must not create a sellable catalogue"
+    );
+    for id in [DEMO_D1, DEMO_D2, DEMO_D3] {
+        assert!(!demo_is_active(&db, id).await);
+    }
+}
+
+/// Deactivated, NOT deleted — and nothing else about them moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_019_deactivates_the_pristine_rows_and_changes_nothing_else() {
+    let db = TempDb::new().await;
+
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products WHERE id IN ('{DEMO_D1}','{DEMO_D2}','{DEMO_D3}')"
+        ))
+        .await,
+        3,
+        "the rows are still there; only their sellability changed"
+    );
+    assert_eq!(
+        db.scalar_string(&format!("SELECT name FROM products WHERE id = '{DEMO_D1}'")).await,
+        "Coffee 250g",
+        "no other column was rewritten"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products
+              WHERE id = '{DEMO_D1}' AND price_incl_vat_cents = 500 AND sku = 'DEMO-001'"
+        ))
+        .await,
+        1
+    );
+    // The children are untouched, including their own timestamps: 019 reads
+    // them and writes none of them.
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM product_barcodes WHERE is_active = 1").await,
+        4
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM product_barcodes WHERE updated_at = created_at").await,
+        4
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM product_uoms WHERE is_active = 1").await,
+        5
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM product_uoms WHERE updated_at = created_at").await,
+        5
+    );
+}
+
+// --- Any product edit means the shop has adopted the row -------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_description_only_edit_keeps_the_product() {
+    only_this_one_survives(
+        &format!("UPDATE products SET description = 'Our house blend' WHERE id = '{DEMO_D1}'"),
+        DEMO_D1,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_price_only_edit_keeps_the_product() {
+    only_this_one_survives(
+        &format!(
+            "UPDATE products SET price_excl_vat_cents = 500, price_incl_vat_cents = 555
+              WHERE id = '{DEMO_D1}'"
+        ),
+        DEMO_D1,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vat_rate_or_pricing_mode_edit_keeps_the_product() {
+    only_this_one_survives(
+        &format!("UPDATE products SET vat_pricing_mode = 'exclusive' WHERE id = '{DEMO_D2}'"),
+        DEMO_D2,
+    )
+    .await;
+
+    let db = v18_then(&format!(
+        "UPDATE products SET vat_rate_id = '00000000-0000-0000-0000-000000000011'
+          WHERE id = '{DEMO_D2}'"
+    ))
+    .await;
+    assert!(demo_is_active(&db, DEMO_D2).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_classification_edit_keeps_the_product() {
+    only_this_one_survives(
+        &format!("UPDATE products SET is_service = 1 WHERE id = '{DEMO_D2}'"),
+        DEMO_D2,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_menu_section_or_icon_edit_keeps_the_product() {
+    only_this_one_survives(
+        &format!("UPDATE products SET category = 'drinks' WHERE id = '{DEMO_D3}'"),
+        DEMO_D3,
+    )
+    .await;
+
+    let db = v18_then(&format!("UPDATE products SET icon = '🫒' WHERE id = '{DEMO_D3}'")).await;
+    assert!(demo_is_active(&db, DEMO_D3).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reorder_point_keeps_the_product() {
+    only_this_one_survives(
+        &format!("UPDATE products SET reorder_point = 5 WHERE id = '{DEMO_D1}'"),
+        DEMO_D1,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renamed_product_keeps_the_product() {
+    only_this_one_survives(
+        &format!("UPDATE products SET name = 'House Coffee' WHERE id = '{DEMO_D1}'"),
+        DEMO_D1,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stock_on_hand_or_a_cost_pool_keeps_the_product() {
+    only_this_one_survives(
+        &format!("UPDATE products SET quantity_on_hand = 7 WHERE id = '{DEMO_D1}'"),
+        DEMO_D1,
+    )
+    .await;
+
+    let db = v18_then(&format!(
+        "UPDATE products SET avg_cost_excl_vat_microcents = 1_500_000,
+                             avg_cost_excl_vat_cents = 2
+          WHERE id = '{DEMO_D2}'"
+    ))
+    .await;
+    assert!(demo_is_active(&db, DEMO_D2).await);
+}
+
+/// An UPDATE that changes no value still fires `trg_products_updated_at`, so
+/// the row can no longer be proven untouched — and is kept. This is the
+/// timestamp evidence on its own, isolated from every other field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_that_was_written_at_all_keeps_the_product() {
+    let db = TempDb::at_schema_version(18).await;
+    // Same values, so every other clause of the predicate still matches.
+    db.exec(&format!(
+        "UPDATE products SET name = 'Coffee 250g', price_incl_vat_cents = 500
+          WHERE id = '{DEMO_D1}'"
+    ))
+    .await;
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products WHERE id = '{DEMO_D1}' AND updated_at > created_at"
+        ))
+        .await,
+        1,
+        "the trigger must have moved updated_at, or this test proves nothing"
+    );
+
+    db.migrate_again().await.expect("upgrade");
+
+    assert!(
+        demo_is_active(&db, DEMO_D1).await,
+        "a row that has been written cannot be proven pristine, so it stays"
+    );
+    assert!(!demo_is_active(&db, DEMO_D2).await);
+}
+
+// --- The children are compared as exact sets -------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_added_barcode_keeps_the_product() {
+    only_this_one_survives(
+        &format!(
+            "INSERT INTO product_barcodes
+               (id, store_id, product_id, barcode, lookup_value, barcode_type, is_primary, is_active)
+             VALUES ('own-bc-1', '{STORE_ID}', '{DEMO_D1}', '5281111111112', '5281111111112',
+                     'EAN13', 0, 1)"
+        ),
+        DEMO_D1,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_or_deactivated_barcode_keeps_the_product() {
+    only_this_one_survives(
+        "DELETE FROM product_barcodes WHERE id = '00000000-0000-0000-0000-000000000a02'",
+        DEMO_D2,
+    )
+    .await;
+
+    let db = v18_then(
+        "UPDATE product_barcodes SET is_active = 0
+          WHERE id = '00000000-0000-0000-0000-000000000a02'",
+    )
+    .await;
+    assert!(demo_is_active(&db, DEMO_D2).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modified_barcode_keeps_the_product() {
+    // The value itself, and separately the primary flag.
+    let db = v18_then(
+        "UPDATE product_barcodes SET barcode = '5289999999999', lookup_value = '5289999999999'
+          WHERE id = '00000000-0000-0000-0000-000000000a03'",
+    )
+    .await;
+    assert!(demo_is_active(&db, DEMO_D3).await);
+
+    let db = v18_then(
+        "UPDATE product_barcodes SET is_primary = 0
+          WHERE id = '00000000-0000-0000-0000-000000000a01'",
+    )
+    .await;
+    assert!(demo_is_active(&db, DEMO_D1).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_added_retired_or_repriced_uom_keeps_the_product() {
+    only_this_one_survives(
+        &format!(
+            "INSERT INTO product_uoms
+               (id, store_id, product_id, uom_code, factor_num, factor_den,
+                is_base, is_default_sale_uom, is_default_purchase_uom, is_active)
+             VALUES ('own-uom-1', '{STORE_ID}', '{DEMO_D1}', 'box', 6, 1, 0, 0, 0, 1)"
+        ),
+        DEMO_D1,
+    )
+    .await;
+
+    let db = v18_then(
+        "UPDATE product_uoms SET is_active = 0
+          WHERE id = '00000000-0000-0000-0000-0000000000e3'",
+    )
+    .await;
+    assert!(demo_is_active(&db, DEMO_D2).await);
+
+    let db = v18_then(
+        "UPDATE product_uoms
+            SET sale_price_excl_vat_cents = 90, sale_price_incl_vat_cents = 100
+          WHERE id = '00000000-0000-0000-0000-0000000000e1'",
+    )
+    .await;
+    assert!(demo_is_active(&db, DEMO_D1).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_uom_factor_keeps_the_product() {
+    let db = v18_then(
+        "UPDATE product_uoms SET factor_num = 24
+          WHERE id = '00000000-0000-0000-0000-0000000000e3'",
+    )
+    .await;
+    assert!(demo_is_active(&db, DEMO_D2).await);
+}
+
+// --- The pairing -----------------------------------------------------------
+
+/// `id IN (...) AND sku IN (...)` would have matched a row whose id belongs
+/// to one seed product and whose SKU belongs to another. The statements pair
+/// them, so a shop that re-SKU'd its demo rows into each other's slots keeps
+/// both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_swapped_id_and_sku_pairing_is_never_matched() {
+    let db = TempDb::at_schema_version(18).await;
+    db.exec(&format!("UPDATE products SET sku = 'TMP-SWAP' WHERE id = '{DEMO_D1}'")).await;
+    db.exec(&format!("UPDATE products SET sku = 'DEMO-001' WHERE id = '{DEMO_D3}'")).await;
+    db.exec(&format!("UPDATE products SET sku = 'DEMO-003' WHERE id = '{DEMO_D1}'")).await;
+
+    db.migrate_again().await.expect("upgrade");
+
+    assert!(demo_is_active(&db, DEMO_D1).await, "id d1 now carries DEMO-003");
+    assert!(demo_is_active(&db, DEMO_D3).await, "id d3 now carries DEMO-001");
+    assert!(!demo_is_active(&db, DEMO_D2).await, "the untouched one still retires");
+}
+
+// --- Financial and history references --------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inventory_movement_keeps_the_product() {
+    only_this_one_survives(
+        &format!(
+            "INSERT INTO inventory_movements
+               (id, store_id, product_id, movement_type, quantity_delta)
+             VALUES ('mv-demo-1', '{STORE_ID}', '{DEMO_D2}', 'opening', 0)"
+        ),
+        DEMO_D2,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_purchase_line_keeps_the_product() {
+    let db = TempDb::at_schema_version(18).await;
+    db.exec(&format!(
+        "INSERT INTO purchases (id, store_id, purchase_number, purchase_date, purchase_type, status)
+         VALUES ('pur-demo', '{STORE_ID}', 1, '2026-03-01', 'opening', 'draft')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO purchase_items (
+           id, purchase_id, store_id, product_id, product_name_snapshot,
+           uom_code_snapshot, factor_num_snapshot, factor_den_snapshot,
+           quantity_in_uom, quantity_base,
+           unit_cost_excl_vat_in_uom_cents, unit_cost_incl_vat_in_uom_cents,
+           unit_cost_excl_vat_base_cents, unit_cost_incl_vat_base_cents,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+         ) VALUES ('pi-demo', 'pur-demo', '{STORE_ID}', '{DEMO_D3}', 'Wholesale Olive Oil 5L',
+                   'pcs', 1, 1, 1, 1, 100, 111, 100, 111, '{VAT_STD_ID}', 1100, 100, 11, 111)"
+    ))
+    .await;
+
+    db.migrate_again().await.expect("upgrade");
+
+    assert!(
+        demo_is_active(&db, DEMO_D3).await,
+        "a product that has been received is the shop's"
+    );
+    assert!(!demo_is_active(&db, DEMO_D1).await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_posted_sale_line_keeps_the_product_and_the_sale_is_untouched() {
+    // A REAL sale of the demonstration coffee, posted by the real command
+    // against a v18 database, then the upgrade.
+    let db = populated_at_schema_version(18).await;
+
+    let lines = vec![SaleLineBuilder::new(DEMO_D1, "Coffee 250g")
+        .qty(1)
+        .unit_incl(500)
+        .uom("pcs", 1, 1)
+        .build()];
+    let total = lines_total(&lines);
+    let mut payload = sale_payload(lines, vec![cash_usd(total)]);
+    payload.store_id = STORE_ID.to_string();
+    payload.shift_id = Some("shift-v14".to_string());
+    payload.exchange_rate_id = "rate-v14".to_string();
+    payload.exchange_rate_lbp_per_usd = 89_500;
+    payload.allow_negative_inventory = true;
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload)
+        .await
+        .expect("the demo coffee sells like any other product at v18");
+
+    let receipt_before = db
+        .scalar_i64(&format!("SELECT receipt_number FROM sales WHERE id = '{sale_id}'"))
+        .await;
+
+    db.migrate_again().await.expect("upgrade");
+
+    assert!(
+        demo_is_active(&db, DEMO_D1).await,
+        "a product that has been SOLD is the shop's, whatever its columns say"
+    );
+    // ...and the sale itself is exactly as it was posted.
+    assert_eq!(
+        db.scalar_i64(&format!("SELECT receipt_number FROM sales WHERE id = '{sale_id}'")).await,
+        receipt_before
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sale_items WHERE sale_id = '{sale_id}' AND product_id = '{DEMO_D1}'"
+        ))
+        .await,
+        1
+    );
+}
+
+/// The credit-memo clause, isolated. A memo line always implies a sale line
+/// for the same product in production, so the row here is deliberately
+/// synthetic: it references the fixture's own sale item while naming a demo
+/// product, which is exactly what the `NOT EXISTS` clause looks at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_credit_memo_line_keeps_the_product() {
+    let db = populated_at_schema_version(18).await;
+    db.exec(&format!(
+        "INSERT INTO sales_credit_memos
+           (id, store_id, original_sale_id, credit_memo_number, exchange_rate_lbp_per_usd, status)
+         VALUES ('cm-demo', '{STORE_ID}', 'sale-v14-cash', 99, 89500, 'draft')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sales_credit_memo_lines (
+           id, credit_memo_id, store_id, original_sale_item_id, product_id,
+           product_name_snapshot, vat_rate_id_snapshot, vat_rate_bps_snapshot,
+           quantity_base, quantity_in_uom,
+           unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents
+         ) VALUES ('cml-demo', 'cm-demo', '{STORE_ID}', 'item-sale-v14-cash', '{DEMO_D2}',
+                   'Bottled Water 1.5L', '{VAT_STD_ID}', 1100, 1, 1, 90, 100, 90, 10, 100)"
+    ))
+    .await;
+
+    db.migrate_again().await.expect("upgrade");
+
+    assert!(demo_is_active(&db, DEMO_D2).await);
+    assert!(!demo_is_active(&db, DEMO_D1).await);
+}
+
+// --- Other products, and the rest of the database --------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_019_touches_no_other_product() {
+    let db = TempDb::at_schema_version(18).await;
+    seed_product(
+        &db,
+        &ProductSpec::stocked("shop-coffee", "SKU-COFFEE", "Coffee 250g"),
+    )
+    .await;
+
+    db.migrate_again().await.expect("upgrade");
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id = 'shop-coffee' AND is_active = 1")
+            .await,
+        1,
+        "a shop's own product sharing a demo NAME must not be switched off"
+    );
+}
+
+/// The populated upgrade: a v18 database with real history goes to v19 with
+/// every financial row byte-identical, and only the demo flags moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_populated_v18_database_upgrades_without_touching_history() {
+    let db = populated_at_schema_version(18).await;
+
+    let sales_before = snapshot(&db, "sales").await;
+    let items_before = snapshot(&db, "sale_items").await;
+    let payments_before = snapshot(&db, "sale_payments").await;
+    let legacy_before = db
+        .scalar_i64("SELECT quantity_on_hand FROM products WHERE id = 'prod-v14'")
+        .await;
+
+    db.migrate_again().await.expect("the chain must apply to a populated v18 database");
+
+    assert_eq!(snapshot(&db, "sales").await, sales_before);
+    assert_eq!(snapshot(&db, "sale_items").await, items_before);
+    assert_eq!(snapshot(&db, "sale_payments").await, payments_before);
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id = 'prod-v14' AND is_active = 1").await,
+        1,
+        "the shop's own product is untouched"
+    );
+    assert_eq!(
+        db.scalar_i64("SELECT quantity_on_hand FROM products WHERE id = 'prod-v14'").await,
+        legacy_before
+    );
+    for id in [DEMO_D1, DEMO_D2, DEMO_D3] {
+        assert!(!demo_is_active(&db, id).await, "and the demo rows did retire");
+    }
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
+}
+
+/// Forward-only and idempotent, through the real runner: running the chain
+/// twice applies 019 once, records one row for it, and changes nothing the
+/// second time (its checksum is validated on the second pass).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_019_is_idempotent_through_the_real_runner() {
+    let db = TempDb::new().await;
+
+    let applied = db
+        .count("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 19")
+        .await;
+    assert_eq!(applied, 1);
+    let state = snapshot(&db, "products").await;
+
+    db.migrate_again().await.expect("a second run must validate and do nothing");
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 19").await,
+        1
+    );
+    assert_eq!(snapshot(&db, "products").await, state);
+}
+
+/// Explicit demo setup is still available, and is the only way to get one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_test_that_wants_the_demo_catalogue_asks_for_it_explicitly() {
+    let db = TempDb::new().await;
+    assert_eq!(db.count("SELECT COUNT(*) FROM products WHERE is_active = 1").await, 0);
+
+    activate_demo_catalogue(&db).await;
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE is_active = 1").await,
+        3,
+        "a development fixture is created by the thing that needs it"
     );
 }

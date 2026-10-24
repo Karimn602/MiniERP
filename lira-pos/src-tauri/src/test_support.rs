@@ -12,6 +12,8 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::cost::{cents_to_microcents, microcents_to_cents};
 use sqlx::migrate::{Migration as SqlxMigration, MigrationType, Migrator};
@@ -124,14 +126,71 @@ pub fn migration_count() -> i64 {
 
 /// A disposable SQLite database for one test.
 ///
-/// The pool is held in an `Option` so `Drop` can release it *before* deleting
-/// the file. sqlx runs each SQLite connection on its own worker thread, so
-/// dropping the last pool handle closes the file without needing an async
-/// runtime — which matters because `Drop` often runs as a test's runtime is
-/// already shutting down.
+/// The pool is held in an `Option` so explicit cleanup can await every raw
+/// connection close before unlinking anything. If a test relies on `Drop`, the
+/// pool is transferred to a bounded set of dedicated async cleanup workers;
+/// the originating test worker waits for only its own jobs as it exits.
 pub struct TempDb {
     pool: Option<SqlitePool>,
     path: PathBuf,
+    cleanup_state: Arc<CleanupState>,
+}
+
+struct CleanupJob {
+    pool: SqlitePool,
+    path: PathBuf,
+    state: Arc<CleanupState>,
+}
+
+#[derive(Default)]
+struct CleanupProgress {
+    pending: usize,
+    failures: Vec<String>,
+}
+
+#[derive(Default)]
+struct CleanupState {
+    progress: Mutex<CleanupProgress>,
+    changed: Condvar,
+}
+
+struct CleanupBarrier {
+    state: Arc<CleanupState>,
+}
+
+thread_local! {
+    static CLEANUP_BARRIER: CleanupBarrier = CleanupBarrier {
+        state: Arc::new(CleanupState::default()),
+    };
+}
+
+impl Drop for CleanupBarrier {
+    fn drop(&mut self) {
+        let progress = self
+            .state
+            .progress
+            .lock()
+            .expect("TempDb cleanup state lock");
+        let (mut progress, timeout) = self
+            .state
+            .changed
+            .wait_timeout_while(progress, Duration::from_secs(30), |state| state.pending > 0)
+            .expect("wait for TempDb cleanup");
+        if timeout.timed_out() && progress.pending > 0 {
+            eprintln!(
+                "TEMPDB CLEANUP BARRIER TIMED OUT with {} database(s) still pending",
+                progress.pending
+            );
+        }
+        let failures = std::mem::take(&mut progress.failures);
+        if !failures.is_empty() {
+            eprintln!(
+                "TEMPDB CLEANUP BARRIER RECORDED {} FAILURE(S):\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        }
+    }
 }
 
 impl TempDb {
@@ -160,6 +219,11 @@ impl TempDb {
 
     /// Create a fresh database file with NO migrations applied.
     pub async fn empty() -> Self {
+        // Associate this database with the worker that created it. When that
+        // worker exits, it waits only for its own cleanup jobs, never for jobs
+        // belonging to concurrently running tests.
+        let cleanup_state = CLEANUP_BARRIER.with(|barrier| Arc::clone(&barrier.state));
+
         let root = test_db_root();
         std::fs::create_dir_all(&root).expect("create temp test-db directory");
         let path = root.join(format!("{}.db", uuid::Uuid::new_v4()));
@@ -184,7 +248,11 @@ impl TempDb {
             .await
             .expect("enable foreign keys");
 
-        Self { pool: Some(pool), path }
+        Self {
+            pool: Some(pool),
+            path,
+            cleanup_state,
+        }
     }
 
     /// The connection pool for this test's database.
@@ -194,6 +262,16 @@ impl TempDb {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Close every owned SQLite connection and remove this disposable database.
+    ///
+    /// Tests which need to observe the post-shutdown filesystem should call this
+    /// explicitly. Ordinary tests may rely on `Drop`, which transfers the same
+    /// work to a dedicated asynchronous cleanup runtime.
+    pub async fn cleanup(mut self) -> Result<(), String> {
+        let pool = self.pool.take().expect("pool is live until cleanup");
+        cleanup_database(pool, self.path.clone()).await
     }
 
     /// A SECOND, independent connection pool against the same database file.
@@ -220,7 +298,6 @@ impl TempDb {
             .expect("enable foreign keys on the rival pool");
         pool
     }
-
 
     /// Re-run the migrator against this database (idempotency checks).
     pub async fn migrate_again(&self) -> Result<(), sqlx::migrate::MigrateError> {
@@ -265,31 +342,186 @@ impl TempDb {
 
 impl Drop for TempDb {
     fn drop(&mut self) {
-        // Release the pool first: Windows will not unlink a file that still has
-        // an open handle. Never `block_on` here — `drop` frequently runs while
-        // the test's own runtime is shutting down, which would deadlock.
-        drop(self.pool.take());
+        let Some(pool) = self.pool.take() else {
+            return;
+        };
 
-        for suffix in ["-wal", "-shm", ""] {
-            let mut p = self.path.clone().into_os_string();
-            p.push(suffix);
-            remove_with_retry(&PathBuf::from(p));
+        let path = self.path.clone();
+        let job = CleanupJob {
+            pool,
+            path: path.clone(),
+            state: Arc::clone(&self.cleanup_state),
+        };
+        self.cleanup_state
+            .progress
+            .lock()
+            .expect("TempDb cleanup state lock")
+            .pending += 1;
+        if let Err(error) = cleanup_sender().send(job) {
+            let job = error.0;
+            let failure = format!(
+                "TEMPDB CLEANUP NOT QUEUED; preserving diagnostic files at {}",
+                path.display()
+            );
+            // Never unlink while the unclosed pool may still own file handles.
+            drop(job.pool);
+            finish_cleanup(&job.state, &path, Err(failure.clone()));
+            eprintln!("{failure}");
         }
     }
 }
 
-/// Unlink a file, tolerating the brief window where the SQLite worker thread
-/// has not yet finished releasing its handle.
-fn remove_with_retry(path: &Path) {
-    for attempt in 0..50 {
-        if !path.exists() {
-            return;
-        }
-        if std::fs::remove_file(path).is_ok() {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(if attempt < 10 { 2 } else { 20 }));
+fn finish_cleanup(state: &CleanupState, path: &Path, result: Result<(), String>) {
+    let mut progress = state.progress.lock().expect("TempDb cleanup state lock");
+    if let Err(error) = result {
+        progress
+            .failures
+            .push(format!("{}: {error}", path.display()));
     }
+    progress.pending = progress
+        .pending
+        .checked_sub(1)
+        .expect("TempDb cleanup completion must have a pending job");
+    state.changed.notify_all();
+}
+
+fn cleanup_sender() -> &'static mpsc::Sender<CleanupJob> {
+    static CLEANUP: OnceLock<mpsc::Sender<CleanupJob>> = OnceLock::new();
+    CLEANUP.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<CleanupJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for worker in 1..=4 {
+            let rx = Arc::clone(&rx);
+            std::thread::Builder::new()
+                .name(format!("greaz-test-db-cleanup-{worker}"))
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build TempDb cleanup runtime");
+                    loop {
+                        let job = {
+                            let receiver = rx.lock().expect("TempDb cleanup receiver lock");
+                            receiver.recv()
+                        };
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        let path = job.path.clone();
+                        let result = runtime.block_on(cleanup_database(job.pool, job.path));
+                        if let Err(error) = &result {
+                            eprintln!(
+                                "TEMPDB CLEANUP FAILED; preserving diagnostic files at {}: {error}",
+                                path.display()
+                            );
+                        }
+                        finish_cleanup(&job.state, &path, result);
+                    }
+                })
+                .expect("spawn TempDb cleanup worker");
+        }
+        tx
+    })
+}
+
+/// Close every raw connection in a pool while retaining SQLx's close result.
+///
+/// `Pool::close()` intentionally discards `Connection::close()` errors. A
+/// disposable test pool has no outstanding borrowers once its `TempDb` drops,
+/// so each current connection can instead be acquired and closed explicitly.
+/// This exposes worker crashes (including a panic from `sqlite3_close`) before
+/// any database, WAL, or SHM file is removed.
+pub async fn close_sqlite_pool_checked(pool: &SqlitePool, what: &str) -> Result<(), String> {
+    let connection_count = pool.size();
+    let mut explicitly_closed = 0;
+    while pool.size() > 0 {
+        let size_before_acquire = pool.size();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let connection = loop {
+            if pool.size() == 0 {
+                // The last connection can finish its asynchronous return and
+                // close between the outer condition and this acquisition.
+                break None;
+            }
+            if let Some(connection) = pool.try_acquire() {
+                break Some(connection);
+            }
+            if pool.size() < size_before_acquire {
+                // SQLx may already be asynchronously closing a connection that
+                // was returning to the pool when TempDb dropped. It is no
+                // longer owned by this pool, so there is nothing left to
+                // acquire or remove before continuing.
+                break None;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{what}: timed out acquiring connection {}/{} for checked close (pool size={}, idle={})",
+                    explicitly_closed + 1,
+                    connection_count,
+                    pool.size(),
+                    pool.num_idle()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let Some(connection) = connection else {
+            continue;
+        };
+        connection.close().await.map_err(|error| {
+            format!(
+                "{what}: raw SQLite connection {}/{} failed to close: {error}",
+                explicitly_closed + 1,
+                connection_count
+            )
+        })?;
+        explicitly_closed += 1;
+    }
+
+    // Marks the now-empty pool closed. There are no raw close errors left for
+    // this call to suppress.
+    pool.close().await;
+    Ok(())
+}
+
+async fn cleanup_database(pool: SqlitePool, path: PathBuf) -> Result<(), String> {
+    close_sqlite_pool_checked(&pool, &format!("TempDb {}", path.display())).await?;
+
+    for suffix in ["-wal", "-shm", ""] {
+        let candidate = sidecar_path(&path, suffix);
+        if let Err(error) = remove_with_retry(&candidate).await {
+            // Stop at the first failed unlink so the main file and every
+            // not-yet-removed sidecar remain available for diagnosis.
+            return Err(format!(
+                "{}: {} (kind={:?}, windows_error={:?})",
+                candidate.display(),
+                error,
+                error.kind(),
+                error.raw_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut candidate = path.as_os_str().to_os_string();
+    candidate.push(suffix);
+    PathBuf::from(candidate)
+}
+
+/// Unlink a file after its pool has closed, tolerating only transient Windows
+/// handle-release delays and returning the final I/O error to the caller.
+async fn remove_with_retry(path: &Path) -> Result<(), std::io::Error> {
+    let mut last_error = None;
+    for attempt in 0..50 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(Duration::from_millis(if attempt < 10 { 2 } else { 20 })).await;
+    }
+    Err(last_error.expect("a failed removal records its I/O error"))
 }
 
 // ============================================================================
@@ -321,6 +553,28 @@ pub const SHIFT_ID: &str = "00000000-0000-0000-0000-00000000f001";
 // ============================================================================
 // Fixture builders
 // ============================================================================
+
+/// The three product ids migration 003 seeds and migration 019 retires.
+pub const DEMO_CATALOGUE_IDS: [&str; 3] = [
+    "00000000-0000-0000-0000-0000000000d1",
+    "00000000-0000-0000-0000-0000000000d2",
+    "00000000-0000-0000-0000-0000000000d3",
+];
+
+/// Make the v3 demonstration catalogue sellable again, for a test that wants it.
+///
+/// This is the "explicitly controlled demo setup" half of migration 019. A
+/// development or demonstration fixture is created by the thing that needs
+/// it, in one visible call; production provisioning creates nothing sellable
+/// at all. Nothing in the suite currently needs this — it exists so that the
+/// next test that wants a ready-made catalogue reaches for a named helper
+/// instead of quietly depending on a migration to leave products switched on.
+pub async fn activate_demo_catalogue(db: &TempDb) {
+    for id in DEMO_CATALOGUE_IDS {
+        db.exec(&format!("UPDATE products SET is_active = 1 WHERE id = '{id}'"))
+        .await;
+    }
+}
 
 pub async fn seed_exchange_rate(db: &TempDb) {
     sqlx::query(

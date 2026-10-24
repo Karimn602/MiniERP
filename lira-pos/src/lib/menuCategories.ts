@@ -121,3 +121,56 @@ export function categoryOrder(raw: string | null | undefined): number {
   const i = MENU_CATEGORIES.findIndex((c) => c.id === id);
   return i < 0 ? MENU_CATEGORIES.length : i;
 }
+
+/**
+ * The most code points a tile glyph may be (WP-A5).
+ *
+ * An icon is ONE glyph in a 27px corner slot. Four code points is generous for
+ * that — a plain emoji is one, a national flag two, a skin-toned or
+ * profession emoji up to four — and it is the bound that stops the column
+ * being used as a second name field, which is what an unbounded "icon" string
+ * becomes the first time somebody imports a spreadsheet.
+ */
+export const ICON_MAX_CODE_POINTS = 4;
+
+/**
+ * Is this a safe value to store as a product's tile glyph?
+ *
+ * The column is NEVER parsed, matched or used to infer anything (migration
+ * 013 says so), so "safe" here is not about semantics. It is about three real
+ * hazards of accepting free text from a spreadsheet:
+ *
+ *   * LENGTH. A 60-character "icon" does not render as a glyph; it renders as
+ *     a broken tile. Bounded above.
+ *
+ *   * CONTROL AND BIDI CHARACTERS. A zero-width joiner inside an emoji is
+ *     legitimate and is allowed; a bare directional OVERRIDE (U+202E and
+ *     friends) is not, because it reverses the rendering of everything after
+ *     it — in a UI that is already bidirectional, one of those in a product
+ *     tile silently garbles the names beside it.
+ *
+ *   * MARKUP AND FORMULA LEAD-INS. `<`, `>`, `&` and a leading `=`, `+` or
+ *     `@` are refused. React escapes markup, so this is not an XSS fix and is
+ *     not claimed as one — it is that a cell starting with `=` is a FORMULA to
+ *     every spreadsheet that reads the catalogue back out, and a glyph field
+ *     is never legitimately any of these characters.
+ *
+ * Returns true for a blank value: no icon is always valid, and the category's
+ * own glyph is used instead.
+ */
+export function isSafeIcon(raw: string | null | undefined): boolean {
+  const icon = raw?.trim() ?? "";
+  if (icon === "") return true;
+  if ([...icon].length > ICON_MAX_CODE_POINTS) return false;
+  for (const ch of icon) {
+    const cp = ch.codePointAt(0)!;
+    // C0 and C1 controls, and DEL.
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) return false;
+    // Bidi overrides and isolates. U+200D (ZWJ) is deliberately NOT here: it
+    // is how a composite emoji is built.
+    if (cp >= 0x202a && cp <= 0x202e) return false;
+    if (cp >= 0x2066 && cp <= 0x2069) return false;
+    if ("<>&".includes(ch)) return false;
+  }
+  return !"=+@".includes(icon[0]);
+}

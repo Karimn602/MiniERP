@@ -55,6 +55,7 @@ import type {
 } from "../db/types";
 import { query } from "../db/client";
 import { ReceiptPrint } from "../components/ReceiptPrint";
+import { KitchenTicketPrint } from "../components/KitchenTicketPrint";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { PageHeader } from "../components/ui/PageHeader";
@@ -123,6 +124,13 @@ import {
   deliveryTotals,
   parseFeeCents,
 } from "../lib/driverCollection";
+import {
+  KITCHEN_NOTE_MAX_CHARS,
+  isKitchenNoteWithinLimit,
+  kitchenNoteLength,
+  kitchenNotesMerge,
+  normalizeKitchenNote,
+} from "../lib/kitchenNote";
 import { driversRepo } from "../db/repos/drivers";
 import type { Driver } from "../db/types";
 import {
@@ -177,6 +185,18 @@ interface CartLine {
   /** Snapshot of which barcode was scanned (null if added via search). */
   barcodeUsed: string | null;
   barcodeType: string | null;
+  /**
+   * The kitchen's instruction for this line (WP-A2) — "no pickles".
+   *
+   * Optional, so every cart parked by an earlier build restores unchanged.
+   * Normalised through `lib/kitchenNote.ts` on the way in and on the way to
+   * the frozen request, because the backend compares it on replay.
+   *
+   * It is part of the LINE, not of the product: two lines of one burger carry
+   * their own, which is what `kitchenNotesMerge` keeps true when a tile is
+   * clicked again.
+   */
+  kitchenNote?: string | null;
   /** Live math; never null because qty defaults to 1 on add. */
   math: SaleLineMath;
 }
@@ -524,6 +544,13 @@ export default function PosRegister() {
     }
   }, [allowNegativeInventory]);
 
+  // Switching carts needs no effect any more: the delivery edit session is
+  // KEYED BY CART ID (`deliveryEditCartId`), so a session opened on the cart
+  // you came from simply does not apply to the one you arrived at, and the
+  // forced-open rule opens the controls again if the new cart still needs a
+  // driver. The effect that used to clear a boolean here could only ever be
+  // one frame behind the cart it was describing.
+
   // Active shift — null = no open shift; undefined = still loading
   const [activeShift, setActiveShift] = useState<Shift | null | undefined>(undefined);
 
@@ -554,6 +581,44 @@ export default function PosRegister() {
   // Discount is likewise folded away until asked for, so it stops occupying
   // prime selling space and stops inviting an accidental discount.
   const [discountOpen, setDiscountOpen] = useState(false);
+  /**
+   * Which cart has an OPEN delivery edit session (WP-A3, corrected).
+   *
+   * The arrangement is decided once per order and then read, so the panel
+   * that decides it collapses to one summary line once there is something to
+   * summarise — the order lines are what a 1366x768 screen is short of, and
+   * five controls and a paragraph were taking that space on every delivery
+   * order. It is forced open whenever a driver is missing or the arrangement
+   * is refused, the same way the discount panel is forced open while a
+   * discount is in effect: a control the cashier must use is never behind a
+   * disclosure.
+   *
+   * WHY THIS IS A SESSION AND NOT A BOOLEAN. The first version folded the
+   * panel the moment the arrangement READ as decided, and "decided" was
+   * recomputed on every keystroke — so typing a fee of 2.50 collapsed the
+   * editor at "2", with the caret still in a box that had just been
+   * unmounted. The cashier then reopened it and typed the rest, or did not
+   * notice and shipped a $2.00 charge. Folding is a decision about the
+   * SCREEN, so it has to be driven by what the cashier did, not by whether an
+   * intermediate value happens to parse.
+   *
+   * So an edit session is explicit, and it is keyed by CART ID rather than
+   * being a bare flag: the register holds several carts, and a session opened
+   * on one must not decide the panel's state on another. The session begins
+   * when the panel is forced open for an undecided order, or when the cashier
+   * presses Edit, and it ends only on a deliberate completion — the Done
+   * button, Enter in the fee box, or focus leaving the panel — and only while
+   * the arrangement is actually decided.
+   */
+  const [deliveryEditCartId, setDeliveryEditCartId] = useState<string | null>(null);
+  /**
+   * The panel element, so a blur can ask whether focus is still inside it.
+   *
+   * Tabbing from the driver select to the fee box is movement WITHIN one edit
+   * session and must not fold the controls away mid-session; tabbing out of
+   * the panel altogether is the cashier saying they are done with it.
+   */
+  const deliveryPanelRef = useRef<HTMLDivElement | null>(null);
 
   // Scan box
   const [scanInput, setScanInput] = useState("");
@@ -574,6 +639,23 @@ export default function PosRegister() {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [receiptSale, setReceiptSale] = useState<SaleWithDetails | null>(null);
+  /**
+   * Which document the next print is for (WP-A2).
+   *
+   * Two print roots now exist — the customer receipt and the kitchen ticket —
+   * and the print stylesheet makes exactly one subtree visible. If both were
+   * mounted, a print would emit both, so the mounted one is chosen here.
+   *
+   * `window.print()` cannot be called in the same handler that chooses it: the
+   * choice is React state, and the DOM only carries it after the commit. So
+   * the handler records the request and an effect fires the print once the
+   * right root is actually in the document. Getting this wrong prints the
+   * previous document, which on a reprint is a receipt handed to the kitchen.
+   */
+  const [printRequest, setPrintRequest] = useState<{
+    doc: "receipt" | "kitchen";
+    nonce: number;
+  } | null>(null);
   /**
    * Which cart, if any, has a post that has not resolved yet. Mirrors the
    * registry's own in-flight flag so the UI can disable that cart's Clear and
@@ -1057,8 +1139,18 @@ export default function PosRegister() {
     // name-search path already did for services.
 
     setLines((prev) => {
+      // Same product, same selling unit AND the same kitchen instruction
+      // (WP-A2). A new unit added from a tile or a scan carries no
+      // instruction, so it joins a line that has none and starts a line of its
+      // own beside one that does — which is how two identical burgers end up
+      // with different notes. Merging on product and unit alone would have
+      // folded a plain burger into the one marked "no pickles" and had the
+      // kitchen make three of them wrong.
       const existingIdx = prev.findIndex(
-        (l) => l.product.id === product.id && l.uom.id === uom.id,
+        (l) =>
+          l.product.id === product.id &&
+          l.uom.id === uom.id &&
+          kitchenNotesMerge(l.kitchenNote, null),
       );
       if (existingIdx >= 0) {
         const next = prev.slice();
@@ -1135,6 +1227,39 @@ export default function PosRegister() {
 
   function removeLine(draftId: string) {
     setLines((prev) => prev.filter((l) => l.draftId !== draftId));
+  }
+
+  /**
+   * Set or clear one line's kitchen instruction (WP-A2).
+   *
+   * Called on EVERY keystroke of the editor, not on a commit: the cart is the
+   * only authoritative place the instruction lives, so there is never a typed
+   * note that posting could miss. `OrderRail` explains the failure that made
+   * that necessary — F5 is a window-level shortcut and does not blur the box.
+   *
+   * The text is therefore stored AS TYPED while the cashier is in the field.
+   * Normalising here would trim a trailing space out from under the caret
+   * mid-word; `""` alone is reduced to `null`, which is what the clear button
+   * sends and what makes the line merge with a plain one again. The canonical
+   * reduction happens where it matters: `buildFrozenRequest` normalises the
+   * note into the posting request, `kitchenNotesMerge` normalises both sides
+   * of the merge rule, and the editor trims once when it closes. So an
+   * untrimmed value can exist in the cart for as long as somebody is typing,
+   * and can never reach a posted row.
+   *
+   * It goes through `setLines`, which is the cart's own edit choke point, so a
+   * locked cart refuses it exactly as it refuses a quantity change: the frozen
+   * request is already on the wire or is the key to a sale that may exist, and
+   * a note typed into it afterwards would turn a retry into a conflict.
+   *
+   * Over-long input is kept on screen rather than silently truncated — the
+   * cashier is told, and Post is gated on the same verdict — because trimming
+   * somebody's instruction to fit is how a kitchen gets half a sentence.
+   */
+  function setLineNote(draftId: string, note: string) {
+    setLines((prev) =>
+      prev.map((l) => (l.draftId === draftId ? { ...l, kitchenNote: note === "" ? null : note } : l)),
+    );
   }
 
   // Clear one cart's contents (lines, discounts, payments) and retire its
@@ -1562,6 +1687,71 @@ export default function PosRegister() {
     collectsByDriver: driverCollect,
   });
 
+  /**
+   * Is there an arrangement worth collapsing to a summary line (WP-A3)?
+   *
+   * A driver, a charge the cashier has actually entered, and no refusal. It
+   * says only that a summary would be TRUE — never that the editor should
+   * close, which is `deliveryEditCartId`'s business, because this value
+   * changes under the caret while somebody is typing.
+   */
+  const deliveryDecided =
+    isDelivery &&
+    activeDriverId !== null &&
+    drivers.some((d) => d.id === activeDriverId) &&
+    deliveryFeeInput.trim() !== "" &&
+    deliveryVerdict === null;
+
+  /** Are the delivery CONTROLS on screen? */
+  const deliveryEditorOpen =
+    isDelivery && (!deliveryDecided || deliveryEditCartId === activeCartId);
+
+  /**
+   * End the session, but only from a decided arrangement.
+   *
+   * Enter on an invalid fee, or with no driver chosen, leaves the controls
+   * exactly where they are: there is nothing to summarise yet, and a panel
+   * that folded over a refusal would hide the message explaining it.
+   */
+  const closeDeliveryEditor = useCallback(() => {
+    if (!deliveryDecided) return;
+    setDeliveryEditCartId((cur) => (cur === activeCartId ? null : cur));
+  }, [deliveryDecided, activeCartId]);
+
+  /**
+   * Open the session for the cart in front of the cashier.
+   *
+   * Also called by the effect below, which is what keeps an undecided order's
+   * controls open through the whole of the typing that decides it.
+   */
+  const openDeliveryEditor = useCallback(() => {
+    setDeliveryEditCartId(activeCartId);
+  }, [activeCartId]);
+
+  useEffect(() => {
+    if (!isDelivery) return;
+    if (deliveryDecided) return;
+    // Undecided: the controls are forced open anyway, so the session is
+    // started here too. Without it, the first keystroke that happened to make
+    // the arrangement parse would fold the panel — which is the defect this
+    // whole mechanism exists to remove.
+    setDeliveryEditCartId((cur) => (cur === activeCartId ? cur : activeCartId));
+  }, [isDelivery, deliveryDecided, activeCartId]);
+
+  /**
+   * The first line whose kitchen instruction is longer than the column holds,
+   * or null (WP-A2).
+   *
+   * A VERDICT rather than a message, like the discount and the delivery
+   * arrangement before it: Post is gated on this, so a missing translation
+   * must not be able to re-enable posting through a note the backend will
+   * refuse. The input carries `maxLength` too, which stops the common case at
+   * the keyboard; this covers a paste, a cart restored from storage, and
+   * anything else that did not come through a keystroke.
+   */
+  const overLongNoteLine =
+    lines.find((l) => !isKitchenNoteWithinLimit(l.kitchenNote)) ?? null;
+
   const isFullyPaid =
     lines.length > 0 &&
     payments.errors.length === 0 &&
@@ -1608,7 +1798,10 @@ export default function PosRegister() {
     // And a delivery order must name who carried it and what he charged.
     // Gated on the verdict rather than its message, for the same reason the
     // discount is: a missing translation must not re-enable posting.
-    deliveryVerdict === null);
+    deliveryVerdict === null &&
+    // And no line may carry an instruction longer than the column holds
+    // (WP-A2) — the backend refuses it, so the till says so first.
+    overLongNoteLine === null);
 
   // ----- Post (active cart only) -----
   //
@@ -1645,6 +1838,15 @@ export default function PosRegister() {
     // Before the tender is read, because a driver-collection leg is only
     // meaningful once there is a driver to owe it.
     if (deliveryVerdict !== null) return t(`delivery.err.${deliveryVerdict}`);
+    // An instruction longer than the column holds (WP-A2). Refused here as
+    // well as in `prepare_sale`, so the cashier is told before a customer is
+    // waiting on a refusal.
+    if (overLongNoteLine !== null) {
+      return t("pos.errNoteTooLong", {
+        name: overLongNoteLine.product.name,
+        max: String(KITCHEN_NOTE_MAX_CHARS),
+      });
+    }
     if (payments.errors.length > 0) return payments.errors[0];
     if (!isAutoPayMode && payments.totalPaidUsdCents < totals.postDiscountTotal) {
       return t("pos.errUnderpaid", {
@@ -1681,6 +1883,15 @@ export default function PosRegister() {
         lineDiscountCents: lineDiscount,
         barcodeUsedSnapshot: l.barcodeUsed,
         barcodeTypeSnapshot: l.barcodeType,
+        // FROZEN with the rest of the request (WP-A2). The instruction a
+        // retry sends is the one the cashier typed before Post, not whatever
+        // the cart says by the time the retry happens — and the backend
+        // compares it, so a note edited under a live attempt would turn the
+        // one recovery path into a conflict. Normalised here as well as in
+        // `setLineNote`, so a cart restored from an older build (where the
+        // field may be absent or blank) freezes the same value the backend
+        // will store.
+        kitchenNote: normalizeKitchenNote(l.kitchenNote),
         isService: l.product.isService,
       };
     });
@@ -1929,6 +2140,39 @@ export default function PosRegister() {
   canPostRef.current = canPost;
   const receiptOpenRef = useRef(receiptSale !== null);
   receiptOpenRef.current = receiptSale !== null;
+
+  /**
+   * The name of the driver who carried the receipt on screen (WP-A4).
+   *
+   * Resolved from the loaded roster, which holds the ACTIVE drivers. A
+   * receipt for a driver retired since shows no name rather than a stale one;
+   * Sales History resolves the same field by id, so a historical receipt
+   * reprinted there still names him.
+   */
+  const receiptDriverName =
+    (receiptSale?.driverId
+      ? drivers.find((d) => d.id === receiptSale.driverId)?.name
+      : null) ?? null;
+
+  /**
+   * Fire the print once the requested root has been committed to the DOM.
+   *
+   * The request is cleared first, so the kitchen root unmounts afterwards and
+   * a later browser-initiated print (Ctrl+P) falls back to the receipt — which
+   * is the right default for a document the customer is holding.
+   */
+  useEffect(() => {
+    if (printRequest === null) return;
+    setPrintRequest(null);
+    window.print();
+  }, [printRequest]);
+
+  /** Ask for a document to be printed. The effect above does the printing. */
+  const requestPrint = useCallback((doc: "receipt" | "kitchen") => {
+    // A nonce, so pressing the same button twice prints twice: without it the
+    // state would be unchanged and the effect would not run again.
+    setPrintRequest({ doc, nonce: Date.now() });
+  }, []);
   const handlePostRef = useRef<() => Promise<void>>(() => Promise.resolve());
   handlePostRef.current = handlePost;
 
@@ -2214,20 +2458,63 @@ export default function PosRegister() {
         </div>
       )}
 
-      {/* Print-only receipt root — outside modal so print:hidden on the modal doesn't suppress it */}
+      {/* Print-only receipt root — outside modal so print:hidden on the modal
+          doesn't suppress it.
+
+          Suppressed while a KITCHEN ticket is the requested document, because
+          the print stylesheet reveals whichever of the two roots is in the
+          document and leaving both mounted would emit both (WP-A2). */}
       {receiptSale && (
-        <div id="receipt-print-root" className="hidden print:block">
-          <ReceiptPrint sale={receiptSale} storeName={storeName} />
+        <div
+          id="receipt-print-root"
+          className={clsx("hidden", printRequest?.doc !== "kitchen" && "print:block")}
+        >
+          <ReceiptPrint
+            sale={receiptSale}
+            storeName={storeName}
+            driverName={receiptDriverName}
+          />
+        </div>
+      )}
+
+      {/* Print-only kitchen-ticket root. Mounted only for the print it was
+          asked for, so a Ctrl+P a minute later still gives the receipt. */}
+      {receiptSale && printRequest?.doc === "kitchen" && (
+        <div id="kitchen-ticket-print-root" className="hidden print:block">
+          <KitchenTicketPrint
+            sale={receiptSale}
+            storeName={storeName}
+            driverName={receiptDriverName}
+          />
         </div>
       )}
 
       {receiptSale && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-scrim/50 p-4 backdrop-blur-sm print:hidden">
           <div className="greaz-paper-doc max-h-[90vh] w-full max-w-sm animate-scale-in overflow-y-auto rounded-panel shadow-2xl">
-            <ReceiptPrint sale={receiptSale} storeName={storeName} />
-            <div className="flex gap-2 border-t border-line p-4 print:hidden">
-              <Button variant="primary" className="flex-1" onClick={() => window.print()}>
+            <ReceiptPrint
+              sale={receiptSale}
+              storeName={storeName}
+              driverName={receiptDriverName}
+            />
+            <div className="flex flex-wrap gap-2 border-t border-line p-4 print:hidden">
+              <Button
+                variant="primary"
+                className="flex-1"
+                onClick={() => requestPrint("receipt")}
+              >
                 {t("pos.printReceipt")}
+              </Button>
+              {/* The kitchen's copy of the same posted order (WP-A2). Offered
+                  on every sale, not only on one carrying instructions: a
+                  ticket with no notes is still the order the kitchen is
+                  making. */}
+              <Button
+                variant="secondary"
+                className="flex-1"
+                onClick={() => requestPrint("kitchen")}
+              >
+                {t("pos.printKitchenTicket")}
               </Button>
               <Button variant="ghost" className="flex-1" onClick={handleNewSale}>
                 {t("pos.newSale")}
@@ -2654,142 +2941,267 @@ export default function PosRegister() {
               })}
             </div>
 
-            {/* THE DELIVERY ARRANGEMENT (WP-6).
-                Only on a delivery order, because a driver and a delivery
-                charge mean nothing on a counter sale — and `post_sale` refuses
-                them there.
-
-                Three things the cashier must be able to tell apart, so they
-                are three separate controls and three separate figures: WHO
-                carried it, WHAT he charged, and the fact that HE collects for
-                it. The totals block below spells out the food, the fee and
-                what the customer hands over.
-
-                Disabled rather than hidden while the cart is locked, like the
-                channel segments: an unresolved delivery order is exactly when
-                the cashier needs to see which driver it was assigned to. */}
-            {isDelivery && (
-              <div className="mt-2 space-y-1.5 rounded-chip border border-line bg-paper p-2 squat:mt-1.5">
-                <label
-                  className="block text-[10px] font-extrabold uppercase tracking-wide text-fg-muted"
-                  htmlFor="pos-driver"
-                >
-                  {t("delivery.driver")}
-                </label>
-                <select
-                  id="pos-driver"
-                  value={activeDriverId ?? ""}
-                  disabled={isActiveCartLocked}
-                  onChange={(e) => setDriverId(e.target.value || null)}
-                  className={clsx(
-                    "w-full rounded-chip border border-line bg-surface px-2 py-1.5 text-xs font-bold text-fg",
-                    isActiveCartLocked && "cursor-not-allowed opacity-50",
-                  )}
-                >
-                  <option value="">{t("delivery.driverUnassigned")}</option>
-                  {drivers.map((d) => (
-                    <option key={d.id} value={d.id}>
-                      {d.name}
-                    </option>
-                  ))}
-                </select>
-                {driversError !== null && (
-                  <p className="text-[10px] font-bold text-danger">{t("delivery.driversUnavailable")}</p>
-                )}
-                {driversError === null && drivers.length === 0 && (
-                  <p className="text-[10px] font-bold text-fg-muted">{t("delivery.noDrivers")}</p>
-                )}
-
-                <label
-                  className="block pt-0.5 text-[10px] font-extrabold uppercase tracking-wide text-fg-muted"
-                  htmlFor="pos-delivery-fee"
-                >
-                  {t("delivery.fee")}
-                </label>
-                <input
-                  id="pos-delivery-fee"
-                  inputMode="decimal"
-                  value={deliveryFeeInput}
-                  disabled={isActiveCartLocked}
-                  onChange={(e) => setDeliveryFeeInput(e.target.value)}
-                  placeholder="0.00"
-                  aria-invalid={deliveryFeeCents === null}
-                  className={clsx(
-                    "w-full rounded-chip border bg-surface px-2 py-1.5 text-xs font-bold text-fg",
-                    deliveryFeeCents === null ? "border-danger" : "border-line",
-                    isActiveCartLocked && "cursor-not-allowed opacity-50",
-                  )}
-                />
-                {/* The fee is the DRIVER's, and the screen says so rather than
-                    leaving the cashier to infer it from a layout. */}
-                <p className="text-[10px] leading-snug text-fg-muted">{t("delivery.feeNote")}</p>
-
-                {/* NOT a toggle (WP-7 SS3). A WhatsApp order is settled by its
-                    driver collecting — that is the whole workflow — so this
-                    STATES the tender rather than offering a choice. Offering
-                    one is what let a delivery order fall through to the
-                    auto-pay path and become cashier cash.
-
-                    It reads as active once a driver is assigned; until then the
-                    message below says what is missing. */}
-                <p
-                  data-testid="driver-collection-tender"
-                  // Whether this order IS driver-collected, for the tests and
-                  // for anything reading the DOM. Derived, like the tender.
-                  data-active={driverCollect ? "true" : "false"}
-                  className={clsx(
-                    "mt-1 rounded-chip border px-2 py-2 text-center text-[11px] font-extrabold uppercase tracking-wide",
-                    driverCollect
-                      ? "border-brand bg-brand text-brand-fg"
-                      : "border-line bg-surface text-fg-muted",
-                  )}
-                >
-                  {t("delivery.collectByDriver")}
-                </p>
-
-                {/* THE THREE FIGURES. `customerPays` is computed here and
-                    stored nowhere: it is the only one of the three that is
-                    nobody's revenue and nobody's receivable. */}
-                {(() => {
-                  const split = deliveryTotals(totals.postDiscountTotal, deliveryFeeCents ?? 0);
-                  return (
-                    <dl className="mt-1 space-y-0.5 border-t border-line pt-1.5 text-[11px]">
-                      <div className="flex justify-between">
-                        <dt className="text-fg-muted">{t("delivery.foodTotal")}</dt>
-                        <dd className="font-bold text-fg">{formatUsd(split.foodInclVatCents)}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt className="text-fg-muted">{t("delivery.driverFee")}</dt>
-                        <dd className="font-bold text-fg">{formatUsd(split.deliveryFeeCents)}</dd>
-                      </div>
-                      <div className="flex justify-between border-t border-line pt-0.5">
-                        <dt className="font-extrabold text-fg">{t("delivery.customerPays")}</dt>
-                        <dd className="font-extrabold text-fg">
-                          {formatUsd(split.customerPaysCents)}
-                        </dd>
-                      </div>
-                    </dl>
-                  );
-                })()}
-
-                {driverCollect && (
-                  <p className="text-[10px] font-bold leading-snug text-fg-muted">
-                    {t("delivery.collectNote")}
-                  </p>
-                )}
-                {deliveryVerdict !== null && (
-                  <p className="text-[10px] font-bold leading-snug text-danger">
-                    {t(`delivery.err.${deliveryVerdict}`)}
-                  </p>
-                )}
-              </div>
-            )}
 
             {/* The order lines are the primary independently scrollable
                 region: a long order scrolls HERE first, so the discount, the
                 totals and the amount due stay where the cashier last saw them
                 instead of sliding about. */}
             <div className="-mx-1 mt-3 min-h-[2.75rem] flex-1 scroll-p-2 overflow-y-auto tiny:min-h-0 px-1 squat:mt-1.5">
+              {/* THE DELIVERY ARRANGEMENT lives INSIDE the scrollable region
+                  (WP-A3). It is order content, not a pinned control: at
+                  1366x768 under 125% Windows scaling the CSS viewport is
+                  1093x614, and with the panel pinned above this region the
+                  flex column overflowed and `overflow-hidden` clipped the
+                  AMOUNT DUE block — the one figure the register has always
+                  insisted must never scroll away. Scrolling the arrangement
+                  and pinning the total is the right way round: the driver
+                  and the fee are decided once and then read, while the
+                  amount due is read continuously. */}
+            {/* THE DELIVERY ARRANGEMENT (WP-6, compacted by WP-A3).
+                Only on a delivery order, because a driver and a delivery
+                charge mean nothing on a counter sale — and `post_sale` refuses
+                them there.
+
+                WHAT COLLAPSES, AND WHAT DOES NOT. The CONTROLS fold away once
+                the arrangement is decided: two labelled selects, an input and
+                an explanatory paragraph were holding roughly 115px of the one
+                region a 1366x768 screen is short of — the order lines —
+                permanently, long after the cashier had chosen the driver and
+                typed the charge. The FIGURES never fold. They are what the
+                cashier reads to the customer and what the shop is owed, and a
+                number you have to open a panel to see is a number nobody
+                checks.
+
+                "Decided" means a driver is chosen AND a charge has been
+                entered (even zero) AND nothing is refused. Until then the
+                controls stay open: a disclosure in front of a field the
+                cashier has not filled yet is the one thing worse than the
+                field being always open. Same rule the discount panel uses.
+
+                Disabled rather than hidden while the cart is locked, like the
+                channel segments: an unresolved delivery order is precisely
+                when the cashier needs to see which driver it was assigned to.
+
+                None of this changes the financial behaviour. The figures are
+                the same `deliveryTotals` split, the tender is still derived
+                from channel plus driver, and `buildFrozenRequest` is
+                untouched. */}
+            {isDelivery &&
+              (() => {
+                const split = deliveryTotals(
+                  totals.postDiscountTotal,
+                  deliveryFeeCents ?? 0,
+                );
+                const driverName =
+                  drivers.find((d) => d.id === activeDriverId)?.name ?? null;
+                // Both lifted to component scope, because the collapse rule
+                // is now a session rather than a re-derivation per render —
+                // see `deliveryEditCartId`.
+                const decided = deliveryDecided;
+                const open = deliveryEditorOpen;
+
+                return (
+                  <div
+                    ref={deliveryPanelRef}
+                    onBlur={(e) => {
+                      // Focus leaving the PANEL ends the session; focus moving
+                      // between its own controls does not. `relatedTarget` is
+                      // null when focus leaves the window entirely (alt-tab,
+                      // the print dialog), and that is not the cashier saying
+                      // they are finished — so it keeps the session open.
+                      const next = e.relatedTarget as Node | null;
+                      if (next && !e.currentTarget.contains(next)) {
+                        closeDeliveryEditor();
+                      }
+                    }}
+                    className="mt-2 rounded-chip border border-line bg-paper p-2 squat:mt-1.5"
+                  >
+                    {/* The header row: the tender as COMPACT STATUS TEXT
+                        (WP-A3 replaces the full-width centred block it used to
+                        be), who is carrying it, and the way back to the
+                        controls. Present in both states, so the one thing the
+                        cashier must never have to guess — whether this order
+                        is settled by its driver — is never behind a
+                        disclosure. */}
+                    <div className="flex items-center gap-2">
+                      <span
+                        data-testid="driver-collection-tender"
+                        // Whether this order IS driver-collected, for the
+                        // tests and for anything reading the DOM. Derived,
+                        // like the tender itself (WP-7 SS3): a WhatsApp order
+                        // is settled by its driver collecting, so this states
+                        // the tender rather than offering a choice. Offering
+                        // one is what let a delivery order fall through to the
+                        // auto-pay path and become cashier cash.
+                        data-active={driverCollect ? "true" : "false"}
+                        className={clsx(
+                          "shrink-0 rounded-chip border px-1.5 py-1 text-[10px] font-extrabold uppercase tracking-wide",
+                          driverCollect
+                            ? "border-brand bg-brand text-brand-fg"
+                            : "border-line bg-surface text-fg-muted",
+                        )}
+                      >
+                        {t("delivery.collectByDriver")}
+                      </span>
+                      <span
+                        data-testid="delivery-summary"
+                        className="min-w-0 flex-1 truncate text-[10px] font-extrabold uppercase tracking-wide text-fg-muted"
+                        title={
+                          driverName
+                            ? t("delivery.summaryTitle", { driver: driverName })
+                            : undefined
+                        }
+                      >
+                        {driverName
+                          ? t("delivery.summary", {
+                              driver: driverName,
+                              fee: formatUsd(split.deliveryFeeCents),
+                            })
+                          : t("delivery.summaryNoDriver")}
+                      </span>
+                      {decided && (
+                        <TinyButton
+                          testId="delivery-editor-toggle"
+                          onClick={() =>
+                            open ? closeDeliveryEditor() : openDeliveryEditor()
+                          }
+                          disabled={isActiveCartLocked}
+                        >
+                          {open ? t("common.done") : t("common.edit")}
+                        </TinyButton>
+                      )}
+                    </div>
+
+                    {open && (
+                      <div className="mt-1.5 space-y-1.5">
+                        <label
+                          className="block text-[10px] font-extrabold uppercase tracking-wide text-fg-muted"
+                          htmlFor="pos-driver"
+                        >
+                          {t("delivery.driver")}
+                        </label>
+                        <select
+                          id="pos-driver"
+                          value={activeDriverId ?? ""}
+                          disabled={isActiveCartLocked}
+                          onChange={(e) => setDriverId(e.target.value || null)}
+                          className={clsx(
+                            "w-full rounded-chip border border-line bg-surface px-2 py-1.5 text-xs font-bold text-fg",
+                            isActiveCartLocked && "cursor-not-allowed opacity-50",
+                          )}
+                        >
+                          <option value="">{t("delivery.driverUnassigned")}</option>
+                          {drivers.map((d) => (
+                            <option key={d.id} value={d.id}>
+                              {d.name}
+                            </option>
+                          ))}
+                        </select>
+                        {driversError !== null && (
+                          <p className="text-[10px] font-bold text-danger">
+                            {t("delivery.driversUnavailable")}
+                          </p>
+                        )}
+                        {driversError === null && drivers.length === 0 && (
+                          <p className="text-[10px] font-bold text-fg-muted">
+                            {t("delivery.noDrivers")}
+                          </p>
+                        )}
+
+                        <label
+                          className="block pt-0.5 text-[10px] font-extrabold uppercase tracking-wide text-fg-muted"
+                          htmlFor="pos-delivery-fee"
+                        >
+                          {t("delivery.fee")}
+                        </label>
+                        <input
+                          id="pos-delivery-fee"
+                          inputMode="decimal"
+                          value={deliveryFeeInput}
+                          disabled={isActiveCartLocked}
+                          onChange={(e) => setDeliveryFeeInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            // Enter is "I am done with this arrangement" —
+                            // and it is honoured only once the arrangement is
+                            // decided, so Enter on "2abc" or with no driver
+                            // leaves the controls and the refusal on screen.
+                            // It never posts: Post is its own button, and the
+                            // F5 shortcut is a window-level handler gated on
+                            // `canPost`.
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              closeDeliveryEditor();
+                            }
+                          }}
+                          placeholder="0.00"
+                          aria-invalid={deliveryFeeCents === null}
+                          className={clsx(
+                            "w-full rounded-chip border bg-surface px-2 py-1.5 text-xs font-bold text-fg",
+                            deliveryFeeCents === null ? "border-danger" : "border-line",
+                            isActiveCartLocked && "cursor-not-allowed opacity-50",
+                          )}
+                        />
+                        {/* The one fact about the fee, shortened to a line and
+                            shown only here — where the figure is being
+                            decided — instead of on every delivery order for
+                            ever (WP-A3). */}
+                        <p className="text-[10px] leading-snug text-fg-muted">
+                          {t("delivery.feeNote")}
+                        </p>
+                      </div>
+                    )}
+
+                    {/* THE FIGURES (WP-A4), never folded.
+
+                        `customerPays` is computed here and stored nowhere: it
+                        is the only one of them that is nobody's revenue and
+                        nobody's receivable, and a total nobody owns is how a
+                        figure like it reaches a revenue report.
+
+                        `driverOwes` is the food total under the name the shop
+                        uses for it, stated separately so the receivable and
+                        the customer's payment can never be read as the same
+                        number. */}
+                    <dl className="mt-1.5 space-y-0.5 border-t border-line pt-1.5 text-[11px]">
+                      <div className="flex justify-between">
+                        <dt className="text-fg-muted">{t("delivery.foodTotal")}</dt>
+                        <dd className="font-bold tabular-nums text-fg">
+                          {formatUsd(split.foodInclVatCents)}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-fg-muted">{t("delivery.driverFee")}</dt>
+                        <dd className="font-bold tabular-nums text-fg">
+                          {formatUsd(split.deliveryFeeCents)}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between border-t border-line pt-0.5">
+                        <dt className="font-extrabold text-fg">
+                          {t("delivery.customerPays")}
+                        </dt>
+                        <dd className="font-extrabold tabular-nums text-fg">
+                          {formatUsd(split.customerPaysCents)}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-fg-muted">{t("delivery.driverOwes")}</dt>
+                        <dd
+                          data-testid="driver-owes"
+                          className="font-bold tabular-nums text-fg"
+                        >
+                          {formatUsd(split.foodInclVatCents)}
+                        </dd>
+                      </div>
+                    </dl>
+
+                    {deliveryVerdict !== null && (
+                      <p className="mt-1 text-[10px] font-bold leading-snug text-danger">
+                        {t(`delivery.err.${deliveryVerdict}`)}
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
               {lines.length === 0 ? (
                 <div className="rounded-chip border border-dashed border-line bg-paper px-2.5 py-8 text-center text-xs text-fg-muted squat:py-4">
                   {t("pos.cartEmptyMessage")}
@@ -2821,9 +3233,37 @@ export default function PosRegister() {
                       decreaseLabel={t("pos.decreaseQty")}
                       increaseLabel={t("pos.increaseQty")}
                       removeLabel={t("common.remove")}
+                      // The kitchen instruction (WP-A2). `setLineNote` goes
+                      // through the cart's edit choke point, so a locked cart
+                      // refuses it exactly as it refuses a quantity change;
+                      // the control is disabled too, so the cashier is not
+                      // typing into something that will be discarded.
+                      note={l.kitchenNote ?? null}
+                      onNoteChange={(next) => setLineNote(l.draftId, next)}
+                      noteAddLabel={t("pos.addNote")}
+                      noteEditLabel={t("pos.editNote")}
+                      noteClearLabel={t("pos.clearNote")}
+                      notePlaceholder={t("pos.notePlaceholder")}
+                      noteMaxLength={KITCHEN_NOTE_MAX_CHARS}
+                      noteInvalid={!isKitchenNoteWithinLimit(l.kitchenNote)}
+                      noteDisabled={isActiveCartLocked}
                     />
                   ))}
                 </div>
+              )}
+
+              {/* An instruction the backend will refuse (WP-A2). Said here,
+                  beside the line it belongs to, rather than only on the Post
+                  button — and Post is gated on the same verdict, so this is
+                  an explanation rather than the control. */}
+              {overLongNoteLine !== null && (
+                <p role="alert" className="mt-2 text-[11px] font-semibold leading-snug text-danger-fg">
+                  {t("pos.errNoteTooLongDetail", {
+                    name: overLongNoteLine.product.name,
+                    count: String(kitchenNoteLength(overLongNoteLine.kitchenNote)),
+                    max: String(KITCHEN_NOTE_MAX_CHARS),
+                  })}
+                </p>
               )}
 
               {/* Discount — folded away by default. It used to sit permanently
@@ -2972,27 +3412,32 @@ export default function PosRegister() {
               {t("pos.paymentTitle")}
             </h3>
 
-            {/* The payment panel's one job is to say what is being taken HERE.
-                On a driver-collected order that is nothing, and saying so is
-                what stops a cashier hunting for a drawer figure that will not
-                appear. */}
-            {driverCollect && (
-              <p className="mt-2 rounded-chip border border-line bg-paper px-2.5 py-2 text-[11px] font-bold leading-snug text-fg-muted">
-                {t("delivery.noCashHere")}
-              </p>
-            )}
 
             <div className="mt-3 space-y-2.5 squat:mt-1.5 squat:space-y-1.5 tiny:grid tiny:grid-cols-2 tiny:gap-2 tiny:space-y-0">
+              {/* The two cash boxes are REMOVED, not merely disabled, on a
+                  driver-collected order (WP-A3).
+
+                  They were already cleared and closed — nothing could be
+                  typed into them and `buildFrozenRequest` ignores them
+                  entirely — so on a delivery order they were two labelled,
+                  dead fields holding about 110px of the one region a 1366x768
+                  till is short of. That is the space the founder's report is
+                  about: it goes to the order lines, which is where a delivery
+                  order needs it.
+
+                  What replaces them is not nothing: the block below states
+                  what the till takes now ($0.00) and what the driver owes, in
+                  the shop's own words. Unassigning the driver brings the boxes
+                  straight back, because `driverCollect` is derived from the
+                  channel plus the driver and nothing else. */}
+              {!driverCollect && (
+                <>
               <Input
                 label={t("pos.cashUsdReceived")}
                 inputMode="decimal"
                 placeholder="0.00"
                 prefix="$"
                 value={cashUsdInput}
-                // Nothing is taken at the counter on a driver-collected order,
-                // so the boxes are closed rather than left to be filled in and
-                // then ignored at post time.
-                disabled={driverCollect}
                 onChange={(e) => setCashUsdInput(e.target.value)}
               />
               <Input
@@ -3007,9 +3452,11 @@ export default function PosRegister() {
                 placeholder={rate ? "0" : "—"}
                 suffix="L.L."
                 value={cashLbpInput}
-                disabled={!rate || driverCollect}
+                disabled={!rate}
                 onChange={(e) => setCashLbpInput(e.target.value)}
               />
+                </>
+              )}
               {/* Card tender is HIDDEN, not removed. Greaz takes physical cash,
                   so the field was noise on every sale. Everything behind it is
                   untouched and still reachable: `cardUsdInput` state, the
@@ -3039,8 +3486,32 @@ export default function PosRegister() {
               )}
             </div>
 
-            {/* The prototype's `.paycalc` box. */}
+            {/* The prototype's `.paycalc` box.
+
+                ON A DRIVER-COLLECTED ORDER IT SAYS SOMETHING ELSE (WP-A3/A4).
+                The ordinary cashier vocabulary is wrong there in both of its
+                terms: "Total paid" would read $0.00 as if the order were
+                unsettled, and "Remaining" would name the food total as if the
+                customer still owed it at the till. Neither is true — the order
+                IS settled, by the driver taking responsibility for the money,
+                and the till is taking nothing. So the two rows state the two
+                facts the cashier needs: nothing is collected here, and the
+                driver owes the shop the food total. */}
             <div className="mt-3 space-y-1 rounded-chip border border-line bg-paper p-2.5 squat:mt-1.5 squat:p-2">
+              {driverCollect ? (
+                <>
+                  <AmountLine
+                    label={t("delivery.cashierReceives")}
+                    value={formatUsd(0)}
+                  />
+                  <AmountLine
+                    label={t("delivery.driverOwes")}
+                    value={formatUsd(totals.postDiscountTotal)}
+                    strong
+                  />
+                </>
+              ) : (
+                <>
               <AmountLine
                 label={t("pos.totalPaidUsdEquiv")}
                 value={formatUsd(payments.totalPaidUsdCents)}
@@ -3085,6 +3556,8 @@ export default function PosRegister() {
                   tone="good"
                 />
               ) : null}
+                </>
+              )}
             </div>
 
             {payments.errors.length > 0 && (

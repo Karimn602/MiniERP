@@ -34,6 +34,7 @@ const en = {
     cancel: "Cancel",
     delete: "Delete",
     edit: "Edit",
+    done: "Done",
     search: "Search",
     close: "Close",
     total: "Total",
@@ -141,21 +142,84 @@ const en = {
     noDrivers: "No drivers set up yet. Add one in Drivers.",
     driversUnavailable: "The driver list could not be loaded. Counter orders still work.",
     fee: "Delivery charge",
-    feeNote: "The driver keeps this. The customer pays it to him, not to the shop.",
-    collectByDriver: "Driver collects",
-    noCashHere:
-      "Nothing is taken at the till for this order. The driver collects the food total from the customer and owes it to the shop.",
-    collectNote:
-      "The driver will collect the food total from the customer and owe it to the shop. Nothing goes in the drawer now.",
+    feeNote: "The driver keeps this charge.",
+    collectByDriver: "Collected by driver",
+    collectNote: "Nothing goes in the drawer now.",
     foodTotal: "Food (shop receipt)",
     driverFee: "Driver delivery fee",
     customerPays: "Customer pays driver",
+    // The receivable, in the shop's own words. NOT "Remaining": nothing is
+    // outstanding at the till on a driver-collected order.
+    driverOwes: "Driver owes Greaz",
+    cashierReceives: "Cashier receives now",
+    // The collapsed one-line summary (WP-A3).
+    summary: "{{driver}} · fee {{fee}}",
+    summaryTitle: "Carried by {{driver}}",
+    summaryNoDriver: "Delivery — no driver chosen",
     err: {
       driverRequired: "Choose the driver who is taking this order.",
       feeNeedsDriver: "A delivery charge needs the driver who collects it.",
       driverNeedsDelivery: "Only a delivery order can have a driver. Switch the channel first.",
       feeInvalid: "Enter the delivery charge as an amount, like 3 or 3.50.",
     },
+  },
+
+  // --- Shift history (WP-A1). Read-only; a closed shift's reconciliation is
+  // the figure `close_shift` recorded, never one recomputed today.
+  shiftHistory: {
+    title: "Shift history",
+    subtitle:
+      "Every shift this store has opened, and the cash reconciliation each one was closed on.",
+    filterFrom: "From",
+    filterTo: "To",
+    filterClear: "Clear dates",
+    loading: "Loading shifts…",
+    loadingDetail: "Loading shift…",
+    none: "No shifts in this range.",
+    notFound: "That shift could not be read.",
+    view: "View",
+    hide: "Hide",
+    colOpened: "Opened",
+    colClosed: "Closed",
+    colCashier: "Cashier",
+    colExpectedUsd: "Expected USD",
+    colCountedUsd: "Counted USD",
+    colVarianceUsd: "Variance USD",
+    colStatus: "Status",
+    status: {
+      open: "Open",
+      closed: "Closed",
+      voided: "Voided",
+    },
+    detailTitle: "Shift of {{date}}",
+    detailClosedAt: "Closed {{time}}",
+    detailStillOpen: "Still open",
+    shiftId: "Shift id",
+    openedBy: "Opened by",
+    closedBy: "Closed by",
+    notClosedYet: "Not closed yet",
+    unknownUser: "Unknown",
+    countedCash: "Counted cash",
+    drawerRecorded: "As recorded when this shift was closed.",
+    drawerRunning: "Running totals — this shift is still open.",
+    asRecorded: "recorded at close",
+    asRunning: "running total",
+    recomputedDiffers:
+      "Today's drawer formula makes {{recomputed}} of this shift's rows. The figure above is the one recorded when the shift was closed and is the figure the cashier was held to — it is not restated here.",
+    readOnlyNote:
+      "A closed shift is final: its counted cash, expected cash and variance were computed and stored in the transaction that closed it, and nothing can change them.",
+    openNote:
+      "This shift is still open, so the drawer figures are running totals. They are stored when it is closed.",
+    print: "Print shift report",
+    printTitle: "Shift report",
+  },
+
+  // --- The kitchen ticket (WP-A2). Read by the kitchen staff, so unlike the
+  // customer receipt it is translated.
+  kitchen: {
+    orderNumber: "Order #{{number}}",
+    notePrefix: "**",
+    notAReceipt: "Kitchen copy — not a receipt",
   },
 
   channel: {
@@ -341,7 +405,17 @@ const en = {
       "No exchange rate is set. Set one in the Exchange Rate page before posting any sale.",
 
     printReceipt: "Print receipt",
+    printKitchenTicket: "Kitchen ticket",
     newSale: "New sale",
+
+    // Per-line kitchen instructions (WP-A2).
+    addNote: "+ Note",
+    editNote: "Kitchen note",
+    clearNote: "Remove note",
+    notePlaceholder: "No pickles…",
+    errNoteTooLong: "Shorten the kitchen note on {{name}} to {{max}} characters.",
+    errNoteTooLongDetail:
+      "The kitchen note on {{name}} is {{count}} characters. The limit is {{max}} — shorten it to post.",
 
     errNoProductForBarcode: 'No product matches barcode "{{barcode}}".',
     errInactiveProduct: '"{{name}}" is inactive and cannot be sold.',
@@ -362,6 +436,15 @@ const en = {
     subtitle: "Cash and payment reconciliation for the current shift.",
     loading: "Loading…",
     refresh: "Refresh",
+
+    // The two tabs (WP-A1).
+    tabCurrent: "Current shift",
+    tabHistory: "Shift history",
+
+    // The always-visible returns summary (WP-A6).
+    returnsNone: "No returns in this shift",
+    returnsSummary: "{{count}} credit memo(s) · {{total}} refunded",
+    returnsShowDetail: "Show detail",
 
     noOpenShiftTitle: "No open shift",
     noOpenShiftSubtitle:
@@ -471,6 +554,7 @@ const en = {
     serviceLabel: "Service",
 
     importProducts: "Import products",
+    showInactive: "Show inactive",
     newProduct: "New product",
 
     formNewTitle: "New product",
@@ -558,6 +642,14 @@ const en = {
   },
   productImport: {
     title: "Import products",
+    // The optional menu columns (WP-A5).
+    optionalCols: "Optional columns — a file without them still imports",
+    colCategoryDesc: "menu section id, e.g. burgers",
+    colIconDesc: "one glyph for the tile, e.g. 🍔",
+    colDescriptionDesc: "short text for the product card",
+    categoryValues: "Accepted menu sections: {{values}}",
+    colSectionHeader: "Section",
+    colIconHeader: "Icon",
     subtitle: "CSV or XLSX — create new products and barcodes from a spreadsheet",
 
     step1Title: "1. Download the template",
@@ -588,7 +680,15 @@ const en = {
     chooseFile: "Choose file (.xlsx or .csv)",
 
     readyToImport: "{{count}} ready to import",
-    willBeSkipped: "{{count}} will be skipped (SKU exists)",
+    willBeSkipped: "{{count}} skipped (already in the database)",
+    rejected: "{{count}} rejected",
+    reasonChecksum: "{{count}} × invalid EAN-13 check digit",
+    reasonDuplicateSkuInFile: "{{count}} × SKU repeated in this file",
+    reasonDuplicateBarcodeInFile: "{{count}} × barcode repeated in this file",
+    reasonSkuExists: "{{count}} × SKU already in the database",
+    reasonBarcodeActive: "{{count}} × barcode used by an active product",
+    reasonBarcodeInactive: "{{count}} × barcode held by an INACTIVE product",
+    reasonMalformed: "{{count}} × other invalid row data",
     haveErrors: "{{count}} have errors",
 
     openingStockNoteShort: "Opening stock quantities are not imported. Use",
@@ -604,6 +704,11 @@ const en = {
     colStockUnitHeader: "Stock unit",
     colSellUnitHeader: "Sell unit",
     colQtyUnit: "Qty/unit",
+    colClassHeader: "Classification",
+    classActive: "Active",
+    classInactive: "Inactive",
+    classService: "Service",
+    classStocked: "Stocked",
     colIssues: "Issues",
 
     blankName: "blank",
@@ -614,7 +719,8 @@ const en = {
 
     doneTitle: "Import complete",
     doneCreated: "{{count}} product(s) created",
-    doneSkipped: ", {{count}} skipped",
+    doneSkipped: ", {{count}} skipped (already in the database)",
+    doneRejected: ", {{count}} rejected",
     doneFailed: ", {{count}} failed unexpectedly",
 
     failedNote:

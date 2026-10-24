@@ -1330,6 +1330,21 @@ describe("driver collection (WP-6)", () => {
   /** Is this order driver-collected? Derived in the register, read here. */
   const isDriverCollected = () => collectTender().getAttribute("data-active") === "true";
 
+  /**
+   * Reopen the delivery editor.
+   *
+   * WP-A3 folds the driver select and the fee input away once the arrangement
+   * is decided — a driver chosen, a charge entered, nothing refused — so the
+   * order lines get the height back. The figures and the tender chip stay
+   * visible either way; only the CONTROLS fold. A test that wants to change
+   * the arrangement after setting it up therefore has to open the editor, the
+   * same way the cashier does.
+   */
+  function reopenDeliveryEditor() {
+    if (screen.queryByLabelText(/^driver$/i)) return;
+    fireEvent.click(screen.getByTestId("delivery-editor-toggle"));
+  }
+
   /** Switch to delivery, pick Ali, and type a fee. */
   async function setUpDelivery(fee = "3.00", driver = "drv-ali") {
     fireEvent.click(deliveryBtn());
@@ -1424,10 +1439,21 @@ describe("driver collection (WP-6)", () => {
 
     await setUpDelivery("3.00");
 
-    // Cleared, closed, and explained.
-    await waitFor(() => expect((screen.getByLabelText(/^cash usd received$/i) as HTMLInputElement).value).toBe(""));
-    expect((screen.getByLabelText(/^cash usd received$/i) as HTMLInputElement).disabled).toBe(true);
-    expect(screen.getByText(/nothing is taken at the till/i)).toBeTruthy();
+    // Cleared, REMOVED, and explained.
+    //
+    // WP-A3 took the two cash boxes off a driver-collected order rather than
+    // leaving them disabled: they were already cleared and ignored, so on a
+    // delivery order they were two dead fields holding about 110px of the one
+    // region a 1366x768 till is short of. Absence is a stronger guarantee than
+    // `disabled` for the thing this test is about — there is no field to type
+    // into at all — and the vocabulary that replaces them is the shop's own:
+    // what the till takes now, and what the driver owes. Not "$0.00 paid" and
+    // the food total "Remaining", as though the customer still owed it here.
+    await waitFor(() => expect(screen.queryByLabelText(/^cash usd received$/i)).toBeNull());
+    expect(screen.queryByLabelText(/cash lbp received/i)).toBeNull();
+    expect(screen.getByText(/cashier receives now/i)).toBeTruthy();
+    expect(screen.getAllByText(/driver owes greaz/i).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/^remaining$/i)).toBeNull();
 
     // And the posted tender is the driver leg alone, for the food total.
     fireEvent.click(postButton());
@@ -1446,15 +1472,17 @@ describe("driver collection (WP-6)", () => {
     await renderRegister();
     await awaitReadyToPost();
     await setUpDelivery("3.00");
-    expect((screen.getByLabelText(/^cash usd received$/i) as HTMLInputElement).disabled).toBe(
-      true,
-    );
+    expect(screen.queryByLabelText(/^cash usd received$/i)).toBeNull();
 
+    reopenDeliveryEditor();
     fireEvent.change(driverSelect(), { target: { value: "" } });
+    // The boxes come straight back, enabled: `driverCollect` is derived from
+    // the channel plus the driver and nothing else, so there is no second
+    // piece of state to get out of step.
     expect((screen.getByLabelText(/^cash usd received$/i) as HTMLInputElement).disabled).toBe(
       false,
     );
-    expect(screen.queryByText(/nothing is taken at the till/i)).toBeNull();
+    expect(screen.queryByText(/cashier receives now/i)).toBeNull();
   });
 
   it("REFUSES to post a driver collection with no driver chosen", async () => {
@@ -1561,6 +1589,7 @@ describe("driver collection (WP-6)", () => {
     await setUpDelivery("0");
     expect(isDriverCollected()).toBe(true);
 
+    reopenDeliveryEditor();
     fireEvent.change(driverSelect(), { target: { value: "" } });
     expect(isDriverCollected()).toBe(false);
     // And the order stops being postable, rather than quietly becoming cash.
@@ -1582,6 +1611,10 @@ describe("driver collection (WP-6)", () => {
     expect(screen.queryByLabelText(/^driver$/i)).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: /cart 1/i }));
+    // Switching carts closes the editor, so the arrangement is read back
+    // through it rather than from a panel left open on the cart we came from.
+    await waitFor(() => expect(screen.getByTestId("delivery-summary").textContent).toContain("Hassan"));
+    reopenDeliveryEditor();
     await waitFor(() => expect(driverSelect().value).toBe("drv-hassan"));
     expect(feeInput().value).toBe("4.00");
   });
@@ -1602,6 +1635,10 @@ describe("driver collection (WP-6)", () => {
     await renderRegister();
     await awaitReadyToPost();
 
+    // The restored arrangement is already decided, so the editor comes back
+    // folded — the summary line is what the cashier sees first.
+    expect(screen.getByTestId("delivery-summary").textContent).toContain("Ali");
+    reopenDeliveryEditor();
     expect(driverSelect().value).toBe("drv-ali");
     expect(feeInput().value).toBe("3.00");
     expect(isDriverCollected()).toBe(true);
@@ -1917,23 +1954,24 @@ describe("no cashier path can settle a delivery order at the till (WP-7 item 7)"
     await waitFor(() => expect(driverSelect()).toBeTruthy());
     fireEvent.change(driverSelect(), { target: { value: "drv-ali" } });
 
+    // The box is gone (WP-A3), and the amount with it: switching back to
+    // Counter must not bring $10.00 of phantom cash with it.
+    expect(screen.queryByLabelText(/^cash usd received$/i)).toBeNull();
+    fireEvent.click(counterBtn());
     expect((screen.getByLabelText(/^cash usd received$/i) as HTMLInputElement).value).toBe("");
   });
 
   it("offers no control that could add a till tender to a delivery order", async () => {
-    // Both cash boxes are closed, and there is no toggle to reopen them while a
-    // driver is assigned. The tender is stated, not chosen.
+    // Both cash boxes are GONE (WP-A3 — they used to be present and
+    // disabled), and there is no toggle to bring them back while a driver is
+    // assigned. The tender is stated, not chosen.
     oneCartWithALine();
     await renderRegister();
     await awaitReadyToPost();
     await setUpDelivery("3.00");
 
-    expect((screen.getByLabelText(/^cash usd received$/i) as HTMLInputElement).disabled).toBe(
-      true,
-    );
-    expect((screen.getByLabelText(/cash lbp received/i) as HTMLInputElement).disabled).toBe(
-      true,
-    );
+    expect(screen.queryByLabelText(/^cash usd received$/i)).toBeNull();
+    expect(screen.queryByLabelText(/cash lbp received/i)).toBeNull();
     expect(screen.queryByRole("button", { name: /driver collects/i })).toBeNull();
     expect(isDriverCollected()).toBe(true);
   });
@@ -2043,5 +2081,591 @@ describe("retirement and re-checkout carry their identity (GZ-P1-2)", () => {
     // the message, and no writer put the record back to "posting".
     await waitFor(() => expect(storedAttemptRow()?.state).toBe("unknown"));
     expect(storedAttemptRow()?.checkoutId).toBe("ck-night");
+  });
+});
+
+// ===========================================================================
+// WP-A2 — per-line kitchen instructions, through the register
+// ===========================================================================
+//
+// The backend half of this is pinned in `src-tauri/src/tests/sales.rs` against
+// a real database: the note is persisted on its own line, it moves no figure,
+// and a replay carrying a different one is a conflict. What is pinned HERE is
+// the register's half, which is the half that can lose a note or attach it to
+// the wrong line:
+//
+//   * a note typed in the cart reaches the FROZEN request, not just the screen;
+//   * two lines of one product keep their own notes and are not merged;
+//   * the note survives a parked cart and a restart;
+//   * a locked cart refuses a note edit, because the request is already frozen.
+
+describe("kitchen notes (WP-A2)", () => {
+  const noteButton = () => screen.getByRole("button", { name: /\+ note/i });
+  const noteInput = () => screen.getByLabelText(/kitchen note/i) as HTMLInputElement;
+
+  /** Type an instruction on the first line that has none. */
+  function typeNote(text: string) {
+    fireEvent.click(noteButton());
+    fireEvent.change(noteInput(), { target: { value: text } });
+    fireEvent.keyDown(noteInput(), { key: "Enter" });
+  }
+
+  it("freezes a typed note into the posting request", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    typeNote("No pickles");
+    await waitFor(() => expect(screen.getByText("No pickles")).toBeTruthy());
+
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+
+    const sent = postSale.mock.calls[0][0];
+    expect(sent.lines).toHaveLength(1);
+    expect(sent.lines[0].kitchenNote).toBe("No pickles");
+  });
+
+  it("sends null, never an empty string, for a line with no note", async () => {
+    // `""` and NULL must not both mean "no instruction": the backend compares
+    // the note on replay, and two spellings of nothing would make a faithful
+    // retry look like a conflict.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBeNull();
+  });
+
+  it("normalises a note typed with surrounding spaces", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    typeNote("  extra crispy  ");
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBe("extra crispy");
+  });
+
+  it("clears a note back to nothing", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    typeNote("No onions");
+    await waitFor(() => expect(screen.getByText("No onions")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /remove note/i }));
+    await waitFor(() => expect(screen.queryByText("No onions")).toBeNull());
+
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBeNull();
+  });
+
+  it("does NOT merge a second unit into a line that carries an instruction", async () => {
+    // The case the whole feature exists for: two identical burgers, made
+    // differently. Clicking the tile again must start a line of its own rather
+    // than bumping the noted line to quantity 2 — which would have the kitchen
+    // make both of them "no pickles" and leave nothing on the receipt to show
+    // what was asked for.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    typeNote("No pickles");
+    await waitFor(() => expect(screen.getByText("No pickles")).toBeTruthy());
+
+    // Add the same product again, from the menu tile.
+    fireEvent.click(screen.getByRole("button", { name: /double burger/i }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /\+ note/i })).toBeTruthy());
+
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+
+    const sent = postSale.mock.calls[0][0];
+    expect(sent.lines).toHaveLength(2);
+    expect(sent.lines.map((l: { kitchenNote: string | null }) => l.kitchenNote).sort()).toEqual([
+      "No pickles",
+      null,
+    ]);
+    // Both lines are one unit — nothing was merged.
+    expect(sent.lines.every((l: { quantityInUom: number }) => l.quantityInUom === 1)).toBe(true);
+  });
+
+  it("still merges a second unit into a line with NO instruction", async () => {
+    // The ordinary case must not regress: a tile clicked twice is still two of
+    // that item on one line.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    fireEvent.click(screen.getByRole("button", { name: /double burger/i }));
+
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+
+    const sent = postSale.mock.calls[0][0];
+    expect(sent.lines).toHaveLength(1);
+    expect(sent.lines[0].quantityInUom).toBe(2);
+  });
+
+  it("survives a restart on a parked cart", async () => {
+    // The note lives on the cart line, so it is written by the same `setItem`
+    // the cart is, and comes back with it.
+    seedCarts([
+      {
+        id: "cart-1",
+        seq: 1,
+        lines: [{ ...persistedLine(burger(), 1), kitchenNote: "Light sauce" }],
+        ...BLANK,
+      },
+    ]);
+    await renderRegister();
+    await awaitReadyToPost();
+
+    expect(screen.getByText("Light sauce")).toBeTruthy();
+
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBe("Light sauce");
+  });
+
+  it("carries an Arabic instruction through unchanged", async () => {
+    seedCarts([
+      {
+        id: "cart-1",
+        seq: 1,
+        lines: [{ ...persistedLine(burger(), 1), kitchenNote: "بدون صوص" }],
+        ...BLANK,
+      },
+    ]);
+    await renderRegister();
+    await awaitReadyToPost();
+
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBe("بدون صوص");
+  });
+
+  it("refuses to post an over-long instruction, and says which line", async () => {
+    // Gated on the VERDICT, not on a message — a missing translation must not
+    // re-enable posting through a note the backend will refuse. The register
+    // says so first so the cashier is not refused with a customer waiting.
+    seedCarts([
+      {
+        id: "cart-1",
+        seq: 1,
+        lines: [{ ...persistedLine(burger(), 1), kitchenNote: "x".repeat(201) }],
+        ...BLANK,
+      },
+    ]);
+    await renderRegister();
+
+    await waitFor(() => expect(postButton().disabled).toBe(true));
+    fireEvent.click(postButton());
+    expect(postSale).not.toHaveBeenCalled();
+    expect(screen.getByText(/201 characters/i)).toBeTruthy();
+  });
+
+  it("does not let a note be edited while a checkout is unresolved", async () => {
+    // The frozen request is already on the wire or is the key to a sale that
+    // may exist. A note typed into it afterwards would turn the one recovery
+    // path into a conflict — so the control is disabled, and `setLines`
+    // refuses it even if something reached past the control.
+    seedCarts([
+      {
+        id: "cart-1",
+        seq: 1,
+        lines: [{ ...persistedLine(burger(), 1), kitchenNote: "No pickles" }],
+        ...BLANK,
+        checkoutId: "checkout-unresolved",
+        attempt: inFlightAttempt("checkout-unresolved"),
+      },
+    ]);
+    await renderRegister();
+
+    const chip = await waitFor(() => screen.getByRole("button", { name: "No pickles" }));
+    expect((chip as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: /remove note/i }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+});
+
+// ===========================================================================
+// Codex WP-A finding 2 — a kitchen instruction is authoritative from the
+// first keystroke, so posting cannot miss one.
+// ===========================================================================
+
+describe("an uncommitted kitchen note cannot be left out of a sale (GZ-A-02)", () => {
+  const noteButton = () => screen.getByRole("button", { name: /\+ note/i });
+  const noteInput = () => screen.getByLabelText(/kitchen note/i) as HTMLInputElement;
+
+  /** Let queued microtasks run without asserting on anything. */
+  async function settle() {
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  }
+
+  /**
+   * Type into the editor WITHOUT finishing: no Enter, no blur, the caret
+   * still in the box. Characters arrive one at a time, which is what a
+   * controlled React input sees from a real keyboard.
+   */
+  function typeIntoOpenEditor(text: string) {
+    fireEvent.click(noteButton());
+    for (let i = 1; i <= text.length; i++) {
+      fireEvent.change(noteInput(), { target: { value: text.slice(0, i) } });
+    }
+  }
+
+  /** The post shortcut, as the window-level handler receives it. */
+  function pressF5() {
+    fireEvent.keyDown(window, { key: "F5" });
+  }
+
+  it("F5 with the caret still in the note box posts the note that was typed", async () => {
+    // THE DEFECT. The editor kept a local draft and committed it on Enter or
+    // on blur. F5 is a window-level shortcut and does not blur the input, so
+    // the sale posted with the line's OLD note (none) while the cashier was
+    // looking at the text they had just typed. The posted line is immutable,
+    // the kitchen ticket prints from the posted sale, and nothing afterwards
+    // can put the instruction back.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    typeIntoOpenEditor("No pickles");
+    pressF5();
+
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBe("No pickles");
+  });
+
+  it("clicking Post with the caret still in the note box posts it too", async () => {
+    // The pointer path has the same shape. A mousedown on Post does blur the
+    // input, but the ordering of that blur against the click handler is not
+    // something a financial guarantee should rest on.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    typeIntoOpenEditor("Extra sauce");
+    fireEvent.click(postButton());
+
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBe("Extra sauce");
+  });
+
+  it("two identical products stay distinguishable by their notes", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    // Note the first line, then add the same product again: the merge rule
+    // compares the normalised note, so this is a SECOND line.
+    typeIntoOpenEditor("No pickles");
+    fireEvent.keyDown(noteInput(), { key: "Enter" });
+    await waitFor(() => expect(screen.getByText("No pickles")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /double burger/i }));
+    await waitFor(() => expect(postButton().disabled).toBe(false));
+
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+
+    const sent = postSale.mock.calls[0][0];
+    expect(sent.lines).toHaveLength(2);
+    const notes = sent.lines.map((l: { kitchenNote: string | null }) => l.kitchenNote);
+    expect(notes).toContain("No pickles");
+    expect(notes).toContain(null);
+  });
+
+  it("Escape restores the instruction the editor opened on", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    typeIntoOpenEditor("No pickles");
+    fireEvent.keyDown(noteInput(), { key: "Enter" });
+    await waitFor(() => expect(screen.getByText("No pickles")).toBeTruthy());
+
+    // Reopen, type something else, then abandon it.
+    fireEvent.click(screen.getByRole("button", { name: "No pickles" }));
+    fireEvent.change(noteInput(), { target: { value: "No pickles and no onions" } });
+    fireEvent.keyDown(noteInput(), { key: "Escape" });
+
+    await waitFor(() => expect(screen.getByText("No pickles")).toBeTruthy());
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBe("No pickles");
+  });
+
+  it("the editor closes when the cart locks mid-edit", async () => {
+    // A lock means a frozen request is on the wire. `setLines` refuses a note
+    // edit from that moment, so an editor left open would be collecting text
+    // that can never be committed: the silent-loss shape again, one step on.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    let release!: (v: unknown) => void;
+    postSale.mockReturnValueOnce(
+      new Promise((res) => {
+        release = res as (v: unknown) => void;
+      }),
+    );
+
+    typeIntoOpenEditor("Light sauce");
+    fireEvent.click(postButton());
+
+    await waitFor(() => expect(screen.queryByLabelText(/kitchen note/i)).toBeNull());
+
+    // And the instruction that was typed is the one that went out.
+    expect(postSale.mock.calls[0][0].lines[0].kitchenNote).toBe("Light sauce");
+
+    await act(async () => {
+      release({ saleId: "sale-1", receiptNumber: 1 });
+    });
+  });
+
+  it("F5 during an unresolved recovery starts no second post, and offers no editor", async () => {
+    // The cart is frozen around an attempt whose answer was lost. F5 must not
+    // ring it up again under a new identity, and the note affordance must not
+    // be usable: a note typed here would turn the one retry into a CONFLICT.
+    seedCarts([
+      {
+        id: "cart-1",
+        seq: 1,
+        lines: [{ ...persistedLine(burger(), 1), kitchenNote: "No pickles" }],
+        ...BLANK,
+        checkoutId: "checkout-unresolved",
+        attempt: inFlightAttempt("checkout-unresolved"),
+      },
+    ]);
+    await renderRegister();
+
+    const chip = await waitFor(() => screen.getByRole("button", { name: "No pickles" }));
+    expect((chip as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByLabelText(/kitchen note/i)).toBeNull();
+
+    // F5 here is the RECOVERY path, not a new sale. If it posts at all it
+    // must post the ORIGINAL identity and the ORIGINAL frozen request — the
+    // whole point of the attempt — and in particular it must not pick up the
+    // cart's note as a fresh edit. A new identity here would ring the basket
+    // up twice.
+    pressF5();
+    await settle();
+    if (postSale.mock.calls.length > 0) {
+      expect(postSale).toHaveBeenCalledTimes(1);
+      const sent = postSale.mock.calls[0][0];
+      expect(sent.saleId).toBe("checkout-unresolved");
+      expect(sent.shiftId).toBe("shift-LAST-NIGHT");
+      expect(sent.cashierUserId).toBe("cashier-LAST-NIGHT");
+    }
+  });
+
+  it("the frozen request is not rewritten by anything that happens after it", async () => {
+    // Belt and braces for the same rule at the layer that matters: whatever
+    // the screen does, what was SENT must be what was frozen.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+
+    let release!: (v: unknown) => void;
+    postSale.mockReturnValueOnce(
+      new Promise((res) => {
+        release = res as (v: unknown) => void;
+      }),
+    );
+
+    typeIntoOpenEditor("No pickles");
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+
+    const frozen = JSON.parse(JSON.stringify(postSale.mock.calls[0][0]));
+    await act(async () => {
+      release({ saleId: "sale-1", receiptNumber: 1 });
+    });
+
+    expect(postSale.mock.calls[0][0]).toEqual(frozen);
+    expect(frozen.lines[0].kitchenNote).toBe("No pickles");
+  });
+});
+
+// ===========================================================================
+// Codex WP-A finding 3 — the delivery editor is a SESSION, not a verdict
+// recomputed on every keystroke.
+// ===========================================================================
+
+describe("the delivery editor stays open for a whole edit session (GZ-A-03)", () => {
+  const deliveryBtn = () =>
+    screen.getByRole("button", { name: /^delivery$/i }) as HTMLButtonElement;
+  const driverSelect = () => screen.getByLabelText(/^driver$/i) as HTMLSelectElement;
+  const feeInput = () => screen.getByLabelText(/delivery charge/i) as HTMLInputElement;
+  const editorOpen = () => screen.queryByLabelText(/delivery charge/i) !== null;
+  const toggle = () => screen.getByTestId("delivery-editor-toggle");
+
+  /** One character at a time, the way a keyboard delivers them. */
+  function typeFee(text: string) {
+    for (let i = 1; i <= text.length; i++) {
+      fireEvent.change(feeInput(), { target: { value: text.slice(0, i) } });
+      // The session must survive every intermediate value, not just the last.
+      expect(editorOpen()).toBe(true);
+    }
+  }
+
+  async function startDelivery(driver = "drv-ali") {
+    fireEvent.click(deliveryBtn());
+    await waitFor(() => expect(driverSelect()).toBeTruthy());
+    fireEvent.change(driverSelect(), { target: { value: driver } });
+  }
+
+  it("typing a decimal fee one key at a time never folds the panel", async () => {
+    // THE DEFECT. "Decided" was recomputed on every render — a driver, a
+    // non-blank fee, no refusal — and the panel folded the instant it read
+    // true. After the first digit of 2.50 the arrangement parsed, so the
+    // controls unmounted with the caret inside them and the charge stayed at
+    // $2.00 unless the cashier noticed and reopened the editor.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+    await startDelivery();
+
+    typeFee("2.50");
+
+    expect(editorOpen()).toBe(true);
+    expect(feeInput().value).toBe("2.50");
+  });
+
+  it("Enter is the deliberate completion, and Edit brings the controls back", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+    await startDelivery();
+    typeFee("2.50");
+
+    fireEvent.keyDown(feeInput(), { key: "Enter" });
+    await waitFor(() => expect(editorOpen()).toBe(false));
+    // The summary still states who is carrying it and for how much.
+    expect(screen.getByTestId("delivery-summary").textContent).toMatch(/ali/i);
+
+    fireEvent.click(toggle());
+    await waitFor(() => expect(editorOpen()).toBe(true));
+    // And the selections survived the round trip.
+    expect(driverSelect().value).toBe("drv-ali");
+    expect(feeInput().value).toBe("2.50");
+  });
+
+  it("Tab between the panel's own controls does not collapse it", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+    await startDelivery();
+    typeFee("2.50");
+
+    // Tab from the fee box back to the driver select: focus is still inside
+    // the panel, so the session is still the cashier's.
+    fireEvent.blur(feeInput(), { relatedTarget: driverSelect() });
+    expect(editorOpen()).toBe(true);
+  });
+
+  it("focus leaving the panel completes the session", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+    await startDelivery();
+    typeFee("2.50");
+
+    fireEvent.blur(feeInput(), { relatedTarget: postButton() });
+    await waitFor(() => expect(editorOpen()).toBe(false));
+  });
+
+  it("focus leaving the WINDOW does not complete it", async () => {
+    // `relatedTarget` is null when focus goes nowhere in this document: an
+    // alt-tab, a print dialog, the window losing focus. None of those is the
+    // cashier saying the arrangement is settled.
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+    await startDelivery();
+    typeFee("2.50");
+
+    fireEvent.blur(feeInput(), { relatedTarget: null });
+    expect(editorOpen()).toBe(true);
+  });
+
+  it("an invalid intermediate value keeps the controls and the refusal on screen", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+    await startDelivery();
+
+    fireEvent.change(feeInput(), { target: { value: "2abc" } });
+    expect(editorOpen()).toBe(true);
+    expect(feeInput().getAttribute("aria-invalid")).toBe("true");
+    await waitFor(() => expect(postButton().disabled).toBe(true));
+
+    // Enter on a refused arrangement is not a completion: there is nothing to
+    // summarise, and folding would hide the message that explains why.
+    fireEvent.keyDown(feeInput(), { key: "Enter" });
+    expect(editorOpen()).toBe(true);
+    // Nor does blurring out of a refused arrangement fold it away.
+    fireEvent.blur(feeInput(), { relatedTarget: postButton() });
+    expect(editorOpen()).toBe(true);
+    expect(postSale).not.toHaveBeenCalled();
+
+    // Correcting it leaves the session open, and then it can be completed.
+    typeFee("2.50");
+    fireEvent.keyDown(feeInput(), { key: "Enter" });
+    await waitFor(() => expect(editorOpen()).toBe(false));
+  });
+
+  it("with no driver the controls cannot be folded away at all", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+    fireEvent.click(deliveryBtn());
+    await waitFor(() => expect(driverSelect()).toBeTruthy());
+
+    fireEvent.change(feeInput(), { target: { value: "2.50" } });
+    // Nothing to summarise, and a control the cashier must use is never
+    // behind a disclosure — so there is no toggle to press either.
+    expect(editorOpen()).toBe(true);
+    expect(screen.queryByTestId("delivery-editor-toggle")).toBeNull();
+  });
+
+  it("collapsing changes no figure and no posted amount", async () => {
+    oneCartWithALine();
+    await renderRegister();
+    await awaitReadyToPost();
+    await startDelivery();
+    typeFee("2.50");
+
+    const owedWhileOpen = screen.getByTestId("driver-owes").textContent;
+    fireEvent.keyDown(feeInput(), { key: "Enter" });
+    await waitFor(() => expect(editorOpen()).toBe(false));
+    expect(screen.getByTestId("driver-owes").textContent).toBe(owedWhileOpen);
+
+    await waitFor(() => expect(postButton().disabled).toBe(false));
+    fireEvent.click(postButton());
+    await waitFor(() => expect(postSale).toHaveBeenCalledTimes(1));
+
+    const sent = postSale.mock.calls[0][0];
+    expect(sent.channel).toBe("online_delivery");
+    expect(sent.driverId).toBe("drv-ali");
+    expect(sent.deliveryFeeCents).toBe(250);
+    expect(sent.payments).toHaveLength(1);
+    expect(sent.payments[0].method).toBe("driver_collection");
+    // The food total, with the fee in neither the sale nor the receivable.
+    expect(sent.payments[0].amountUsdCentsEquivalent).toBe(PRICE);
+    expect(sent.lines[0].lineTotalInclVatCents).toBe(PRICE);
   });
 });

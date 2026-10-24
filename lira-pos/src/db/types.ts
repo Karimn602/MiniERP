@@ -337,6 +337,30 @@ export interface Sale {
   voidedByUserId: string | null;
   voidReason: string | null;
   notes: string | null;
+  /**
+   * Where the order came from (WP-4): `"counter"` or `"online_delivery"`.
+   *
+   * A bare string rather than an import of `SalesChannel`, to keep this module
+   * off `lib/` beyond the three value types at the top. The column is NOT NULL
+   * with a CHECK, so every row holds one of the two.
+   */
+  channel: string;
+  /**
+   * The shop's own driver who carried a delivery order (WP-6), or null.
+   *
+   * Here because a receipt and a kitchen ticket both have to be able to say who
+   * took the order. The RECEIVABLE is a `driver_ledger` row and is not this
+   * field.
+   */
+  driverId: string | null;
+  /**
+   * What the customer paid the DRIVER for the delivery, in USD cents (WP-6).
+   *
+   * Outside every sale total, never VAT-rated, not a `sale_items` row, and not
+   * in the driver's receivable — he keeps it. It is on the sale so the shop can
+   * state what the customer's whole payment was; see `lib/driverCollection.ts`.
+   */
+  deliveryFeeCents: UsdCents;
 }
 
 export interface SaleItem {
@@ -367,6 +391,15 @@ export interface SaleItem {
   uomCodeSnapshot: string | null;
   factorNumSnapshot: number | null;
   factorDenSnapshot: number | null;
+  /**
+   * The kitchen's instruction for this line, as it was given (WP-A2).
+   *
+   * A snapshot in exactly the sense the name and the price beside it are: it
+   * is what the kitchen was told, at the moment the order was taken, and
+   * migration 012's seal means it can never be rewritten. Carries no money —
+   * a PAID modifier is a priced line of its own.
+   */
+  kitchenNote: string | null;
 }
 
 export interface SalePayment {
@@ -634,6 +667,15 @@ export interface ReturnableLine {
   vatRateBpsSnapshot: number;
   /** True when the original line moved no stock, so it can never restock. */
   isService: boolean;
+  /**
+   * The instruction this line was made to (WP-A2), or null.
+   *
+   * Carried into the return dialog because two lines of one product are
+   * otherwise identical there — and the instruction is frequently the reason
+   * one of them is coming back. It affects no figure: a memo's amounts are
+   * prorated from the line's persisted components, never from its note.
+   */
+  kitchenNote: string | null;
 }
 
 /** How much a sale may still be refunded through one of its own tenders. */

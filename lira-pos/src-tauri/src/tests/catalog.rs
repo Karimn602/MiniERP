@@ -956,3 +956,81 @@ async fn saving_a_section_moves_no_stock_and_no_cost() {
         "and no movement was invented"
     );
 }
+
+// ===========================================================================
+// The ACTIVE flag reaches the row (Codex WP-A finding 4, layer 3)
+// ===========================================================================
+//
+// The spreadsheet importer read every row's `active` column, carried the
+// parsed flag onto the validated row, and then omitted it from the save call
+// — and `isActive` is optional on the way in, defaulting to true, so a
+// product the shop had deliberately marked inactive was created SELLABLE.
+//
+// The frontend half of that is pinned in tests/unit/productImportDialog.test.tsx
+// (the preview, and the arguments the dialog passes). This is the half no
+// frontend test can prove: what the command actually writes.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_marked_inactive_is_stored_inactive() {
+    let db = shop().await;
+
+    let mut payload = create_payload("cat-inactive", "SKU-INACTIVE", "Seasonal Shake");
+    payload.is_active = false;
+    save_product_with_pool(db.pool(), payload)
+        .await
+        .expect("the create must save");
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id = 'cat-inactive' AND is_active = 0")
+            .await,
+        1,
+        "a product imported as inactive must not be sellable the moment it is created"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_create_marked_active_is_stored_active() {
+    let db = shop().await;
+
+    save_product_with_pool(
+        db.pool(),
+        create_payload("cat-active", "SKU-ACTIVE", "House Lemonade"),
+    )
+    .await
+    .expect("the create must save");
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM products WHERE id = 'cat-active' AND is_active = 1")
+            .await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_update_can_retire_and_restore_a_product() {
+    let db = shop().await;
+
+    let mut payload = update_payload("Coffee 250g");
+    payload.is_active = false;
+    save_product_with_pool(db.pool(), payload).await.expect("retire must save");
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products WHERE id = '{P_EXISTING}' AND is_active = 0"
+        ))
+        .await,
+        1
+    );
+
+    save_product_with_pool(db.pool(), update_payload("Coffee 250g"))
+        .await
+        .expect("restore must save");
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products WHERE id = '{P_EXISTING}' AND is_active = 1"
+        ))
+        .await,
+        1,
+        "and the stock it holds is not disturbed by either change"
+    );
+    assert_eq!(quantity_on_hand(&db, P_EXISTING).await, 10);
+}

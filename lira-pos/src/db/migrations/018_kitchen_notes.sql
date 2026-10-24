@@ -1,0 +1,79 @@
+-- ============================================================================
+-- Migration v18 — per-line kitchen instructions (WP-A2)
+-- ----------------------------------------------------------------------------
+-- ONE nullable TEXT column on `sale_items`, and nothing else. No data is
+-- rewritten, no existing constraint is tightened, and no existing row changes
+-- meaning: every `sale_items` row that exists today reads NULL and stays
+-- valid, which is the only acceptable shape for a column added to a table of
+-- immutable posted documents.
+--
+-- WHAT THE COLUMN IS
+--
+-- "No pickles". "Light sauce". "بدون صوص". A preparation instruction the
+-- cashier attaches to ONE order line, so the kitchen makes that burger
+-- differently from the identical burger beside it on the same receipt.
+--
+-- WHY IT IS A SNAPSHOT ON THE LINE AND NOT A SEPARATE TABLE
+--
+-- It is part of what was sold, in exactly the sense `product_name_snapshot`
+-- and `unit_price_incl_vat_cents` are: it is the instruction the kitchen was
+-- given for that line, at the moment the order was taken, and it must read
+-- the same in six months when someone asks why a refund was given. A child
+-- table would let a note be added to, changed under, or orphaned from a
+-- posted sale — and migration 012 spent a whole file making that impossible
+-- for the children `sale_items` already has. A column inherits those guards
+-- for free: `trg_sale_items_no_update` and `trg_sale_items_no_delete` already
+-- forbid rewriting it, so a posted note is as immutable as the price beside
+-- it.
+--
+-- WHY IT IS NOT FINANCIAL, AND MUST NOT BECOME SO
+--
+-- A kitchen note carries NO price. It never touches a total, a VAT figure, a
+-- discount allocation, a COGS rate, an inventory movement or a driver's
+-- receivable, and no posting command reads it to decide anything. A PAID
+-- modifier — extra cheddar, a large upgrade — is a priced `sale_items` row of
+-- its own and stays one: the moment free text starts carrying money, the
+-- receipt stops reconciling to the lines and nobody can tell which notes were
+-- charged for. That boundary is the reason this column is deliberately dumb.
+--
+-- It IS, however, part of the sale's CANONICAL CONTENT for replay purposes.
+-- `post_sale` is idempotent on `sales.id`, and a retry that arrives with a
+-- different instruction on a line is not the same order the kitchen is
+-- cooking — so `CanonicalLine` compares it and a mismatch is refused as a
+-- conflict rather than accepted and silently ignored. Accepting it would hand
+-- the caller a receipt while the stored line still said "no pickles".
+--
+-- WHY THE CONSTRAINTS ARE HERE AND NOT ONLY IN RUST
+--
+-- `length(kitchen_note) <= 200` bounds a free-text field that is written on
+-- every order line of every sale for ever; without a bound the only limit is
+-- how long a cashier can lean on a key. 200 characters is longer than any
+-- real instruction and far short of anything that would bloat the file.
+--
+-- `TRIM(kitchen_note) <> ''` is the more important one. It makes NULL the
+-- ONLY way to say "no instruction", so "" and NULL cannot both exist meaning
+-- the same thing — which matters because the value is compared on replay: a
+-- client sending "" where the stored row holds NULL would otherwise be a
+-- spurious conflict on a faithful retry. `post_sale` normalises blank to
+-- NULL before binding; this is the engine-level backstop that keeps any other
+-- writer to the same rule.
+--
+-- Both are CHECK constraints on a column that no row has yet, so they can
+-- refuse nothing that already exists. SQLite applies them to every
+-- subsequent INSERT and UPDATE of the column.
+
+ALTER TABLE sale_items ADD COLUMN kitchen_note TEXT
+  CHECK (
+    kitchen_note IS NULL
+    OR (TRIM(kitchen_note) <> '' AND length(kitchen_note) <= 200)
+  );
+
+-- No index. Nothing queries BY a note: the kitchen ticket, the receipt and
+-- Sales History all read the notes of one named sale, which the existing
+-- `idx_sale_items_sale` already serves. An index on free text would cost a
+-- write on every line of every sale and serve no reader.
+--
+-- No column on `sales_credit_memo_lines` either. A memo line names the
+-- `sale_item_id` it reverses (migration 011), so the instruction the customer
+-- was unhappy about is one join away and does not need copying — and copying
+-- it would create a second place for it to disagree with the first.

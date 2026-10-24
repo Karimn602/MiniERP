@@ -24,6 +24,7 @@ import { formatLbp, formatUsd, usdCentsToLbp } from "../lib/money";
 import { formatUnitCostUsd } from "../lib/cost";
 import { formatPrettyDate, isoToLocalDate, relativeFromToday } from "../lib/dates";
 import { ReceiptPrint } from "../components/ReceiptPrint";
+import { driversRepo } from "../db/repos/drivers";
 import { CreateReturnModal } from "../components/CreateReturnModal";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
@@ -69,6 +70,15 @@ export default function SalesHistory() {
     new Map(),
   );
   const [memosForSale, setMemosForSale] = useState<CreditMemo[]>([]);
+  /**
+   * The name of the driver who carried the open receipt (WP-A4), or null.
+   *
+   * Looked up BY ID rather than taken from a list of active drivers: a receipt
+   * from last month may name somebody who has since been retired, and a
+   * historical document that stopped saying who carried it would be worse than
+   * one that never said.
+   */
+  const [detailsDriverName, setDetailsDriverName] = useState<string | null>(null);
   const [hasOpenShift, setHasOpenShift] = useState(false);
   const [returningSaleId, setReturningSaleId] = useState<string | null>(null);
   const [returnNotice, setReturnNotice] = useState<string | null>(null);
@@ -121,6 +131,7 @@ export default function SalesHistory() {
     setSelectedId(id);
     setDetails(null);
     setMemosForSale([]);
+    setDetailsDriverName(null);
     setDetailsError(null);
     setDetailsLoading(true);
 
@@ -132,6 +143,17 @@ export default function SalesHistory() {
       if (!row) throw new Error("Sale not found.");
       setDetails(row);
       setMemosForSale(memos);
+      // A second, dependent read rather than a join: it is needed only for the
+      // receipt of a delivery order, and a driver row that cannot be read must
+      // not stop the sale's own detail from opening.
+      if (row.driverId) {
+        try {
+          const driver = await driversRepo.findById(row.driverId);
+          setDetailsDriverName(driver?.name ?? null);
+        } catch {
+          setDetailsDriverName(null);
+        }
+      }
     } catch (e) {
       setDetailsError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -326,6 +348,7 @@ export default function SalesHistory() {
                   setSelectedId(null);
                   setDetails(null);
                   setMemosForSale([]);
+                  setDetailsDriverName(null);
                 }}
               />
             </div>
@@ -366,7 +389,11 @@ export default function SalesHistory() {
       {/* Print-only receipt root — outside the drawer so fixed positioning escapes correctly */}
       {details && (
         <div id="receipt-print-root" className="hidden print:block">
-          <ReceiptPrint sale={details} storeName={storeName} />
+          <ReceiptPrint
+            sale={details}
+            storeName={storeName}
+            driverName={detailsDriverName}
+          />
         </div>
       )}
     </div>
@@ -579,6 +606,16 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
                       : t("salesHistory.noSkuLabel")}
                     {line.uomCodeSnapshot ? ` · ${line.uomCodeSnapshot}` : ""}
                   </div>
+                  {/* The kitchen instruction this line was made to (WP-A2).
+                      Shown because it is often the answer to "why was this
+                      refunded?", and because two lines of one product are
+                      otherwise indistinguishable on this table — including in
+                      the return dialog that reads from it. */}
+                  {line.kitchenNote && (
+                    <div className="mt-0.5 inline-block rounded border border-warn-line bg-warn-bg px-1.5 py-0.5 text-xs text-warn-fg">
+                      {line.kitchenNote}
+                    </div>
+                  )}
                 </td>
 
                 <td className="px-4 py-2 text-xs text-slate-600">

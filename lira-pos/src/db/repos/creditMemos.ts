@@ -363,6 +363,7 @@ export const creditMemosRepo = {
       line_total_incl_vat_cents: number;
       line_discount_cents: number;
       vat_rate_bps_snapshot: number;
+      kitchen_note: string | null;
       moved_stock: number;
     }>(
       `SELECT si.id                                   AS sale_item_id,
@@ -390,6 +391,7 @@ export const creditMemosRepo = {
               si.line_total_incl_vat_cents,
               si.line_discount_cents,
               si.vat_rate_bps_snapshot,
+              si.kitchen_note,
               CASE WHEN EXISTS (
                 SELECT 1 FROM inventory_movements im
                  WHERE im.related_sale_item_id = si.id AND im.movement_type = 'sale'
@@ -422,6 +424,7 @@ export const creditMemosRepo = {
       lineDiscountCents: r.line_discount_cents,
       vatRateBpsSnapshot: r.vat_rate_bps_snapshot,
       isService: r.moved_stock === 0,
+      kitchenNote: r.kitchen_note,
     }));
   },
 

@@ -399,6 +399,18 @@ export function CreateReturnModal({
                                   {` · ${formatUsd(line.unitPriceInclVatCents)}`}
                                   {unit ? ` / ${unit}` : ""}
                                 </div>
+                                {/* The instruction this line was made to
+                                    (WP-A2). Two lines of one product are
+                                    otherwise indistinguishable here, and the
+                                    note is often the reason one of them is
+                                    coming back. It changes no figure: the
+                                    refund is prorated from the line's
+                                    persisted components. */}
+                                {line.kitchenNote && (
+                                  <div className="mt-0.5 inline-block rounded border border-warn-line bg-warn-bg px-1.5 py-0.5 text-xs text-warn-fg">
+                                    {line.kitchenNote}
+                                  </div>
+                                )}
                                 {chosen && (
                                   <div className="mt-0.5 text-xs font-medium text-brand-ink">
                                     {formatUsd(chosen.lineRefundCents)}

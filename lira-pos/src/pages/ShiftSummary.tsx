@@ -14,6 +14,7 @@ import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { formatUsd, formatLbp, parseUsdInput, parseLbpInput } from "../lib/money";
 import { useTranslation } from "../lib/i18n";
+import { ShiftHistoryPanel } from "../components/ShiftHistoryPanel";
 import type { PaymentMethod } from "../db/types";
 import clsx from "clsx";
 
@@ -136,6 +137,30 @@ export default function ShiftSummary() {
   const [closingLbpInput, setClosingLbpInput] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
+
+  /**
+   * Which tab is showing (WP-A1).
+   *
+   * `"current"` is the default because the till is what the cashier opens this
+   * screen for. History is a second tab rather than a second route: it reads
+   * the same five shift-scoped accessors against a different shift id, and a
+   * route would have duplicated the store/hydration plumbing for no gain.
+   */
+  const [tab, setTab] = useState<"current" | "history">("current");
+
+  /**
+   * Is the Returns & Refunds detail expanded (WP-A6)?
+   *
+   * Collapsed by default, with a compact count-and-total summary always on the
+   * line above it: most shifts have no returns at all, and five stat cards and
+   * a breakdown table for a zero was pushing the Cash Drawer — the section the
+   * cashier actually came for — off the bottom of a 768px screen.
+   *
+   * Forced open whenever anything was refunded, on the same principle the
+   * discount panel in the register uses: a figure that exists is never hidden
+   * behind a disclosure.
+   */
+  const [returnsOpen, setReturnsOpen] = useState(false);
 
   // ---------- Load ----------
 
@@ -375,21 +400,47 @@ export default function ShiftSummary() {
           <h2 className="text-2xl font-bold tracking-tight text-slate-900">{t("shift.title")}</h2>
           <p className="text-sm text-slate-600">{t("shift.subtitle")}</p>
         </div>
-        {activeShift && (
+        {activeShift && tab === "current" && (
           <Button variant="ghost" onClick={refreshSummary} disabled={loading || submitting}>
             {t("shift.refresh")}
           </Button>
         )}
       </div>
 
-      {error && (
+      {/* TWO TABS (WP-A1). Current Shift is the till; Shift History is every
+          shift this store has opened, with the reconciliation each was closed
+          on. Before this, a closed shift's counted cash, expected cash and
+          variance were stored and unreachable. */}
+      <div role="tablist" aria-label={t("shift.title")} className="flex gap-1 border-b border-line">
+        {(["current", "history"] as const).map((id) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={tab === id}
+            onClick={() => setTab(id)}
+            className={clsx(
+              "-mb-px border-b-2 px-4 py-2 text-sm font-semibold transition-colors",
+              tab === id
+                ? "border-brand text-fg"
+                : "border-transparent text-fg-muted hover:text-fg",
+            )}
+          >
+            {t(id === "current" ? "shift.tabCurrent" : "shift.tabHistory")}
+          </button>
+        ))}
+      </div>
+
+      {tab === "history" && storeId && <ShiftHistoryPanel storeId={storeId} />}
+
+      {error && tab === "current" && (
         <div className="rounded-md border border-danger-line bg-danger-bg px-4 py-3 text-sm text-danger-fg">
           {error}
         </div>
       )}
 
       {/* ── NO OPEN SHIFT ────────────────────────────────────────── */}
-      {!activeShift && (
+      {tab === "current" && !activeShift && (
         <Card>
           <CardHeader
             title={t("shift.noOpenShiftTitle")}
@@ -426,7 +477,7 @@ export default function ShiftSummary() {
       )}
 
       {/* ── OPEN SHIFT ───────────────────────────────────────────── */}
-      {activeShift && (
+      {tab === "current" && activeShift && (
         <>
           {/* Shift status banner */}
           <div className="flex flex-wrap items-center gap-4 rounded-lg border border-good-line bg-good-bg px-5 py-3">
@@ -580,12 +631,58 @@ export default function ShiftSummary() {
             )}
           </Card>
 
-          {/* Section 3 — Returns / Refunds (WP-06) */}
+          {/* Section 3 — Returns / Refunds (WP-06, folded by WP-A6).
+
+              The COMPACT SUMMARY — how many credit memos, and how much went
+              back — is on the heading row and is always visible. The five stat
+              cards and the method breakdown fold away, because most shifts
+              refund nothing at all and a block of zeroes was pushing the Cash
+              Drawer, which is the section the cashier opened this screen for,
+              off the bottom of a 768px display.
+
+              FORCED OPEN whenever anything was actually refunded. A figure
+              that exists is never behind a disclosure — the same rule the
+              register's discount panel follows. */}
           <div>
-            <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-700">
-              {t("shift.returnsTitle")}
-            </h3>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-700">
+                {t("shift.returnsTitle")}
+              </h3>
+              <div className="flex items-center gap-3">
+                {/* The always-visible summary. Reads "None" rather than
+                    "0 · $0.00" when there is nothing, which is the sentence a
+                    cashier can act on. */}
+                <span
+                  data-testid="returns-summary"
+                  className="text-xs font-medium text-fg-muted"
+                >
+                  {refundSummary === null
+                    ? "—"
+                    : refundSummary.memoCount === 0
+                      ? t("shift.returnsNone")
+                      : t("shift.returnsSummary", {
+                          count: String(refundSummary.memoCount),
+                          total: formatUsd(refundSummary.totalInclVatCents),
+                        })}
+                </span>
+                {refundSummary !== null && refundSummary.memoCount === 0 && (
+                  <Button variant="ghost" onClick={() => setReturnsOpen(!returnsOpen)}>
+                    {returnsOpen ? t("common.close") : t("shift.returnsShowDetail")}
+                  </Button>
+                )}
+              </div>
+            </div>
+            <div
+              className={clsx(
+                "grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5",
+                // Hidden only when there is genuinely nothing to show and the
+                // cashier has not asked to see it.
+                refundSummary !== null &&
+                  refundSummary.memoCount === 0 &&
+                  !returnsOpen &&
+                  "hidden",
+              )}
+            >
               <StatCard
                 label={t("shift.returnsCount")}
                 value={refundSummary ? String(refundSummary.memoCount) : "—"}
@@ -784,6 +881,16 @@ export default function ShiftSummary() {
                       label={t("shift.cashRefunded")}
                       value={drawer.refundLbp > 0 ? `− ${formatLbp(drawer.refundLbp)}` : "—"}
                       tone={drawer.refundLbp > 0 ? "warn" : undefined}
+                    />
+                    {/* The lira half of the driver hand-overs (WP-A6).
+                        `expectedLbp` has carried this term since WP-7 and the
+                        column did not show it, so the lira figure could not be
+                        explained from the rows above it — the same shape of
+                        defect the WP-7 walkthrough caught in dollars, one
+                        currency over. */}
+                    <DrawerRow
+                      label={t("shift.driverRemittances")}
+                      value={formatLbp(drawer.driverRemitLbp)}
                     />
                     <DrawerRow
                       label={t("shift.expectedInDrawer")}

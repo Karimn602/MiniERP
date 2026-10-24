@@ -62,6 +62,7 @@ impl SaleLineBuilder {
                 line_discount_cents: 0,
                 barcode_used_snapshot: None,
                 barcode_type_snapshot: None,
+                kitchen_note: None,
                 is_service: false,
             },
         }
@@ -104,6 +105,12 @@ impl SaleLineBuilder {
 
     pub fn service(mut self, is_service: bool) -> Self {
         self.line.is_service = is_service;
+        self
+    }
+
+    /// The kitchen's instruction for this line (WP-A2).
+    pub fn note(mut self, note: &str) -> Self {
+        self.line.kitchen_note = Some(note.to_string());
         self
     }
 
@@ -153,6 +160,7 @@ impl SaleLineBuilder {
             line_discount_cents: self.line.line_discount_cents,
             barcode_used_snapshot: self.line.barcode_used_snapshot.clone(),
             barcode_type_snapshot: self.line.barcode_type_snapshot.clone(),
+            kitchen_note: self.line.kitchen_note.clone(),
             is_service: self.line.is_service,
         }
     }
@@ -360,6 +368,7 @@ pub fn clone_sale_line(l: &PostSaleLine) -> PostSaleLine {
         line_discount_cents: l.line_discount_cents,
         barcode_used_snapshot: l.barcode_used_snapshot.clone(),
         barcode_type_snapshot: l.barcode_type_snapshot.clone(),
+        kitchen_note: l.kitchen_note.clone(),
         is_service: l.is_service,
     }
 }
@@ -448,8 +457,9 @@ pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePaylo
                line_discount_cents,
                unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
                unit_cogs_excl_vat_microcents,
-               quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)",
+               quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot,
+               kitchen_note
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?)",
         )
         .bind(&line.sale_item_id)
         .bind(&payload.sale_id)
@@ -470,6 +480,11 @@ pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePaylo
         .bind(&line.uom_code_snapshot)
         .bind(line.factor_num_snapshot)
         .bind(line.factor_den_snapshot)
+        // The instruction the historical line carried (WP-A2). Bound from the
+        // payload rather than left NULL, for the same reason the channel and
+        // the driver are: it is compared on replay, so a fixture that dropped
+        // it would make a faithful retry look like a conflict.
+        .bind(crate::posting::normalize_kitchen_note(&line.kitchen_note))
         .execute(db.pool())
         .await
         .expect("seed historical sale item");

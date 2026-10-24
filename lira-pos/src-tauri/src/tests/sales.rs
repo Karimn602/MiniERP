@@ -2754,3 +2754,436 @@ async fn channel_totals_reconcile_to_the_overall_sales_total() {
         0
     );
 }
+
+// ============================================================================
+// 14. WP-A2 — per-line kitchen instructions
+// ============================================================================
+//
+// A note is a presentational snapshot that carries no money (migration 018
+// states the whole boundary), so these tests are about three things and not
+// about arithmetic:
+//
+//   * it is PERSISTED on the line it was typed against, and two lines of the
+//     same product keep their own;
+//   * it moves no figure — no total, no VAT, no discount, no COGS, no
+//     inventory movement, no receivable;
+//   * it is part of the CANONICAL content, so a faithful retry reconciles and
+//     a retry carrying a different instruction is refused as a conflict rather
+//     than accepted while the stored line says something else.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kitchen_note_is_persisted_on_the_line_it_was_typed_against() {
+    let db = store_with_coffee().await;
+
+    let lines = vec![
+        SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).note("No sugar").build(),
+        SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).build(),
+    ];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.expect("post");
+
+    // Two lines of ONE product, and only one of them carries the instruction.
+    // This is the case the whole feature exists for: the cashier must be able
+    // to order two identical burgers and have the kitchen make them
+    // differently.
+    assert_eq!(
+        db.count(&format!("SELECT COUNT(*) FROM sale_items WHERE sale_id='{sale_id}'")).await,
+        2,
+        "the two lines are not merged by the backend"
+    );
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT kitchen_note FROM sale_items
+              WHERE sale_id='{sale_id}' AND kitchen_note IS NOT NULL"
+        ))
+        .await,
+        "No sugar"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sale_items
+              WHERE sale_id='{sale_id}' AND kitchen_note IS NULL"
+        ))
+        .await,
+        1,
+        "the untouched line stores NULL, not an empty string"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_arabic_kitchen_note_survives_the_round_trip_unchanged() {
+    // The staff type Arabic. A note that came back re-encoded, truncated at a
+    // byte boundary or stripped of its interior spacing would reach the kitchen
+    // as something the cashier did not write.
+    let db = store_with_coffee().await;
+
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .qty(1)
+        .unit_incl(500)
+        .note("بدون صوص")
+        .build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.expect("post");
+
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT kitchen_note FROM sale_items WHERE sale_id='{sale_id}'"
+        ))
+        .await,
+        "بدون صوص"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blank_kitchen_note_is_stored_as_null_rather_than_an_empty_string() {
+    // NULL is the one way to say "no instruction" (migration 018's CHECK), and
+    // `normalize_kitchen_note` is what keeps a client that sends three spaces
+    // from creating a second way — which would then be a spurious conflict on
+    // an otherwise faithful replay.
+    let db = store_with_coffee().await;
+
+    let lines =
+        vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).note("   ").build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.expect("post");
+
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sale_items
+              WHERE sale_id='{sale_id}' AND kitchen_note IS NULL"
+        ))
+        .await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kitchen_note_is_trimmed_but_its_interior_spacing_is_left_alone() {
+    let db = store_with_coffee().await;
+
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .qty(1)
+        .unit_incl(500)
+        .note("  no  pickles  ")
+        .build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.expect("post");
+
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT kitchen_note FROM sale_items WHERE sale_id='{sale_id}'"
+        ))
+        .await,
+        "no  pickles",
+        "the cashier's phrasing is theirs; only the edges are tidied"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kitchen_note_moves_no_figure_and_no_stock() {
+    // The honesty assertion, and the reason the column is deliberately dumb: a
+    // free-text instruction must never become a way to charge for something.
+    // Two identical sales, one noted and one not, agree on every figure.
+    let db = store_with_coffee().await;
+
+    let plain = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(2).unit_incl(500).build()];
+    let noted = vec![SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .qty(2)
+        .unit_incl(500)
+        .note("Extra crispy")
+        .build()];
+
+    let plain_total = lines_total(&plain);
+    let p1 = sale_payload(plain, vec![cash_usd(plain_total)]);
+    let id1 = p1.sale_id.clone();
+    post_sale_with_pool(db.pool(), p1).await.expect("post plain");
+
+    let noted_total = lines_total(&noted);
+    let p2 = sale_payload(noted, vec![cash_usd(noted_total)]);
+    let id2 = p2.sale_id.clone();
+    post_sale_with_pool(db.pool(), p2).await.expect("post noted");
+
+    for column in [
+        "subtotal_excl_vat_cents",
+        "vat_total_cents",
+        "total_incl_vat_cents",
+        "discount_cents",
+        "cogs_total_cents",
+    ] {
+        let a = db.scalar_i64(&format!("SELECT {column} FROM sales WHERE id='{id1}'")).await;
+        let b = db.scalar_i64(&format!("SELECT {column} FROM sales WHERE id='{id2}'")).await;
+        assert_eq!(a, b, "{column} must not depend on a kitchen note");
+    }
+
+    // And the stock movement is the same size, so a note cannot consume or
+    // conjure an ingredient either.
+    let moved = db
+        .scalar_i64(&format!(
+            "SELECT SUM(quantity_delta) FROM inventory_movements
+              WHERE related_sale_id IN ('{id1}','{id2}')"
+        ))
+        .await;
+    assert_eq!(moved, -4, "two units each, note or no note");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_faithful_replay_of_a_noted_sale_reconciles_to_its_receipt() {
+    let db = store_with_coffee().await;
+
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .qty(1)
+        .unit_incl(500)
+        .note("No pickles")
+        .build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let replay = replay_of(&payload);
+
+    let first = post_sale_with_pool(db.pool(), payload).await.expect("post");
+    let second = post_sale_with_pool(db.pool(), replay).await.expect("the retry reconciles");
+
+    assert_eq!(first.receipt_number, second.receipt_number);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales WHERE status='posted'").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_that_sends_blank_for_an_absent_note_still_reconciles() {
+    // The normalisation's reason for existing. A client that serialises an
+    // untouched note as an empty string, where the stored row holds NULL, is
+    // describing the same order — and refusing it would break recovery for the
+    // overwhelmingly common case of a line with no instruction at all.
+    let db = store_with_coffee().await;
+
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let mut replay = replay_of(&payload);
+    replay.lines[0].kitchen_note = Some(String::new());
+
+    let first = post_sale_with_pool(db.pool(), payload).await.expect("post");
+    let second = post_sale_with_pool(db.pool(), replay).await.expect("the retry reconciles");
+
+    assert_eq!(first.receipt_number, second.receipt_number);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replay_carrying_a_different_kitchen_note_is_a_conflict() {
+    // The one that gives the column its teeth. Nothing can edit a posted line
+    // (migration 012), so a difference accepted here would be permanent: the
+    // caller would be told its instruction had posted while the stored line,
+    // the kitchen ticket and the receipt all still said something else.
+    let db = store_with_coffee().await;
+
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .qty(1)
+        .unit_incl(500)
+        .note("No pickles")
+        .build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let mut replay = replay_of(&payload);
+    replay.lines[0].kitchen_note = Some("Extra pickles".to_string());
+
+    post_sale_with_pool(db.pool(), payload).await.expect("post");
+    let err = post_sale_with_pool(db.pool(), replay)
+        .await
+        .expect_err("a different instruction is a different order");
+
+    assert!(err.contains("already exists"), "got: {err}");
+    assert!(err.contains("basket line"), "got: {err}");
+    // And nothing was written twice.
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales WHERE status='posted'").await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_a_note_to_a_previously_unnoted_line_is_also_a_conflict() {
+    // The asymmetric direction, which a naive "compare only when both sides
+    // have one" implementation would let through.
+    let db = store_with_coffee().await;
+
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let mut replay = replay_of(&payload);
+    replay.lines[0].kitchen_note = Some("No onions".to_string());
+
+    post_sale_with_pool(db.pool(), payload).await.expect("post");
+    let err = post_sale_with_pool(db.pool(), replay)
+        .await
+        .expect_err("a note added on retry is a different order");
+    assert!(err.contains("already exists"), "got: {err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_long_kitchen_note_is_refused_before_a_receipt_number_is_spent() {
+    // The bound is the column's (migration 018). It is refused HERE so the
+    // operator gets a sentence instead of a CHECK failure — and refused in
+    // `prepare_sale`, so the receipt sequence is untouched.
+    let db = store_with_coffee().await;
+
+    let before = db.scalar_i64("SELECT COALESCE(MAX(receipt_number), 0) FROM sales").await;
+
+    let long = "x".repeat(201);
+    let lines =
+        vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).note(&long).build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+
+    let err = post_sale_with_pool(db.pool(), payload)
+        .await
+        .expect_err("201 characters is over the limit");
+    assert!(err.contains("kitchen note"), "got: {err}");
+    assert!(err.contains("201"), "got: {err}");
+
+    assert_eq!(
+        db.scalar_i64("SELECT COALESCE(MAX(receipt_number), 0) FROM sales").await,
+        before,
+        "a refused note costs the receipt sequence nothing"
+    );
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_note_at_exactly_the_limit_posts_and_is_counted_in_characters() {
+    // 200 ARABIC letters is 400 bytes. Counting bytes would refuse a note the
+    // column accepts, in the language the staff actually type.
+    let db = store_with_coffee().await;
+
+    let note = "ص".repeat(200);
+    let lines =
+        vec![SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).note(&note).build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.expect("200 characters is within the limit");
+
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT length(kitchen_note) FROM sale_items WHERE sale_id='{sale_id}'"
+        ))
+        .await,
+        200,
+        "SQLite counts characters too, so the two bounds agree"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_posted_kitchen_note_cannot_be_edited_even_by_direct_sql() {
+    // It inherits migration 012's seal rather than needing one of its own,
+    // which is the whole argument for a column over a child table.
+    let db = store_with_coffee().await;
+
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .qty(1)
+        .unit_incl(500)
+        .note("No pickles")
+        .build()];
+    let total = lines_total(&lines);
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.expect("post");
+
+    let err = db
+        .try_exec(&format!(
+            "UPDATE sale_items SET kitchen_note='Extra pickles' WHERE sale_id='{sale_id}'"
+        ))
+        .await
+        .expect_err("a posted line is immutable")
+        .to_string();
+    assert!(err.to_lowercase().contains("posted"), "got: {err}");
+
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT kitchen_note FROM sale_items WHERE sale_id='{sale_id}'"
+        ))
+        .await,
+        "No pickles"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_engine_refuses_a_blank_or_over_long_note_from_any_writer() {
+    // Migration 018's CHECK, against a DRAFT row so the immutability trigger is
+    // not what refuses it. `post_sale` normalises, so this is the backstop for
+    // an import, a script or a future screen that does not.
+    let db = store_with_coffee().await;
+
+    db.exec(&format!(
+        "INSERT INTO sales (id, store_id, receipt_number, exchange_rate_lbp_per_usd,
+                            subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+                            discount_cents, cogs_total_cents, status)
+         VALUES ('draft-kn', '{STORE_ID}', 9998, 89500, 0, 0, 0, 0, 0, 'draft')"
+    ))
+    .await;
+
+    let over_long = "x".repeat(201);
+    for bad in ["", "   ", over_long.as_str()] {
+        let err = db
+            .try_exec(&format!(
+                "INSERT INTO sale_items (
+                   id, sale_id, store_id, product_id,
+                   product_name_snapshot, vat_rate_id_snapshot, vat_rate_bps_snapshot,
+                   quantity, unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+                   line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+                   kitchen_note
+                 ) VALUES (
+                   '{}', 'draft-kn', '{STORE_ID}', '{P_COFFEE}',
+                   'Coffee', '{VAT_STD_ID}', {VAT_STD_BPS},
+                   1, 450, 500, 450, 50, 500, '{bad}'
+                 )",
+                uuid()
+            ))
+            .await
+            .expect_err("the CHECK must reject it")
+            .to_string();
+        assert!(err.contains("CHECK constraint failed"), "for [{bad}], got: {err}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_order_carries_its_kitchen_notes_too() {
+    // Delivery is where instructions matter most — nobody can ask the customer
+    // at the window — and the delivery path builds its own tender, so it is
+    // worth pinning that the notes survive it and the receivable does not move.
+    let db = store_with_coffee().await;
+
+    let lines = vec![
+        SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).note("No sugar").build(),
+        SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(500).note("Extra hot").build(),
+    ];
+    let payload = delivery_payload(lines, D_SAMI, 200);
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.expect("post");
+
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM sale_items
+              WHERE sale_id='{sale_id}' AND kitchen_note IS NOT NULL"
+        ))
+        .await,
+        2
+    );
+    // The receivable is still the food total, and the $2.00 fee is still in
+    // neither it nor the sale.
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT amount_cents FROM driver_ledger
+              WHERE related_sale_id='{sale_id}' AND entry_type='collection'"
+        ))
+        .await,
+        1000
+    );
+    assert_eq!(
+        db.scalar_i64(&format!("SELECT total_incl_vat_cents FROM sales WHERE id='{sale_id}'"))
+            .await,
+        1000
+    );
+}

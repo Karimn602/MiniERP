@@ -133,24 +133,55 @@ export function seedShift(
     openingUsdCents?: number;
     openingLbp?: number;
     status?: "open" | "closed";
+    openedAt?: string;
+    closedAt?: string;
+    /**
+     * The reconciliation `close_shift` RECORDED, for the shift-history tests
+     * (WP-A1).
+     *
+     * Stated by the fixture rather than derived from the rows on purpose: the
+     * whole point of those columns is that they are a historical statement,
+     * computed once inside the closing transaction and immutable afterwards
+     * (migration 009). A fixture that recomputed them could not express the
+     * one case that matters — a shift closed on an EARLIER version of the
+     * drawer formula, whose recorded figure does not match what today's
+     * formula makes of the same rows.
+     */
+    expectedUsdCents?: number;
+    expectedLbp?: number;
+    closingUsdCents?: number;
+    closingLbp?: number;
   },
 ): string {
   const closed = opts.status === "closed";
+  // Variance is `counted − expected`, the definition `close_shift` uses.
+  const variance = (counted?: number, expected?: number) =>
+    counted === undefined || expected === undefined ? null : counted - expected;
   db.prepare(
     `INSERT INTO shifts (
        id, store_id, opened_by_user_id, opened_at,
        closed_at, closed_by_user_id,
-       opening_cash_usd_cents, opening_cash_lbp, status
-     ) VALUES (?, ?, ?, '2026-03-01T08:00:00.000Z', ?, ?, ?, ?, ?)`,
+       opening_cash_usd_cents, opening_cash_lbp, status,
+       expected_cash_usd_cents, expected_cash_lbp,
+       closing_cash_usd_cents, closing_cash_lbp,
+       variance_usd_cents, variance_lbp
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     opts.id,
     STORE_ID,
     USER_ID,
-    closed ? "2026-03-01T16:00:00.000Z" : null,
+    opts.openedAt ?? "2026-03-01T08:00:00.000Z",
+    closed ? (opts.closedAt ?? "2026-03-01T16:00:00.000Z") : null,
     closed ? USER_ID : null,
     opts.openingUsdCents ?? 0,
     opts.openingLbp ?? 0,
     closed ? "closed" : "open",
+    closed ? (opts.expectedUsdCents ?? null) : null,
+    closed ? (opts.expectedLbp ?? null) : null,
+    closed ? (opts.closingUsdCents ?? null) : null,
+    closed ? (opts.closingLbp ?? null) : null,
+    closed ? variance(opts.closingUsdCents, opts.expectedUsdCents) : null,
+    closed ? variance(opts.closingLbp, opts.expectedLbp) : null,
   );
   return opts.id;
 }

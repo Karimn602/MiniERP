@@ -120,6 +120,18 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/017_driver_source_integrity.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 18,
+            description: "kitchen_notes",
+            sql: include_str!("../../src/db/migrations/018_kitchen_notes.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 19,
+            description: "retire_demo_catalogue",
+            sql: include_str!("../../src/db/migrations/019_retire_demo_catalogue.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 

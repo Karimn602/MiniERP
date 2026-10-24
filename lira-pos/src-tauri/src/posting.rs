@@ -2436,6 +2436,25 @@ pub struct PostSaleLine {
     pub barcode_used_snapshot: Option<String>,
     pub barcode_type_snapshot: Option<String>,
 
+    /// The kitchen's instruction for THIS line — "no pickles", "بدون صوص"
+    /// (WP-A2, migration 018).
+    ///
+    /// Defaulted, so a payload from a client that predates the field keeps
+    /// working and stores NULL, which is what every historical row already
+    /// reads.
+    ///
+    /// Carries no price and decides nothing: no total, no VAT figure, no
+    /// discount allocation, no COGS rate, no inventory movement and no
+    /// receivable reads it. A PAID modifier is a priced line of its own.
+    ///
+    /// It IS compared on replay (`CanonicalLine`), because a retry that
+    /// arrives with a different instruction is not the order the kitchen is
+    /// cooking. `normalize_kitchen_note` is applied on both sides of that
+    /// comparison and before the insert, so a client sending `""` where the
+    /// stored row holds NULL reconciles instead of conflicting.
+    #[serde(default)]
+    pub kitchen_note: Option<String>,
+
     // Whether the CLIENT believes this product is a service. Accepted for wire
     // compatibility and never acted on: `post_sale` reads `products.is_service`
     // instead, so a parked cart holding a stale flag cannot suppress a stocked
@@ -2651,6 +2670,20 @@ struct CanonicalLine {
     line_vat_cents: i64,
     line_total_incl_vat_cents: i64,
     line_discount_cents: i64,
+    /// The kitchen's instruction for this line (WP-A2).
+    ///
+    /// Compared, and that is a deliberate decision rather than an oversight in
+    /// either direction. It carries no money, so leaving it out would not
+    /// misstate a figure — but a retry that arrives saying "no pickles" where
+    /// the posted line says nothing is not the order that is being cooked, and
+    /// accepting it would hand the caller a receipt and a success while the
+    /// stored line, the kitchen ticket and the immutable record all still said
+    /// something else. Nothing can edit it afterwards (migration 012), so a
+    /// silently ignored difference would be permanent.
+    ///
+    /// Always `normalize_kitchen_note`d on both sides, so `""`, `"  "` and
+    /// NULL are one value and a faithful retry still reconciles.
+    kitchen_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2682,6 +2715,7 @@ impl CanonicalSale {
                 line_vat_cents: l.line_vat_cents,
                 line_total_incl_vat_cents: l.line_total_incl_vat_cents,
                 line_discount_cents: l.line_discount_cents,
+                kitchen_note: normalize_kitchen_note(&l.kitchen_note),
             })
             .collect();
         lines.sort();
@@ -2763,7 +2797,7 @@ async fn load_sale_by_identity(
                 unit_price_excl_vat_cents, unit_price_incl_vat_cents,
                 vat_rate_id_snapshot, vat_rate_bps_snapshot,
                 line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
-                line_discount_cents
+                line_discount_cents, kitchen_note
            FROM sale_items WHERE sale_id = ?",
     )
     .bind(sale_id)
@@ -2792,6 +2826,13 @@ async fn load_sale_by_identity(
                 .try_get("line_total_incl_vat_cents")
                 .map_err(d("line_total"))?,
             line_discount_cents: r.try_get("line_discount_cents").map_err(d("line_discount"))?,
+            // Normalised on the way out too, not merely on the way in: a row
+            // written by an older build, or by hand, could hold a blank string
+            // the CHECK in migration 018 would refuse today, and a faithful
+            // retry must still reconcile against it.
+            kitchen_note: normalize_kitchen_note(
+                &r.try_get::<Option<String>, _>("kitchen_note").map_err(d("kitchen_note"))?,
+            ),
         })
     })
     .collect::<Result<Vec<_>, String>>()?;
@@ -3031,6 +3072,58 @@ pub(crate) struct PreparedSale {
     pub total: i64,
     pub change_total_usd: i64,
     pub change_row_index: Option<usize>,
+}
+
+/// The longest kitchen instruction a line may carry (WP-A2).
+///
+/// The same bound migration 018's CHECK enforces, stated here so the operator
+/// gets a sentence they can act on instead of a constraint failure. Longer
+/// than any real instruction; short enough that a free-text column written on
+/// every line of every sale for ever cannot grow without limit.
+pub(crate) const KITCHEN_NOTE_MAX_CHARS: usize = 200;
+
+/// The canonical form of a kitchen instruction: trimmed, and blank is NONE.
+///
+/// NULL is the only way to say "no instruction" (migration 018 enforces it),
+/// and this is the one place that decides it. It matters beyond tidiness: the
+/// note is compared on replay, so a client that sends `""` for an untouched
+/// line while the stored row holds NULL would be refused as a conflict on a
+/// perfectly faithful retry. Both sides of that comparison, and the insert,
+/// go through here.
+///
+/// Interior whitespace is left exactly as typed — "no  pickles" is the
+/// cashier's phrasing, not an error to correct, and rewriting it would make
+/// the stored instruction differ from what was approved at the till.
+pub(crate) fn normalize_kitchen_note(raw: &Option<String>) -> Option<String> {
+    let trimmed = raw.as_deref()?.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Refuse a kitchen instruction longer than the column will hold.
+///
+/// Counted in CHARACTERS, not bytes, because `length()` in SQLite counts
+/// characters for a TEXT value and the Arabic a Greaz cashier types is two
+/// bytes per letter. Counting bytes here would refuse a 110-letter Arabic note
+/// the database would have accepted, and — worse the other way — a byte bound
+/// above the column's character bound would let the CHECK fire instead, with
+/// no message anybody can act on.
+fn validate_kitchen_note(index: usize, raw: &Option<String>) -> Result<(), String> {
+    if let Some(note) = normalize_kitchen_note(raw) {
+        let chars = note.chars().count();
+        if chars > KITCHEN_NOTE_MAX_CHARS {
+            return Err(format!(
+                "Line {}'s kitchen note is {} characters; the limit is {}. Shorten it.",
+                index + 1,
+                chars,
+                KITCHEN_NOTE_MAX_CHARS
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Per-line financial reconciliation (GP-A06).
@@ -3287,6 +3380,9 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
         if line.unit_price_excl_vat_cents < 0 || line.unit_price_incl_vat_cents < 0 {
             return Err(format!("Line {} has negative price.", i + 1));
         }
+        // Before a receipt number is consumed, like every other line check, so
+        // an over-long instruction costs the sequence nothing (WP-A2).
+        validate_kitchen_note(i, &line.kitchen_note)?;
         validate_line_financials(i, line)?;
     }
 
@@ -4039,8 +4135,9 @@ pub(crate) async fn post_sale_tx(
                  unit_cogs_excl_vat_microcents,
                  barcode_used_snapshot, barcode_type_snapshot,
                  quantity_in_uom, uom_code_snapshot,
-                 factor_num_snapshot, factor_den_snapshot
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 factor_num_snapshot, factor_den_snapshot,
+                 kitchen_note
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&line.sale_item_id)
         .bind(&payload.sale_id)
@@ -4066,6 +4163,9 @@ pub(crate) async fn post_sale_tx(
         .bind(&line.uom_code_snapshot)
         .bind(r.factor_num)
         .bind(r.factor_den)
+        // Normalised, so blank is stored as NULL and the column's one way of
+        // saying "no instruction" stays the only one (WP-A2).
+        .bind(normalize_kitchen_note(&line.kitchen_note))
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert sale_item: {e}"))?;

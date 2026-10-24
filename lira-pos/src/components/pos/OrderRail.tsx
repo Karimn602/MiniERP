@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import type { ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 /**
  * The right-hand order rail — the prototype's `.order` / `.payment` column.
@@ -40,12 +40,20 @@ export function TinyButton({
   disabled,
   title,
   className,
+  testId,
 }: {
   children: ReactNode;
   onClick: () => void;
   disabled?: boolean;
   title?: string;
   className?: string;
+  /**
+   * A stable hook for tests. Several of these buttons carry one-word labels
+   * ("Edit", "Close") that a role+name query cannot tell apart from the next
+   * one-word button added beside them, so the controls a test must find by
+   * identity rather than by wording name themselves.
+   */
+  testId?: string;
 }) {
   return (
     <button
@@ -53,6 +61,7 @@ export function TinyButton({
       onClick={onClick}
       disabled={disabled}
       title={title}
+      data-testid={testId}
       className={clsx(
         "shrink-0 rounded-chip border border-line bg-paper px-2.5 py-1.5 text-[11px] font-extrabold text-fg transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-40",
         className,
@@ -70,6 +79,43 @@ export function TinyButton({
  * each row. Amount and quantity are tabular lining numerals in the body face,
  * never the display face: these are the figures a cashier reads back to a
  * customer, and Impact has no Arabic glyphs.
+ *
+ * ## The kitchen instruction (WP-A2)
+ *
+ * The note is at most ONE extra line tall, and on a line that has no
+ * instruction it is no extra height at all: the "add" button rides on the
+ * detail row beside the price and unit, and only a REAL note (or the editor)
+ * takes a row of its own. That is not fussiness — the order list is the region
+ * that gives up height first on a 768px screen, and an affordance that cost
+ * every line sixteen pixels would be charging the cashier for a feature most
+ * lines never use.
+ *
+ * Whether the row is BEING EDITED is local state and belongs here. It is
+ * presentation — nothing outside this component can be affected by which row
+ * has a caret in it — and keeping it here means the register holds no map of
+ * open editors to get out of step with the cart.
+ *
+ * THE TEXT IS NOT LOCAL, and that is the correction. It was a local draft
+ * committed on Enter or on blur, which saved a cart write per keystroke and
+ * cost something far more expensive: F5 is the post shortcut and it is a
+ * window-level key handler, so pressing it with the caret still in the box
+ * posted the sale while the typed instruction existed only inside this
+ * component. The kitchen got a burger with no note, the receipt showed none,
+ * and the posted line is immutable — so nothing could be done about it
+ * afterwards. A blur does not happen on a keyboard shortcut, and no amount of
+ * care in the register can see a draft it is not told about.
+ *
+ * So every keystroke updates the cart's authoritative note through
+ * `onNoteChange`. There is no uncommitted state to lose, and the cart's own
+ * locked-cart choke point still refuses an edit to a frozen line exactly as
+ * it refuses a quantity change. The cart holds the text EXACTLY as typed
+ * while the editor is open — trimming per keystroke would eat a trailing
+ * space under the caret — and the trim happens once, when the editor closes;
+ * posting normalises again through `lib/kitchenNote.ts`, as does the merge
+ * rule, so an untrimmed value in flight can never reach a posted row.
+ *
+ * The whole affordance is absent unless `onNoteChange` is passed, so the
+ * design preview and any other caller render exactly what they did before.
  */
 export function CartLineRow({
   name,
@@ -82,6 +128,15 @@ export function CartLineRow({
   decreaseLabel,
   increaseLabel,
   removeLabel,
+  note,
+  onNoteChange,
+  noteAddLabel,
+  notePlaceholder,
+  noteEditLabel,
+  noteClearLabel,
+  noteMaxLength,
+  noteInvalid,
+  noteDisabled,
 }: {
   name: string;
   detail?: ReactNode;
@@ -93,18 +148,139 @@ export function CartLineRow({
   decreaseLabel: string;
   increaseLabel: string;
   removeLabel: string;
+  /** The line's kitchen instruction, or null/undefined for none. */
+  note?: string | null;
+  /** Commit a new instruction. Omit to hide the affordance entirely. */
+  onNoteChange?: (next: string) => void;
+  noteAddLabel?: string;
+  notePlaceholder?: string;
+  noteEditLabel?: string;
+  noteClearLabel?: string;
+  noteMaxLength?: number;
+  /** True when the instruction is longer than the backend will accept. */
+  noteInvalid?: boolean;
+  /** True while the cart is locked for an unresolved checkout. */
+  noteDisabled?: boolean;
 }) {
+  const [editing, setEditing] = useState(false);
+  /**
+   * The instruction as it stood when this editor was opened.
+   *
+   * Escape restores it. With the text authoritative from the first keystroke
+   * there is no draft to throw away, so "cancel" has to be an explicit
+   * reversal rather than the absence of a commit — and it is still one
+   * deliberate action by the cashier, not a silent omission.
+   */
+  const openedWithRef = useRef<string>("");
+
+  // A cart that locks takes the editor away rather than leaving a caret in a
+  // box over a frozen line. `setLines` refuses the edit anyway while a
+  // checkout is unresolved, so an open editor there would be collecting text
+  // that can never be committed — the exact shape of the bug this change
+  // exists to remove.
+  useEffect(() => {
+    if (noteDisabled) setEditing(false);
+  }, [noteDisabled]);
+
+  function openEditor() {
+    openedWithRef.current = note ?? "";
+    setEditing(true);
+  }
+
+  function closeEditor() {
+    setEditing(false);
+    // Tidy once, at the end. Nothing is "committed" here — the value has been
+    // the cart's since it was typed — this only removes the whitespace the
+    // editor deliberately preserved while the caret was in the box.
+    const current = note ?? "";
+    if (onNoteChange && current !== current.trim()) onNoteChange(current.trim());
+  }
+
+  function cancelEditor() {
+    setEditing(false);
+    const restore = openedWithRef.current;
+    if (onNoteChange && (note ?? "") !== restore) onNoteChange(restore);
+  }
+
   return (
     <div className="group/row grid grid-cols-[minmax(0,1fr)_91px_57px] items-center gap-1.5 border-b border-dashed border-line py-2.5 squat:py-1.5">
       <div className="min-w-0">
         <div className="truncate text-[11px] font-extrabold text-fg" title={name}>
           {name}
         </div>
-        {detail && (
-          <div className="truncate text-[10px] leading-tight text-fg-muted">
-            {detail}
+        {/* Detail and the ADD affordance share ONE row, so a line with no
+            instruction is exactly as tall as it was before this feature
+            existed. The detail truncates and the button does not: the unit
+            and the unit price can lose their tail, but a control that
+            disappeared at a narrow width would be unreachable. */}
+        {(detail || (onNoteChange && !editing && !note)) && (
+          <div className="flex items-center gap-1 text-[10px] leading-tight text-fg-muted">
+            {detail && <span className="min-w-0 truncate">{detail}</span>}
+            {onNoteChange && !editing && !note && (
+              <button
+                type="button"
+                disabled={noteDisabled}
+                onClick={openEditor}
+                className="shrink-0 rounded-chip border border-dashed border-line px-1 font-bold text-fg-muted transition-colors hover:border-brand hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {noteAddLabel}
+              </button>
+            )}
           </div>
         )}
+
+        {onNoteChange && (editing ? (
+          <input
+            autoFocus
+            value={note ?? ""}
+            maxLength={noteMaxLength}
+            placeholder={notePlaceholder}
+            aria-label={noteEditLabel}
+            disabled={noteDisabled}
+            onChange={(e) => onNoteChange(e.target.value)}
+            onBlur={closeEditor}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                closeEditor();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                // An explicit reversal to the instruction this editor opened
+                // on — see `openedWithRef`.
+                cancelEditor();
+              }
+            }}
+            className="mt-0.5 w-full rounded-chip border border-brand bg-surface px-1.5 py-0.5 text-[10px] font-semibold text-fg outline-none"
+          />
+        ) : note ? (
+          <div className="mt-0.5 flex items-center gap-1">
+            <button
+              type="button"
+              disabled={noteDisabled}
+              onClick={openEditor}
+              title={noteEditLabel}
+              className={clsx(
+                "min-w-0 flex-1 truncate rounded-chip border px-1.5 py-0.5 text-start text-[10px] font-bold leading-tight",
+                noteInvalid
+                  ? "border-danger-line bg-danger-bg text-danger-fg"
+                  : "border-warn-line bg-warn-bg text-warn-fg",
+                noteDisabled ? "cursor-not-allowed opacity-60" : "hover:border-brand",
+              )}
+            >
+              {note}
+            </button>
+            <button
+              type="button"
+              disabled={noteDisabled}
+              onClick={() => onNoteChange("")}
+              aria-label={noteClearLabel}
+              title={noteClearLabel}
+              className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-fg-subtle transition-colors hover:bg-danger-bg hover:text-danger-fg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              ×
+            </button>
+          </div>
+        ) : null)}
       </div>
 
       <div className="flex items-center justify-center gap-1.5">

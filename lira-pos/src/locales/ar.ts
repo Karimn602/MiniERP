@@ -36,6 +36,7 @@ const ar: TranslationDict = {
     cancel: "إلغاء",
     delete: "حذف",
     edit: "تعديل",
+    done: "تم",
     search: "بحث",
     close: "إغلاق",
     total: "المجموع",
@@ -142,21 +143,83 @@ const ar: TranslationDict = {
     noDrivers: "لا يوجد سائقون بعد. أضف سائقاً من شاشة السائقين.",
     driversUnavailable: "لم يتم تحميل قائمة السائقين. طلبات الكاونتر تعمل كالمعتاد.",
     fee: "أجرة التوصيل",
-    feeNote: "الأجرة للسائق. يدفعها الزبون له، لا للمطعم.",
-    collectByDriver: "السائق يقبض",
-    noCashHere:
-      "لا يُقبض شيء عند الصندوق لهذا الطلب. السائق يقبض قيمة الطعام من الزبون وتصبح ديناً عليه للمطعم.",
-    collectNote:
-      "سيقبض السائق قيمة الطعام من الزبون وتصبح ديناً عليه للمطعم. لا شيء يدخل الصندوق الآن.",
+    feeNote: "الأجرة تبقى للسائق.",
+    collectByDriver: "مقبوضة من السائق",
+    collectNote: "لا شيء يدخل الصندوق الآن.",
     foodTotal: "الطعام (فاتورة المطعم)",
     driverFee: "أجرة السائق",
     customerPays: "ما يدفعه الزبون للسائق",
+    // الدين على السائق، بتعبير المطعم نفسه. ليست "المتبقي": لا شيء متبقٍ عند
+    // الصندوق في طلب يقبضه السائق.
+    driverOwes: "دين السائق للمطعم",
+    cashierReceives: "ما يُقبض عند الصندوق الآن",
+    // السطر المختصر عند الإغلاق (WP-A3).
+    summary: "{{driver}} · أجرة {{fee}}",
+    summaryTitle: "يحمله {{driver}}",
+    summaryNoDriver: "توصيل — لم يُختر سائق",
     err: {
       driverRequired: "اختر السائق الذي سيأخذ هذا الطلب.",
       feeNeedsDriver: "أجرة التوصيل تحتاج السائق الذي يقبضها.",
       driverNeedsDelivery: "السائق يكون لطلب توصيل فقط. غيّر القناة أولاً.",
       feeInvalid: "أدخل أجرة التوصيل كمبلغ، مثل ٣ أو ٣.٥٠.",
     },
+  },
+
+  // --- سجل الورديات (WP-A1). للقراءة فقط؛ تسوية الوردية المغلقة هي الرقم
+  // الذي سجّله close_shift، لا رقم يُحسب اليوم.
+  shiftHistory: {
+    title: "سجل الورديات",
+    subtitle: "كل وردية فُتحت في هذا الفرع، وتسوية الصندوق التي أُغلقت عليها.",
+    filterFrom: "من",
+    filterTo: "إلى",
+    filterClear: "مسح التواريخ",
+    loading: "جارٍ تحميل الورديات…",
+    loadingDetail: "جارٍ تحميل الوردية…",
+    none: "لا ورديات في هذه الفترة.",
+    notFound: "لم يتم قراءة هذه الوردية.",
+    view: "عرض",
+    hide: "إخفاء",
+    colOpened: "الفتح",
+    colClosed: "الإغلاق",
+    colCashier: "الكاشير",
+    colExpectedUsd: "المتوقع دولار",
+    colCountedUsd: "المعدود دولار",
+    colVarianceUsd: "الفرق دولار",
+    colStatus: "الحالة",
+    status: {
+      open: "مفتوحة",
+      closed: "مغلقة",
+      voided: "ملغاة",
+    },
+    detailTitle: "وردية {{date}}",
+    detailClosedAt: "أُغلقت {{time}}",
+    detailStillOpen: "ما زالت مفتوحة",
+    shiftId: "رقم الوردية",
+    openedBy: "فتحها",
+    closedBy: "أغلقها",
+    notClosedYet: "لم تُغلق بعد",
+    unknownUser: "غير معروف",
+    countedCash: "النقد المعدود",
+    drawerRecorded: "كما سُجّلت عند إغلاق هذه الوردية.",
+    drawerRunning: "أرقام جارية — هذه الوردية ما زالت مفتوحة.",
+    asRecorded: "مسجّل عند الإغلاق",
+    asRunning: "رقم جارٍ",
+    recomputedDiffers:
+      "معادلة الصندوق الحالية تُنتج {{recomputed}} من حركات هذه الوردية. الرقم أعلاه هو المسجّل عند إغلاق الوردية وهو الرقم الذي حُوسب عليه الكاشير — ولا يُعاد تقديره هنا.",
+    readOnlyNote:
+      "الوردية المغلقة نهائية: النقد المعدود والمتوقع والفرق حُسبت وخُزّنت في المعاملة التي أغلقتها، ولا شيء يستطيع تغييرها.",
+    openNote:
+      "هذه الوردية ما زالت مفتوحة، لذلك أرقام الصندوق جارية. تُخزّن عند إغلاقها.",
+    print: "طباعة تقرير الوردية",
+    printTitle: "تقرير الوردية",
+  },
+
+  // --- بيان المطبخ (WP-A2). يقرأه طاقم المطبخ، لذلك هو مترجم بخلاف إيصال
+  // الزبون.
+  kitchen: {
+    orderNumber: "طلب رقم {{number}}",
+    notePrefix: "**",
+    notAReceipt: "نسخة المطبخ — ليست إيصالاً",
   },
 
   channel: {
@@ -341,7 +404,17 @@ const ar: TranslationDict = {
       "لا يوجد سعر صرف محدد. حدّد سعراً في صفحة سعر الصرف قبل تسجيل أي بيع.",
 
     printReceipt: "طباعة الإيصال",
+    printKitchenTicket: "بيان المطبخ",
     newSale: "بيع جديد",
+
+    // ملاحظات المطبخ على كل سطر (WP-A2).
+    addNote: "+ ملاحظة",
+    editNote: "ملاحظة المطبخ",
+    clearNote: "إزالة الملاحظة",
+    notePlaceholder: "بدون مخلل…",
+    errNoteTooLong: "اختصر ملاحظة المطبخ على {{name}} إلى {{max}} حرفاً.",
+    errNoteTooLongDetail:
+      "ملاحظة المطبخ على {{name}} طولها {{count}} حرفاً، والحد هو {{max}} — اختصرها للترحيل.",
 
     errNoProductForBarcode: 'لا يوجد منتج يطابق الباركود "{{barcode}}".',
     errInactiveProduct: '"{{name}}" غير نشط ولا يمكن بيعه.',
@@ -360,6 +433,14 @@ const ar: TranslationDict = {
   },
   shift: {
     title: "ملخص الوردية",
+    // التبويبان (WP-A1).
+    tabCurrent: "الوردية الحالية",
+    tabHistory: "سجل الورديات",
+
+    // ملخص المرتجعات الظاهر دائماً (WP-A6).
+    returnsNone: "لا مرتجعات في هذه الوردية",
+    returnsSummary: "{{count}} إشعار دائن · {{total}} مُعاد",
+    returnsShowDetail: "عرض التفصيل",
     subtitle: "تسوية النقد والمدفوعات للوردية الحالية.",
     loading: "جارٍ التحميل…",
     refresh: "تحديث",
@@ -470,6 +551,7 @@ const ar: TranslationDict = {
     serviceLabel: "خدمة",
 
     importProducts: "استيراد المنتجات",
+    showInactive: "إظهار غير المُفعّلة",
     newProduct: "منتج جديد",
 
     formNewTitle: "منتج جديد",
@@ -555,6 +637,14 @@ const ar: TranslationDict = {
     errMissingId: "معرّف المنتج مفقود.",
   },
   productImport: {
+    // الأعمدة الاختيارية للقائمة (WP-A5).
+    optionalCols: "أعمدة اختيارية — الملف الذي لا يحتويها يُستورد كما هو",
+    colCategoryDesc: "معرّف قسم القائمة، مثل burgers",
+    colIconDesc: "رمز واحد للبطاقة، مثل 🍔",
+    colDescriptionDesc: "نص قصير لبطاقة المنتج",
+    categoryValues: "أقسام القائمة المقبولة: {{values}}",
+    colSectionHeader: "القسم",
+    colIconHeader: "الرمز",
     title: "استيراد المنتجات",
     subtitle: "CSV أو XLSX — أنشئ منتجات وباركودات من جدول بيانات",
 
@@ -586,6 +676,14 @@ const ar: TranslationDict = {
 
     readyToImport: "{{count}} جاهز للاستيراد",
     willBeSkipped: "{{count}} سيُتخطى (SKU موجود)",
+    rejected: "{{count}} مرفوضة",
+    reasonChecksum: "{{count}} × رقم تحقق EAN-13 غير صحيح",
+    reasonDuplicateSkuInFile: "{{count}} × رمز SKU مكرر في هذا الملف",
+    reasonDuplicateBarcodeInFile: "{{count}} × باركود مكرر في هذا الملف",
+    reasonSkuExists: "{{count}} × رمز SKU موجود مسبقاً في قاعدة البيانات",
+    reasonBarcodeActive: "{{count}} × باركود مستخدم لمنتج مُفعّل",
+    reasonBarcodeInactive: "{{count}} × باركود يخص منتجاً غير مُفعّل",
+    reasonMalformed: "{{count}} × بيانات صف غير صالحة",
     haveErrors: "{{count}} يحتوي على أخطاء",
 
     openingStockNoteShort: "لا يتم استيراد كميات المخزون الافتتاحي. استخدم",
@@ -601,6 +699,11 @@ const ar: TranslationDict = {
     colStockUnitHeader: "وحدة المخزون",
     colSellUnitHeader: "وحدة البيع",
     colQtyUnit: "كمية/وحدة",
+    colClassHeader: "التصنيف",
+    classActive: "مُفعّل",
+    classInactive: "غير مُفعّل",
+    classService: "خدمة",
+    classStocked: "مخزون",
     colIssues: "المشاكل",
 
     blankName: "فارغ",
@@ -612,6 +715,7 @@ const ar: TranslationDict = {
     doneTitle: "اكتمل الاستيراد",
     doneCreated: "تم إنشاء {{count}} منتج",
     doneSkipped: "، تخطي {{count}}",
+    doneRejected: "، {{count}} مرفوضة",
     doneFailed: "، فشل {{count}} بشكل غير متوقع",
 
     failedNote:

@@ -30,6 +30,22 @@
  * Which also means: a shop whose online orders are prepaid by the platform has
  * no honest way to post them yet, and should keep taking them as whatever
  * tender actually reaches it until that design exists.
+ *
+ * ## SUPERSEDED IN PART BY WP-6 — read this before the paragraphs above
+ *
+ * Everything above is still true of the CHANNEL, which is all this module
+ * owns: it is a reporting dimension, it is not a payment method, and marking
+ * an order "Delivery" still settles nothing.
+ *
+ * What is no longer true is the claim that there is "no courier balance and no
+ * delivery fee anywhere in this release". Greaz's confirmed process has no
+ * third-party platform in it at all — the shop's OWN driver collects food plus
+ * a delivery charge, keeps the charge, and owes the food money back. So the
+ * deferred platform-AR design that paragraph is about was CANCELLED rather
+ * than postponed, and what exists instead is a driver subledger
+ * (`driver_ledger`), a `driver_collection` tender, and a delivery charge that
+ * is in no sale total. `lib/driverCollection.ts` owns that arrangement; this
+ * module still owns only where the order came from.
  */
 
 /** The stored values. These are the `sales.channel` CHECK, in TypeScript. */

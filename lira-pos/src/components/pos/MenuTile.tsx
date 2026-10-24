@@ -14,6 +14,23 @@ import clsx from "clsx";
  * does not say, and the price stays legible because "how much are the wings?"
  * is still asked on a day the wings ran out.
  *
+ * ## Why the out-of-stock tile is no longer faded (WP-A6)
+ *
+ * It used to be the whole tile at `opacity-[0.38]`, which defeated the
+ * paragraph above: at 38% the item name landed around 2:1 against the tile and
+ * the price lower still, so the one thing the tile exists to tell the cashier —
+ * WHICH item and HOW MUCH — became the hardest thing on the screen to read, in
+ * both appearances and worse in Midnight.
+ *
+ * Transparency was doing two jobs at once: saying "not available" and saying
+ * "de-emphasised". The signals are separated now. Unavailability is said
+ * EXPLICITLY — a dashed border, a struck-through price and a full-contrast
+ * SOLD-OUT chip — and emphasis is handled by the ordinary muted text roles,
+ * which are contrast-checked tokens rather than a blanket alpha. Nothing about
+ * the tile reads as orderable: it is still `disabled`, still
+ * `cursor-not-allowed`, and now says so in words instead of in opacity. Only
+ * the decorative corner glyph stays faded, because it carries no information.
+ *
  * Purely presentational: it is handed a formatted price string and an onClick.
  * It knows nothing about products, stock, VAT or carts, which is what lets the
  * design preview render it against a fixture with no database in sight.
@@ -47,7 +64,7 @@ export function MenuTile({
         "group/tile relative flex min-h-[125px] flex-col items-stretch rounded-tile border-[1.5px] px-[11px] pb-2.5 pt-[13px] text-start transition-[transform,border-color,box-shadow] duration-100",
         "squat:min-h-[112px] squat:pt-2.5",
         outOfStock
-          ? "cursor-not-allowed border-line bg-tile opacity-[0.38]"
+          ? "cursor-not-allowed border-dashed border-line bg-paper"
           : // Red arrives on HOVER, not at rest. Twenty red tiles at rest would
             // be a messy poster and would destroy scanning speed; red on the
             // one tile under the cursor is brand personality that also says
@@ -58,7 +75,12 @@ export function MenuTile({
       {symbol && (
         <span
           aria-hidden="true"
-          className="pointer-events-none absolute top-3 text-[27px] leading-none ltr:right-3 rtl:left-3"
+          className={clsx(
+            "pointer-events-none absolute top-3 text-[27px] leading-none ltr:right-3 rtl:left-3",
+            // The one thing that may still fade: it is decoration and carries
+            // nothing the cashier needs to read.
+            outOfStock && "opacity-40",
+          )}
         >
           {symbol}
         </span>
@@ -66,7 +88,12 @@ export function MenuTile({
 
       {/* The item name IS the poster voice — uppercase, condensed, two lines
           reserved. Not a number, so the display face is safe here. */}
-      <span className="greaz-display line-clamp-2 min-h-[52px] max-w-[calc(100%-42px)] text-[17px] uppercase leading-[1.15] text-fg squat:min-h-[44px] squat:text-[16px]">
+      <span
+        className={clsx(
+          "greaz-display line-clamp-2 min-h-[52px] max-w-[calc(100%-42px)] text-[17px] uppercase leading-[1.15] squat:min-h-[44px] squat:text-[16px]",
+          outOfStock ? "text-fg-muted" : "text-fg",
+        )}
+      >
         {name}
       </span>
 
@@ -79,7 +106,15 @@ export function MenuTile({
             headline figure on a poster, not a line item a cashier reads back,
             which is why it may wear the display face when the cart rows and
             the payment fields may not. */}
-        <span className="greaz-display text-[24px] leading-none text-brand-ink squat:text-[22px]">
+        <span
+          className={clsx(
+            "greaz-display text-[24px] leading-none squat:text-[22px]",
+            // Struck through rather than dimmed: a line through a price says
+            // "not today" in a way no amount of grey does, and it stays
+            // legible while saying it.
+            outOfStock ? "text-fg-muted line-through" : "text-brand-ink",
+          )}
+        >
           {price}
         </span>
         {outOfStock ? (

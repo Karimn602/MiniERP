@@ -15,8 +15,9 @@
 //     `TempDb::rival_pool()` stands in for it: same `sqlite://…?mode=rwc` URL,
 //     same `SqlitePool::connect`, same pragma.
 //
-// SQLite checkpoints a WAL and unlinks the sidecars when the LAST connection to
-// the file closes. That is the whole mechanism these tests turn on.
+// SQLite normally attempts its final WAL checkpoint when the LAST connection
+// closes. These tests prove the resulting main file is actually complete rather
+// than inferring success from that mechanism or from sidecar disappearance.
 
 use std::path::{Path, PathBuf};
 
@@ -42,7 +43,11 @@ async fn enable_wal(db: &TempDb) {
         .expect("set journal_mode = WAL")
         .try_get(0)
         .expect("decode journal_mode");
-    assert_eq!(mode.to_lowercase(), "wal", "the disposable database must be in WAL");
+    assert_eq!(
+        mode.to_lowercase(),
+        "wal",
+        "the disposable database must be in WAL"
+    );
 }
 
 /// A store that can post one sale, in WAL mode like production.
@@ -76,90 +81,138 @@ fn wal_of(path: &Path) -> PathBuf {
     sidecar(path, "-wal")
 }
 
-/// How long a sidecar is given to disappear after the last pool is closed.
-const SIDECAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+#[derive(Clone, Copy)]
+struct ExpectedCommittedSale<'a> {
+    id: &'a str,
+    payment_count: i64,
+    movement_count: i64,
+}
 
 /// Assert that a clean shutdown left the database SELF-CONTAINED.
 ///
 /// ## What was actually wrong with the old assertion
 ///
-/// These tests asserted `!wal_of(&path).exists()` on the instruction after the
-/// last `pool.close()`, and that failed about one run in six under `cargo
-/// test`. The obvious diagnosis — that `close()` returns before the operating
-/// system has caught up — turned out to be WRONG, and it matters that it was,
-/// because the fix for a timing race (wait a little) would have papered over
-/// something real.
+/// The original test asserted only that the sidecars disappeared. A later
+/// version opened a main-file copy but merely checked integrity and that the
+/// `sales` table was readable. Neither assertion proves that the committed sale
+/// made it out of the WAL; the intermittent failed copies contained zero sales.
+/// Waiting longer is not a durability proof, and sidecar disappearance alone is
+/// not accepted as one here.
 ///
-/// Instrumenting the failure showed a WAL still present, 168 KB of it, ten
-/// seconds after both pools had closed — and, at the same moment, a copy of
-/// the main file ALONE that already contained the committed sale. So the
-/// CHECKPOINT had happened. What had not happened was the UNLINK.
-///
-/// That asymmetry is SQLite working as designed. When the last connection
-/// closes it checkpoints the WAL into the main database and then tries to
-/// delete the `-wal` and `-shm` files. The checkpoint is part of the
-/// durability contract; the deletion is tidy-up. On Windows the deletion is
-/// routinely refused, because something outside the process — a search
-/// indexer, a virus scanner, a backup agent — holds a handle on a file that
-/// appeared in `%TEMP%` milliseconds earlier. SQLite cannot delete it, does
-/// not care, and is right not to: the data is already in the main file.
-///
-/// So the old assertion was testing the tidy-up and calling it durability.
 /// The guarantee the application actually rests on — the one `BACKUP.md`
 /// invokes when it tells the operator to copy a single file — is that the main
-/// file is COMPLETE after a clean shutdown. That is what this asserts, and it
-/// asserts it more strictly than before:
+/// file is COMPLETE after a clean shutdown. The precise reason SQLite's
+/// automatic final-close checkpoint occasionally failed in the earlier runs is
+/// still unknown. This helper therefore asserts the required outcome directly:
 ///
-///   * the sidecars are given a moment to go, and if they do, the database is
-///     self-contained by construction; otherwise
-///   * the main file is copied ON ITS OWN and opened, and both
-///     `PRAGMA integrity_check` and a read of `sales` must succeed against
-///     that copy — which is the operator's backup procedure, performed for
-///     real rather than inferred from a missing file.
+///   * WAL and SHM presence and sizes are recorded for every failure;
+///   * the main file is always copied ON ITS OWN and opened, regardless of
+///     whether either sidecar disappeared; and
+///   * integrity, the exact committed sale id, its payment legs, and its stock
+///     movement are checked on that standalone copy.
 ///
-/// A genuinely un-checkpointed WAL fails the second arm, because the lone copy
-/// would be inconsistent or missing the committed pages. Nothing is weakened;
-/// the subject is corrected.
-async fn assert_self_contained_after_shutdown(path: &Path, what: &str) {
-    let deadline = std::time::Instant::now() + SIDECAR_TIMEOUT;
-    while (wal_of(path).exists() || shm_of(path).exists())
-        && std::time::Instant::now() < deadline
-    {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    if !wal_of(path).exists() && !shm_of(path).exists() {
-        return;
-    }
-
+/// A genuinely un-checkpointed WAL fails because the lone copy is missing the
+/// exact committed sale and its linked rows. Nothing is weakened.
+async fn assert_self_contained_after_shutdown(
+    path: &Path,
+    expected: ExpectedCommittedSale<'_>,
+    what: &str,
+) {
+    let source_files = sqlite_file_state(path);
     let copy = scratch_path("self-contained-proof");
-    std::fs::copy(path, &copy)
-        .unwrap_or_else(|e| panic!("{what}: copy the main file alone: {e}"));
-    assert!(
-        !wal_of(&copy).exists() && !shm_of(&copy).exists(),
-        "{what}: the copy must be a lone file"
-    );
+    let result = async {
+        std::fs::copy(path, &copy).map_err(|error| format!("copy the main file alone: {error}"))?;
+        if wal_of(&copy).exists() || shm_of(&copy).exists() {
+            return Err("the standalone-copy path unexpectedly had sidecars before open".into());
+        }
 
-    let restored = open_like_production(&copy).await;
+        let restored = open_like_production_result(&copy).await?;
+        let verification = verify_expected_sale(&restored, expected).await;
+        let close = close_sqlite_pool_checked(&restored, "standalone proof pool").await;
+        match (verification, close) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(verify_error), Ok(())) => Err(verify_error),
+            (Ok(()), Err(close_error)) => Err(close_error),
+            (Err(verify_error), Err(close_error)) => {
+                Err(format!("{verify_error}; additionally, {close_error}"))
+            }
+        }
+    }
+    .await;
 
+    if let Err(error) = result {
+        let evidence = preserve_sqlite_set(path);
+        panic!(
+            "{what}: standalone-main-file proof failed: {error}\nsource state: {source_files}\n{evidence}\nstandalone copy preserved at {}",
+            copy.display()
+        );
+    }
+
+    remove_scratch(&copy)
+        .await
+        .unwrap_or_else(|error| panic!("{what}: remove successful proof copy: {error}"));
+}
+
+async fn verify_expected_sale(
+    pool: &sqlx::SqlitePool,
+    expected: ExpectedCommittedSale<'_>,
+) -> Result<(), String> {
     use sqlx::Row;
+
     let integrity: String = sqlx::query("PRAGMA integrity_check")
-        .fetch_one(&restored)
+        .fetch_one(pool)
         .await
-        .unwrap_or_else(|e| panic!("{what}: integrity_check on the lone copy: {e}"))
-        .get(0);
-    assert_eq!(
-        integrity, "ok",
-        "{what}: the main file alone is not a consistent database"
-    );
+        .map_err(|error| format!("integrity_check on the standalone copy: {error}"))?
+        .try_get(0)
+        .map_err(|error| format!("decode integrity_check: {error}"))?;
+    if integrity != "ok" {
+        return Err(format!(
+            "standalone copy integrity_check returned {integrity:?}"
+        ));
+    }
 
-    // Readable the way the application reads it, which is what proves the
-    // committed pages were folded in rather than left behind in the WAL.
-    sqlx::query("SELECT COUNT(*) FROM sales")
-        .fetch_one(&restored)
+    let total_sales: i64 = sqlx::query("SELECT COUNT(*) FROM sales")
+        .fetch_one(pool)
         .await
-        .unwrap_or_else(|e| panic!("{what}: the lone copy has no usable sales table: {e}"));
+        .map_err(|error| format!("count sales in the standalone copy: {error}"))?
+        .try_get(0)
+        .map_err(|error| format!("decode total sale count: {error}"))?;
+    if total_sales != 1 {
+        return Err(format!(
+            "standalone copy contains {total_sales} sales; expected exactly the one committed sale {}",
+            expected.id
+        ));
+    }
 
-    restored.close().await;
+    for (label, sql, wanted) in [
+        ("sale", "SELECT COUNT(*) FROM sales WHERE id = ?", 1),
+        (
+            "payment legs",
+            "SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?",
+            expected.payment_count,
+        ),
+        (
+            "inventory movements",
+            "SELECT COUNT(*) FROM inventory_movements WHERE related_sale_id = ?",
+            expected.movement_count,
+        ),
+    ] {
+        let found: i64 = sqlx::query(sql)
+            .bind(expected.id)
+            .fetch_one(pool)
+            .await
+            .map_err(|error| format!("count {label} for committed sale {}: {error}", expected.id))?
+            .try_get(0)
+            .map_err(|error| format!("decode {label} count for {}: {error}", expected.id))?;
+        if found != wanted {
+            return Err(format!(
+                "committed sale {} has {found} {label} rows in the standalone copy; expected {wanted}",
+                expected.id
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn shm_of(path: &Path) -> PathBuf {
@@ -168,25 +221,118 @@ fn shm_of(path: &Path) -> PathBuf {
 
 /// A disposable path beside the test databases, for copies and snapshots.
 fn scratch_path(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir()
-        .join("greaz-pos-tests")
-        .join(format!("{}-{}.db", tag, uuid::Uuid::new_v4()));
+    let p = std::env::temp_dir().join("greaz-pos-tests").join(format!(
+        "{}-{}.db",
+        tag,
+        uuid::Uuid::new_v4()
+    ));
     assert_not_production_db(&p);
     p
 }
 
-fn forget(path: &Path) {
+fn sqlite_file_state(path: &Path) -> String {
+    ["", "-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let candidate = sidecar(path, suffix);
+            match std::fs::metadata(&candidate) {
+                Ok(metadata) => {
+                    format!("{}=present({} bytes)", candidate.display(), metadata.len())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    format!("{}=absent", candidate.display())
+                }
+                Err(error) => format!(
+                    "{}=metadata-error({error}, kind={:?}, windows_error={:?})",
+                    candidate.display(),
+                    error.kind(),
+                    error.raw_os_error()
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn preserve_sqlite_set(path: &Path) -> String {
+    let evidence = scratch_path("checkpoint-failure-source");
+    let mut copied = Vec::new();
+    let mut failures = Vec::new();
     for suffix in ["-wal", "-shm", ""] {
-        let _ = std::fs::remove_file(sidecar(path, suffix));
+        let source = sidecar(path, suffix);
+        if !source.exists() {
+            continue;
+        }
+        let destination = sidecar(&evidence, suffix);
+        match std::fs::copy(&source, &destination) {
+            Ok(bytes) => copied.push(format!("{} ({bytes} bytes)", destination.display())),
+            Err(error) => failures.push(format!(
+                "{} -> {}: {error} (kind={:?}, windows_error={:?})",
+                source.display(),
+                destination.display(),
+                error.kind(),
+                error.raw_os_error()
+            )),
+        }
+    }
+    format!(
+        "source database evidence copied without opening SQLite: [{}]; copy failures: [{}]",
+        copied.join(", "),
+        failures.join(", ")
+    )
+}
+
+async fn remove_scratch(path: &Path) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for suffix in ["-wal", "-shm", ""] {
+        let candidate = sidecar(path, suffix);
+        let mut last_error = None;
+        for attempt in 0..50 {
+            match std::fs::remove_file(&candidate) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    last_error = None;
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(if attempt < 10 {
+                2
+            } else {
+                20
+            }))
+            .await;
+        }
+        if let Some(error) = last_error {
+            failures.push(format!(
+                "{}: {error} (kind={:?}, windows_error={:?})",
+                candidate.display(),
+                error.kind(),
+                error.raw_os_error()
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
 /// Post one $5.00 sale through the given pool and return its id.
 async fn post_one_sale(pool: &sqlx::SqlitePool) -> String {
-    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee 250g").qty(1).unit_incl(500).build()];
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee 250g")
+        .qty(1)
+        .unit_incl(500)
+        .build()];
     let payload = sale_payload(lines, vec![cash_usd(500)]);
     let sale_id = payload.sale_id.clone();
-    post_sale_with_pool(pool, payload).await.expect("sale posts");
+    post_sale_with_pool(pool, payload)
+        .await
+        .expect("sale posts");
     sale_id
 }
 
@@ -202,11 +348,17 @@ async fn sales_count(pool: &sqlx::SqlitePool) -> i64 {
 
 /// Open a pool on an arbitrary file the way production opens its own.
 async fn open_like_production(path: &Path) -> sqlx::SqlitePool {
+    open_like_production_result(path)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+async fn open_like_production_result(path: &Path) -> Result<sqlx::SqlitePool, String> {
     assert_not_production_db(path);
     let url = format!("sqlite://{}?mode=rwc", path.display());
     sqlx::SqlitePool::connect(&url)
         .await
-        .unwrap_or_else(|e| panic!("open pool on {}: {e}", path.display()))
+        .map_err(|error| format!("open pool on {}: {error}", path.display()))
 }
 
 // ============================================================================
@@ -254,7 +406,11 @@ async fn sqlx_does_not_open_in_wal_the_frontend_pragma_does() {
         .expect("read journal_mode")
         .try_get(0)
         .expect("decode");
-    assert_eq!(after.to_lowercase(), "wal", "WAL persists in the header for every later pool");
+    assert_eq!(
+        after.to_lowercase(),
+        "wal",
+        "WAL persists in the header for every later pool"
+    );
 
     let fk: i64 = sqlx::query("PRAGMA foreign_keys")
         .fetch_one(&rival)
@@ -262,9 +418,15 @@ async fn sqlx_does_not_open_in_wal_the_frontend_pragma_does() {
         .expect("read foreign_keys")
         .try_get(0)
         .expect("decode");
-    assert_eq!(fk, 1, "foreign keys are enforced on the production pool shape");
+    assert_eq!(
+        fk, 1,
+        "foreign keys are enforced on the production pool shape"
+    );
 
-    rival.close().await;
+    close_sqlite_pool_checked(&rival, "production-shape rival pool")
+        .await
+        .expect("close production-shape rival pool");
+    db.cleanup().await.expect("remove production-shape TempDb");
 }
 
 // ============================================================================
@@ -283,12 +445,17 @@ async fn closing_only_the_plugin_pool_leaves_the_wal_behind() {
 
     // Greaz's own posting pool, opened as production opens it.
     let greaz_pool = db.rival_pool().await;
-    post_one_sale(&greaz_pool).await;
+    let sale_id = post_one_sale(&greaz_pool).await;
 
-    assert!(wal_of(&path).exists(), "a live WAL exists while connections are open");
+    assert!(
+        wal_of(&path).exists(),
+        "a live WAL exists while connections are open"
+    );
 
     // The plugin's Exit handler closes ITS pool. Greaz's pool is untouched.
-    db.pool().close().await;
+    close_sqlite_pool_checked(db.pool(), "plugin pool in one-pool reproduction")
+        .await
+        .expect("close plugin pool");
 
     assert!(
         wal_of(&path).exists(),
@@ -297,13 +464,23 @@ async fn closing_only_the_plugin_pool_leaves_the_wal_behind() {
     assert!(shm_of(&path).exists(), "REPRODUCED: the SHM survives too");
 
     // Closing the remaining pool is what actually checkpoints.
-    greaz_pool.close().await;
+    close_sqlite_pool_checked(&greaz_pool, "last posting pool in one-pool reproduction")
+        .await
+        .expect("close last posting pool");
 
     assert_self_contained_after_shutdown(
         &path,
+        ExpectedCommittedSale {
+            id: &sale_id,
+            payment_count: 1,
+            movement_count: 1,
+        },
         "FIX MECHANISM: closing the last pool checkpoints the WAL into the main file",
     )
     .await;
+    db.cleanup()
+        .await
+        .expect("remove one-pool reproduction TempDb");
 }
 
 /// With every pool closed, the committed sale is in the main file — so a
@@ -316,17 +493,34 @@ async fn closing_every_pool_folds_committed_sales_into_the_main_file() {
     let greaz_pool = db.rival_pool().await;
     let sale_id = post_one_sale(&greaz_pool).await;
 
-    greaz_pool.close().await;
-    db.pool().close().await;
+    close_sqlite_pool_checked(&greaz_pool, "posting pool during clean shutdown")
+        .await
+        .expect("close posting pool");
+    close_sqlite_pool_checked(db.pool(), "plugin pool during clean shutdown")
+        .await
+        .expect("close plugin pool");
 
-    assert_self_contained_after_shutdown(&path, "clean shutdown folds the WAL in").await;
+    assert_self_contained_after_shutdown(
+        &path,
+        ExpectedCommittedSale {
+            id: &sale_id,
+            payment_count: 1,
+            movement_count: 1,
+        },
+        "clean shutdown folds the WAL in",
+    )
+    .await;
 
     // Copy ONLY the main file, as BACKUP.md instructs, and read it back.
     let copy = scratch_path("backup-after-clean-shutdown");
     std::fs::copy(&path, &copy).expect("copy the database file");
 
     let restored = open_like_production(&copy).await;
-    assert_eq!(sales_count(&restored).await, 1, "the sale survived a single-file copy");
+    assert_eq!(
+        sales_count(&restored).await,
+        1,
+        "the sale survived a single-file copy"
+    );
 
     use sqlx::Row;
     let found: i64 = sqlx::query("SELECT COUNT(*) FROM sales WHERE id = ?")
@@ -346,8 +540,11 @@ async fn closing_every_pool_folds_committed_sales_into_the_main_file() {
         .expect("decode");
     assert_eq!(integrity, "ok");
 
-    restored.close().await;
-    forget(&copy);
+    close_sqlite_pool_checked(&restored, "clean-shutdown restored copy")
+        .await
+        .expect("close restored copy");
+    remove_scratch(&copy).await.expect("remove restored copy");
+    db.cleanup().await.expect("remove clean-shutdown TempDb");
 }
 
 /// THE CORRECTION, and the fact that its ordering does not matter.
@@ -366,15 +563,28 @@ async fn the_exit_sequence_leaves_one_self_contained_file_in_either_order() {
         let sale_id = post_one_sale(&greaz_pool).await;
 
         if greaz_closes_first {
-            greaz_pool.close().await;
-            db.pool().close().await;
+            close_sqlite_pool_checked(&greaz_pool, "posting pool (first)")
+                .await
+                .expect("close posting pool first");
+            close_sqlite_pool_checked(db.pool(), "plugin pool (last)")
+                .await
+                .expect("close plugin pool last");
         } else {
-            db.pool().close().await;
-            greaz_pool.close().await;
+            close_sqlite_pool_checked(db.pool(), "plugin pool (first)")
+                .await
+                .expect("close plugin pool first");
+            close_sqlite_pool_checked(&greaz_pool, "posting pool (last)")
+                .await
+                .expect("close posting pool last");
         }
 
         assert_self_contained_after_shutdown(
             &path,
+            ExpectedCommittedSale {
+                id: &sale_id,
+                payment_count: 1,
+                movement_count: 1,
+            },
             &format!(
                 "self-contained whichever pool closes first                  (greaz_closes_first = {greaz_closes_first})"
             ),
@@ -396,8 +606,13 @@ async fn the_exit_sequence_leaves_one_self_contained_file_in_either_order() {
             .expect("decode");
         assert_eq!(found, 1, "the sale is in the main file either way");
 
-        restored.close().await;
-        forget(&copy);
+        close_sqlite_pool_checked(&restored, "exit-order restored copy")
+            .await
+            .expect("close exit-order restored copy");
+        remove_scratch(&copy)
+            .await
+            .expect("remove exit-order restored copy");
+        db.cleanup().await.expect("remove exit-order TempDb");
     }
 }
 
@@ -424,7 +639,11 @@ async fn copying_only_the_main_file_while_the_wal_is_live_loses_the_sale() {
 
     let before = sales_count(&greaz_pool).await;
     post_one_sale(&greaz_pool).await;
-    assert_eq!(sales_count(&greaz_pool).await, before + 1, "the sale is committed and visible");
+    assert_eq!(
+        sales_count(&greaz_pool).await,
+        before + 1,
+        "the sale is committed and visible"
+    );
 
     // The operator copies the single file while the app is still open.
     let copy = scratch_path("backup-taken-live");
@@ -436,10 +655,19 @@ async fn copying_only_the_main_file_while_the_wal_is_live_loses_the_sale() {
         before,
         "THE HAZARD: the copy is missing a committed sale that the app reported as posted"
     );
-    restored.close().await;
-    forget(&copy);
+    close_sqlite_pool_checked(&restored, "live-main-file hazard copy")
+        .await
+        .expect("close live-main-file hazard copy");
+    remove_scratch(&copy)
+        .await
+        .expect("remove live-main-file hazard copy");
 
-    greaz_pool.close().await;
+    close_sqlite_pool_checked(&greaz_pool, "live-main-file source pool")
+        .await
+        .expect("close live-main-file source pool");
+    db.cleanup()
+        .await
+        .expect("remove live-main-file source TempDb");
 }
 
 // ============================================================================
@@ -480,7 +708,10 @@ async fn an_abandoned_wal_replays_on_the_next_open_and_is_not_corruption() {
         .expect("look up the sale")
         .try_get(0)
         .expect("decode");
-    assert_eq!(found, 1, "the committed sale replayed out of the abandoned WAL");
+    assert_eq!(
+        found, 1,
+        "the committed sale replayed out of the abandoned WAL"
+    );
 
     let integrity: String = sqlx::query("PRAGMA integrity_check")
         .fetch_one(&recovered)
@@ -494,11 +725,23 @@ async fn an_abandoned_wal_replays_on_the_next_open_and_is_not_corruption() {
         .fetch_all(&recovered)
         .await
         .expect("foreign_key_check");
-    assert!(fk_violations.is_empty(), "no foreign-key violations after recovery");
+    assert!(
+        fk_violations.is_empty(),
+        "no foreign-key violations after recovery"
+    );
 
-    recovered.close().await;
-    forget(&crashed);
-    greaz_pool.close().await;
+    close_sqlite_pool_checked(&recovered, "abandoned-WAL recovery pool")
+        .await
+        .expect("close abandoned-WAL recovery pool");
+    remove_scratch(&crashed)
+        .await
+        .expect("remove abandoned-WAL recovery copy");
+    close_sqlite_pool_checked(&greaz_pool, "abandoned-WAL source pool")
+        .await
+        .expect("close abandoned-WAL source pool");
+    db.cleanup()
+        .await
+        .expect("remove abandoned-WAL source TempDb");
 }
 
 // ============================================================================
@@ -526,7 +769,10 @@ async fn vacuum_into_snapshots_a_live_database_including_wal_commits() {
         .await
         .expect("VACUUM INTO must succeed against a live database");
 
-    assert!(!wal_of(&snapshot).exists(), "the snapshot is a single self-contained file");
+    assert!(
+        !wal_of(&snapshot).exists(),
+        "the snapshot is a single self-contained file"
+    );
 
     let restored = open_like_production(&snapshot).await;
 
@@ -548,9 +794,18 @@ async fn vacuum_into_snapshots_a_live_database_including_wal_commits() {
         .expect("decode");
     assert_eq!(integrity, "ok");
 
-    restored.close().await;
-    forget(&snapshot);
-    greaz_pool.close().await;
+    close_sqlite_pool_checked(&restored, "VACUUM INTO restored pool")
+        .await
+        .expect("close VACUUM INTO restored pool");
+    remove_scratch(&snapshot)
+        .await
+        .expect("remove VACUUM INTO snapshot");
+    close_sqlite_pool_checked(&greaz_pool, "VACUUM INTO source pool")
+        .await
+        .expect("close VACUUM INTO source pool");
+    db.cleanup()
+        .await
+        .expect("remove VACUUM INTO source TempDb");
 }
 
 // ============================================================================
@@ -569,17 +824,34 @@ async fn a_restored_backup_preserves_sales_payment_legs_movements_and_counters()
     let greaz_pool = db.rival_pool().await;
 
     // A split-tender sale: two payment legs, like the Pilot 001 transaction.
-    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee 250g").qty(2).unit_incl(500).build()];
-    let payload = sale_payload(lines, vec![cash_usd(500), cash_lbp(500 * RATE_LBP_PER_USD / 100)]);
+    let lines = vec![SaleLineBuilder::new(P_COFFEE, "Coffee 250g")
+        .qty(2)
+        .unit_incl(500)
+        .build()];
+    let payload = sale_payload(
+        lines,
+        vec![cash_usd(500), cash_lbp(500 * RATE_LBP_PER_USD / 100)],
+    );
     let sale_id = payload.sale_id.clone();
-    let result = post_sale_with_pool(&greaz_pool, payload).await.expect("sale posts");
+    let result = post_sale_with_pool(&greaz_pool, payload)
+        .await
+        .expect("sale posts");
     let receipt_number = result.receipt_number;
 
     // Shut down in order, then copy the single file.
-    greaz_pool.close().await;
-    db.pool().close().await;
+    close_sqlite_pool_checked(&greaz_pool, "restore-rehearsal posting pool")
+        .await
+        .expect("close restore-rehearsal posting pool");
+    close_sqlite_pool_checked(db.pool(), "restore-rehearsal plugin pool")
+        .await
+        .expect("close restore-rehearsal plugin pool");
     assert_self_contained_after_shutdown(
         &path,
+        ExpectedCommittedSale {
+            id: &sale_id,
+            payment_count: 2,
+            movement_count: 1,
+        },
         "clean shutdown leaves one self-contained file",
     )
     .await;
@@ -602,7 +874,10 @@ async fn a_restored_backup_preserves_sales_payment_legs_movements_and_counters()
         .fetch_all(&restored)
         .await
         .expect("foreign_key_check");
-    assert!(fk.is_empty(), "no foreign-key violations in the restored database");
+    assert!(
+        fk.is_empty(),
+        "no foreign-key violations in the restored database"
+    );
 
     let legs: i64 = sqlx::query("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
         .bind(&sale_id)
@@ -630,7 +905,10 @@ async fn a_restored_backup_preserves_sales_payment_legs_movements_and_counters()
         .expect("read receipt number")
         .try_get(0)
         .expect("decode");
-    assert_eq!(persisted_receipt, receipt_number as i64, "the receipt number survived");
+    assert_eq!(
+        persisted_receipt, receipt_number as i64,
+        "the receipt number survived"
+    );
 
     // The counter continues from the restored state rather than colliding.
     let next = post_one_sale(&restored).await;
@@ -647,6 +925,11 @@ async fn a_restored_backup_preserves_sales_payment_legs_movements_and_counters()
         "the restored database continues the receipt sequence"
     );
 
-    restored.close().await;
-    forget(&backup);
+    close_sqlite_pool_checked(&restored, "restore-rehearsal restored pool")
+        .await
+        .expect("close restore-rehearsal restored pool");
+    remove_scratch(&backup)
+        .await
+        .expect("remove restore-rehearsal backup");
+    db.cleanup().await.expect("remove restore-rehearsal TempDb");
 }

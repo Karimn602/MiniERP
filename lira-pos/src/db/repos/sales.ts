@@ -40,6 +40,9 @@ interface SaleRow {
   voided_by_user_id: string | null;
   void_reason: string | null;
   notes: string | null;
+  channel: SalesChannel;
+  driver_id: string | null;
+  delivery_fee_cents: number;
 }
 
 interface SaleItemRow {
@@ -67,6 +70,7 @@ interface SaleItemRow {
   uom_code_snapshot: string | null;
   factor_num_snapshot: number | null;
   factor_den_snapshot: number | null;
+  kitchen_note: string | null;
 }
 
 interface SalePaymentRow {
@@ -111,6 +115,12 @@ function toSale(r: SaleRow): Sale {
     voidedByUserId: r.voided_by_user_id,
     voidReason: r.void_reason,
     notes: r.notes,
+    // The delivery attribution, carried onto the domain object so a receipt, a
+    // kitchen ticket and Sales History can all state it (WP-A4). `SELECT *`
+    // already returned these three columns; nothing read them.
+    channel: r.channel,
+    driverId: r.driver_id,
+    deliveryFeeCents: r.delivery_fee_cents,
   };
 }
 
@@ -140,6 +150,7 @@ function toSaleItem(r: SaleItemRow): SaleItem {
     uomCodeSnapshot: r.uom_code_snapshot,
     factorNumSnapshot: r.factor_num_snapshot,
     factorDenSnapshot: r.factor_den_snapshot,
+    kitchenNote: r.kitchen_note,
   };
 }
 
@@ -188,6 +199,19 @@ export interface PostSaleLineInput {
 
   barcodeUsedSnapshot: string | null;
   barcodeTypeSnapshot: string | null;
+
+  /**
+   * The kitchen's instruction for this line (WP-A2), or null.
+   *
+   * Part of the sale's canonical content, so a replay carrying a different
+   * instruction is refused as a conflict rather than silently ignored — see
+   * `posting.rs::CanonicalLine`. The backend trims it and stores blank as
+   * NULL, so `""` and `null` describe the same line and a faithful retry
+   * reconciles either way.
+   *
+   * Carries no money. A PAID modifier is a priced line of its own.
+   */
+  kitchenNote: string | null;
 
   isService: boolean;
 }

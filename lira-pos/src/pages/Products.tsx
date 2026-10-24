@@ -173,6 +173,21 @@ export default function Products() {
   const [saveOk, setSaveOk] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  /**
+   * Are RETIRED products listed too?
+   *
+   * Off by default, because the list is the menu. It exists because an
+   * inactive product was previously unreachable from this screen —
+   * `listEnriched` filters `is_active = 1` — while still holding its SKU and
+   * its barcodes, which are unique per store whatever the product's state.
+   * So an operator told "that barcode belongs to a product that is inactive"
+   * had nowhere to go: the product was invisible here, and the only ways out
+   * were to invent a different barcode or to delete history. Turning this on
+   * shows the row, and the existing edit form's Active checkbox reactivates
+   * it through the ordinary `save` path. Nothing here reactivates anything by
+   * itself, and no barcode is ever moved between products.
+   */
+  const [showInactive, setShowInactive] = useState(false);
 
   const reload = useCallback(async () => {
     if (!storeId) return;
@@ -182,7 +197,7 @@ export default function Products() {
 
     try {
       const [productRows, vatRows, uomRows] = await Promise.all([
-        productsRepo.listEnriched({ storeId }),
+        productsRepo.listEnriched({ storeId, includeInactive: showInactive }),
         vatRatesRepo.listActive(),
         uomsRepo.listActive(),
       ]);
@@ -209,7 +224,7 @@ export default function Products() {
     } finally {
       setLoading(false);
     }
-  }, [storeId]);
+  }, [storeId, showInactive]);
 
   useEffect(() => {
     if (hydrated) void reload();
@@ -503,6 +518,16 @@ export default function Products() {
         subtitle={t("products.subtitle")}
         actions={
           <>
+            <label className="flex items-center gap-2 text-xs font-medium text-fg-muted">
+              <input
+                type="checkbox"
+                data-testid="show-inactive"
+                checked={showInactive}
+                onChange={(e) => setShowInactive(e.target.checked)}
+                className="h-4 w-4 rounded border-line"
+              />
+              {t("products.showInactive")}
+            </label>
             <Button variant="secondary" onClick={() => setShowImport(true)}>
               {t("products.importProducts")}
             </Button>
@@ -712,10 +737,17 @@ export default function Products() {
               <div className="grid gap-3 sm:grid-cols-[2fr_1fr]">
                 <label className="block text-xs font-medium text-slate-700">
                   {t("products.categoryLabel")}
+                  {/* `bg-surface text-fg` is not decoration: this was the one
+                      select in the application without them, so in Midnight it
+                      rendered at the user-agent default — a white box with
+                      near-white text — while every other dropdown on the same
+                      form was themed. The focus ring is matched to those too,
+                      so the form no longer has one control that behaves
+                      differently from its neighbours. */}
                   <select
                     value={form.category}
                     onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))}
-                    className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                    className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-2 py-1.5 text-sm text-fg shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
                   >
                     <option value="">{t("menuCategory.none")}</option>
                     {MENU_CATEGORIES.filter((c) => c.id !== UNCATEGORIZED_ID).map((c) => (

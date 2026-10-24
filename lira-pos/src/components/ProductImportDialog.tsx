@@ -3,11 +3,13 @@ import { productsRepo } from "../db/repos/products";
 import { classifyBarcode } from "../lib/barcode";
 import {
   downloadTemplate,
+  importableCategoryIds,
   parseSpreadsheet,
   validateImportRows,
   type ImportRowValidated,
   type RowStatus,
 } from "../lib/productImport";
+import { resolveCategory, resolveIcon } from "../lib/menuCategories";
 import type { VatRate, UnitOfMeasure } from "../db/types";
 import { formatUsd } from "../lib/money";
 import { Button } from "./ui/Button";
@@ -64,11 +66,39 @@ export function ProductImportDialog({
   const [rows, setRows] = useState<ImportRowValidated[]>([]);
   const [importedCount, setImportedCount] = useState(0);
   const [skippedCount, setSkippedCount] = useState(0);
+  const [rejectedCount, setRejectedCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
 
   const validRows = rows.filter((r) => r.status === "valid");
+  /** Rows that are fine but already in the database: deliberately skipped. */
   const warnRows = rows.filter((r) => r.status === "warning");
+  /** Rows REFUSED. Not the same thing, and no longer counted as the same. */
   const errorRows = rows.filter((r) => r.status === "error");
+
+  /**
+   * How many rows carry each reason, so the summary can say what is actually
+   * wrong instead of attributing every non-import to an existing SKU.
+   *
+   * A row can hold more than one issue (a bad checksum AND a duplicate SKU),
+   * and it is counted under each: these are reason counts, not a partition.
+   * The three row counts above are the partition.
+   */
+  const reasonCounts = rows.reduce<Record<string, number>>((acc, row) => {
+    for (const code of new Set(row.issues.map((i) => i.code))) {
+      acc[code] = (acc[code] ?? 0) + 1;
+    }
+    return acc;
+  }, {});
+
+  const REASON_LABEL: Record<string, string> = {
+    invalid_barcode_checksum: "productImport.reasonChecksum",
+    duplicate_sku_in_file: "productImport.reasonDuplicateSkuInFile",
+    duplicate_barcode_in_file: "productImport.reasonDuplicateBarcodeInFile",
+    sku_exists: "productImport.reasonSkuExists",
+    barcode_taken_by_active_product: "productImport.reasonBarcodeActive",
+    barcode_taken_by_inactive_product: "productImport.reasonBarcodeInactive",
+    malformed_row: "productImport.reasonMalformed",
+  };
 
   // ── File selected ──────────────────────────────────────────────────────────
 
@@ -100,7 +130,6 @@ export function ProductImportDialog({
     setStep("importing");
 
     let imported = 0;
-    let skipped = 0;
     let failed = 0;
 
     for (const row of validRows) {
@@ -123,13 +152,27 @@ export function ProductImportDialog({
           storeId,
           sku,
           name: row.name,
-          description: null,
+          // The three presentation fields the importer used to drop (WP-A5).
+          // `productsRepo.save` normalises the category and trims the icon, so
+          // the spreadsheet path and the Products form write the column the
+          // same way.
+          description: row.description,
+          category: row.category,
+          icon: row.icon,
           vatRateId: row.vatRate.id,
           vatPricingMode: "inclusive",
           priceExclVatCents: row.priceExclVatCents,
           priceInclVatCents: row.priceInclVatCents,
           reorderPoint: null,
           isService: row.isService,
+          // The file's own `active` column, which this call used to drop.
+          // `ProductSaveArgs.isActive` defaults to true when it is omitted,
+          // so every row of every import landed SELLABLE — including the
+          // ones a shop had deliberately marked inactive because they are
+          // seasonal, out of contract, or not ready to be ordered. Nothing
+          // in the preview contradicted it either, which is why it survived
+          // a desktop walkthrough.
+          isActive: row.isActive,
           barcode: row.barcode ?? null,
           barcodeType: row.barcode ? classifyBarcode(row.barcode) : null,
           baseUomCode: row.stockUom.code,
@@ -145,10 +188,11 @@ export function ProductImportDialog({
       }
     }
 
-    skipped = warnRows.length;
-
+    // Skipped and rejected are DIFFERENT outcomes and are reported as such:
+    // a skipped row was already in the database, a rejected one was refused.
     setImportedCount(imported);
-    setSkippedCount(skipped);
+    setSkippedCount(warnRows.length);
+    setRejectedCount(errorRows.length);
     setFailedCount(failed);
     setStep("done");
 
@@ -221,6 +265,27 @@ export function ProductImportDialog({
                   <span><code>is_service</code> — {t("productImport.colIsServiceDesc")}</span>
                   <span><code>active</code> — {t("productImport.colActiveDesc")}</span>
                 </div>
+
+                {/* The optional menu columns (WP-A5). Listed separately and
+                    labelled optional, because a file without them is still a
+                    valid file — that is the backward-compatibility promise. */}
+                <p className="mb-2 mt-4 font-medium text-slate-800">
+                  {t("productImport.optionalCols")}
+                </p>
+                <div className="grid grid-cols-1 gap-x-4 gap-y-1 sm:grid-cols-3">
+                  <span>
+                    <code>menu_category</code> — {t("productImport.colCategoryDesc")}
+                  </span>
+                  <span><code>icon</code> — {t("productImport.colIconDesc")}</span>
+                  <span>
+                    <code>description</code> — {t("productImport.colDescriptionDesc")}
+                  </span>
+                </div>
+                <p className="mt-2 text-fg-muted">
+                  {t("productImport.categoryValues", {
+                    values: importableCategoryIds().join(", "),
+                  })}
+                </p>
               </div>
 
               {/* Opening stock note */}
@@ -266,19 +331,47 @@ export function ProductImportDialog({
           {step === "preview" && (
             <div className="space-y-4">
               {/* Summary bar */}
-              <div className="flex flex-wrap gap-3 text-sm">
-                <span className="rounded-full bg-good-bg px-3 py-1 text-good-fg">
-                  {t("productImport.readyToImport", { count: String(validRows.length) })}
-                </span>
-                {warnRows.length > 0 && (
-                  <span className="rounded-full bg-warn-bg px-3 py-1 text-warn-fg">
-                    {t("productImport.willBeSkipped", { count: String(warnRows.length) })}
+              <div className="space-y-2">
+                <div className="flex flex-wrap gap-3 text-sm">
+                  <span
+                    data-testid="count-ready"
+                    className="rounded-full bg-good-bg px-3 py-1 text-good-fg"
+                  >
+                    {t("productImport.readyToImport", { count: String(validRows.length) })}
                   </span>
-                )}
-                {errorRows.length > 0 && (
-                  <span className="rounded-full bg-danger-bg px-3 py-1 text-danger-fg">
-                    {t("productImport.haveErrors", { count: String(errorRows.length) })}
-                  </span>
+                  {errorRows.length > 0 && (
+                    <span
+                      data-testid="count-rejected"
+                      className="rounded-full bg-danger-bg px-3 py-1 text-danger-fg"
+                    >
+                      {t("productImport.rejected", { count: String(errorRows.length) })}
+                    </span>
+                  )}
+                  {warnRows.length > 0 && (
+                    <span
+                      data-testid="count-skipped"
+                      className="rounded-full bg-warn-bg px-3 py-1 text-warn-fg"
+                    >
+                      {t("productImport.willBeSkipped", { count: String(warnRows.length) })}
+                    </span>
+                  )}
+                </div>
+                {/* WHY, by reason. The old summary had one bucket and called
+                    it "SKU exists", so a row dropped for a bad check digit
+                    was reported as a clash that had not happened. */}
+                {Object.keys(reasonCounts).length > 0 && (
+                  <ul
+                    data-testid="reason-breakdown"
+                    className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-fg-muted"
+                  >
+                    {Object.entries(reasonCounts).map(([code, n]) => (
+                      <li key={code} data-testid={`reason-${code}`}>
+                        {t(REASON_LABEL[code] ?? "productImport.reasonMalformed", {
+                          count: String(n),
+                        })}
+                      </li>
+                    ))}
+                  </ul>
                 )}
               </div>
 
@@ -305,6 +398,9 @@ export function ProductImportDialog({
                       <th className="px-3 py-2">{t("productImport.colStockUnitHeader")}</th>
                       <th className="px-3 py-2">{t("productImport.colSellUnitHeader")}</th>
                       <th className="px-3 py-2">{t("productImport.colQtyUnit")}</th>
+                      <th className="px-3 py-2">{t("productImport.colClassHeader")}</th>
+                      <th className="px-3 py-2">{t("productImport.colSectionHeader")}</th>
+                      <th className="px-3 py-2">{t("productImport.colIconHeader")}</th>
                       <th className="px-3 py-2">{t("productImport.colIssues")}</th>
                     </tr>
                   </thead>
@@ -355,6 +451,60 @@ export function ProductImportDialog({
                         <td className="px-3 py-2 text-slate-600">
                           {row.rawQtyPerSellingUnit || "1"}
                         </td>
+                        {/* WHAT THIS ROW WILL BECOME, in the two dimensions
+                            that decide whether it can be sold and whether it
+                            holds stock. Shown as the RESOLVED classification,
+                            not the raw cells: a blank `active` means yes and
+                            a blank `is_service` means goods, and a preview
+                            that printed the empty cell would leave the
+                            operator to remember which way each default
+                            falls. The active flag in particular had no
+                            representation anywhere on this screen while the
+                            importer was quietly ignoring it. */}
+                        <td className="px-3 py-2">
+                          <div className="flex flex-wrap gap-1">
+                            <span
+                              data-testid={`row-${row.rowNum}-active`}
+                              className={clsx(
+                                "rounded-chip border px-1.5 py-0.5 text-[10px] font-bold uppercase",
+                                row.isActive
+                                  ? "border-good-line bg-good-bg text-good-fg"
+                                  : "border-line bg-paper text-fg-muted",
+                              )}
+                            >
+                              {t(
+                                row.isActive
+                                  ? "productImport.classActive"
+                                  : "productImport.classInactive",
+                              )}
+                            </span>
+                            <span
+                              data-testid={`row-${row.rowNum}-kind`}
+                              className="rounded-chip border border-line bg-paper px-1.5 py-0.5 text-[10px] font-bold uppercase text-fg-muted"
+                            >
+                              {t(
+                                row.isService
+                                  ? "productImport.classService"
+                                  : "productImport.classStocked",
+                              )}
+                            </span>
+                          </div>
+                        </td>
+                        {/* The RESOLVED section, not the raw cell: a row that
+                            named no section shows what it will actually be,
+                            which is uncategorised. */}
+                        <td className="px-3 py-2 text-slate-600">
+                          {row.category
+                            ? t(resolveCategory(row.category).labelKey)
+                            : t("menuCategory.none")}
+                        </td>
+                        <td className="px-3 py-2 text-center text-base">
+                          {row.icon ?? (
+                            <span className="text-xs text-fg-muted">
+                              {resolveIcon(null, row.category)}
+                            </span>
+                          )}
+                        </td>
                         <td className="px-3 py-2 max-w-xs">
                           {row.errors.map((e, i) => (
                             <div key={i} className="text-danger-fg">{e}</div>
@@ -404,11 +554,15 @@ export function ProductImportDialog({
                     {t("productImport.doneTitle")}
                   </p>
                   <p className="text-xs text-slate-500">
-                    {t("productImport.doneCreated", { count: String(importedCount) })}
-                    {skippedCount > 0 &&
-                      t("productImport.doneSkipped", { count: String(skippedCount) })}
-                    {failedCount > 0 &&
-                      t("productImport.doneFailed", { count: String(failedCount) })}
+                    <span data-testid="done-counts">
+                      {t("productImport.doneCreated", { count: String(importedCount) })}
+                      {skippedCount > 0 &&
+                        t("productImport.doneSkipped", { count: String(skippedCount) })}
+                      {rejectedCount > 0 &&
+                        t("productImport.doneRejected", { count: String(rejectedCount) })}
+                      {failedCount > 0 &&
+                        t("productImport.doneFailed", { count: String(failedCount) })}
+                    </span>
                   </p>
                 </div>
               </div>
