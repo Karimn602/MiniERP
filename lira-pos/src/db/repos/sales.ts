@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { query } from "../client";
+import { normalizeCogsSource } from "../../lib/standardCost";
 import { newId } from "../../lib/ids";
 import type { SalesChannel } from "../../lib/salesChannel";
 import type {
@@ -71,6 +72,7 @@ interface SaleItemRow {
   factor_num_snapshot: number | null;
   factor_den_snapshot: number | null;
   kitchen_note: string | null;
+  cogs_source: string | null;
 }
 
 interface SalePaymentRow {
@@ -151,6 +153,10 @@ function toSaleItem(r: SaleItemRow): SaleItem {
     factorNumSnapshot: r.factor_num_snapshot,
     factorDenSnapshot: r.factor_den_snapshot,
     kitchenNote: r.kitchen_note,
+    // Anything unrecognised — and the missing key a row decoded from a
+    // pre-020 database carries — reads as `null`, which is exactly what
+    // "costed before this feature existed" means (WP-B1).
+    cogsSource: normalizeCogsSource(r.cogs_source),
   };
 }
 

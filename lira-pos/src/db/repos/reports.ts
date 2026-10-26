@@ -44,6 +44,7 @@
  */
 import { query } from "../client";
 import type { DriverSettlementRow } from "../../lib/driverCollection";
+import { normalizeCogsSource, type CogsSource } from "../../lib/standardCost";
 
 export interface DailySalesRow {
   localDate: string;
@@ -121,6 +122,62 @@ export interface ProductReturnsRow {
   lineTotalInclVatCents: number;
   /** Reversed COGS, which is zero for a line that was written off. */
   lineCogsCents: number;
+}
+
+/**
+ * One `cogs_source` bucket of the posted sale lines in a period (WP-B1).
+ *
+ * This is the "cost completeness" series, and it exists because a gross-profit
+ * figure alone cannot be read honestly. Every line in this application is
+ * costed at SOMETHING, and before migration 020 a line costed at nothing
+ * looked identical to one costed at zero on purpose: both printed $0.00 and
+ * both produced a 100% margin. The buckets separate them.
+ *
+ * It is a SERIES BESIDE the sales figures, exactly as returns are, and for the
+ * same reason: it is not folded into any total, so no existing number changes
+ * meaning. `lineSubtotalExclVatCents` and `lineCogsExclVatCents` here are the
+ * same columns `productSales` sums, scoped the same way, so the buckets add up
+ * to the period's gross figures and the panel cannot disagree with the KPI
+ * cards above it.
+ */
+export interface CogsCoverageRow {
+  /** `null` for lines posted before migration 020 existed. */
+  source: CogsSource | null;
+  lineCount: number;
+  /** Base units sold on those lines. */
+  totalQty: number;
+  lineSubtotalExclVatCents: number;
+  lineCogsExclVatCents: number;
+  /**
+   * How many of those lines carry a COGS rate of exactly zero.
+   *
+   * Reported per bucket rather than summed, because a zero means something
+   * different in each: in `standard` it is the owner's deliberate assertion;
+   * in `uncosted` it is the absence of an answer; in `purchase_average` it is
+   * a receipt that stated zero, since WP-B1's P1-A correction records a
+   * product with no valuation basis at all as `uncosted` instead.
+   */
+  zeroRateLineCount: number;
+  /**
+   * The lines of this bucket whose persisted COGS snapshot is NOT zero, and
+   * the revenue earned on them.
+   *
+   * This exists for ONE bucket: `source === null`. A legacy line was posted
+   * before migration 020 and carries no provenance, but it does carry the COGS
+   * figure it was posted with — and that figure is what a gross-profit number
+   * is actually built from. Reporting every NULL-source line as uncosted
+   * claimed a cost was missing while the cost sat in the row, and told the
+   * owner their profit was overstated when the arithmetic behind it was
+   * complete. So presence-of-cost and knowledge-of-source are measured
+   * separately, and only the NULL bucket needs the former: every other bucket
+   * states its own answer.
+   *
+   * Both persisted forms are consulted — the authoritative microcent rate and
+   * the line's rounded money — so a legacy row written by any path counts as
+   * cost-bearing if either says a cost was recorded.
+   */
+  costBearingLineCount: number;
+  costBearingSubtotalExclVatCents: number;
 }
 
 export interface DailyPurchasesRow {
@@ -624,6 +681,73 @@ export const reportsRepo = {
       usdCents: r.usd_cents,
       lbp: r.lbp,
       totalUsdEquivalentCents: r.total_usd_equivalent_cents,
+    }));
+  },
+
+  /**
+   * Posted sale lines of the period, bucketed by how they were costed (WP-B1).
+   *
+   * Grouped on the raw column so a value this build does not recognise still
+   * appears rather than vanishing into another bucket — the mapping normalises
+   * it to `null` ("not a source I can explain"), which is honest, where
+   * dropping the row would silently shrink the denominator a coverage
+   * percentage is taken over.
+   */
+  async cogsCoverage(args: {
+    storeId: string;
+    dateFrom: string;
+    dateTo: string;
+  }): Promise<CogsCoverageRow[]> {
+    interface Row {
+      cogs_source: string | null;
+      line_count: number;
+      total_qty: number;
+      line_subtotal_excl_vat_cents: number;
+      line_cogs_excl_vat_cents: number;
+      zero_rate_line_count: number;
+      cost_bearing_line_count: number;
+      cost_bearing_subtotal_excl_vat_cents: number;
+    }
+
+    const rows = await query<Row>(
+      `SELECT
+         si.cogs_source,
+         COUNT(*) AS line_count,
+         COALESCE(SUM(si.quantity), 0) AS total_qty,
+         COALESCE(SUM(si.line_subtotal_excl_vat_cents), 0) AS line_subtotal_excl_vat_cents,
+         COALESCE(SUM(si.line_cogs_excl_vat_cents), 0) AS line_cogs_excl_vat_cents,
+         COALESCE(SUM(CASE WHEN si.unit_cogs_excl_vat_microcents = 0 THEN 1 ELSE 0 END), 0)
+           AS zero_rate_line_count,
+         COALESCE(SUM(
+           CASE WHEN si.unit_cogs_excl_vat_microcents <> 0
+                      OR si.line_cogs_excl_vat_cents <> 0
+                THEN 1 ELSE 0 END), 0)
+           AS cost_bearing_line_count,
+         COALESCE(SUM(
+           CASE WHEN si.unit_cogs_excl_vat_microcents <> 0
+                      OR si.line_cogs_excl_vat_cents <> 0
+                THEN si.line_subtotal_excl_vat_cents ELSE 0 END), 0)
+           AS cost_bearing_subtotal_excl_vat_cents
+       FROM sale_items si
+       JOIN sales s ON s.id = si.sale_id
+       WHERE s.store_id = ?
+         AND s.status = 'posted'
+         AND s.posted_at >= ?
+         AND s.posted_at <= ?
+       GROUP BY si.cogs_source
+       ORDER BY line_count DESC`,
+      [args.storeId, utcFrom(args.dateFrom), utcTo(args.dateTo)],
+    );
+
+    return rows.map((r) => ({
+      source: normalizeCogsSource(r.cogs_source),
+      lineCount: r.line_count,
+      totalQty: r.total_qty,
+      lineSubtotalExclVatCents: r.line_subtotal_excl_vat_cents,
+      lineCogsExclVatCents: r.line_cogs_excl_vat_cents,
+      zeroRateLineCount: r.zero_rate_line_count,
+      costBearingLineCount: r.cost_bearing_line_count,
+      costBearingSubtotalExclVatCents: r.cost_bearing_subtotal_excl_vat_cents,
     }));
   },
 

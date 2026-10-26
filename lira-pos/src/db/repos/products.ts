@@ -3,6 +3,7 @@ import { query } from "../client";
 import { newId } from "../../lib/ids";
 import { normalizeCategoryId } from "../../lib/menuCategories";
 import { assertVatRateChosen } from "../../lib/catalogDefaults";
+import { normalizeCostingMethod, type CostingMethod } from "../../lib/standardCost";
 import { barcodesRepo } from "./barcodes";
 import type {
   BarcodeScanResult,
@@ -80,6 +81,9 @@ interface ProductRow {
   is_service: number;
   category: string | null;
   icon: string | null;
+  costing_method: string | null;
+  standard_cost_excl_vat_microcents: number | null;
+  standard_cost_set_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -153,6 +157,26 @@ export type ProductSaveArgs = {
   icon?: string | null;
   /** Create defaults to active; an update states it. */
   isActive?: boolean;
+  /**
+   * How sales of this product are costed (WP-B1).
+   *
+   * Optional, and the omission MEANS something different per mode: on a
+   * `"create"` it takes `"purchase_average"`, so the spreadsheet importer and
+   * every other caller that predates this field keep describing exactly the
+   * product they described before; on an `"update"` it PRESERVES whatever is
+   * configured, because a caller that does not mention costing is not asking
+   * for a manual cost to be thrown away.
+   */
+  costingMethod?: CostingMethod;
+  /**
+   * The typed cost: a RATE per base unit, EXCLUSIVE of VAT, in microcents.
+   *
+   * `null` is "not configured"; `0` is a deliberate assertion that the item
+   * costs nothing. Required when `costingMethod` is `"standard"` — the backend
+   * refuses the save rather than defaulting a missing figure to zero, and
+   * migration 020's trigger refuses the row regardless of caller.
+   */
+  standardCostExclVatMicrocents?: number | null;
   baseUomCode: string;
   saleUomCode: string;
   saleFactor: Factor;
@@ -187,6 +211,14 @@ function rowToProduct(r: ProductRow): Product {
     // key at all, and `undefined` would travel into the UI as a category id.
     category: r.category ?? null,
     icon: r.icon ?? null,
+    // Same `?? null` reasoning as `category` above, and it matters more here:
+    // a row decoded from a database still at migration 019 has no such key,
+    // and `normalizeCostingMethod` maps the missing value onto the behaviour
+    // the row actually has rather than letting `undefined` travel into a
+    // screen that would print it.
+    costingMethod: normalizeCostingMethod(r.costing_method),
+    standardCostExclVatMicrocents: r.standard_cost_excl_vat_microcents ?? null,
+    standardCostSetAt: r.standard_cost_set_at ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -440,6 +472,16 @@ export const productsRepo = {
           category: normalizeCategoryId(args.category),
           icon: args.icon?.trim() || null,
           isActive: args.isActive ?? true,
+          // Costing configuration (WP-B1), passed through EXACTLY as the
+          // caller stated it — `null` when they said nothing. The backend
+          // distinguishes the two: silence on a create takes the default
+          // (`purchase_average`), and silence on an UPDATE preserves whatever
+          // the owner configured. Substituting a default here would erase that
+          // distinction before it reached the only place that can honour it,
+          // and a manual-costed item would silently revert on any unrelated
+          // edit by a caller that predates this field.
+          costingMethod: args.costingMethod ?? null,
+          standardCostExclVatMicrocents: args.standardCostExclVatMicrocents ?? null,
           baseUomCode: args.baseUomCode,
           saleUomCode: args.saleUomCode,
           saleFactorNum: args.saleFactor.num,

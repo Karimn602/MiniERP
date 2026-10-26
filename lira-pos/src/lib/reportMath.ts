@@ -39,11 +39,13 @@
  * `mergeProductRows`.
  */
 import type {
+  CogsCoverageRow,
   DailySalesRow,
   DailyReturnsRow,
   ProductSalesRow,
   ProductReturnsRow,
 } from "../db/repos/reports";
+import { isVerifiedCostSource, type CogsSource } from "./standardCost";
 
 export interface PeriodTotals {
   saleCount: number;
@@ -338,4 +340,248 @@ export function mergeProductRows(
 export function formatMargin(profitCents: number, netSalesCents: number): string {
   if (netSalesCents <= 0) return "—";
   return `${Math.round((profitCents / netSalesCents) * 1000) / 10}%`;
+}
+
+// ---------------------------------------------------------------------------
+// Cost completeness (WP-B1)
+// ---------------------------------------------------------------------------
+
+/**
+ * How much of a period's revenue was earned on lines that HAVE a cost, and how
+ * much of THAT has a recorded cost source.
+ *
+ * The figure a gross-profit number has to be read against. Greaz has sold food
+ * at a 100% paper margin since the day it shipped, not because the margin was
+ * good but because nothing had been costed, and a profit figure printed
+ * without this beside it is indistinguishable from one that is simply wrong.
+ *
+ * TWO QUESTIONS, NOT ONE. WP-B1's first cut asked only "does this line name a
+ * cost source?", and then printed the answer under a label about having a
+ * cost. For a line posted before migration 020 those are different questions
+ * with different answers: its provenance is NULL and always will be — history
+ * is not restated — but the COGS figure it was posted with is sitting in the
+ * row, and that figure is what every gross-profit number in this application
+ * is already built from. Calling it uncosted claimed money was missing from a
+ * calculation that was complete, and warned that profit was overstated when it
+ * was not. So the two are measured separately:
+ *
+ *   * COST-BEARING revenue — a cost figure exists behind it. Includes a legacy
+ *     line with a nonzero COGS snapshot, and includes a deliberate zero
+ *     (`standard` with a stated $0.00), because that is an answer.
+ *   * VERIFIED-SOURCE revenue — the subset whose cost source is recorded, so
+ *     the figure can be traced to a document or to a stated assertion.
+ *
+ * Cost-bearing is the share a profit figure is read against; verified-source is
+ * the share an auditor is read against. A legacy line sits inside the first and
+ * outside the second, and is labelled as exactly that — never as
+ * `purchase_average` or `standard`, which would invent a provenance for it.
+ *
+ * MISSING COST is the only thing that CAN overstate profit, and it is the union
+ * of two states: a line whose source SAYS no cost was configured (`uncosted`), and
+ * a legacy line whose COGS snapshot is zero, where nothing distinguishes "cost
+ * of nothing" from "nobody said". The first is a to-do list the owner can work
+ * through on the Products page today; the second is a fact about the past.
+ *
+ * Shares are of REVENUE, not of line count: ten uncosted sides matter less than
+ * one uncosted platter, and it is the money that reaches the margin. Both counts
+ * are reported too, because an owner looking for what to configure next wants
+ * the item count.
+ *
+ * THE REVENUE BASIS IS GROSS, AND BOTH SHARES USE IT. Every figure here is taken
+ * over posted sale lines before returns — the basis `productSales` sums on — and
+ * the DENOMINATOR of both fractions is `totalRevenueExclVatCents`, the whole
+ * period. `verifiedSourceRevenueFraction` is therefore a share of gross sales
+ * and NOT a share of cost-bearing revenue; it is smaller than
+ * `costBearingRevenueFraction` because it counts fewer lines over the same
+ * total, and the two labels say so rather than reading as a nested breakdown.
+ *
+ * The gross-profit card beside this panel is NET of returns
+ * (`grossProfitCents = netSalesExclVatCents - netCogsCents`), so neither share
+ * is a percentage of it. A returned line was still costed or not costed when it
+ * was sold, so excluding returns would answer a different question; but the
+ * label has to say which basis it is, and `costing.coverage.grossBasisNote`
+ * does.
+ *
+ * AND NO FIGURE HERE QUANTIFIES THE OVERSTATEMENT. `missingCostRevenue*` is
+ * REVENUE earned on lines with no cost, not the cost those lines are missing:
+ * what they should have cost is exactly the unknown, so it cannot be recovered
+ * from their sales. The warning says profit MAY be overstated and stops there,
+ * because the only honest way to close the gap is to configure the products.
+ */
+export interface CostCoverageSummary {
+  /** Gross revenue, excl. VAT, of every posted line in the period — before returns. */
+  totalRevenueExclVatCents: number;
+  totalLineCount: number;
+
+  /**
+   * Revenue on lines that have a cost figure behind them: a recorded source
+   * that is an answer, or a legacy line whose COGS snapshot is nonzero.
+   */
+  costBearingRevenueExclVatCents: number;
+  costBearingLineCount: number;
+  /**
+   * Cost-bearing revenue as a fraction of total revenue, or `null` when there
+   * is no revenue to take a share of. A caller shows a dash rather than
+   * dividing by zero or printing a confident 0%.
+   */
+  costBearingRevenueFraction: number | null;
+
+  /** Of the above, revenue whose cost SOURCE is recorded and traceable. */
+  verifiedSourceRevenueExclVatCents: number;
+  verifiedSourceLineCount: number;
+  /**
+   * A share of TOTAL revenue, like `costBearingRevenueFraction` and over the
+   * same denominator — never of cost-bearing revenue. Dividing by the subset
+   * would print a confident 100% for a period whose costs are mostly untraced.
+   */
+  verifiedSourceRevenueFraction: number | null;
+
+  /** All revenue posted before migration 020, costed or not. */
+  legacyRevenueExclVatCents: number;
+  legacyLineCount: number;
+  /** Of that, revenue carrying a nonzero COGS snapshot of unknown source. */
+  legacyCostedRevenueExclVatCents: number;
+  legacyCostedLineCount: number;
+  /** Of that, revenue whose legacy COGS snapshot is zero: indeterminate. */
+  legacyUncostedRevenueExclVatCents: number;
+  legacyUncostedLineCount: number;
+
+  /** Revenue on lines whose recorded source says no cost was configured. */
+  uncostedRevenueExclVatCents: number;
+  uncostedLineCount: number;
+
+  /**
+   * Revenue with no cost behind it at all — `uncosted` plus legacy zeros.
+   *
+   * REVENUE, not the missing cost. It is the only thing that can make the gross
+   * profit beside it an overstatement, and it does not say by how much: what
+   * those lines should have cost is the unknown itself.
+   */
+  missingCostRevenueExclVatCents: number;
+  missingCostLineCount: number;
+
+  /**
+   * Revenue earned on lines costed from the owner's typed figures rather than
+   * from purchase documents. Estimated food cost, as distinct from
+   * inventory-reconciled cost — the two are different claims and the report
+   * shows them as different rows.
+   */
+  estimatedRevenueExclVatCents: number;
+  /** Revenue costed from purchase valuation: documents, not assertions. */
+  documentedRevenueExclVatCents: number;
+
+  /** True when some revenue in the period has no cost behind it. */
+  hasMissingCost: boolean;
+  /**
+   * True when some revenue carries a cost whose SOURCE is not recorded. Not a
+   * gap in the arithmetic, and deliberately not folded into `hasMissingCost`:
+   * one warning says the profit figure is overstated, the other says it cannot
+   * be traced, and they call for different things.
+   */
+  hasUnknownSource: boolean;
+}
+
+/** Revenue costed from a purchase document rather than from an assertion. */
+function isDocumentedSource(source: CogsSource | null): boolean {
+  return source === "purchase_average" || source === "last_purchase";
+}
+
+/** Revenue costed from a figure a person stated. */
+function isEstimatedSource(source: CogsSource | null): boolean {
+  return source === "standard" || source === "recipe";
+}
+
+export function costCoverage(rows: CogsCoverageRow[]): CostCoverageSummary {
+  let totalRevenueExclVatCents = 0;
+  let totalLineCount = 0;
+  let verifiedSourceRevenueExclVatCents = 0;
+  let verifiedSourceLineCount = 0;
+  let legacyRevenueExclVatCents = 0;
+  let legacyLineCount = 0;
+  let legacyCostedRevenueExclVatCents = 0;
+  let legacyCostedLineCount = 0;
+  let uncostedRevenueExclVatCents = 0;
+  let uncostedLineCount = 0;
+  let estimatedRevenueExclVatCents = 0;
+  let documentedRevenueExclVatCents = 0;
+
+  for (const row of rows) {
+    totalRevenueExclVatCents += row.lineSubtotalExclVatCents;
+    totalLineCount += row.lineCount;
+
+    if (isVerifiedCostSource(row.source)) {
+      // A recorded source that is an answer. The FIGURE is not consulted: a
+      // `standard` zero is the owner asserting the item costs nothing, which is
+      // as much of an answer as $1.85.
+      verifiedSourceRevenueExclVatCents += row.lineSubtotalExclVatCents;
+      verifiedSourceLineCount += row.lineCount;
+    } else if (row.source === null) {
+      // Legacy. There is no provenance to read, so the only honest evidence is
+      // the posted COGS snapshot itself, and the bucket is split by it.
+      legacyRevenueExclVatCents += row.lineSubtotalExclVatCents;
+      legacyLineCount += row.lineCount;
+      legacyCostedRevenueExclVatCents += row.costBearingSubtotalExclVatCents;
+      legacyCostedLineCount += row.costBearingLineCount;
+    } else {
+      uncostedRevenueExclVatCents += row.lineSubtotalExclVatCents;
+      uncostedLineCount += row.lineCount;
+    }
+
+    if (isEstimatedSource(row.source)) {
+      estimatedRevenueExclVatCents += row.lineSubtotalExclVatCents;
+    } else if (isDocumentedSource(row.source)) {
+      documentedRevenueExclVatCents += row.lineSubtotalExclVatCents;
+    }
+  }
+
+  const legacyUncostedRevenueExclVatCents =
+    legacyRevenueExclVatCents - legacyCostedRevenueExclVatCents;
+  const legacyUncostedLineCount = legacyLineCount - legacyCostedLineCount;
+
+  const costBearingRevenueExclVatCents =
+    verifiedSourceRevenueExclVatCents + legacyCostedRevenueExclVatCents;
+  const costBearingLineCount = verifiedSourceLineCount + legacyCostedLineCount;
+
+  const missingCostRevenueExclVatCents =
+    uncostedRevenueExclVatCents + legacyUncostedRevenueExclVatCents;
+  const missingCostLineCount = uncostedLineCount + legacyUncostedLineCount;
+
+  const share = (part: number): number | null =>
+    totalRevenueExclVatCents === 0 ? null : part / totalRevenueExclVatCents;
+
+  return {
+    totalRevenueExclVatCents,
+    totalLineCount,
+    costBearingRevenueExclVatCents,
+    costBearingLineCount,
+    costBearingRevenueFraction: share(costBearingRevenueExclVatCents),
+    verifiedSourceRevenueExclVatCents,
+    verifiedSourceLineCount,
+    verifiedSourceRevenueFraction: share(verifiedSourceRevenueExclVatCents),
+    legacyRevenueExclVatCents,
+    legacyLineCount,
+    legacyCostedRevenueExclVatCents,
+    legacyCostedLineCount,
+    legacyUncostedRevenueExclVatCents,
+    legacyUncostedLineCount,
+    uncostedRevenueExclVatCents,
+    uncostedLineCount,
+    missingCostRevenueExclVatCents,
+    missingCostLineCount,
+    estimatedRevenueExclVatCents,
+    documentedRevenueExclVatCents,
+    hasMissingCost: missingCostLineCount > 0,
+    hasUnknownSource: legacyCostedLineCount > 0,
+  };
+}
+
+/**
+ * A coverage share as a label, or a dash when there is nothing to take a share
+ * of. `formatMargin`'s sibling, and deliberately not reusing it: a margin may
+ * legitimately be negative and is bounded by nothing, while a coverage share
+ * is a fraction of a total and 0% is a real and important answer.
+ */
+export function formatCoverage(fraction: number | null): string {
+  if (fraction === null) return "—";
+  return `${Math.round(fraction * 1000) / 10}%`;
 }

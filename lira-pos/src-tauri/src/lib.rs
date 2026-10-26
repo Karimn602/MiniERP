@@ -132,6 +132,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/019_retire_demo_catalogue.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 20,
+            description: "manual_standard_cost",
+            sql: include_str!("../../src/db/migrations/020_manual_standard_cost.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 

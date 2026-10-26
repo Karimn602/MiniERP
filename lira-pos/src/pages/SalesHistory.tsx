@@ -27,6 +27,7 @@ import { ReceiptPrint } from "../components/ReceiptPrint";
 import { driversRepo } from "../db/repos/drivers";
 import { CreateReturnModal } from "../components/CreateReturnModal";
 import { useTranslation } from "../lib/i18n";
+import { cogsSourceLabelKey, isCostBearingLine } from "../lib/standardCost";
 import clsx from "clsx";
 
 function isoToTime(iso: string): string {
@@ -635,8 +636,34 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
                   {formatUsd(line.unitPriceInclVatCents)}
                 </td>
 
+                {/* The rate this line was costed at, and WHERE that rate came
+                    from (WP-B1). The provenance matters most where the figure
+                    is $0.00: a deliberate manual zero and a line nobody ever
+                    costed print the same number and are not the same claim,
+                    and the profit column two cells along reads as a 100%
+                    margin either way. A line posted before migration 020
+                    carries no source at all, which is the truth about it and
+                    is labelled as such rather than guessed. */}
                 <td className="px-4 py-2 text-end tabular-nums text-slate-700">
-                  {formatUnitCostUsd(line.unitCogsExclVatMicrocents)}
+                  <div>{formatUnitCostUsd(line.unitCogsExclVatMicrocents)}</div>
+                  <div
+                    className={clsx(
+                      "mt-0.5 text-[11px]",
+                      // Warn only where no cost exists. A legacy line carrying
+                      // a real COGS rate — printed in the cell directly above
+                      // — is unverifiable, not uncosted, and colouring it as a
+                      // gap contradicted the figure beside it.
+                      isCostBearingLine(
+                        line.cogsSource,
+                        line.unitCogsExclVatMicrocents,
+                        line.lineCogsExclVatCents,
+                      )
+                        ? "text-fg-muted"
+                        : "text-warn-fg",
+                    )}
+                  >
+                    {t(cogsSourceLabelKey(line.cogsSource))}
+                  </div>
                 </td>
 
                 <td className="px-4 py-2 text-end tabular-nums font-medium text-slate-900">

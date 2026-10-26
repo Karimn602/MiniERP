@@ -528,7 +528,94 @@ const en = {
       other: "Other",
     },
   },
+  // ---- Costing vocabulary (WP-B1) ----
+  //
+  // One place for the words every costing-aware screen uses, because the
+  // Products form, the profitability report and Sales History all talk about
+  // the same five things and three slightly different vocabularies is how a
+  // report comes to disagree with the page it was derived from.
+  costing: {
+    method: {
+      purchase_average: "Purchase valuation",
+      standard: "Manual cost",
+      recipe: "Recipe cost (not available yet)",
+    },
+    methodHint: {
+      purchase_average:
+        "Cost comes from what you paid for the stock. Correct for anything you buy and count.",
+      standard:
+        "You type the cost. For prepared menu items with no stock tracking — no recipe needed.",
+      recipe: "Calculated from a recipe of ingredients. Coming in a later release.",
+    },
+    status: {
+      manual: "Manual cost set",
+      manual_zero: "Manual cost set to zero (deliberate)",
+      purchase: "Valued from purchases",
+      purchase_uncosted: "No cost yet — buy stock in, or switch to manual cost",
+      service_uncosted: "No cost configured — margins on this item read as 100%",
+    },
+    source: {
+      purchase_average: "Purchase average",
+      last_purchase: "Last purchase",
+      standard: "Manual cost",
+      recipe: "Recipe",
+      uncosted: "Not costed",
+      legacy: "Before costing",
+    },
+    sourceShort: {
+      purchase_average: "Purchases",
+      last_purchase: "Last buy",
+      standard: "Manual",
+      recipe: "Recipe",
+      uncosted: "None",
+      legacy: "Legacy",
+    },
+    coverage: {
+      title: "Cost coverage",
+      subtitle:
+        "Gross profit is only as good as the costs behind it. Both shares below are taken over the SAME figure — this period's gross sales excluding VAT, before returns: how much of it was earned on items that have a cost, and how much on items whose cost source Greaz recorded.",
+      costBearing: "Share of gross sales with a cost",
+      verifiedSource: "Share of gross sales with a recorded cost source",
+      missingCost: "Gross sales with no cost at all",
+      legacyCosted: "Costed before this feature (source unknown)",
+      uncosted: "Revenue with no cost configured",
+      legacy: "Revenue posted before costing existed",
+      estimated: "Costed from manual (estimated) costs",
+      documented: "Costed from purchase documents",
+      colSource: "Cost source",
+      colLines: "Lines",
+      colQty: "Qty",
+      colRevenue: "Revenue excl. VAT",
+      colCost: "Cost",
+      colZeroRate: "At zero cost",
+      noMissingCost: "Every line in this period carries a cost.",
+      missingCostWarning:
+        "Some revenue in this period has no cost behind it, so the gross profit above may be overstated. The figure beside this is REVENUE, not the missing cost: nobody has said what those items cost, so how much the profit is overstated by cannot be worked out from their sales. Items shown as “Not costed” can be configured on the Products page, which is what would answer it; “Before costing” lines that were posted at no cost were posted before this feature existed and are not restated.",
+      unknownSourceNote:
+        "Some lines were posted before Greaz recorded where a cost came from. Their cost IS in the profit figure above — it is the figure they were posted with — but Greaz cannot say whether it came from a purchase or from a stated cost, and it is never guessed or rewritten.",
+      estimatedNote:
+        "Manual costs are what the owner stated, not what was counted. They are an estimate, and nothing here reconciles them against stock.",
+      grossBasisNote:
+        "Both shares are measured over this period's posted sale lines BEFORE returns. The gross profit card above is NET of returns, so these are not shares of that figure and not a percentage of it. A returned line was still costed or not costed when it was sold, so it is counted here either way.",
+      empty: "No sales in this period.",
+    },
+  },
+
   products: {
+    costingSection: "Costing",
+    costingMethodLabel: "How is this item costed?",
+    manualCostLabel: "Cost per unit, excluding VAT",
+    manualCostHint:
+      "What one unit costs you. Excluding VAT, because every profit figure in Greaz is net of VAT. Up to four decimals.",
+    manualCostSetAt: "Cost last stated {{when}}",
+    costStatusLabel: "Cost status:",
+    colCosting: "Costing",
+    errManualCostInvalid:
+      "That is not a cost. Enter a number with up to four decimal places, such as 1.85 or 0.0025.",
+    errManualCostRequired:
+      "Manual cost needs a figure. Enter a cost excluding VAT, or choose purchase valuation.",
+    errManualCostNeedsService:
+      "Manual cost applies to non-stock items only. A stocked product is valued from its purchases, so a typed cost would contradict the stock movements its sales write. Tick “Service item (no stock tracking)”, or leave it on purchase valuation.",
     eyebrow: "Menu & stock",
     title: "Menu items",
     subtitle: "Everything Greaz sells. Set the name, the price and how it is counted.",

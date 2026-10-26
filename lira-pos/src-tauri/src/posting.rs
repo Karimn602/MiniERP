@@ -3651,6 +3651,99 @@ struct ResolvedLine {
     /// The line's COGS as money: `round(unit_cogs_excl_mc x quantity_base /
     /// COST_SCALE)`, the single rounding boundary between cost and cents.
     line_cogs_cents: i64,
+    /// WHERE the rate above came from (WP-B1): provenance, not arithmetic.
+    ///
+    /// Derived here from the product row, never taken from the payload, so a
+    /// replay cannot carry a different value and it stays out of the canonical
+    /// comparison. Reporting needs it to tell a cost read off a document from
+    /// one the owner typed — and, above all, to stop presenting an uncosted
+    /// line's zero as a verified 100% margin.
+    cogs_source: &'static str,
+}
+
+/// Does this product have a persisted VALUATION BASIS — evidence that somebody
+/// once stated what a unit of it costs (WP-B1 P1-A)?
+///
+/// The question exists because a zero weighted average is TWO different facts
+/// wearing the same figure, and WP-B1's first cut recorded both as
+/// `purchase_average`:
+///
+///   * a product that has been received at a stated cost of nothing — a free
+///     case, a supplier sample, an opening count valued at zero — whose COGS
+///     of $0.00 is a documented answer; and
+///   * a product that has NEVER been purchased, whose $0.00 is the absence of
+///     an answer and whose sale therefore prints a 100% margin that nothing
+///     supports.
+///
+/// Reporting reads `cogs_source` as "this line's cost is an answer", so calling
+/// the second one `purchase_average` put unverified revenue inside the verified
+/// share — the single figure the coverage panel exists to make trustworthy.
+///
+/// THE EVIDENCE IS A DOCUMENT, not a symptom. The only persisted thing in this
+/// schema that states a purchase cost for a product is an `inventory_movements`
+/// row of type `purchase` or `opening`: those are the two movement types the
+/// weighted average is computed from, and the same pair the `last_purchase`
+/// resolution already reads. Deliberately NOT evidence:
+///
+///   * `quantity_on_hand` — stock can arrive by adjustment, and an adjustment
+///     is valued AT the average and never moves it, so it states no cost;
+///   * `avg_cost_* == 0` itself — that is the ambiguity, not its resolution;
+///   * a `sale`, `return_in`, `return_out` or `adjustment` movement — each of
+///     those carries the cost rate it inherited from the pool, so treating one
+///     as a basis would let an uncosted sale certify its own successors.
+///
+/// A nonzero average needs no probe and never reaches here: the average IS the
+/// valuation, and a figure above zero cannot have come from nowhere.
+async fn has_purchase_valuation_basis(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    store_id: &str,
+    product_id: &str,
+) -> Result<bool, String> {
+    let found: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+           SELECT 1 FROM inventory_movements
+            WHERE store_id = ?
+              AND product_id = ?
+              AND movement_type IN ('purchase', 'opening')
+              AND unit_cost_excl_vat_microcents >= 0
+         )",
+    )
+    .bind(store_id)
+    .bind(product_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| format!("read cost basis for {product_id}: {e}"))?;
+    Ok(found != 0)
+}
+
+/// The COGS rate and provenance of a stocked line valued from its purchases.
+///
+/// Returns the weighted average unchanged — WP-B1 P1-A changes no money — and
+/// only decides what the line is allowed to CLAIM about where that figure came
+/// from. A zero pair with no document behind it is `uncosted`: the same zero
+/// COGS, the same movement row, the same stock effect, now named honestly so
+/// the coverage panel counts it as revenue to configure rather than as revenue
+/// already answered for.
+///
+/// Both halves of the pair must be zero before the probe runs. The two columns
+/// are written together by one weighted-average computation, so an excl of zero
+/// beside a nonzero incl is a cost that exists and rounds small, not a missing
+/// one — and this correction is deliberately narrow: it reclassifies only what
+/// it can show has no basis at all.
+async fn purchase_valuation_basis(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    store_id: &str,
+    product_id: &str,
+    avg_cost_excl_mc: i64,
+    avg_cost_incl_mc: i64,
+) -> Result<(i64, i64, &'static str), String> {
+    if avg_cost_excl_mc == 0
+        && avg_cost_incl_mc == 0
+        && !has_purchase_valuation_basis(tx, store_id, product_id).await?
+    {
+        return Ok((0, 0, "uncosted"));
+    }
+    Ok((avg_cost_excl_mc, avg_cost_incl_mc, "purchase_average"))
 }
 
 /// The transactional body of `post_sale`.
@@ -3891,7 +3984,8 @@ pub(crate) async fn post_sale_tx(
         let row = sqlx::query(
             "SELECT quantity_on_hand,
                     avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
-                    is_active, is_service
+                    is_active, is_service,
+                    costing_method, standard_cost_excl_vat_microcents
              FROM products WHERE id = ? AND store_id = ?",
         )
         .bind(&line.product_id)
@@ -3923,6 +4017,16 @@ pub(crate) async fn post_sale_tx(
         let is_service_db: i64 = row
             .try_get("is_service")
             .map_err(|e| format!("decode is_service: {e}"))?;
+        // WP-B1: the product's own costing configuration. Read here, inside the
+        // posting transaction, from the row itself — a COGS basis is never
+        // taken from cashier-controlled request data, and there is no field for
+        // one on the wire.
+        let costing_method: String = row
+            .try_get("costing_method")
+            .map_err(|e| format!("decode costing_method: {e}"))?;
+        let standard_cost_mc: Option<i64> = row
+            .try_get("standard_cost_excl_vat_microcents")
+            .map_err(|e| format!("decode standard_cost_excl_vat_microcents: {e}"))?;
 
         if is_active == 0 {
             return Err(format!(
@@ -4012,13 +4116,61 @@ pub(crate) async fn post_sale_tx(
             ));
         }
 
-        // ---- COGS basis, in microcents (GP-A03) ----
-        // The costing POLICY is unchanged — weighted average or last purchase,
-        // whichever the sale declares — only its precision. Both bases are read
-        // from the microcent columns, so an ingredient costing a fraction of a
-        // cent per base unit is costed at that fraction and not at zero.
-        let (unit_excl_mc, unit_incl_mc) = if is_service {
-            (0, 0)
+        // ---- COGS basis, in microcents (GP-A03, extended by WP-B1) ----
+        //
+        // The PRODUCT's own `costing_method` decides first; only when it is
+        // `purchase_average` does the SALE's `cogs_method` (weighted average or
+        // last purchase) get consulted at all. That ordering is the whole of
+        // WP-B1's posting change, and it is why two settings that look similar
+        // do not fight: one is a property of the item, the other a property of
+        // the till.
+        //
+        // Every basis is read from the microcent columns, so a cost that is a
+        // fraction of a cent per base unit is costed at that fraction and not
+        // at zero.
+        let (unit_excl_mc, unit_incl_mc, cogs_source) = if costing_method == "standard" {
+            // A MANUAL STANDARD COST (WP-B1).
+            //
+            // Restricted to non-stock items, and refused here as well as by
+            // migration 020's trigger: a manual rate on a stocked line would be
+            // stamped onto the sale's `inventory_movements` row while the cost
+            // pool those goods left says something else, and an append-only
+            // movement table can never unwind that disagreement.
+            if !is_service {
+                return Err(format!(
+                    "Line {}: \"{}\" is set to Manual Cost but is a stocked product. \
+                     Manual Cost applies to non-stock menu items only; a stocked \
+                     product is valued from its purchases.",
+                    i + 1,
+                    line.product_name_snapshot
+                ));
+            }
+            // NULL is "not configured" and is NOT zero. Posting at zero here is
+            // precisely how a restaurant ends up with a year of 100% margins
+            // and no way to find out when it started, so a product whose owner
+            // asked for a cost and did not supply one stops at the till instead.
+            let rate = standard_cost_mc.ok_or_else(|| {
+                format!(
+                    "Line {}: \"{}\" is set to Manual Cost but no cost has been entered. \
+                     Set a cost excluding VAT on the product, or switch it back to \
+                     purchase valuation.",
+                    i + 1,
+                    line.product_name_snapshot
+                )
+            })?;
+            // The typed cost is stated EXCLUSIVE of VAT and has no inclusive
+            // sibling: the excl figure is the only one any report reads, and
+            // deriving an incl one would mean choosing a VAT rate for a cost
+            // with no document behind it. The incl slot is carried at the same
+            // value and reaches no row — a service line writes no movement, and
+            // the movement is the only place `unit_cogs_incl_mc` is persisted.
+            (rate, rate, "standard")
+        } else if is_service {
+            // A service with purchase valuation has no basis at all: the only
+            // writer of `avg_cost_*` is a purchase, and a service is not
+            // purchased into stock. That was already a silent zero before
+            // WP-B1; it is now a zero that SAYS it is uncosted.
+            (0, 0, "uncosted")
         } else if cogs_method == "last_purchase" {
             let last_cost_row = sqlx::query(
                 "SELECT unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents
@@ -4043,13 +4195,35 @@ pub(crate) async fn post_sale_tx(
                 let last_incl: i64 = cost_row
                     .try_get("unit_cost_incl_vat_microcents")
                     .map_err(|e| format!("decode last_cost_incl: {e}"))?;
-                (last_excl, last_incl)
+                // The movement row IS the document, so a rate of zero here is a
+                // RECEIPT that stated zero — a free case, a sample, an opening
+                // valuation of nothing — and stays `last_purchase`. That is the
+                // documented-free-purchase half of the WP-B1 P1 distinction.
+                (last_excl, last_incl, "last_purchase")
             } else {
-                // Fallback: products without a purchase/opening movement still use WAC.
-                (avg_cost_excl_mc, avg_cost_incl_mc)
+                // Fallback: products without a purchase/opening movement still
+                // use WAC. The provenance records what actually supplied the
+                // rate, not what was asked for — a line recorded as
+                // `last_purchase` when no purchase existed would be a lie in a
+                // column that exists to stop exactly that.
+                purchase_valuation_basis(
+                    &mut tx,
+                    &payload.store_id,
+                    &line.product_id,
+                    avg_cost_excl_mc,
+                    avg_cost_incl_mc,
+                )
+                .await?
             }
         } else {
-            (avg_cost_excl_mc, avg_cost_incl_mc)
+            purchase_valuation_basis(
+                &mut tx,
+                &payload.store_id,
+                &line.product_id,
+                avg_cost_excl_mc,
+                avg_cost_incl_mc,
+            )
+            .await?
         };
 
         // The one rounding boundary: multiply the precise rate by the
@@ -4075,6 +4249,7 @@ pub(crate) async fn post_sale_tx(
             unit_cogs_excl_mc: unit_excl_mc,
             unit_cogs_incl_mc: unit_incl_mc,
             line_cogs_cents,
+            cogs_source,
         });
     }
 
@@ -4136,8 +4311,9 @@ pub(crate) async fn post_sale_tx(
                  barcode_used_snapshot, barcode_type_snapshot,
                  quantity_in_uom, uom_code_snapshot,
                  factor_num_snapshot, factor_den_snapshot,
-                 kitchen_note
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 kitchen_note,
+                 cogs_source
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&line.sale_item_id)
         .bind(&payload.sale_id)
@@ -4166,6 +4342,10 @@ pub(crate) async fn post_sale_tx(
         // Normalised, so blank is stored as NULL and the column's one way of
         // saying "no instruction" stays the only one (WP-A2).
         .bind(normalize_kitchen_note(&line.kitchen_note))
+        // Provenance of the rate three columns up (WP-B1). Resolved from the
+        // product row, so it describes how this line was costed and not what
+        // the caller hoped.
+        .bind(r.cogs_source)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert sale_item: {e}"))?;

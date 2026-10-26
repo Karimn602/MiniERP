@@ -734,6 +734,70 @@ pub async fn seed_product_avg_cost_microcents(
     .unwrap_or_else(|e| panic!("seed microcent cost for {product_id}: {e}"));
 }
 
+/// Configure a product for MANUAL STANDARD COST (WP-B1, migration 020).
+///
+/// `cost_microcents` is a RATE per base unit, exclusive of VAT. Setting the
+/// method and the figure in ONE statement is not a convenience: migration
+/// 020's trigger judges the resulting row, so a fixture that set the method
+/// first would be refused before it could state the cost.
+pub async fn seed_manual_cost(db: &TempDb, product_id: &str, cost_microcents: i64) {
+    sqlx::query(
+        "UPDATE products
+            SET costing_method = 'standard',
+                standard_cost_excl_vat_microcents = ?,
+                standard_cost_set_at = '2026-10-25T00:00:00.000Z'
+          WHERE id = ? AND store_id = ?",
+    )
+    .bind(cost_microcents)
+    .bind(product_id)
+    .bind(STORE_ID)
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("seed manual cost for {product_id}: {e}"));
+}
+
+/// Forge the state migration 020 forbids: Manual Cost with NO figure.
+///
+/// The row is UNREACHABLE while the schema holds — `save_product` refuses it
+/// and `trg_products_costing_coherence_{ins,upd}` refuses it — so the only way
+/// to test `post_sale`'s own refusal is to drop the guard and write it. That
+/// is the point of the test, not a workaround: the posting command must not
+/// depend on the schema having held, because the same row is what a migration
+/// bug, a hand-edited database or a future importer would produce.
+///
+/// The trigger stays dropped. The database is disposable and belongs to one
+/// test.
+pub async fn forge_manual_cost_without_figure(db: &TempDb, product_id: &str) {
+    db.exec("DROP TRIGGER IF EXISTS trg_products_costing_coherence_upd").await;
+    db.exec(&format!(
+        "UPDATE products
+            SET costing_method = 'standard',
+                standard_cost_excl_vat_microcents = NULL,
+                standard_cost_set_at = NULL
+          WHERE id = '{product_id}' AND store_id = '{STORE_ID}'"
+    ))
+    .await;
+}
+
+/// The `costing_method` / `standard_cost_excl_vat_microcents` pair as stored.
+pub async fn costing_config(db: &TempDb, product_id: &str) -> (String, Option<i64>) {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT costing_method, standard_cost_excl_vat_microcents
+           FROM products WHERE id = ? AND store_id = ?",
+    )
+    .bind(product_id)
+    .bind(STORE_ID)
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("read costing config for {product_id}: {e}"));
+    (
+        row.try_get("costing_method").expect("costing_method"),
+        row.try_get("standard_cost_excl_vat_microcents")
+            .expect("standard_cost_excl_vat_microcents"),
+    )
+}
+
 /// Add a non-base sale UoM to a product: `1 <uom_code> = num/den` base units.
 /// The frontend only ever offers active rows, so this row is active.
 pub async fn seed_product_uom(db: &TempDb, product_id: &str, uom_code: &str, num: i64, den: i64) {

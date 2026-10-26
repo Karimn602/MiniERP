@@ -13,6 +13,7 @@
 import type { Factor } from "../lib/uom";
 import type { UsdCents } from "../lib/money";
 import type { Microcents } from "../lib/cost";
+import type { CogsSource, CostingMethod } from "../lib/standardCost";
 
 // A note on COST fields (WP-03, GP-A03). Money is `UsdCents` everywhere. A UNIT
 // COST is a rate, not an amount, and is `Microcents` (1 cent = 1,000,000) so a
@@ -89,6 +90,31 @@ export interface Product {
   category: string | null;
   /** Short decorative glyph for the menu tile, or null to use the section's. */
   icon: string | null;
+  /**
+   * How a sale of this product is costed (WP-B1, migration 020).
+   *
+   * `"purchase_average"` is the default and the behaviour every product had
+   * before: the weighted average, or the last purchase rate when the SALE asks
+   * for that. `"standard"` is the owner's typed cost, read from
+   * `standardCostExclVatMicrocents`. See `lib/standardCost.ts`.
+   */
+  costingMethod: CostingMethod;
+  /**
+   * The typed cost: a RATE per base unit, EXCLUSIVE of VAT, in microcents.
+   *
+   * `null` means NOT CONFIGURED and is deliberately distinct from `0`, which
+   * is the owner asserting the item costs nothing. There is no VAT-inclusive
+   * sibling: every COGS figure any report reads is net.
+   */
+  standardCostExclVatMicrocents: Microcents | null;
+  /**
+   * When the manual cost was last stated, or `null` if none is.
+   *
+   * A standard cost is an assertion by a person rather than a figure derived
+   * from documents, so when it was made is part of reading it. It moves only
+   * when the figure moves — an ordinary edit does not restamp it.
+   */
+  standardCostSetAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -385,6 +411,16 @@ export interface SaleItem {
   unitCogsExclVatCents: UsdCents;
   /** The line's COGS as money: round(rate x quantity). */
   lineCogsExclVatCents: UsdCents;
+  /**
+   * WHERE the COGS rate above came from (WP-B1, migration 020).
+   *
+   * `null` means the line was posted before the column existed, which is the
+   * truth about it — no posted row was rewritten. Provenance only: no total is
+   * derived from it, no posting command reads it, and it is not part of the
+   * sale's canonical content, because the backend derives it from the product
+   * row rather than accepting it on the wire.
+   */
+  cogsSource: CogsSource | null;
   barcodeUsedSnapshot: string | null;
   barcodeTypeSnapshot: string | null;
   quantityInUom: number | null;

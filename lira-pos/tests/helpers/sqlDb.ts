@@ -207,6 +207,21 @@ export interface SaleLineFixture {
   cogs?: number;
   vatRateId?: string;
   vatBps?: number;
+  /**
+   * `sale_items.cogs_source` — how the line was costed (WP-B1, migration 020).
+   *
+   * Omitting it writes NULL, which is what every line posted before the
+   * column existed carries. A fixture that is about cost coverage states it
+   * explicitly, because the whole point of the column is that the absence of
+   * a value is a different claim from any value.
+   */
+  cogsSource?:
+    | "purchase_average"
+    | "last_purchase"
+    | "standard"
+    | "recipe"
+    | "uncosted"
+    | null;
 }
 
 export interface PaymentFixture {
@@ -292,9 +307,9 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
          line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
          line_discount_cents,
          unit_cogs_excl_vat_cents, unit_cogs_excl_vat_microcents,
-         line_cogs_excl_vat_cents,
+         line_cogs_excl_vat_cents, cogs_source,
          quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'each', 1, 1)`,
     ).run(
       id("item"),
       saleId,
@@ -317,6 +332,7 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
       Math.round((line.cogs ?? 0) / line.quantity),
       Math.round(centsToMicrocents(line.cogs ?? 0) / line.quantity),
       line.cogs ?? 0,
+      line.cogsSource ?? null,
       line.quantity,
     );
   }

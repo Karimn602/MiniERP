@@ -2238,6 +2238,37 @@ async fn snapshot(db: &TempDb, table: &str) -> Vec<String> {
     .unwrap_or_else(|e| panic!("snapshot {table}: {e}"))
 }
 
+/// Assert that an upgrade left every PRE-EXISTING field byte-identical and
+/// that every column added since reads NULL.
+///
+/// `snapshot` digests whatever columns the table HAS, so a table that gains a
+/// nullable column legitimately gains `|<NULL>` on the end of every row's
+/// digest. Writing that suffix into the expectation by hand couples the test
+/// to the number of columns added AFTER the migration under test — which is
+/// how the 018 upgrade tests came to fail the day 020 added a second one,
+/// reporting a history rewrite that had not happened.
+///
+/// So the claim is stated the way it is actually meant: the old digest, plus
+/// some number of appended NULLs, and nothing else. The comparison is still
+/// exact — the expected string is reconstructed and compared in full, never
+/// matched as a prefix — so a migration that moved a posted figure fails here
+/// exactly as loudly as before.
+fn assert_only_null_columns_appended(before: &[String], after: &[String], what: &str) {
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "{what}: an additive migration must not add or remove rows"
+    );
+    for (b, a) in before.iter().zip(after.iter()) {
+        let added = a.matches('|').count().saturating_sub(b.matches('|').count());
+        assert_eq!(
+            a.as_str(),
+            format!("{b}{}", "|<NULL>".repeat(added)).as_str(),
+            "{what}: every pre-existing field must be unchanged and every new column NULL"
+        );
+    }
+}
+
 async fn object_names(db: &TempDb, kind: &str, table: &str) -> Vec<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT name FROM sqlite_master WHERE type = ? AND tbl_name = ? ORDER BY name",
@@ -2907,10 +2938,10 @@ async fn migration_018_upgrades_a_populated_v17_database_and_keeps_its_lines() {
     // each row's digest is its old digest plus the new column — which makes
     // this one assertion prove both halves at once: no historical value moved,
     // and "no instruction" is the state of all history.
-    assert_eq!(
-        snapshot(&db, "sale_items").await,
-        before.iter().map(|d| format!("{d}|<NULL>")).collect::<Vec<_>>(),
-        "018 must append a NULL column and rewrite nothing"
+    assert_only_null_columns_appended(
+        &before,
+        &snapshot(&db, "sale_items").await,
+        "018 must append a NULL column and rewrite nothing",
     );
     assert_eq!(
         db.count("SELECT COUNT(*) FROM sale_items WHERE kitchen_note IS NOT NULL").await,
@@ -2934,9 +2965,10 @@ async fn migration_018_upgrades_a_populated_v14_database_too() {
 
     db.migrate_again().await.expect("the whole chain must apply to a populated v14 database");
 
-    assert_eq!(
-        snapshot(&db, "sale_items").await,
-        before.iter().map(|d| format!("{d}|<NULL>")).collect::<Vec<_>>(),
+    assert_only_null_columns_appended(
+        &before,
+        &snapshot(&db, "sale_items").await,
+        "the v14 chain must append NULL columns and rewrite nothing",
     );
     assert_eq!(
         db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
@@ -3456,26 +3488,51 @@ async fn a_purchase_line_keeps_the_product() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posted_sale_line_keeps_the_product_and_the_sale_is_untouched() {
-    // A REAL sale of the demonstration coffee, posted by the real command
-    // against a v18 database, then the upgrade.
+    // A sale of the demonstration coffee that exists BEFORE 019 runs, then the
+    // upgrade. 019's transaction guard must leave the product active.
+    //
+    // The sale is written by hand rather than through `post_sale`, and the
+    // reason is worth stating: since WP-B1 the command reads
+    // `products.costing_method`, which migration 020 adds, so it can no longer
+    // be run against a v18 database at all. Every posting command targets the
+    // CURRENT schema — the application migrates on boot before anything posts
+    // — and a test that drives one against an older one breaks on each
+    // additive migration that touches its statements.
+    //
+    // `post_sale`'s own behaviour on a demonstration product is proved at the
+    // latest schema instead, by
+    // `a_reactivated_demo_product_still_sells_through_the_real_command`.
     let db = populated_at_schema_version(18).await;
 
-    let lines = vec![SaleLineBuilder::new(DEMO_D1, "Coffee 250g")
-        .qty(1)
-        .unit_incl(500)
-        .uom("pcs", 1, 1)
-        .build()];
-    let total = lines_total(&lines);
-    let mut payload = sale_payload(lines, vec![cash_usd(total)]);
-    payload.store_id = STORE_ID.to_string();
-    payload.shift_id = Some("shift-v14".to_string());
-    payload.exchange_rate_id = "rate-v14".to_string();
-    payload.exchange_rate_lbp_per_usd = 89_500;
-    payload.allow_negative_inventory = true;
-    let sale_id = payload.sale_id.clone();
-    post_sale_with_pool(db.pool(), payload)
-        .await
-        .expect("the demo coffee sells like any other product at v18");
+    let sale_id = "sale-demo-d1".to_string();
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, shift_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, exchange_rate_id,
+           subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents,
+           discount_cents, cogs_total_cents, cogs_method, status
+         ) VALUES ('{sale_id}', '{STORE_ID}', 'shift-v14', '{USER_ID}', 901,
+                   89500, 'rate-v14', 450, 50, 500, 0, 0, 'weighted_average', 'draft')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_items (
+           id, sale_id, store_id, product_id, product_name_snapshot,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot, quantity,
+           unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+           quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
+         ) VALUES ('item-demo-d1', '{sale_id}', '{STORE_ID}', '{DEMO_D1}', 'Coffee 250g',
+                   '{VAT_STD_ID}', 1100, 1, 450, 500, 450, 50, 500, 1, 'pcs', 1, 1)"
+    ))
+    .await;
+    // Promoted last: migration 012's INSERT guard keys on the parent's
+    // `posted_at`, so a sale written as `posted` can take no lines.
+    db.exec(&format!(
+        "UPDATE sales SET status = 'posted', posted_at = '2026-03-02T10:00:00.000Z'
+          WHERE id = '{sale_id}'"
+    ))
+    .await;
 
     let receipt_before = db
         .scalar_i64(&format!("SELECT receipt_number FROM sales WHERE id = '{sale_id}'"))
@@ -3569,7 +3626,13 @@ async fn a_populated_v18_database_upgrades_without_touching_history() {
     db.migrate_again().await.expect("the chain must apply to a populated v18 database");
 
     assert_eq!(snapshot(&db, "sales").await, sales_before);
-    assert_eq!(snapshot(&db, "sale_items").await, items_before);
+    // `sale_items` gained `cogs_source` in 020, so its digest grows by one
+    // NULL field and by nothing else.
+    assert_only_null_columns_appended(
+        &items_before,
+        &snapshot(&db, "sale_items").await,
+        "a v18 upgrade must not touch a posted line",
+    );
     assert_eq!(snapshot(&db, "sale_payments").await, payments_before);
     assert_eq!(
         db.count("SELECT COUNT(*) FROM products WHERE id = 'prod-v14' AND is_active = 1").await,
@@ -3611,6 +3674,61 @@ async fn migration_019_is_idempotent_through_the_real_runner() {
     assert_eq!(snapshot(&db, "products").await, state);
 }
 
+/// The real-command half of `a_posted_sale_line_keeps_the_product_and_the_sale_is_untouched`.
+///
+/// That test now writes its pre-019 sale by hand, because `post_sale` reads a
+/// v20 column and cannot run against a v18 database. The claim it gave up —
+/// that a demonstration product sells through the real command like any other
+/// — is proved here instead, at the CURRENT schema, where a shop that
+/// reactivated one would actually sell it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reactivated_demo_product_still_sells_through_the_real_command() {
+    use crate::test_support::{seed_exchange_rate, seed_open_shift};
+
+    let db = TempDb::new().await;
+    seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
+    activate_demo_catalogue(&db).await;
+
+    let lines = vec![SaleLineBuilder::new(DEMO_D1, "Coffee 250g")
+        .qty(1)
+        .unit_incl(500)
+        .uom("pcs", 1, 1)
+        .build()];
+    let total = lines_total(&lines);
+    let mut payload = sale_payload(lines, vec![cash_usd(total)]);
+    payload.allow_negative_inventory = true;
+    let sale_id = payload.sale_id.clone();
+
+    post_sale_with_pool(db.pool(), payload)
+        .await
+        .expect("a reactivated demo product sells like any other");
+
+    // A seeded demonstration product has never been purchased: no `purchase`
+    // or `opening` movement states what one costs, and its average is zero
+    // because nothing has ever valued it. So the line is `uncosted` — the
+    // WP-B1 P1-A correction. Recording it as `purchase_average` would have put
+    // this revenue inside the share the coverage panel presents as costed, and
+    // a 100% margin on a product nobody ever bought is the exact figure that
+    // panel exists to flag.
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT cogs_source FROM sale_items WHERE sale_id = '{sale_id}'"
+        ))
+        .await,
+        "uncosted"
+    );
+    // And the MONEY is unchanged: the rate was zero before the correction and
+    // is zero after it. Only the claim the line makes about that zero moved.
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT line_cogs_excl_vat_cents FROM sale_items WHERE sale_id = '{sale_id}'"
+        ))
+        .await,
+        0
+    );
+}
+
 /// Explicit demo setup is still available, and is the only way to get one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_test_that_wants_the_demo_catalogue_asks_for_it_explicitly() {
@@ -3624,4 +3742,381 @@ async fn a_test_that_wants_the_demo_catalogue_asks_for_it_explicitly() {
         3,
         "a development fixture is created by the thing that needs it"
     );
+}
+
+// ============================================================================
+// Migration 020 — manual standard cost (WP-B1)
+// ============================================================================
+
+/// A POPULATED v19 database: two products, a posted sale with a COGS
+/// snapshot, and the inventory movement that sale wrote.
+///
+/// The point of populating it is that migration 020 must be provably additive.
+/// A schema-only upgrade test cannot catch a migration that rewrites a posted
+/// figure, and a posted figure is the only thing in this application that can
+/// never be put back.
+async fn populated_v19_database() -> TempDb {
+    let db = TempDb::at_schema_version(19).await;
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents,
+           avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
+           avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
+           quantity_on_hand, is_service
+         ) VALUES ('b1-coffee', '{STORE_ID}', 'SKU-B1', 'Coffee 250g',
+                   '{VAT_STD_ID}', 'inclusive', 450, 500,
+                   200, 222, 200000000, 222000000, 40, 0)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents, quantity_on_hand, is_service
+         ) VALUES ('b1-burger', '{STORE_ID}', 'SKU-B2', 'Greaz Burger',
+                   '{VAT_STD_ID}', 'inclusive', 1000, 1110, 0, 1)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, subtotal_excl_vat_cents, vat_total_cents,
+           total_incl_vat_cents, cogs_total_cents, cogs_method, status
+         ) VALUES ('b1-sale', '{STORE_ID}', '{USER_ID}', 1,
+                   89000, 450, 50, 500, 200, 'weighted_average', 'draft')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_items (
+           id, sale_id, store_id, product_id, product_name_snapshot,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot, quantity,
+           unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+           unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
+           unit_cogs_excl_vat_microcents,
+           quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
+         ) VALUES ('b1-line', 'b1-sale', '{STORE_ID}', 'b1-coffee', 'Coffee 250g',
+                   '{VAT_STD_ID}', 1100, 1, 450, 500, 450, 50, 500,
+                   200, 200, 200000000, 1, 'each', 1, 1)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO inventory_movements (
+           id, store_id, product_id, movement_type, quantity_delta,
+           unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+           unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents,
+           related_sale_id, related_sale_item_id, posted_at
+         ) VALUES ('b1-move', '{STORE_ID}', 'b1-coffee', 'sale', -1,
+                   200, 222, 200000000, 222000000,
+                   'b1-sale', 'b1-line', '2026-10-20T10:00:00.000Z')"
+    ))
+    .await;
+    // A SECOND pre-020 sale, whose line carries a COGS of ZERO.
+    //
+    // The pair is the point. Both lines have NULL provenance after the
+    // upgrade — 020 backfills nothing — but one of them was costed and the
+    // other was not, and the difference is readable in the row itself. The
+    // burger is a service item, which is how a restaurant acquired lines like
+    // this: nothing could value prepared food before WP-B1, so it posted at
+    // zero and printed a 100% margin.
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, subtotal_excl_vat_cents, vat_total_cents,
+           total_incl_vat_cents, cogs_total_cents, cogs_method, status
+         ) VALUES ('b1-sale-free', '{STORE_ID}', '{USER_ID}', 2,
+                   89000, 1000, 110, 1110, 0, 'weighted_average', 'draft')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_items (
+           id, sale_id, store_id, product_id, product_name_snapshot,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot, quantity,
+           unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+           unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
+           unit_cogs_excl_vat_microcents,
+           quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
+         ) VALUES ('b1-line-free', 'b1-sale-free', '{STORE_ID}', 'b1-burger',
+                   'Greaz Burger', '{VAT_STD_ID}', 1100, 1, 1000, 1110,
+                   1000, 110, 1110, 0, 0, 0, 1, 'each', 1, 1)"
+    ))
+    .await;
+    // The fixture consumed receipt numbers 1 and 2, so the counter must say so
+    // — a real shop's would. Without this the next real sale collides with the
+    // fixture's own receipts.
+    db.exec("UPDATE app_settings SET value = '3' WHERE key = 'next_receipt_number'")
+        .await;
+    // Promoted LAST, exactly as every posting command does since WP-07:
+    // migration 012's INSERT guards key on the parent's `posted_at`, so a sale
+    // written as `posted` in its first statement can take no lines at all.
+    db.exec(
+        "UPDATE sales SET status = 'posted', posted_at = '2026-10-20T10:00:00.000Z'
+          WHERE id IN ('b1-sale', 'b1-sale-free')",
+    )
+    .await;
+    db
+}
+
+/// The whole safety claim of migration 020, stated as a test: it ADDS, and
+/// rewrites nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_020_upgrades_a_populated_v19_database_without_restating_it() {
+    let db = populated_v19_database().await;
+
+    let sales_before = snapshot(&db, "sales").await;
+    let items_before = snapshot(&db, "sale_items").await;
+    let movements_before = snapshot(&db, "inventory_movements").await;
+
+    db.migrate_again().await.expect("migration 020 must apply");
+
+    // Every existing product keeps the behaviour it had: the default is the
+    // weighted-average / last-purchase resolution `post_sale` already
+    // performed, and no cost is configured, because nobody has stated one.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM products
+              WHERE costing_method = 'purchase_average'
+                AND standard_cost_excl_vat_microcents IS NULL
+                AND standard_cost_set_at IS NULL"
+        )
+        .await,
+        db.count("SELECT COUNT(*) FROM products").await,
+        "no product changes meaning on upgrade"
+    );
+
+    // Both posted lines have NULL provenance: they were costed before the
+    // column existed, which is the truth about them and is why the column is
+    // nullable. 020 backfills NOTHING — not even the line whose cost is
+    // plainly a weighted average, because "plainly" is a guess about a posted
+    // document.
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM sale_items WHERE cogs_source IS NULL").await,
+        2
+    );
+    // And the two are DISTINGUISHABLE without provenance, which is what the
+    // WP-B1 P1-B reporting correction stands on: the cost-bearing line kept
+    // its $2.00 rate and the uncosted one kept its zero. A report may read
+    // "this line has a cost, of an unknown source" off the row itself.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sale_items
+              WHERE cogs_source IS NULL AND unit_cogs_excl_vat_microcents <> 0"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sale_items
+              WHERE cogs_source IS NULL
+                AND unit_cogs_excl_vat_microcents = 0
+                AND line_cogs_excl_vat_cents = 0"
+        )
+        .await,
+        1
+    );
+
+    // And nothing else moved. `snapshot` digests EVERY column of each row, so
+    // this compares the posted figures byte for byte.
+    assert_eq!(snapshot(&db, "sales").await, sales_before);
+    assert_eq!(movements_before, snapshot(&db, "inventory_movements").await);
+
+    // `sale_items` gained `cogs_source`, so its digest legitimately grows by
+    // one NULL field. Comparing this way rather than skipping the table is the
+    // point: a migration that touched a posted COGS figure still fails here.
+    assert_only_null_columns_appended(
+        &items_before,
+        &snapshot(&db, "sale_items").await,
+        "a posted line may gain a NULL provenance and change in no other way",
+    );
+}
+
+/// An upgraded database and a brand-new one must be indistinguishable, or a
+/// bug reproduces on only one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v19_upgrade_converges_on_the_same_schema_as_a_fresh_install() {
+    let fresh = TempDb::new().await;
+    let upgraded = populated_v19_database().await;
+    upgraded.migrate_again().await.expect("migration 020 must apply");
+
+    let schema_sql = "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+                      (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        fresh.scalar_string(schema_sql).await,
+        upgraded.scalar_string(schema_sql).await,
+        "a v19 upgrade and a fresh install must have identical schemas"
+    );
+}
+
+/// An upgraded v19 database can post a manual-costed sale against its own
+/// history — the end-to-end proof that 020 left a working shop working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgraded_database_can_post_a_manual_cost_sale() {
+    use crate::posting::post_sale_with_pool;
+    use crate::test_support::{seed_exchange_rate, seed_open_shift};
+    use crate::tests::builders::{cash_usd, sale_payload, SaleLineBuilder};
+
+    let db = populated_v19_database().await;
+    db.migrate_again().await.expect("migration 020 must apply");
+
+    seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
+    db.exec(&format!(
+        "INSERT INTO product_uoms
+           (id, store_id, product_id, uom_code, factor_num, factor_den,
+            is_base, is_default_sale_uom, is_default_purchase_uom, is_active)
+         VALUES ('b1-uom', '{STORE_ID}', 'b1-burger', 'each', 1, 1, 1, 1, 1, 1)"
+    ))
+    .await;
+    db.exec(
+        "UPDATE products
+            SET costing_method = 'standard', standard_cost_excl_vat_microcents = 185000000
+          WHERE id = 'b1-burger'",
+    )
+    .await;
+
+    let payload = sale_payload(
+        vec![SaleLineBuilder::new("b1-burger", "Greaz Burger")
+            .service(true)
+            .qty(1)
+            .unit_incl(1110)
+            .build()],
+        vec![cash_usd(1110)],
+    );
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.unwrap();
+
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT unit_cogs_excl_vat_microcents FROM sale_items WHERE sale_id='{sale_id}'"
+        ))
+        .await,
+        185_000_000
+    );
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT cogs_source FROM sale_items WHERE sale_id='{sale_id}'"
+        ))
+        .await,
+        "standard"
+    );
+    // And the pre-upgrade line is still exactly as it was posted.
+    assert_eq!(
+        db.scalar_i64("SELECT unit_cogs_excl_vat_microcents FROM sale_items WHERE id='b1-line'")
+            .await,
+        200_000_000
+    );
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM sale_items WHERE id='b1-line' AND cogs_source IS NULL")
+            .await,
+        1
+    );
+    // Including the legacy line that was never costed at all: posting a
+    // manual-cost sale beside it does not retro-label it, and nothing in 020
+    // or in WP-B1's reporting correction writes to a posted row.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sale_items
+              WHERE id='b1-line-free' AND cogs_source IS NULL
+                AND unit_cogs_excl_vat_microcents = 0"
+        )
+        .await,
+        1
+    );
+}
+
+/// The shape of the three new columns, stated as a schema assertion so it
+/// cannot drift into a figure something computes with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_020_columns_are_configuration_and_provenance_not_money() {
+    let db = TempDb::new().await;
+
+    // `cogs_source` is TEXT, and it lives on the line that was costed.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM pragma_table_info('sale_items')
+              WHERE name = 'cogs_source' AND type = 'TEXT'"
+        )
+        .await,
+        1
+    );
+    // It reached no other table: provenance belongs to one row, once. A second
+    // copy is a second place for it to disagree with the first.
+    for table in ["sales", "inventory_movements", "sales_credit_memo_lines"] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'cogs_source'"
+            ))
+            .await,
+            0,
+            "{table} must not carry a second copy of a line's provenance"
+        );
+    }
+    // The typed cost is a NULLABLE integer rate, so "not configured" is
+    // expressible and is not zero.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM pragma_table_info('products')
+              WHERE name = 'standard_cost_excl_vat_microcents'
+                AND type = 'INTEGER' AND [notnull] = 0"
+        )
+        .await,
+        1
+    );
+    // There is deliberately no VAT-inclusive sibling: every COGS figure any
+    // report reads is net, so one would be a column with no reader. And no
+    // rounded cents mirror either — unlike `avg_cost_*`, this column has no
+    // pre-microcent history to be compatible with.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM pragma_table_info('products')
+              WHERE name LIKE 'standard_cost_incl%'
+                 OR name = 'standard_cost_excl_vat_cents'"
+        )
+        .await,
+        0
+    );
+}
+
+/// A negative manual cost is refused by the engine, not merely by the UI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_engine_refuses_a_negative_manual_cost() {
+    let db = TempDb::new().await;
+    seed_product(
+        &db,
+        &ProductSpec {
+            is_service: true,
+            ..ProductSpec::stocked("b1-neg", "SKU-N1", "Negative")
+        },
+    )
+    .await;
+
+    assert!(db
+        .try_exec(
+            "UPDATE products
+                SET costing_method = 'standard', standard_cost_excl_vat_microcents = -1
+              WHERE id = 'b1-neg'"
+        )
+        .await
+        .is_err());
+}
+
+/// Migration 020 is forward-only and idempotent through the real runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_020_is_idempotent_through_the_real_runner() {
+    let db = TempDb::new().await;
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 20").await,
+        1
+    );
+    let state = snapshot(&db, "products").await;
+
+    db.migrate_again().await.expect("a second run must validate and do nothing");
+
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 20").await,
+        1
+    );
+    assert_eq!(snapshot(&db, "products").await, state);
 }

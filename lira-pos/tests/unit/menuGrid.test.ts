@@ -67,6 +67,11 @@ function product(over: Partial<ProductWithUoms> & { name: string }): ProductWith
     isService: false,
     category: null,
     icon: null,
+    // Purchase valuation with no cost configured (WP-B1): the state every
+    // product was in before migration 020, and the one this fixture means.
+    costingMethod: "purchase_average" as const,
+    standardCostExclVatMicrocents: null,
+    standardCostSetAt: null,
     createdAt: "2026-01-01",
     updatedAt: "2026-01-01",
     uoms: [base],

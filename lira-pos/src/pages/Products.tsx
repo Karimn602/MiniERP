@@ -23,6 +23,18 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { Badge } from "../components/ui/Badge";
 import { BarcodeManager } from "../components/BarcodeManager";
 import { formatUsd, parseUsdInput } from "../lib/money";
+import { formatPrettyDate, isoToLocalDate } from "../lib/dates";
+import {
+  costConfigurationStatus,
+  costStatusLabelKey,
+  effectiveUnitCostMicrocents,
+  isUncostedStatus,
+  formatManualCostInput,
+  isBlankCostInput,
+  parseManualCostInput,
+  SELECTABLE_COSTING_METHODS,
+  type SelectableCostingMethod,
+} from "../lib/standardCost";
 import { formatUnitCostUsd } from "../lib/cost";
 import { addVat, formatBps, stripVat } from "../lib/vat";
 import {
@@ -73,6 +85,22 @@ interface ProductFormState {
 
   isService: boolean;
   isActive: boolean;
+
+  /**
+   * How sales of this product are costed (WP-B1). `"recipe"` is not offered:
+   * it is in the schema so WP-B2 needs no table rebuild, and nothing honours
+   * it yet.
+   */
+  costingMethod: SelectableCostingMethod;
+  /**
+   * The typed manual cost, EXCLUSIVE of VAT, exactly as entered.
+   *
+   * Held as text rather than as a parsed number so a half-typed "1." is not
+   * silently read as 1 — the WP-A importer lesson, applied to a field whose
+   * value becomes a COGS rate on every future sale of the item. Blank means
+   * "not configured", which is a legal state and NOT zero.
+   */
+  manualCostInput: string;
 }
 
 const EMPTY_FORM: ProductFormState = {
@@ -101,6 +129,9 @@ const EMPTY_FORM: ProductFormState = {
 
   isService: false,
   isActive: true,
+
+  costingMethod: "purchase_average",
+  manualCostInput: "",
 };
 
 function toIntInput(v: string, fallback = 0): number {
@@ -323,6 +354,14 @@ export default function Products() {
 
       isService: product.isService,
       isActive: product.isActive,
+
+      costingMethod: product.costingMethod === "standard"
+        ? "standard"
+        : "purchase_average",
+      // The stored RATE, formatted back to the shape it was typed in. Never
+      // read from the rounded cents mirror: a sub-cent cost would come back as
+      // "0.00" and an unrelated edit would then save that over it.
+      manualCostInput: formatManualCostInput(product.standardCostExclVatMicrocents),
     });
 
     setSaveError(null);
@@ -391,6 +430,35 @@ export default function Products() {
         throw new Error(t("products.errReorderNegative"));
       }
 
+      // ---- Costing configuration (WP-B1) ----
+      //
+      // All three refusals exist in `catalog.rs::validate_save_product` and
+      // again as migration 020 triggers; they are repeated here only so the
+      // operator reads a sentence in their own language before a round trip.
+      // The backend remains the authority — this form is not trusted to have
+      // checked anything.
+      let standardCostExclVatMicrocents: number | null = null;
+      if (!isBlankCostInput(form.manualCostInput)) {
+        standardCostExclVatMicrocents = parseManualCostInput(form.manualCostInput);
+        if (standardCostExclVatMicrocents === null) {
+          throw new Error(t("products.errManualCostInvalid"));
+        }
+      }
+      if (form.costingMethod === "standard") {
+        // A missing figure is refused, never defaulted to zero: a menu posting
+        // at zero under a configuration that claims to have costs is how a
+        // shop acquires a year of 100% margins it cannot date.
+        if (standardCostExclVatMicrocents === null) {
+          throw new Error(t("products.errManualCostRequired"));
+        }
+        // A stocked line's COGS rate is also stamped onto the sale's
+        // inventory movement, so a typed rate there would make the stock
+        // ledger and the P&L disagree with no document between them.
+        if (!form.isService) {
+          throw new Error(t("products.errManualCostNeedsService"));
+        }
+      }
+
       let factor: Factor;
       try {
         factor = validateFactor(
@@ -434,6 +502,8 @@ export default function Products() {
           priceInclVatCents: price.inclVatCents,
           reorderPoint,
           isService: form.isService,
+          costingMethod: form.costingMethod,
+          standardCostExclVatMicrocents,
           category: form.category || null,
           icon: form.icon || null,
           barcode: barcode || null,
@@ -463,6 +533,8 @@ export default function Products() {
           reorderPoint,
           isService: form.isService,
           isActive: form.isActive,
+          costingMethod: form.costingMethod,
+          standardCostExclVatMicrocents,
           category: form.category || null,
           icon: form.icon || null,
           baseUomCode: form.baseUomCode,
@@ -614,8 +686,36 @@ export default function Products() {
                         {getProductPriceDisplay(p)}
                       </td>
 
+                      {/* The cost a sale of this item would be costed at
+                          TODAY, and where that figure comes from. Showing
+                          `avgCost` unconditionally printed $0.00 for exactly
+                          the products whose cost the owner HAD stated, and
+                          printed the same $0.00 for the ones nobody had. */}
                       <td className="whitespace-nowrap px-5 py-3 text-right tabular-nums text-slate-500">
-                        {formatUnitCostUsd(p.avgCostExclVatMicrocents)}
+                        {(() => {
+                          const rate = effectiveUnitCostMicrocents(p);
+                          const status = costConfigurationStatus(p);
+                          return (
+                            <>
+                              <div
+                                className={clsx(
+                                  isUncostedStatus(status) && "text-warn-fg",
+                                )}
+                              >
+                                {rate === null ? "—" : formatUnitCostUsd(rate)}
+                              </div>
+                              <div className="mt-0.5 text-[11px] text-fg-muted">
+                                {t(`costing.sourceShort.${
+                                  p.costingMethod === "standard"
+                                    ? "standard"
+                                    : isUncostedStatus(status)
+                                      ? "uncosted"
+                                      : "purchase_average"
+                                }`)}
+                              </div>
+                            </>
+                          );
+                        })()}
                       </td>
 
                       <td className="whitespace-nowrap px-5 py-3 text-right tabular-nums">
@@ -895,6 +995,97 @@ export default function Products() {
                       {formatUnitCostUsd(selectedProduct.avgCostExclVatMicrocents)}
                     </span>
                     <span className="ml-1 text-fg-muted">{t("products.avgCostNote")}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* ---- Costing (WP-B1) ----
+
+                A section of its own rather than a field inside Pricing,
+                because a cost is not a price: the price is what the customer
+                pays and the cost is what the owner believes the plate cost
+                him. Putting them in one box is how a cashier changes one
+                meaning to fix the other. */}
+            <div className="rounded-md border border-slate-200 p-3">
+              <div className="mb-2 text-sm font-medium text-slate-900">
+                {t("products.costingSection")}
+              </div>
+
+              <div className="space-y-3">
+                <label className="block text-xs font-medium text-slate-700">
+                  {t("products.costingMethodLabel")}
+                  <select
+                    value={form.costingMethod}
+                    onChange={(e) =>
+                      setForm((f) => ({
+                        ...f,
+                        costingMethod: e.target.value as SelectableCostingMethod,
+                      }))
+                    }
+                    className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+                  >
+                    {SELECTABLE_COSTING_METHODS.map((method) => (
+                      <option key={method} value={method}>
+                        {t(`costing.method.${method}`)}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="mt-1 block text-[11px] font-normal text-slate-500">
+                    {t(`costing.methodHint.${form.costingMethod}`)}
+                  </span>
+                </label>
+
+                {form.costingMethod === "standard" && (
+                  <>
+                    <Input
+                      label={t("products.manualCostLabel")}
+                      prefix="$"
+                      inputMode="decimal"
+                      value={form.manualCostInput}
+                      onChange={(e) =>
+                        setForm((f) => ({ ...f, manualCostInput: e.target.value }))
+                      }
+                      placeholder="0.00"
+                      hint={t("products.manualCostHint")}
+                    />
+
+                    {/* The restriction, stated where it is reachable rather
+                        than only in the error the save would return. */}
+                    {!form.isService && (
+                      <div className="rounded border border-warn-line bg-warn-bg p-2 text-xs text-warn-fg">
+                        {t("products.errManualCostNeedsService")}
+                      </div>
+                    )}
+
+                    {form.mode === "edit" &&
+                      selectedProduct?.standardCostSetAt && (
+                        <div className="text-[11px] text-slate-500">
+                          {/* Through `isoToLocalDate` like every other date in
+                              the app: the column is a UTC timestamp, and
+                              slicing its first ten characters shows the UTC
+                              day — which after midnight local reads as
+                              yesterday. A cost stated at 01:41 on the 25th
+                              displayed "Oct 24", caught on the desktop. */}
+                          {t("products.manualCostSetAt", {
+                            when: formatPrettyDate(
+                              isoToLocalDate(selectedProduct.standardCostSetAt),
+                            ),
+                          })}
+                        </div>
+                      )}
+                  </>
+                )}
+
+                {/* The status, in words. A stated zero and an unstated cost
+                    are both "$0.00" and they are NOT the same claim; the whole
+                    point of this line is that the screen says which. */}
+                {form.mode === "edit" && selectedProduct && (
+                  <div className="rounded bg-slate-50 p-2 text-xs text-slate-600">
+                    {t("products.costStatusLabel")}{" "}
+                    <span className="font-medium text-slate-800">
+                      {t(costStatusLabelKey(costConfigurationStatus(selectedProduct)))}
+                    </span>
                   </div>
                 )}
               </div>

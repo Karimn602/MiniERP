@@ -164,6 +164,24 @@ pub struct SaveProductPayload {
     #[serde(default)]
     pub icon: Option<String>,
 
+    // ---- Costing configuration (WP-B1, migration 020). ----
+    /// `"purchase_average"` (the default and today's behaviour) or
+    /// `"standard"` (the owner's typed cost).
+    ///
+    /// `None` means `"purchase_average"`: omitting the field keeps every
+    /// existing caller — the spreadsheet importer among them — valid and
+    /// unchanged, and a product with no costing opinion has always been a
+    /// purchase-valued product.
+    #[serde(default)]
+    pub costing_method: Option<String>,
+    /// The typed cost: a RATE per base unit, EXCLUSIVE of VAT, in microcents.
+    ///
+    /// `None` is "not configured" and is NOT zero — `Some(0)` is the owner
+    /// deliberately asserting the item costs nothing. Selecting Manual Cost
+    /// without a figure is refused rather than defaulted (migration 020).
+    #[serde(default)]
+    pub standard_cost_excl_vat_microcents: Option<i64>,
+
     // ---- The UoM configuration the Products page edits as one unit. ----
     /// The stocking unit. On an update it is informational: a product's base
     /// UoM is not something this command changes (see `save_product_tx`).
@@ -252,8 +270,82 @@ pub(crate) fn validate_save_product(payload: &SaveProductPayload) -> Result<(), 
             return Err(format!("Invalid barcode type: {t}"));
         }
     }
+
+    // ---- Costing configuration (WP-B1) ----
+    //
+    // Shape only, which is all this function does — but all three rules here
+    // ARE shape, because the payload carries everything they need: the method,
+    // the figure, and whether the item is stocked. Migration 020's trigger pair
+    // holds the same three against every other writer; this is the half that
+    // can explain itself in a sentence the operator can act on.
+    // Keyed on what the payload STATES, not on the default it would fall back
+    // to: `None` is "this caller is not talking about costing", and on an
+    // update that leaves the product's configuration alone (see
+    // `save_product_tx`). There is nothing to validate about a silence.
+    match stated_costing_method(payload) {
+        None | Some("purchase_average") => {}
+        Some("standard") => {
+            // A missing figure is refused, never replaced with zero: posting a
+            // menu at zero under a configuration that claims to have costs is
+            // how a shop acquires a year of 100% margins it cannot date.
+            if payload.standard_cost_excl_vat_microcents.is_none() {
+                return Err(MANUAL_COST_REQUIRED.into());
+            }
+            // See migration 020's header for the financial argument. Short
+            // version: a stocked line's COGS rate is also written onto its
+            // `inventory_movements` row, so a manual rate there would make the
+            // stock ledger and the P&L disagree with no document between them.
+            if !payload.is_service {
+                return Err(MANUAL_COST_NEEDS_SERVICE.into());
+            }
+        }
+        Some("recipe") => return Err(RECIPE_COSTING_UNIMPLEMENTED.into()),
+        Some(other) => return Err(format!("Invalid costing method: {other}")),
+    }
+    if payload.standard_cost_excl_vat_microcents.is_some_and(|c| c < 0) {
+        return Err("A manual cost cannot be negative.".into());
+    }
+
     Ok(())
 }
+
+/// The costing method a payload actually STATES, or `None` for silence.
+///
+/// A blank string is silence too: an empty form field and an absent field mean
+/// the same thing to every caller that produces either.
+pub(crate) fn stated_costing_method(payload: &SaveProductPayload) -> Option<&str> {
+    payload
+        .costing_method
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+}
+
+/// The method a NEW product gets: what the payload states, else today's
+/// behaviour.
+///
+/// A caller that has never heard of WP-B1 — the spreadsheet importer, a
+/// script, a test fixture written last month — creates exactly the product it
+/// described before. This is the CREATE default only; see `save_product_tx`
+/// for why an update treats silence differently.
+pub(crate) fn created_costing_method(payload: &SaveProductPayload) -> &str {
+    stated_costing_method(payload).unwrap_or("purchase_average")
+}
+
+/// Manual Cost was chosen and no figure was stated.
+pub const MANUAL_COST_REQUIRED: &str =
+    "Manual Cost needs a cost. Enter a cost excluding VAT, or choose purchase valuation.";
+
+/// Manual Cost was chosen for a stocked product.
+pub const MANUAL_COST_NEEDS_SERVICE: &str =
+    "Manual Cost applies to non-stock menu items only. A stocked product is valued from its \
+     purchases, so a typed cost would contradict the inventory movements its sales write. \
+     Mark the item as a service (no stock tracking), or leave it on purchase valuation.";
+
+/// Recipe costing is WP-B2. The enum value exists in the schema so that
+/// shipping it needs no `products` table rebuild; nothing honours it yet.
+pub const RECIPE_COSTING_UNIMPLEMENTED: &str =
+    "Recipe costing is not implemented yet. Choose purchase valuation or Manual Cost.";
 
 #[tauri::command]
 pub async fn save_product(
@@ -300,6 +392,12 @@ pub(crate) async fn save_product_tx(
 ) -> Result<SaveProductResult, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
     let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+    // Only `standard_cost_set_at` uses this: every other timestamp on a
+    // product row is written by the schema's own DEFAULT or by
+    // `trg_products_updated_at`.
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
 
     if payload.mode == "create" {
         // ---- Stock and cost are NOT this command's to set (GZ-HI-10) ----
@@ -320,8 +418,10 @@ pub(crate) async fn save_product_tx(
                  avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
                  quantity_on_hand, reorder_point,
                  is_active, is_service,
-                 category, icon
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?)"#,
+                 category, icon,
+                 costing_method, standard_cost_excl_vat_microcents,
+                 standard_cost_set_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&payload.product_id)
         .bind(&payload.store_id)
@@ -337,6 +437,15 @@ pub(crate) async fn save_product_tx(
         .bind(i64::from(payload.is_service))
         .bind(blank_to_none(&payload.category))
         .bind(blank_to_none(&payload.icon))
+        // Costing configuration (WP-B1). A stated cost is dated; an unstated
+        // one has no date, because nothing was stated.
+        .bind(created_costing_method(&payload))
+        .bind(payload.standard_cost_excl_vat_microcents)
+        .bind(
+            payload
+                .standard_cost_excl_vat_microcents
+                .map(|_| now.clone()),
+        )
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -421,7 +530,9 @@ pub(crate) async fn save_product_tx(
         // UPDATE
         // ================================================================
         let current = sqlx::query(
-            "SELECT quantity_on_hand, is_service FROM products WHERE id = ? AND store_id = ?",
+            "SELECT quantity_on_hand, is_service, costing_method,
+                    standard_cost_excl_vat_microcents, standard_cost_set_at
+               FROM products WHERE id = ? AND store_id = ?",
         )
         .bind(&payload.product_id)
         .bind(&payload.store_id)
@@ -437,6 +548,56 @@ pub(crate) async fn save_product_tx(
         let qoh: i64 = current.try_get("quantity_on_hand").map_err(d("quantity_on_hand"))?;
         let was_service: bool =
             current.try_get::<i64, _>("is_service").map_err(d("is_service"))? == 1;
+        // ---- When the manual cost was last STATED (WP-B1) ----
+        //
+        // The date means "when this figure was asserted", so it moves only when
+        // the figure does. An ordinary edit — a renamed product, a new price, a
+        // changed section — must not restamp it, or an eighteen-month-old plate
+        // cost would read as stated today and stop looking like a number worth
+        // doubting. Clearing the cost clears the date, because nothing is
+        // stated any more.
+        let current_method: String = current
+            .try_get("costing_method")
+            .map_err(d("costing_method"))?;
+        let current_cost: Option<i64> = current
+            .try_get("standard_cost_excl_vat_microcents")
+            .map_err(d("standard_cost_excl_vat_microcents"))?;
+        let current_set_at: Option<String> = current
+            .try_get("standard_cost_set_at")
+            .map_err(d("standard_cost_set_at"))?;
+
+        // ---- SILENCE PRESERVES THE COSTING CONFIGURATION ----
+        //
+        // On an update, a payload that names no `costing_method` is not asking
+        // for purchase valuation — it is a caller that does not know this
+        // field exists, and the three it would overwrite are the ones the
+        // owner typed. Defaulting here would be the WP-A `isActive` defect
+        // again, in a worse place: a manual-costed burger would silently
+        // revert to a product with no cost basis, its future margins would
+        // read 100%, and nothing on screen would have said so.
+        //
+        // A CREATE has nothing to preserve, so there the default stands
+        // (`created_costing_method`). The Products form always states the
+        // method explicitly, so this changes nothing a user can see; it bounds
+        // what an importer, a script or a future screen can do by omission.
+        let (costing_method, new_cost, standard_cost_set_at) =
+            match stated_costing_method(&payload) {
+                None => (current_method, current_cost, current_set_at),
+                Some(method) => {
+                    let new_cost = payload.standard_cost_excl_vat_microcents;
+                    // The date means "when this figure was asserted", so it
+                    // moves only when the figure does. An ordinary edit must
+                    // not restamp an eighteen-month-old plate cost as stated
+                    // today. Clearing the cost clears the date, because
+                    // nothing is stated any more.
+                    let set_at = if new_cost == current_cost {
+                        current_set_at
+                    } else {
+                        new_cost.map(|_| now.clone())
+                    };
+                    (method.to_string(), new_cost, set_at)
+                }
+            };
 
         // ---- Stocked -> service, with stock on the shelf, is REFUSED ----
         //
@@ -480,7 +641,10 @@ pub(crate) async fn save_product_tx(
                       is_service = ?,
                       is_active = ?,
                       category = ?,
-                      icon = ?
+                      icon = ?,
+                      costing_method = ?,
+                      standard_cost_excl_vat_microcents = ?,
+                      standard_cost_set_at = ?
                 WHERE id = ? AND store_id = ?"#,
         )
         .bind(&payload.sku)
@@ -495,6 +659,9 @@ pub(crate) async fn save_product_tx(
         .bind(i64::from(payload.is_active))
         .bind(blank_to_none(&payload.category))
         .bind(blank_to_none(&payload.icon))
+        .bind(&costing_method)
+        .bind(new_cost)
+        .bind(standard_cost_set_at)
         .bind(&payload.product_id)
         .bind(&payload.store_id)
         .execute(&mut *tx)

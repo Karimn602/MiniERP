@@ -26,6 +26,7 @@ mod reconciliation;
 mod returns;
 mod sales;
 mod shifts;
+mod standard_cost;
 mod supplier_ap;
 mod supplier_payments;
 mod tenders;

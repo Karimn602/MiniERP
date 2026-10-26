@@ -87,6 +87,11 @@ fn create_payload(product_id: &str, sku: &str, name: &str) -> SaveProductPayload
         sale_factor_den: 1,
         sale_price_excl_vat_cents: None,
         sale_price_incl_vat_cents: None,
+        // Costing: today's behaviour, stated explicitly. A `None` here would
+        // also mean purchase valuation (`resolved_costing_method`), and the
+        // tests that care about the default send `None` deliberately.
+        costing_method: Some("purchase_average".to_string()),
+        standard_cost_excl_vat_microcents: None,
         barcode: None,
         barcode_type: None,
     }
@@ -119,6 +124,11 @@ fn update_payload(name: &str) -> SaveProductPayload {
         sale_factor_den: 1,
         sale_price_excl_vat_cents: None,
         sale_price_incl_vat_cents: None,
+        // Costing: today's behaviour, stated explicitly. A `None` here would
+        // also mean purchase valuation (`resolved_costing_method`), and the
+        // tests that care about the default send `None` deliberately.
+        costing_method: Some("purchase_average".to_string()),
+        standard_cost_excl_vat_microcents: None,
         barcode: None,
         barcode_type: None,
     }

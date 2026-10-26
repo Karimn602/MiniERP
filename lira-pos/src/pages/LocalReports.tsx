@@ -7,6 +7,7 @@ import {
   type ProductSalesRow,
   type ProductReturnsRow,
   type DailyPurchasesRow,
+  type CogsCoverageRow,
 } from "../db/repos/reports";
 import { Card, CardHeader } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
@@ -22,11 +23,14 @@ import {
 import { summariseDrivers, type DriverSettlementRow } from "../lib/driverCollection";
 import { todayLocalDate, formatPrettyDate } from "../lib/dates";
 import {
+  costCoverage,
+  formatCoverage,
   formatMargin,
   mergeDailyRows,
   mergeProductRows,
   periodTotals,
 } from "../lib/reportMath";
+import { cogsSourceLabelKey } from "../lib/standardCost";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
@@ -52,6 +56,7 @@ export default function LocalReports() {
   const [channelRows, setChannelRows] = useState<
     { channel: string; orderCount: number; grossInclVatCents: number; refundedInclVatCents: number }[]
   >([]);
+  const [coverageRows, setCoverageRows] = useState<CogsCoverageRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [driverRows, setDriverRows] = useState<DriverSettlementRow[]>([]);
@@ -64,7 +69,7 @@ export default function LocalReports() {
     setLoading(true);
     setLoadError(null);
     try {
-      const [ds, dr, ps, pr, dp, ch, drv, rem] = await Promise.all([
+      const [ds, dr, ps, pr, dp, ch, drv, rem, cov] = await Promise.all([
         reportsRepo.dailySales({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.dailyReturns({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.productSales({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
@@ -73,6 +78,7 @@ export default function LocalReports() {
         reportsRepo.salesByChannel({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.driverSettlements({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
         reportsRepo.driverRemittances({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
+        reportsRepo.cogsCoverage({ storeId, dateFrom: appliedFrom, dateTo: appliedTo }),
       ]);
       setDailySales(ds);
       setDailyReturns(dr);
@@ -82,6 +88,7 @@ export default function LocalReports() {
       setChannelRows(ch);
       setDriverRows(drv);
       setRemittanceRows(rem);
+      setCoverageRows(cov);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -107,6 +114,11 @@ export default function LocalReports() {
     dailySales,
     dailyReturns,
   ]);
+
+  // Cost completeness (WP-B1). Derived from the SAME posted sale lines the
+  // product table sums, scoped the same way, so the buckets reconcile to the
+  // period's gross figures and this panel cannot disagree with the KPI cards.
+  const coverage = useMemo(() => costCoverage(coverageRows), [coverageRows]);
 
   // The channel mix, over the SAME period as every other figure on the page.
   // Its totals are summed from the per-channel rows, so the breakdown cannot
@@ -236,6 +248,153 @@ export default function LocalReports() {
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <StatCard label={t("localReports.statPurchases")} value={formatUsd(purchasesTotal)} />
       </div>
+
+      {/* COST COVERAGE (WP-B1).
+          Sits immediately under the gross-profit card because it is the figure
+          that card has to be read against. Greaz has shown a 100% paper margin
+          on food since the day it shipped — not because the margin was good
+          but because nothing had been costed — and a profit number printed
+          without this beside it is indistinguishable from one that is simply
+          wrong.
+
+          Four distinctions this panel exists to keep:
+
+            * HAVING a cost and having a RECORDED SOURCE for it are different
+              questions. A line posted before migration 020 carries the COGS it
+              was posted with and no provenance at all, so it is cost-bearing
+              with an unknown source — inside the first share, outside the
+              second. Reporting it as uncosted claimed money was missing from a
+              calculation that was complete.
+            * MISSING COST is the only thing that overstates the profit above:
+              a line whose source says nothing was configured, or a legacy line
+              whose COGS snapshot is zero. The first is a to-do list the owner
+              can work through on Products today; the second is a fact about
+              the past and is never restated.
+            * ESTIMATED (a manual cost somebody typed) is not the same claim as
+              DOCUMENTED (a cost derived from a purchase invoice), and the two
+              are separate rows rather than one "costed" total.
+            * The shares are shares of REVENUE, not of line count: ten uncosted
+              sides matter less than one uncosted platter, and it is the money
+              that reaches the margin.
+
+          Both shares divide by the SAME denominator — this period's gross
+          sales excl. VAT, before returns — so the verified-source share is a
+          share of gross sales and not of the cost-bearing subset, and both
+          labels name that denominator rather than reading as a nested
+          breakdown. The gross-profit card above is NET of returns, so neither
+          share is a percentage of it; a returned line was still costed or not
+          costed when it was sold, so excluding returns would answer a
+          different question. The note under the table says both things.
+
+          And the missing-cost figure is REVENUE, not the cost those lines are
+          missing — that is the unknown itself — so the warning says profit MAY
+          be overstated and never quantifies it. */}
+      <Card>
+        <CardHeader
+          title={t("costing.coverage.title")}
+          subtitle={t("costing.coverage.subtitle")}
+        />
+
+        {coverage.totalLineCount === 0 ? (
+          <p className="px-5 py-4 text-sm text-fg-muted">{t("costing.coverage.empty")}</p>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-3 px-5 py-4 md:grid-cols-5">
+              <StatCard
+                label={t("costing.coverage.costBearing")}
+                value={formatCoverage(coverage.costBearingRevenueFraction)}
+                tone={
+                  coverage.costBearingRevenueFraction === 1
+                    ? "good"
+                    : coverage.hasMissingCost
+                      ? "warn"
+                      : undefined
+                }
+              />
+              <StatCard
+                label={t("costing.coverage.verifiedSource")}
+                value={formatCoverage(coverage.verifiedSourceRevenueFraction)}
+              />
+              <StatCard
+                label={t("costing.coverage.missingCost")}
+                value={formatUsd(coverage.missingCostRevenueExclVatCents)}
+                tone={coverage.missingCostRevenueExclVatCents > 0 ? "warn" : undefined}
+              />
+              <StatCard
+                label={t("costing.coverage.legacyCosted")}
+                value={formatUsd(coverage.legacyCostedRevenueExclVatCents)}
+              />
+              <StatCard
+                label={t("costing.coverage.estimated")}
+                value={formatUsd(coverage.estimatedRevenueExclVatCents)}
+              />
+            </div>
+
+            <div className="overflow-x-auto px-5">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-line text-start text-xs uppercase text-fg-muted">
+                    <th className="py-2 pe-3 font-semibold">{t("costing.coverage.colSource")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("costing.coverage.colLines")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("costing.coverage.colQty")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("costing.coverage.colRevenue")}</th>
+                    <th className="py-2 pe-3 text-end font-semibold">{t("costing.coverage.colCost")}</th>
+                    <th className="py-2 text-end font-semibold">{t("costing.coverage.colZeroRate")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {coverageRows.map((row) => {
+                    // A legacy row is only a gap for the lines of it that carry
+                    // no cost. Colouring the whole row warn would say the
+                    // $2.00 COGS beside it was missing.
+                    const missing =
+                      row.source === "uncosted" ||
+                      (row.source === null && row.costBearingLineCount < row.lineCount);
+                    return (
+                      <tr
+                        key={row.source ?? "legacy"}
+                        className="border-b border-line/60 last:border-0"
+                      >
+                        <td className="py-2 pe-3">
+                          <span className={clsx(missing && "text-warn-fg")}>
+                            {t(cogsSourceLabelKey(row.source))}
+                          </span>
+                        </td>
+                        <td className="py-2 pe-3 text-end tabular-nums">{row.lineCount}</td>
+                        <td className="py-2 pe-3 text-end tabular-nums">{row.totalQty}</td>
+                        <td className="py-2 pe-3 text-end tabular-nums">
+                          {formatUsd(row.lineSubtotalExclVatCents)}
+                        </td>
+                        <td className="py-2 pe-3 text-end tabular-nums">
+                          {formatUsd(row.lineCogsExclVatCents)}
+                        </td>
+                        <td className="py-2 text-end tabular-nums">{row.zeroRateLineCount}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="space-y-2 px-5 py-4 text-xs">
+              {coverage.hasMissingCost ? (
+                <p className="rounded border border-warn-line bg-warn-bg p-2 text-warn-fg">
+                  {t("costing.coverage.missingCostWarning")}
+                </p>
+              ) : (
+                <p className="text-fg-muted">{t("costing.coverage.noMissingCost")}</p>
+              )}
+              {coverage.hasUnknownSource && (
+                <p className="text-fg-muted">{t("costing.coverage.unknownSourceNote")}</p>
+              )}
+              {coverage.estimatedRevenueExclVatCents > 0 && (
+                <p className="text-fg-muted">{t("costing.coverage.estimatedNote")}</p>
+              )}
+              <p className="text-fg-muted">{t("costing.coverage.grossBasisNote")}</p>
+            </div>
+          </>
+        )}
+      </Card>
 
       {/* ORDERS BY CHANNEL (WP-4).
           Four figures the owner asked for — counter and online order counts and
