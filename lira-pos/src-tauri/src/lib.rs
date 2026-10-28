@@ -4,6 +4,8 @@ use tauri_plugin_sql::{Migration, MigrationKind};
 mod catalog;
 mod cost;
 mod posting;
+mod recipe_cost;
+mod recipes;
 use posting::DbState;
 
 #[cfg(test)]
@@ -138,6 +140,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/020_manual_standard_cost.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 21,
+            description: "recipes",
+            sql: include_str!("../../src/db/migrations/021_recipes.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -199,6 +207,9 @@ pub fn run() {
             catalog::add_product_barcode,
             catalog::set_primary_product_barcode,
             catalog::remove_product_barcode,
+            recipes::save_recipe_draft,
+            recipes::activate_recipe,
+            recipes::retire_recipe,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

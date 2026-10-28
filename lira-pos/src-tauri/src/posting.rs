@@ -3694,7 +3694,7 @@ struct ResolvedLine {
 ///
 /// A nonzero average needs no probe and never reaches here: the average IS the
 /// valuation, and a figure above zero cannot have come from nowhere.
-async fn has_purchase_valuation_basis(
+pub(crate) async fn has_purchase_valuation_basis(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     store_id: &str,
     product_id: &str,

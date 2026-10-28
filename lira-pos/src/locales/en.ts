@@ -601,6 +601,81 @@ const en = {
     },
   },
 
+  recipes: {
+    eyebrow: "Ingredient costing",
+    title: "Recipe — {{name}}",
+    subtitle:
+      "What this item is made of, and what those ingredients cost. The cost is worked out from the ingredients' own purchase costs, so it follows your purchase prices without being retyped.",
+    action: "Recipe",
+    badgeDraft: "draft",
+    badgeActive: "v{{version}}",
+    badgeRetired: "retired",
+
+    loading: "Loading the recipe…",
+    notYetSellingCost:
+      "Recipes can be built and published now. Using one as an item's selling cost arrives in the next release — nothing here changes any sale, any report or any stock figure yet.",
+    editingCreatesNewVersion:
+      "This item already has a published recipe. Published versions are never edited, so saving creates version {{version}} as a new draft. The published one keeps its ingredients and quantities exactly as they were and goes on showing its estimated cost here until you publish the new one — it is not yet applied to sales, so neither version changes any receipt, any profit figure or any stock count.",
+
+    ingredients: "Ingredients",
+    addIngredient: "Add ingredient",
+    removeIngredient: "Remove this ingredient",
+    emptyLines: "No ingredients yet. Add the first one to see what this item costs to make.",
+    noEligibleIngredients:
+      "There are no products that can be used as ingredients yet. Add the things you buy — buns, mince, sauce — as products first.",
+
+    colIngredient: "Ingredient",
+    colQuantity: "Quantity",
+    colUnit: "Unit",
+    colWaste: "Waste",
+
+    unitCost: "Costs",
+    lineCost: "In this recipe:",
+    lineNoCost:
+      "No cost yet — receive it on a purchase, or set a Manual Cost if it is not stocked.",
+
+    yieldLabel: "One batch makes (in {{unit}})",
+    yieldHint:
+      "Leave this at 1 for a single plate. For something you make in bulk — a pot of sauce that fills 20 portions — put 20, and the cost per portion is worked out for you.",
+    notesLabel: "Notes (optional)",
+
+    costPerServing: "Cost per {{unit}}",
+    batchCost: "Whole batch: {{cost}}",
+    noCostYet: "Add ingredients and quantities to see the cost.",
+    cannotCost:
+      "Cannot be costed yet: {{names}} has no cost on file. You can still save this as a draft.",
+    activateBlocked: "Every ingredient needs a cost before this can be published.",
+
+    saveDraft: "Save draft",
+    saveAndActivate: "Save and publish",
+    savedComplete: "Draft v{{version}} saved. It costs {{cost}} per unit.",
+    savedIncomplete: "Draft v{{version}} saved, but it cannot be published yet: {{names}} has no cost on file.",
+    activated: "Version {{version}} published at {{cost}} per unit.",
+    retired: "That version is retired. This item has no published recipe now.",
+
+    versions: "Versions",
+    versionLabel: "Version {{version}}",
+    componentCount: "{{count}} ingredients",
+    activatedAt: "published {{when}}",
+    retiredAt: "retired {{when}}",
+    retire: "Retire",
+    conversionDrifted:
+      "an ingredient's unit has been changed since this version was published; this version still uses the unit it was published with",
+    conversionUnavailable:
+      "an ingredient's unit no longer exists or has been switched off; this version still uses the unit it was published with, and a new version cannot be built on that unit until it is restored",
+    status: {
+      draft: "Draft",
+      active: "Published",
+      retired: "Retired",
+    },
+
+    errPickIngredient: "Choose an ingredient for every line.",
+    errPickUnit: "Choose a unit for {{name}}.",
+    errQuantity: "Enter a quantity, such as 150, 0.5 or 1/3.",
+    errWaste: "The waste for {{name}} must be a percentage from 0 to under 100.",
+    errYield: "A batch yield must be a whole number of 1 or more.",
+  },
+
   products: {
     costingSection: "Costing",
     costingMethodLabel: "How is this item costed?",

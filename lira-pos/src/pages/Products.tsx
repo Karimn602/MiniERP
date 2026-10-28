@@ -18,6 +18,8 @@ import type {
 import { Card, CardHeader, CardBody } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
+import { RecipeEditor } from "../components/RecipeEditor";
+import { recipesRepo, type RecipeSummary } from "../db/repos/recipes";
 import { PageHeader } from "../components/ui/PageHeader";
 import { EmptyState } from "../components/ui/EmptyState";
 import { Badge } from "../components/ui/Badge";
@@ -203,6 +205,14 @@ export default function Products() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveOk, setSaveOk] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
+  // WP-B2-A. A recipe is a property of a PRODUCT, so the editor opens from the
+  // row rather than from a nav item of its own, and the summaries are one
+  // query for the whole catalogue — a per-row probe is how a list comes to
+  // take a second to open.
+  const [recipeFor, setRecipeFor] = useState<string | null>(null);
+  const [recipeSummaries, setRecipeSummaries] = useState<Map<string, RecipeSummary>>(
+    new Map(),
+  );
   const [showImport, setShowImport] = useState(false);
   /**
    * Are RETIRED products listed too?
@@ -227,15 +237,18 @@ export default function Products() {
     setLoadError(null);
 
     try {
-      const [productRows, vatRows, uomRows] = await Promise.all([
+      const [productRows, vatRows, uomRows, recipeRows] = await Promise.all([
         productsRepo.listEnriched({ storeId, includeInactive: showInactive }),
         vatRatesRepo.listActive(),
         uomsRepo.listActive(),
+        // WP-B2-A: one grouped query for the whole catalogue's recipe state.
+        recipesRepo.summaries(storeId),
       ]);
 
       setProducts(productRows);
       setVatRates(vatRows);
       setUoms(uomRows);
+      setRecipeSummaries(recipeRows);
 
       // Fill only what the operator has NOT already chosen, and only with a
       // defensible value. The VAT rate is deliberately left empty — see
@@ -741,6 +754,52 @@ export default function Products() {
                       </td>
 
                       <td className="whitespace-nowrap px-5 py-3 text-end">
+                        {/* WP-B2-A. A recipe belongs to the item, so it opens
+                            from the item's own row. The badge says what state
+                            the recipe is in without a round trip, because the
+                            owner's question is usually "did I finish that
+                            one?". */}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setRecipeFor(p.id)}
+                        >
+                          {t("recipes.action")}
+                          {(() => {
+                            const r = recipeSummaries.get(p.id);
+                            if (!r) return null;
+                            // THREE outcomes, because a summary row exists for
+                            // any product with recipe HISTORY. Reading "not a
+                            // draft" as "active" showed a green v-badge with a
+                            // blank version for a product whose only recipes
+                            // were retired — a badge claiming something the
+                            // data does not say.
+                            if (r.hasActive && r.activeVersion !== null) {
+                              return (
+                                <span className="ms-1 text-[10px] font-extrabold text-good-fg">
+                                  {t("recipes.badgeActive", {
+                                    version: String(r.activeVersion),
+                                  })}
+                                </span>
+                              );
+                            }
+                            if (r.hasDraft) {
+                              return (
+                                <span className="ms-1 text-[10px] font-extrabold text-warn-fg">
+                                  {t("recipes.badgeDraft")}
+                                </span>
+                              );
+                            }
+                            if (r.retiredCount > 0) {
+                              return (
+                                <span className="ms-1 text-[10px] font-extrabold text-fg-muted">
+                                  {t("recipes.badgeRetired")}
+                                </span>
+                              );
+                            }
+                            return null;
+                          })()}
+                        </Button>
                         <Button variant="ghost" size="sm" onClick={() => editProduct(p)}>
                           {t("common.edit")}
                         </Button>
@@ -1296,6 +1355,26 @@ export default function Products() {
           onImported={() => void reload()}
         />
       )}
+
+      {/* RECIPE EDITOR (WP-B2-A).
+          Keyed by product id so a session opened on one item can never
+          describe another — the WP-A3 lesson about state that belongs to a
+          row. The product is looked up rather than captured, so a reload
+          cannot leave the editor holding a stale name or base unit. */}
+      {recipeFor && storeId && (() => {
+        const target = products.find((p) => p.id === recipeFor);
+        if (!target) return null;
+        return (
+          <RecipeEditor
+            storeId={storeId}
+            productId={target.id}
+            productName={target.name}
+            baseUomCode={target.baseUom.uomCode}
+            onClose={() => setRecipeFor(null)}
+            onChanged={() => void reload()}
+          />
+        );
+      })()}
     </div>
   );
 }

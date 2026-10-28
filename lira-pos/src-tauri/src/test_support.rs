@@ -333,6 +333,19 @@ impl TempDb {
         sqlx::query(sql).execute(self.pool()).await.map(|_| ())
     }
 
+    /// Run a statement that a trigger or constraint MUST refuse, and return
+    /// the engine's message so a test can assert WHICH rule fired.
+    ///
+    /// A refusal test that only checks `is_err` passes when the statement
+    /// fails for the wrong reason, which is how a guard comes to be believed
+    /// in without being there.
+    pub async fn exec_err(&self, sql: &str) -> String {
+        match self.try_exec(sql).await {
+            Ok(()) => panic!("this statement should have been refused: {sql}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
     pub async fn exec(&self, sql: &str) {
         self.try_exec(sql)
             .await
@@ -1112,4 +1125,56 @@ pub fn migrator_with_extra_migration(version: i64, description: &str, sql: &str)
         migrations: Cow::Owned(list),
         ..Migrator::DEFAULT
     }
+}
+
+// ============================================================================
+// Recipes (WP-B2-A)
+// ============================================================================
+
+/// Give a product a DOCUMENTED cost basis without going through the purchase
+/// command: one `purchase` movement at the stated rate.
+///
+/// A rate of zero is the point for some fixtures — it is the documented free
+/// receipt that WP-B1's P1-A correction distinguishes from an absent cost.
+pub async fn seed_purchase_movement(db: &TempDb, product_id: &str, rate_microcents: i64) {
+    sqlx::query(
+        "INSERT INTO inventory_movements
+           (id, store_id, product_id, movement_type, quantity_delta,
+            unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+            unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents, posted_at)
+         VALUES (?, ?, ?, 'purchase', 10, ?, ?, ?, ?, '2026-10-20T08:00:00.000Z')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(STORE_ID)
+    .bind(product_id)
+    .bind(microcents_to_cents(rate_microcents).expect("representable"))
+    .bind(microcents_to_cents(rate_microcents).expect("representable"))
+    .bind(rate_microcents)
+    .bind(rate_microcents)
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("seed purchase movement for {product_id}: {e}"));
+}
+
+/// The status of a recipe row, for a transition assertion.
+pub async fn recipe_status(db: &TempDb, recipe_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM recipes WHERE id = ?")
+        .bind(recipe_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("read status of {recipe_id}: {e}"))
+}
+
+/// `(activated_at, retired_at)` of a recipe row — the lifecycle history.
+pub async fn recipe_timestamps(db: &TempDb, recipe_id: &str) -> (Option<String>, Option<String>) {
+    use sqlx::Row;
+    let row = sqlx::query("SELECT activated_at, retired_at FROM recipes WHERE id = ?")
+        .bind(recipe_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("read timestamps of {recipe_id}: {e}"));
+    (
+        row.try_get("activated_at").expect("decode activated_at"),
+        row.try_get("retired_at").expect("decode retired_at"),
+    )
 }

@@ -4120,3 +4120,242 @@ async fn migration_020_is_idempotent_through_the_real_runner() {
     );
     assert_eq!(snapshot(&db, "products").await, state);
 }
+
+// ============================================================================
+// Migration 021 — recipe definitions (WP-B2-A)
+// ============================================================================
+
+/// A v20 database with a shop's history in it: a costed sale, its movement, a
+/// manual-costed service item, and an ingredient with a documented cost.
+///
+/// Populated for the same reason `populated_v19_database` is: a schema-only
+/// upgrade test cannot catch a migration that rewrites a posted figure, and a
+/// posted figure is the only thing in this application that can never be put
+/// back.
+async fn populated_v20_database() -> TempDb {
+    let db = TempDb::at_schema_version(20).await;
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents,
+           avg_cost_excl_vat_cents, avg_cost_incl_vat_cents,
+           avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
+           quantity_on_hand, is_service, costing_method
+         ) VALUES ('b2-bun', '{STORE_ID}', 'SKU-B2BUN', 'Burger bun',
+                   '{VAT_STD_ID}', 'inclusive', 90, 100,
+                   22, 24, 220000, 244000, 200, 0, 'purchase_average')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO product_uoms
+           (id, store_id, product_id, uom_code, factor_num, factor_den,
+            is_base, is_default_sale_uom, is_default_purchase_uom, is_active)
+         VALUES ('b2-bun-uom', '{STORE_ID}', 'b2-bun', 'each', 1, 1, 1, 1, 1, 1)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO products (
+           id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents, quantity_on_hand, is_service,
+           costing_method, standard_cost_excl_vat_microcents, standard_cost_set_at
+         ) VALUES ('b2-burger', '{STORE_ID}', 'SKU-B2BRG', 'Greaz Burger',
+                   '{VAT_STD_ID}', 'inclusive', 1000, 1110, 0, 1,
+                   'standard', 185000000, '2026-10-25T00:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO product_uoms
+           (id, store_id, product_id, uom_code, factor_num, factor_den,
+            is_base, is_default_sale_uom, is_default_purchase_uom, is_active)
+         VALUES ('b2-burger-uom', '{STORE_ID}', 'b2-burger', 'each', 1, 1, 1, 1, 1, 1)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sales (
+           id, store_id, cashier_user_id, receipt_number,
+           exchange_rate_lbp_per_usd, subtotal_excl_vat_cents, vat_total_cents,
+           total_incl_vat_cents, cogs_total_cents, cogs_method, status
+         ) VALUES ('b2-sale', '{STORE_ID}', '{USER_ID}', 1,
+                   89000, 1000, 110, 1110, 185, 'weighted_average', 'draft')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO sale_items (
+           id, sale_id, store_id, product_id, product_name_snapshot,
+           vat_rate_id_snapshot, vat_rate_bps_snapshot, quantity,
+           unit_price_excl_vat_cents, unit_price_incl_vat_cents,
+           line_subtotal_excl_vat_cents, line_vat_cents, line_total_incl_vat_cents,
+           unit_cogs_excl_vat_cents, line_cogs_excl_vat_cents,
+           unit_cogs_excl_vat_microcents, cogs_source,
+           quantity_in_uom, uom_code_snapshot, factor_num_snapshot, factor_den_snapshot
+         ) VALUES ('b2-line', 'b2-sale', '{STORE_ID}', 'b2-burger', 'Greaz Burger',
+                   '{VAT_STD_ID}', 1100, 1, 1000, 1110, 1000, 110, 1110,
+                   185, 185, 185000000, 'standard', 1, 'each', 1, 1)"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO inventory_movements (
+           id, store_id, product_id, movement_type, quantity_delta,
+           unit_cost_excl_vat_cents, unit_cost_incl_vat_cents,
+           unit_cost_excl_vat_microcents, unit_cost_incl_vat_microcents, posted_at
+         ) VALUES ('b2-move', '{STORE_ID}', 'b2-bun', 'purchase', 200,
+                   22, 24, 220000, 244000, '2026-10-20T08:00:00.000Z')"
+    ))
+    .await;
+    db.exec("UPDATE app_settings SET value = '2' WHERE key = 'next_receipt_number'")
+        .await;
+    db.exec(
+        "UPDATE sales SET status = 'posted', posted_at = '2026-10-25T10:00:00.000Z'
+          WHERE id = 'b2-sale'",
+    )
+    .await;
+    db
+}
+
+/// The whole safety claim of migration 021: it ADDS TWO EMPTY TABLES and
+/// rewrites nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_021_upgrades_a_populated_v20_database_without_restating_it() {
+    let db = populated_v20_database().await;
+
+    let products_before = snapshot(&db, "products").await;
+    let sales_before = snapshot(&db, "sales").await;
+    let items_before = snapshot(&db, "sale_items").await;
+    let movements_before = snapshot(&db, "inventory_movements").await;
+    let uoms_before = snapshot(&db, "product_uoms").await;
+
+    db.migrate_again().await.expect("migration 021 must apply");
+
+    // Not one byte of any existing table moved. 021 adds no column anywhere,
+    // so these are plain equalities rather than `assert_only_null_columns_appended`.
+    assert_eq!(snapshot(&db, "products").await, products_before);
+    assert_eq!(snapshot(&db, "sales").await, sales_before);
+    assert_eq!(snapshot(&db, "sale_items").await, items_before);
+    assert_eq!(snapshot(&db, "inventory_movements").await, movements_before);
+    assert_eq!(snapshot(&db, "product_uoms").await, uoms_before);
+
+    // The two new tables exist and are EMPTY. A migration is not a fixture.
+    assert_eq!(db.count("SELECT COUNT(*) FROM recipes").await, 0);
+    assert_eq!(db.count("SELECT COUNT(*) FROM recipe_components").await, 0);
+
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
+}
+
+/// 021 adds no column to any existing table. Stated as a schema assertion so
+/// it cannot drift: the whole point of putting `'recipe'` in migration 020's
+/// CHECK was that B2 would need no `products` rebuild.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_021_adds_no_column_to_any_existing_table() {
+    let fresh = TempDb::new().await;
+    let v20 = TempDb::at_schema_version(20).await;
+
+    for table in [
+        "products",
+        "product_uoms",
+        "sale_items",
+        "sales",
+        "inventory_movements",
+    ] {
+        let sql = format!(
+            "SELECT COALESCE(GROUP_CONCAT(name, ','), '') FROM
+               (SELECT name FROM pragma_table_info('{table}') ORDER BY name)"
+        );
+        assert_eq!(
+            fresh.scalar_string(&sql).await,
+            v20.scalar_string(&sql).await,
+            "{table} must be identical at v20 and v21"
+        );
+    }
+}
+
+/// An upgraded database and a brand-new one must be indistinguishable, or a
+/// bug reproduces on only one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v20_upgrade_converges_on_the_same_schema_as_a_fresh_install() {
+    let fresh = TempDb::new().await;
+    let upgraded = populated_v20_database().await;
+    upgraded.migrate_again().await.expect("migration 021 must apply");
+
+    let schema_sql = "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+                      (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        fresh.scalar_string(schema_sql).await,
+        upgraded.scalar_string(schema_sql).await,
+        "a v20 upgrade and a fresh install must have identical schemas"
+    );
+}
+
+/// Forward-only and idempotent, through the real runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_021_is_idempotent_through_the_real_runner() {
+    let db = TempDb::new().await;
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 21")
+            .await,
+        1
+    );
+    let state = snapshot(&db, "products").await;
+    db.migrate_again()
+        .await
+        .expect("a second run must validate and do nothing");
+    assert_eq!(
+        db.count("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 21")
+            .await,
+        1
+    );
+    assert_eq!(snapshot(&db, "products").await, state);
+}
+
+/// A fully migrated virgin database still holds nothing sellable and nothing
+/// buildable. The migration-019 rule, extended: production provisioning
+/// creates no recipe either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virgin_v21_database_holds_no_recipe() {
+    let db = TempDb::new().await;
+    assert_eq!(db.count("SELECT COUNT(*) FROM products WHERE is_active = 1").await, 0);
+    assert_eq!(db.count("SELECT COUNT(*) FROM recipes").await, 0);
+    assert_eq!(db.count("SELECT COUNT(*) FROM recipe_components").await, 0);
+}
+
+/// Migration 020's refusal of `costing_method = 'recipe'` SURVIVES 021.
+///
+/// This is the WP-B2-A boundary as a migration assertion: creating the recipe
+/// tables must not, by itself, make recipe costing selectable. WP-B2-B
+/// replaces that trigger pair in the same migration that teaches `post_sale`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_021_leaves_the_recipe_costing_refusal_in_place() {
+    let db = populated_v20_database().await;
+    db.migrate_again().await.expect("migration 021 must apply");
+
+    for sql in [
+        "UPDATE products SET costing_method = 'recipe' WHERE id = 'b2-burger'",
+        &format!(
+            "INSERT INTO products (id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+               price_excl_vat_cents, price_incl_vat_cents, is_service, costing_method)
+             VALUES ('b2-new', '{STORE_ID}', 'SKU-NEW', 'New item', '{VAT_STD_ID}',
+                     'inclusive', 100, 111, 1, 'recipe')"
+        ),
+    ] {
+        let e = db.exec_err(sql).await;
+        assert!(
+            e.contains("recipe costing is not implemented"),
+            "021 must not relax 020's refusal: {e}"
+        );
+    }
+
+    // Both coherence triggers are still the ones 020 created.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type = 'trigger'
+                AND name IN ('trg_products_costing_coherence_ins',
+                             'trg_products_costing_coherence_upd')
+                AND sql LIKE '%not implemented%'"
+        )
+        .await,
+        2
+    );
+}
