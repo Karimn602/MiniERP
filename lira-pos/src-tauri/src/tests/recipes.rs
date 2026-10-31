@@ -1242,19 +1242,40 @@ async fn an_ingredient_deactivated_after_the_draft_was_saved_blocks_activation()
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_product_still_cannot_be_recipe_costed() {
-    // Migration 020's refusal STANDS. WP-B2-B replaces that trigger pair in
-    // the same migration that teaches `post_sale` to honour a recipe; until
-    // then a recipe is a definition and a cost preview, and no sale reads it.
+async fn a_published_recipe_is_what_makes_recipe_costing_selectable() {
+    // WP-B2-B. 020's blanket refusal became a conditional one, and the
+    // condition is the thing this file exists to produce: a PUBLISHED recipe
+    // for that product in that store. With one, the method is accepted.
     let db = kitchen().await;
     an_active_recipe(&db, "b001").await;
+
+    db.exec(&format!(
+        "UPDATE products SET costing_method='recipe' WHERE id='{P_BURGER}'"
+    ))
+    .await;
+    assert_eq!(
+        db.scalar_string(&format!(
+            "SELECT costing_method FROM products WHERE id='{P_BURGER}'"
+        ))
+        .await,
+        "recipe"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recipe_costing_is_refused_without_a_published_recipe() {
+    // The other side of the same rule: a product with NO recipe cannot select
+    // the method, because `post_sale` would have nothing to cost it from and
+    // would stop in front of a customer for a configuration mistake made days
+    // earlier. A DRAFT is not a publication and does not satisfy it either.
+    let db = kitchen().await;
 
     let e = db
         .exec_err(&format!(
             "UPDATE products SET costing_method='recipe' WHERE id='{P_BURGER}'"
         ))
         .await;
-    assert!(e.contains("not implemented"), "{e}");
+    assert!(e.contains("published recipe"), "{e}");
     assert_eq!(
         db.scalar_string(&format!(
             "SELECT costing_method FROM products WHERE id='{P_BURGER}'"

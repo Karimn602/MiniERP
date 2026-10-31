@@ -25,6 +25,7 @@ const en = {
     switchToMidnight: "Switch to Midnight dark appearance",
   },
   common: {
+    hide: "Hide",
     workspace: "Workspace",
     loading: "Loading…",
     add: "Add",
@@ -538,21 +539,27 @@ const en = {
     method: {
       purchase_average: "Purchase valuation",
       standard: "Manual cost",
-      recipe: "Recipe cost (not available yet)",
+      recipe: "Recipe cost",
     },
     methodHint: {
       purchase_average:
         "Cost comes from what you paid for the stock. Correct for anything you buy and count.",
       standard:
         "You type the cost. For prepared menu items with no stock tracking — no recipe needed.",
-      recipe: "Calculated from a recipe of ingredients. Coming in a later release.",
+      recipe:
+        "Worked out from this item's published recipe, at what its ingredients cost today. An estimate from the recipe — it does not count ingredients out of stock. Needs a published recipe, and applies to items with no stock tracking.",
     },
+    recipeEstimateShort: "estimated from the recipe",
     status: {
       manual: "Manual cost set",
       manual_zero: "Manual cost set to zero (deliberate)",
       purchase: "Valued from purchases",
       purchase_uncosted: "No cost yet — buy stock in, or switch to manual cost",
       service_uncosted: "No cost configured — margins on this item read as 100%",
+      recipe: "Costed from its recipe",
+      recipe_missing: "Recipe costing is selected but no recipe is published — publish one",
+      recipe_uncosted:
+        "Recipe costing is selected, but one of the recipe's ingredients has no cost on file — a sale would be refused until it does",
     },
     source: {
       purchase_average: "Purchase average",
@@ -570,6 +577,23 @@ const en = {
       uncosted: "None",
       legacy: "Legacy",
     },
+    recipeBreakdown: {
+      title: "Recipe cost (version {{version}})",
+      subtitle:
+        "What this item’s ingredients cost when the sale was posted. An estimated food cost — no ingredient was counted out of stock.",
+      colIngredient: "Ingredient",
+      colQuantity: "Quantity (one batch)",
+      colRate: "Ingredient cost",
+      colContribution: "In one batch",
+      perUnit: "Cost per unit",
+      none: "No recipe breakdown was recorded for this line.",
+      estimated: "Estimated from the recipe, not reconciled against stock.",
+      batchYield: "One batch makes",
+      batchCost: "Cost of one batch",
+      perSellingUnit: "Costed per selling unit",
+      batchNote:
+        "The quantities and amounts below are for ONE BATCH, which makes {{yield}} selling units. This line was costed at the batch cost divided by {{yield}}.",
+    },
     coverage: {
       title: "Cost coverage",
       subtitle:
@@ -580,7 +604,7 @@ const en = {
       legacyCosted: "Costed before this feature (source unknown)",
       uncosted: "Revenue with no cost configured",
       legacy: "Revenue posted before costing existed",
-      estimated: "Costed from manual (estimated) costs",
+      estimated: "Costed from estimated costs (manual, or from a recipe)",
       documented: "Costed from purchase documents",
       colSource: "Cost source",
       colLines: "Lines",
@@ -594,7 +618,7 @@ const en = {
       unknownSourceNote:
         "Some lines were posted before Greaz recorded where a cost came from. Their cost IS in the profit figure above — it is the figure they were posted with — but Greaz cannot say whether it came from a purchase or from a stated cost, and it is never guessed or rewritten.",
       estimatedNote:
-        "Manual costs are what the owner stated, not what was counted. They are an estimate, and nothing here reconciles them against stock.",
+        "An estimated cost is a manual cost the owner typed, or a recipe cost worked out from what its ingredients cost at the time of the sale. Neither is a count. A recipe cost does NOT consume ingredients out of stock and is not reconciled against any stock figure, so a difference between it and what the kitchen actually used will not show up anywhere here.",
       grossBasisNote:
         "Both shares are measured over this period's posted sale lines BEFORE returns. The gross profit card above is NET of returns, so these are not shares of that figure and not a percentage of it. A returned line was still costed or not costed when it was sold, so it is counted here either way.",
       empty: "No sales in this period.",
@@ -613,9 +637,9 @@ const en = {
 
     loading: "Loading the recipe…",
     notYetSellingCost:
-      "Recipes can be built and published now. Using one as an item's selling cost arrives in the next release — nothing here changes any sale, any report or any stock figure yet.",
+      "Publish a recipe, then set this item’s costing to Recipe cost to use it. Greaz will cost each sale from the published version, at what the ingredients cost on the day of the sale. It is an estimate from the recipe: no ingredient is counted out of stock.",
     editingCreatesNewVersion:
-      "This item already has a published recipe. Published versions are never edited, so saving creates version {{version}} as a new draft. The published one keeps its ingredients and quantities exactly as they were and goes on showing its estimated cost here until you publish the new one — it is not yet applied to sales, so neither version changes any receipt, any profit figure or any stock count.",
+      "This item already has a published recipe. Published versions are never edited, so saving creates version {{version}} as a new draft. The published one keeps its ingredients and quantities exactly as they were and goes on costing sales until you publish the new one. Publishing changes what the NEXT sale costs — receipts already issued keep the cost they were posted with, and no stock count changes either way.",
 
     ingredients: "Ingredients",
     addIngredient: "Add ingredient",
@@ -689,6 +713,10 @@ const en = {
       "That is not a cost. Enter a number with up to four decimal places, such as 1.85 or 0.0025.",
     errManualCostRequired:
       "Manual cost needs a figure. Enter a cost excluding VAT, or choose purchase valuation.",
+    errRecipeCostNeedsRecipe:
+      "Recipe costing needs a published recipe. Open this item’s Recipe, add its ingredients and publish it, then set the costing method.",
+    errRecipeCostNeedsService:
+      "Recipe costing applies to non-stock items only. A stocked product is valued from its purchases, so a recipe-derived cost would contradict the inventory movements its sales write. Tick “Service item (no stock tracking)”, or leave it on purchase valuation.",
     errManualCostNeedsService:
       "Manual cost applies to non-stock items only. A stocked product is valued from its purchases, so a typed cost would contradict the stock movements its sales write. Tick “Service item (no stock tracking)”, or leave it on purchase valuation.",
     eyebrow: "Menu & stock",

@@ -5,6 +5,7 @@ mod catalog;
 mod cost;
 mod posting;
 mod recipe_cost;
+mod recipe_sale_cost;
 mod recipes;
 use posting::DbState;
 
@@ -144,6 +145,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             version: 21,
             description: "recipes",
             sql: include_str!("../../src/db/migrations/021_recipes.sql"),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 22,
+            description: "recipe_sale_costing",
+            sql: include_str!("../../src/db/migrations/022_recipe_sale_costing.sql"),
             kind: MigrationKind::Up,
         },
     ]

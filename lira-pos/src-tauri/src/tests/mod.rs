@@ -22,6 +22,7 @@ mod migrations;
 mod purchase_authority;
 mod purchases;
 mod pure;
+mod recipe_sale_costing;
 mod recipes;
 mod reconciliation;
 mod returns;

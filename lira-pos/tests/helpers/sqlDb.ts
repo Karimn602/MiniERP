@@ -358,10 +358,20 @@ export function insertSale(db: DatabaseSync, sale: SaleFixture): string {
     );
   }
 
-  // Seal it, exactly as `post_sale`'s last statement does.
+  // Seal it, exactly as `post_sale`'s last statement does: ONE statement
+  // setting both markers together.
+  //
+  // A sale this helper leaves as a DRAFT keeps `posted_at` NULL. It used to be
+  // given a timestamp regardless, which is the very incoherence migration
+  // 022's `trg_sales_posting_state_coherent` now forbids — a draft carrying a
+  // posting time is a row whose two markers of the same fact disagree. A
+  // VOIDED fixture keeps its timestamp, because a voided sale was posted
+  // first and 001's carve-out requires the void to preserve when that
+  // happened.
+  const status = sale.status ?? "posted";
   db.prepare(
     `UPDATE sales SET status = ?, posted_at = ? WHERE id = ? AND status = 'draft'`,
-  ).run(sale.status ?? "posted", sale.postedAt, saleId);
+  ).run(status, status === "draft" ? null : sale.postedAt, saleId);
 
   return saleId;
 }

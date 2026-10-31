@@ -116,13 +116,18 @@ async function addLine(index: number, productId: string, qty: string, uom?: stri
 }
 
 describe("the recipe editor", () => {
-  it("says plainly that a recipe is not yet an item's selling cost", async () => {
-    // The WP-B2-A boundary, where the operator can see it. A screen that lets
-    // you build a recipe and does not say it is inert yet is a screen that
-    // implies a margin it has not changed.
+  it("says what publishing does, and what it does NOT do", async () => {
+    // The WP-B2-B boundary, where the operator can see it. Publishing alone
+    // changes no cost — the ITEM has to be set to Recipe cost — and a recipe
+    // COGS figure is an estimate from the recipe, not evidence that any
+    // ingredient was counted out of stock. A screen that implies either would
+    // be claiming an inventory guarantee B2-B does not make.
     renderEditor();
     expect(
-      await screen.findByText(/Using one as an item's selling cost arrives/),
+      await screen.findByText(/set this item.s costing to Recipe cost to use it/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/no ingredient is counted out of stock/),
     ).toBeTruthy();
   });
 

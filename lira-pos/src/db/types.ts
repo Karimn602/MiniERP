@@ -421,6 +421,17 @@ export interface SaleItem {
    * row rather than accepting it on the wire.
    */
   cogsSource: CogsSource | null;
+  /**
+   * WHICH published recipe version supplied the rate (WP-B2-B, migration 022).
+   *
+   * Both are `null` unless `cogsSource === "recipe"`, and migration 022's
+   * `trg_sale_items_recipe_coherence` refuses every way the three could
+   * disagree. They exist so a posted cost stays explainable after version 2 is
+   * published and version 1 retired: `sale_item_recipe_costs` holds the
+   * per-ingredient breakdown under the same identity.
+   */
+  recipeId: string | null;
+  recipeVersion: number | null;
   barcodeUsedSnapshot: string | null;
   barcodeTypeSnapshot: string | null;
   quantityInUom: number | null;

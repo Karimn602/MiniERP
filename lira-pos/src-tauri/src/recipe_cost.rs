@@ -67,7 +67,8 @@
 //! final unit of 1 microcent. It can therefore change the answer only if the
 //! true value lies within 0.000032 of an exact half-microcent boundary — and
 //! if it does, both answers are within half a microcent of the truth anyway.
-//! For comparison, one microcent is one ten-thousandth of a cent.
+//! For comparison, one microcent is one MILLIONTH of a cent: `COST_SCALE` is
+//! 1,000,000 microcents to the cent, so a microcent is $0.00000001.
 //!
 //! In the COMMON case step 1 does not round at all. When `waste_bps` is 0 and
 //! both denominators are 1 the divisor is 10,000, the numerator carries a
@@ -496,7 +497,7 @@ pub const FIXTURES: &[Fixture] = &[
     // component to a whole microcent first loses all three pinches —
     // 22,000,000 + 0 + 0 + 0 — because each one rounds to zero on its own.
     // Accumulating at ACC scale and rounding once gives 22,000,001.2 ->
-    // 22,000,001. The difference is a ten-thousandth of a cent on one plate,
+    // 22,000,001. The difference is a MILLIONTH of a cent on one plate,
     // which is the point: it is the shape of the GP-A03 defect, where rounding
     // a rate before multiplying it made $0.0025/g flour cost $0.00.
     //

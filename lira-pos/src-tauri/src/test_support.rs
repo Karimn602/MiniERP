@@ -304,6 +304,22 @@ impl TempDb {
         app_migrator().run(self.pool()).await
     }
 
+    /// Advance this database to `max_version` and no further.
+    ///
+    /// `migrate_again` runs everything the application ships, which is right
+    /// for an upgrade test and wrong for a BOUNDARY one: an assertion that
+    /// migration N does not, by itself, relax a rule has to stop at N, or it
+    /// silently becomes an assertion about N+1 the day N+1 arrives. That is
+    /// exactly what would have happened to
+    /// `migration_021_leaves_the_recipe_costing_refusal_in_place` when 022
+    /// landed.
+    pub async fn migrate_through(
+        &self,
+        max_version: i64,
+    ) -> Result<(), sqlx::migrate::MigrateError> {
+        app_migrator_through(max_version).run(self.pool()).await
+    }
+
     // ---- small query helpers ----
 
     pub async fn scalar_i64(&self, sql: &str) -> i64 {

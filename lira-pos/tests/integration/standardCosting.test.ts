@@ -149,10 +149,14 @@ describe("migration 020 coherence guards", () => {
     ).toThrow(/non-stock/i);
   });
 
-  it("refuses recipe costing until WP-B2", () => {
+  it("refuses recipe costing for an item with no published recipe", () => {
+    // WP-B2-B (migration 022) replaced 020's blanket refusal with a
+    // conditional one. This fixture publishes no recipe, so the condition
+    // fails and the method is still refused — now for a reason the operator
+    // can act on rather than because the feature does not exist.
     expect(() =>
       db.prepare(`UPDATE products SET costing_method='recipe' WHERE id=?`).run(BURGER),
-    ).toThrow(/not implemented/i);
+    ).toThrow(/published recipe/i);
   });
 
   it("refuses a negative manual cost", () => {

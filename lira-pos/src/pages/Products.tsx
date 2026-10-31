@@ -28,6 +28,7 @@ import { formatUsd, parseUsdInput } from "../lib/money";
 import { formatPrettyDate, isoToLocalDate } from "../lib/dates";
 import {
   costConfigurationStatus,
+  costSourceShortKey,
   costStatusLabelKey,
   effectiveUnitCostMicrocents,
   isUncostedStatus,
@@ -35,6 +36,7 @@ import {
   isBlankCostInput,
   parseManualCostInput,
   SELECTABLE_COSTING_METHODS,
+  isSelectableCostingMethod,
   type SelectableCostingMethod,
 } from "../lib/standardCost";
 import { formatUnitCostUsd } from "../lib/cost";
@@ -89,9 +91,11 @@ interface ProductFormState {
   isActive: boolean;
 
   /**
-   * How sales of this product are costed (WP-B1). `"recipe"` is not offered:
-   * it is in the schema so WP-B2 needs no table rebuild, and nothing honours
-   * it yet.
+   * How sales of this product are costed (WP-B1, extended by WP-B2-B).
+   *
+   * All three methods are selectable now. `"recipe"` carries two conditions
+   * the engine holds and this form states first: a non-stock item, and a
+   * PUBLISHED recipe to cost it from.
    */
   costingMethod: SelectableCostingMethod;
   /**
@@ -368,8 +372,12 @@ export default function Products() {
       isService: product.isService,
       isActive: product.isActive,
 
-      costingMethod: product.costingMethod === "standard"
-        ? "standard"
+      // Round-tripped through the selectable set rather than collapsed to a
+      // pair: before WP-B2-B this read `=== "standard" ? "standard" :
+      // "purchase_average"`, which would now silently rewrite a recipe-costed
+      // item to purchase valuation on any unrelated edit of it.
+      costingMethod: isSelectableCostingMethod(product.costingMethod)
+        ? product.costingMethod
         : "purchase_average",
       // The stored RATE, formatted back to the shape it was typed in. Never
       // read from the rounded cents mirror: a sub-cent cost would come back as
@@ -469,6 +477,24 @@ export default function Products() {
         // ledger and the P&L disagree with no document between them.
         if (!form.isService) {
           throw new Error(t("products.errManualCostNeedsService"));
+        }
+      }
+      // WP-B2-B. The same two conditions the backend holds, said here first so
+      // the operator reads a sentence in their own language before a round
+      // trip — and the backend stays the authority, because this form is not
+      // trusted to have checked anything.
+      if (form.costingMethod === "recipe") {
+        // A recipe-derived rate on a stocked line would be stamped onto the
+        // sale's inventory movement while the pool those goods left says
+        // something else, and that ledger is append-only.
+        if (!form.isService) {
+          throw new Error(t("products.errRecipeCostNeedsService"));
+        }
+        // A product configured this way with no published recipe cannot be
+        // sold at all, so the refusal belongs here and not in front of a
+        // customer. A DRAFT is not a publication.
+        if (!form.id || !recipeSummaries.get(form.id)?.hasActive) {
+          throw new Error(t("products.errRecipeCostNeedsRecipe"));
         }
       }
 
@@ -706,8 +732,21 @@ export default function Products() {
                           printed the same $0.00 for the ones nobody had. */}
                       <td className="whitespace-nowrap px-5 py-3 text-right tabular-nums text-slate-500">
                         {(() => {
-                          const rate = effectiveUnitCostMicrocents(p);
-                          const status = costConfigurationStatus(p);
+                          // WP-B2-B. A recipe-costed item reads neither
+                          // `avg_cost_*` (zero for ever on a non-stock item)
+                          // nor its inert Manual Cost, so both the figure and
+                          // the label have to be told about the recipe. Before
+                          // this the cell printed "—" and "None" over a
+                          // correctly configured burger, which is exactly the
+                          // reading that says "nobody has costed this".
+                          const r = recipeSummaries.get(p.id);
+                          const recipe = {
+                            hasActive: r?.hasActive ?? false,
+                            perBaseUnitMicrocents:
+                              r?.activeCostPerBaseUnitMicrocents ?? null,
+                          };
+                          const rate = effectiveUnitCostMicrocents(p, recipe);
+                          const status = costConfigurationStatus(p, recipe);
                           return (
                             <>
                               <div
@@ -718,14 +757,17 @@ export default function Products() {
                                 {rate === null ? "—" : formatUnitCostUsd(rate)}
                               </div>
                               <div className="mt-0.5 text-[11px] text-fg-muted">
-                                {t(`costing.sourceShort.${
-                                  p.costingMethod === "standard"
-                                    ? "standard"
-                                    : isUncostedStatus(status)
-                                      ? "uncosted"
-                                      : "purchase_average"
-                                }`)}
+                                {t(costSourceShortKey(status))}
                               </div>
+                              {/* A recipe cost is an ESTIMATE from the
+                                  ingredients' rates: nothing is counted out of
+                                  stock. Said on the row, not only in a panel
+                                  the owner may never open. */}
+                              {status === "recipe" && (
+                                <div className="mt-0.5 text-[11px] text-fg-muted">
+                                  {t("costing.recipeEstimateShort")}
+                                </div>
+                              )}
                             </>
                           );
                         })()}
@@ -1095,6 +1137,31 @@ export default function Products() {
                   </span>
                 </label>
 
+                {form.costingMethod === "recipe" && (
+                  <>
+                    {/* Both conditions stated where they are reachable, rather
+                        than only in the error a save would return. */}
+                    {!form.isService && (
+                      <div className="rounded border border-warn-line bg-warn-bg p-2 text-xs text-warn-fg">
+                        {t("products.errRecipeCostNeedsService")}
+                      </div>
+                    )}
+                    {form.isService &&
+                      !(form.id && recipeSummaries.get(form.id)?.hasActive) && (
+                        <div className="rounded border border-warn-line bg-warn-bg p-2 text-xs text-warn-fg">
+                          {t("products.errRecipeCostNeedsRecipe")}
+                        </div>
+                      )}
+                    {form.id &&
+                      recipeSummaries.get(form.id)?.hasActive &&
+                      form.isService && (
+                        <div className="text-[11px] text-slate-500">
+                          {t("costing.status.recipe")}
+                        </div>
+                      )}
+                  </>
+                )}
+
                 {form.costingMethod === "standard" && (
                   <>
                     <Input
@@ -1143,7 +1210,17 @@ export default function Products() {
                   <div className="rounded bg-slate-50 p-2 text-xs text-slate-600">
                     {t("products.costStatusLabel")}{" "}
                     <span className="font-medium text-slate-800">
-                      {t(costStatusLabelKey(costConfigurationStatus(selectedProduct)))}
+                      {t(
+                        costStatusLabelKey(
+                          costConfigurationStatus(selectedProduct, {
+                            hasActive:
+                              recipeSummaries.get(selectedProduct.id)?.hasActive ?? false,
+                            perBaseUnitMicrocents:
+                              recipeSummaries.get(selectedProduct.id)
+                                ?.activeCostPerBaseUnitMicrocents ?? null,
+                          }),
+                        ),
+                      )}
                     </span>
                   </div>
                 )}

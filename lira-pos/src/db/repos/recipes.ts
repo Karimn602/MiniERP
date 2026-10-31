@@ -16,7 +16,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { query } from "../client";
 import { newId } from "../../lib/ids";
 import type { Quantity } from "../../lib/recipeQuantity";
-import type { ComponentCostSource } from "../../lib/recipeCost";
+import { recipeCost, type ComponentCostSource } from "../../lib/recipeCost";
 import type { Microcents } from "../../lib/cost";
 
 export type RecipeStatus = "draft" | "active" | "retired";
@@ -160,6 +160,23 @@ export interface RecipeSummary {
   hasActive: boolean;
   activeVersion: number | null;
   retiredCount: number;
+  /**
+   * The ACTIVE version's batch yield, or `null` when there is no active
+   * version. A screen that shows a per-unit cost beside a recipe has to be
+   * able to say whether that cost is per BATCH or per selling unit.
+   */
+  activeYieldQuantityBase: number | null;
+  /**
+   * What a sale of this item WOULD be costed at today, per base unit, in
+   * microcents — the figure `recipe_sale_cost.rs` would resolve.
+   *
+   * `null` when there is no active version, or when one of its ingredients has
+   * no cost on file. NEVER 0 for either of those: a cost that cannot be worked
+   * out is ABSENT, and returning zero is how a catalogue of 100% margins stops
+   * looking like a problem. It is an ESTIMATE — no ingredient is counted out
+   * of stock — and the screens that print it say so.
+   */
+  activeCostPerBaseUnitMicrocents: Microcents | null;
 }
 
 interface HeaderSql {
@@ -177,6 +194,7 @@ interface HeaderSql {
 
 interface ComponentSql {
   id: string;
+  recipe_id: string;
   component_product_id: string;
   component_name: string;
   component_sku: string | null;
@@ -224,8 +242,17 @@ function resolveRate(r: ComponentSql): {
   };
 }
 
-const COMPONENT_SQL = `
+/**
+ * The component projection, shared by the per-recipe read and the store-wide
+ * one the Products list needs.
+ *
+ * ONE select list for both, deliberately: the two differ only in which recipes
+ * they cover, and two copies of this join is how the catalogue list comes to
+ * price an ingredient differently from the recipe editor.
+ */
+const COMPONENT_COLUMNS = `
   SELECT rc.id,
+         rc.recipe_id,
          rc.component_product_id,
          p.name            AS component_name,
          p.sku             AS component_sku,
@@ -256,9 +283,17 @@ const COMPONENT_SQL = `
            ON u.product_id = rc.component_product_id
           AND u.store_id   = rc.store_id
           AND u.uom_code   = rc.uom_code
-          AND u.is_active  = 1
+          AND u.is_active  = 1`;
+
+const COMPONENT_SQL = `${COMPONENT_COLUMNS}
    WHERE rc.recipe_id = ?
    ORDER BY rc.sort_order, rc.id`;
+
+/** Every component of every ACTIVE recipe of one store, in one round trip. */
+const ACTIVE_COMPONENT_SQL = `${COMPONENT_COLUMNS}
+    JOIN recipes r ON r.id = rc.recipe_id
+   WHERE r.store_id = ? AND r.status = 'active'
+   ORDER BY rc.recipe_id, rc.sort_order, rc.id`;
 
 function compareConversion(r: ComponentSql): ConversionState {
   if (r.catalog_factor_num === null || r.catalog_factor_den === null) {
@@ -326,6 +361,62 @@ function mapHeader(h: HeaderSql, components: RecipeComponentRow[]): RecipeRow {
   };
 }
 
+/**
+ * One frozen ingredient line of a POSTED recipe-costed sale line.
+ *
+ * Every physical figure is the published version's own snapshot and the rate
+ * is what the ingredient cost when the sale posted. Nothing here is ever
+ * recomputed: `sale_item_recipe_costs` takes no UPDATE and no DELETE.
+ */
+export interface PostedRecipeCostRow {
+  componentProductId: string;
+  componentName: string;
+  uomCode: string;
+  quantity: Quantity;
+  factorNum: number;
+  factorDen: number;
+  wasteBps: number;
+  unitCostExclVatMicrocents: Microcents;
+  costSource: ComponentCostSource;
+  /** This ingredient's share of ONE BATCH. Display: nothing sums these. */
+  contributionMicrocents: Microcents;
+  recipeId: string;
+  recipeVersion: number;
+  /**
+   * What ONE BATCH of that published version yields, in the menu item's own
+   * base unit — `recipes.yield_quantity_base`, read by join.
+   *
+   * Joined rather than snapshotted because a published header's yield can
+   * never change (migration 021's lifecycle rules freeze it the moment the
+   * version leaves `draft`), so the join returns the figure the sale was
+   * costed against and not today's.
+   *
+   * It is in this row because without it the breakdown is unreadable for any
+   * recipe that makes more than one serving: the quantities and contributions
+   * describe the BATCH, and the line's COGS rate is that batch divided by this
+   * number. Reading the two as if they were the same thing overstates a
+   * twenty-portion sauce by twentyfold.
+   */
+  yieldQuantityBase: number;
+}
+
+interface PostedRecipeCostSql {
+  component_product_id: string;
+  component_name_snapshot: string;
+  uom_code: string;
+  quantity_num: number;
+  quantity_den: number;
+  factor_num_snapshot: number;
+  factor_den_snapshot: number;
+  waste_bps: number;
+  unit_cost_excl_vat_microcents: number;
+  cost_source: string;
+  contribution_microcents: number;
+  recipe_id: string;
+  recipe_version: number;
+  yield_quantity_base: number;
+}
+
 export const recipesRepo = {
   /** Mint a recipe identity. The caller mints it once and re-uses it. */
   newRecipeId(): string {
@@ -368,10 +459,20 @@ export const recipesRepo = {
   },
 
   /**
-   * Which products have a draft, an active version, or retired history.
+   * Which products have a draft, an active version, or retired history — and
+   * what the active version COSTS.
    *
-   * One query for the whole catalogue, because the Products list renders every
-   * row and a per-row probe is how a list comes to take a second to open.
+   * TWO queries for the whole catalogue, not two per row: the Products list
+   * renders every product and a per-row probe is how a list comes to take a
+   * second to open. The second query brings back every component of every
+   * active recipe of the store at once, and the cost is worked out here with
+   * `lib/recipeCost.ts` — the mirror of `recipe_cost.rs`, pinned to it by
+   * shared fixtures.
+   *
+   * IT IS A PREVIEW, not an authority. A posted line carries its own frozen
+   * rate and its own evidence rows, and nothing here can move them. This
+   * figure answers only "what would the next sale be costed at", which is the
+   * question the Products list is asking.
    */
   async summaries(storeId: string): Promise<Map<string, RecipeSummary>> {
     const rows = await query<{
@@ -379,29 +480,74 @@ export const recipesRepo = {
       has_draft: number;
       has_active: number;
       active_version: number | null;
+      active_recipe_id: string | null;
+      active_yield: number | null;
       retired_count: number;
     }>(
       `SELECT product_id,
               MAX(status = 'draft')   AS has_draft,
               MAX(status = 'active')  AS has_active,
               MAX(CASE WHEN status = 'active' THEN version END) AS active_version,
+              MAX(CASE WHEN status = 'active' THEN id END)      AS active_recipe_id,
+              MAX(CASE WHEN status = 'active' THEN yield_quantity_base END)
+                                                                AS active_yield,
               SUM(status = 'retired') AS retired_count
          FROM recipes
         WHERE store_id = ?
         GROUP BY product_id`,
       [storeId],
     );
+
+    const componentRows = await query<ComponentSql>(ACTIVE_COMPONENT_SQL, [storeId]);
+    const byRecipe = new Map<string, RecipeComponentRow[]>();
+    for (const c of componentRows) {
+      const list = byRecipe.get(c.recipe_id);
+      if (list) list.push(mapComponent(c));
+      else byRecipe.set(c.recipe_id, [mapComponent(c)]);
+    }
+
     return new Map(
-      rows.map((r) => [
-        r.product_id,
-        {
-          productId: r.product_id,
-          hasDraft: r.has_draft === 1,
-          hasActive: r.has_active === 1,
-          activeVersion: r.active_version,
-          retiredCount: r.retired_count ?? 0,
-        },
-      ]),
+      rows.map((r) => {
+        // `null` whenever the cost cannot be stated: no active version, no
+        // components, an ingredient with no basis, or a figure outside the
+        // arithmetic's admissible envelope. Every one of those is the ABSENCE
+        // of a cost, and none of them is zero.
+        let cost: Microcents | null = null;
+        if (r.active_recipe_id !== null && r.active_yield !== null) {
+          const components = byRecipe.get(r.active_recipe_id) ?? [];
+          if (components.length > 0) {
+            const outcome = recipeCost(
+              components.map((c) => ({
+                componentProductId: c.componentProductId,
+                componentName: c.componentName,
+                quantity: c.quantity,
+                uomCode: c.uomCode,
+                factorNum: c.factorNum,
+                factorDen: c.factorDen,
+                wasteBps: c.wasteBps,
+                unitCostExclVatMicrocents: c.unitCostExclVatMicrocents,
+                costSource: c.costSource,
+              })),
+              r.active_yield,
+            );
+            if (outcome.kind === "costed") {
+              cost = outcome.cost.perBaseUnitMicrocents;
+            }
+          }
+        }
+        return [
+          r.product_id,
+          {
+            productId: r.product_id,
+            hasDraft: r.has_draft === 1,
+            hasActive: r.has_active === 1,
+            activeVersion: r.active_version,
+            retiredCount: r.retired_count ?? 0,
+            activeYieldQuantityBase: r.active_yield,
+            activeCostPerBaseUnitMicrocents: cost,
+          },
+        ];
+      }),
     );
   },
 
@@ -557,5 +703,48 @@ export const recipesRepo = {
     retiredAt: string;
   }> {
     return invoke("retire_recipe", { payload: args });
+  },
+  /**
+   * The frozen per-ingredient explanation of a POSTED recipe-costed sale line
+   * (WP-B2-B).
+   *
+   * Read from `sale_item_recipe_costs`, which is append-only and immutable, so
+   * this answers "why did this burger cost $1.74 in March?" with what was true
+   * in March — not with today's rates, today's recipe or today's units. An
+   * empty array means the line was not costed from a recipe (or was posted
+   * before migration 022), and the caller says so rather than showing an empty
+   * table as though something were missing.
+   */
+  async postedCostBreakdown(args: {
+    saleItemId: string;
+  }): Promise<PostedRecipeCostRow[]> {
+    const rows = await query<PostedRecipeCostSql>(
+      `SELECT e.component_product_id, e.component_name_snapshot, e.uom_code,
+              e.quantity_num, e.quantity_den,
+              e.factor_num_snapshot, e.factor_den_snapshot, e.waste_bps,
+              e.unit_cost_excl_vat_microcents, e.cost_source,
+              e.contribution_microcents, e.recipe_id, e.recipe_version,
+              r.yield_quantity_base
+         FROM sale_item_recipe_costs e
+         JOIN recipes r ON r.id = e.recipe_id AND r.version = e.recipe_version
+        WHERE e.sale_item_id = ?
+        ORDER BY e.sort_order, e.component_name_snapshot`,
+      [args.saleItemId],
+    );
+    return rows.map((r) => ({
+      componentProductId: r.component_product_id,
+      componentName: r.component_name_snapshot,
+      uomCode: r.uom_code,
+      quantity: { num: r.quantity_num, den: r.quantity_den },
+      factorNum: r.factor_num_snapshot,
+      factorDen: r.factor_den_snapshot,
+      wasteBps: r.waste_bps,
+      unitCostExclVatMicrocents: r.unit_cost_excl_vat_microcents as Microcents,
+      costSource: r.cost_source as ComponentCostSource,
+      contributionMicrocents: r.contribution_microcents as Microcents,
+      recipeId: r.recipe_id,
+      recipeVersion: r.recipe_version,
+      yieldQuantityBase: r.yield_quantity_base,
+    }));
   },
 };

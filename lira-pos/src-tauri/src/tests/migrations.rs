@@ -4224,7 +4224,10 @@ async fn migration_021_upgrades_a_populated_v20_database_without_restating_it() 
     let movements_before = snapshot(&db, "inventory_movements").await;
     let uoms_before = snapshot(&db, "product_uoms").await;
 
-    db.migrate_again().await.expect("migration 021 must apply");
+    // THROUGH 21. This test is about what 021 does on its own, and 022 does add
+    // two columns to `sale_items` — running the whole migrator would turn a
+    // precise statement about one migration into a false one about the next.
+    db.migrate_through(21).await.expect("migration 021 must apply");
 
     // Not one byte of any existing table moved. 021 adds no column anywhere,
     // so these are plain equalities rather than `assert_only_null_columns_appended`.
@@ -4240,7 +4243,7 @@ async fn migration_021_upgrades_a_populated_v20_database_without_restating_it() 
 
     assert_eq!(
         db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
-        latest_migration_version()
+        21
     );
 }
 
@@ -4249,7 +4252,9 @@ async fn migration_021_upgrades_a_populated_v20_database_without_restating_it() 
 /// CHECK was that B2 would need no `products` rebuild.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migration_021_adds_no_column_to_any_existing_table() {
-    let fresh = TempDb::new().await;
+    // Both sides pinned to 21: `TempDb::new()` is the LATEST schema, which from
+    // 022 onward is not v21 any more.
+    let v21 = TempDb::at_schema_version(21).await;
     let v20 = TempDb::at_schema_version(20).await;
 
     for table in [
@@ -4264,7 +4269,7 @@ async fn migration_021_adds_no_column_to_any_existing_table() {
                (SELECT name FROM pragma_table_info('{table}') ORDER BY name)"
         );
         assert_eq!(
-            fresh.scalar_string(&sql).await,
+            v21.scalar_string(&sql).await,
             v20.scalar_string(&sql).await,
             "{table} must be identical at v20 and v21"
         );
@@ -4328,7 +4333,10 @@ async fn a_virgin_v21_database_holds_no_recipe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migration_021_leaves_the_recipe_costing_refusal_in_place() {
     let db = populated_v20_database().await;
-    db.migrate_again().await.expect("migration 021 must apply");
+    // THROUGH 21, not "everything". This assertion is about what 021 does on
+    // its own; running the whole migrator would turn it into an assertion about
+    // 022, which relaxes exactly this rule on purpose.
+    db.migrate_through(21).await.expect("migration 021 must apply");
 
     for sql in [
         "UPDATE products SET costing_method = 'recipe' WHERE id = 'b2-burger'",
@@ -4358,4 +4366,382 @@ async fn migration_021_leaves_the_recipe_costing_refusal_in_place() {
         .await,
         2
     );
+}
+
+// ===========================================================================
+// Migration 022 — recipe-derived sale costing (WP-B2-B)
+// ===========================================================================
+
+/// A populated v21 database: everything `populated_v20_database` holds, plus a
+/// PUBLISHED recipe, so the 022 upgrade has something of every shape to leave
+/// alone.
+async fn populated_v21_database() -> TempDb {
+    let db = populated_v20_database().await;
+    db.migrate_through(21).await.expect("migration 021 must apply");
+    // Built as a DRAFT and promoted last, because 021 seals a published
+    // version against new ingredient lines — the same build-then-promote shape
+    // `save_recipe_draft` and `activate_recipe` use.
+    db.exec(&format!(
+        "INSERT INTO recipes (id, store_id, product_id, version, yield_quantity_base,
+           status, created_at, updated_at)
+         VALUES ('b2-recipe', '{STORE_ID}', 'b2-burger', 1, 1,
+                 'draft', '2026-10-26T08:00:00.000Z', '2026-10-26T08:00:00.000Z')"
+    ))
+    .await;
+    db.exec(&format!(
+        "INSERT INTO recipe_components (id, recipe_id, store_id, component_product_id,
+           quantity_num, quantity_den, uom_code,
+           product_uom_id_snapshot, factor_num_snapshot, factor_den_snapshot,
+           waste_bps, sort_order)
+         VALUES ('b2-rc1', 'b2-recipe', '{STORE_ID}', 'b2-bun',
+                 2, 1, 'each', 'b2-bun-uom', 1, 1, 0, 0)"
+    ))
+    .await;
+    db.exec(
+        "UPDATE recipes SET status='active', activated_at='2026-10-26T09:00:00.000Z'
+          WHERE id='b2-recipe'",
+    )
+    .await;
+    db
+}
+
+/// The whole safety claim of migration 022: it adds two NULL columns and one
+/// empty table, and restates nothing that was already posted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_022_upgrades_a_populated_v21_database_without_restating_it() {
+    let db = populated_v21_database().await;
+
+    let products_before = snapshot(&db, "products").await;
+    let sales_before = snapshot(&db, "sales").await;
+    let items_before = snapshot(&db, "sale_items").await;
+    let movements_before = snapshot(&db, "inventory_movements").await;
+    let payments_before = snapshot(&db, "sale_payments").await;
+    let recipes_before = snapshot(&db, "recipes").await;
+    let components_before = snapshot(&db, "recipe_components").await;
+
+    db.migrate_again().await.expect("migration 022 must apply");
+
+    // `sale_items` gains exactly two columns, both NULL on every existing row.
+    assert_only_null_columns_appended(
+        &items_before,
+        &snapshot(&db, "sale_items").await,
+        "sale_items",
+    );
+    // Nothing else moves at all.
+    assert_eq!(snapshot(&db, "products").await, products_before);
+    assert_eq!(snapshot(&db, "sales").await, sales_before);
+    assert_eq!(snapshot(&db, "inventory_movements").await, movements_before);
+    assert_eq!(snapshot(&db, "sale_payments").await, payments_before);
+    assert_eq!(snapshot(&db, "recipes").await, recipes_before);
+    assert_eq!(snapshot(&db, "recipe_components").await, components_before);
+
+    // The posted line's FINANCIAL figures are byte for byte what they were,
+    // named one by one rather than left to a digest: these are the numbers a
+    // migration can never be allowed to move.
+    assert_eq!(
+        db.scalar_string(
+            "SELECT unit_cogs_excl_vat_cents || '/' || line_cogs_excl_vat_cents || '/' ||
+                    unit_cogs_excl_vat_microcents || '/' || COALESCE(cogs_source,'none') || '/' ||
+                    line_total_incl_vat_cents || '/' || line_vat_cents
+               FROM sale_items WHERE id = 'b2-line'"
+        )
+        .await,
+        "185/185/185000000/standard/1110/110"
+    );
+    assert_eq!(
+        db.scalar_string(
+            "SELECT cogs_total_cents || '/' || total_incl_vat_cents || '/' || receipt_number
+               FROM sales WHERE id = 'b2-sale'"
+        )
+        .await,
+        "185/1110/1"
+    );
+    // And the legacy line carries NO recipe identity, which is the truth about
+    // it: it was posted before a recipe could cost anything.
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sale_items
+              WHERE recipe_id IS NOT NULL OR recipe_version IS NOT NULL"
+        )
+        .await,
+        0
+    );
+
+    // The new table exists and is EMPTY. A migration is not a fixture.
+    assert_eq!(db.count("SELECT COUNT(*) FROM sale_item_recipe_costs").await, 0);
+
+    assert_eq!(
+        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
+        latest_migration_version()
+    );
+}
+
+/// 022 REPLACES 020's trigger pair rather than leaving it in place — the 017
+/// lesson, asserted so it cannot regress to `IF NOT EXISTS`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_022_replaces_the_costing_coherence_triggers() {
+    let db = populated_v21_database().await;
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type='trigger'
+                AND name IN ('trg_products_costing_coherence_ins',
+                             'trg_products_costing_coherence_upd')
+                AND sql LIKE '%not implemented%'"
+        )
+        .await,
+        2,
+        "the v21 database starts with 020's refusing pair"
+    );
+
+    db.migrate_again().await.expect("migration 022 must apply");
+
+    assert_eq!(
+        db.count(
+            "SELECT COUNT(*) FROM sqlite_master
+              WHERE type='trigger'
+                AND name IN ('trg_products_costing_coherence_ins',
+                             'trg_products_costing_coherence_upd')
+                AND sql LIKE '%not implemented%'"
+        )
+        .await,
+        0,
+        "and ends with neither of them"
+    );
+
+    // The burger has a published recipe, so it may now be recipe-costed...
+    db.exec("UPDATE products SET costing_method='recipe' WHERE id='b2-burger'")
+        .await;
+    assert_eq!(
+        db.scalar_string("SELECT costing_method FROM products WHERE id='b2-burger'")
+            .await,
+        "recipe"
+    );
+    // ...and the bun, which is STOCKED, may not, whatever recipes exist.
+    let e = db
+        .exec_err("UPDATE products SET costing_method='recipe' WHERE id='b2-bun'")
+        .await;
+    assert!(e.contains("non-stock menu items only"), "{e}");
+
+    // A non-stock item with no published recipe is refused for the OTHER
+    // reason, which is the clause this pair of assertions exists to separate.
+    db.exec(&format!(
+        "INSERT INTO products (id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+           price_excl_vat_cents, price_incl_vat_cents, is_service, costing_method)
+         VALUES ('b2-wrap', '{STORE_ID}', 'SKU-WRAP', 'Greaz Wrap', '{VAT_STD_ID}',
+                 'inclusive', 800, 888, 1, 'purchase_average')"
+    ))
+    .await;
+    let e = db
+        .exec_err("UPDATE products SET costing_method='recipe' WHERE id='b2-wrap'")
+        .await;
+    assert!(e.contains("published recipe"), "{e}");
+
+    // And the INSERT guard says the same thing, so a row cannot be born wrong.
+    let e = db
+        .exec_err(&format!(
+            "INSERT INTO products (id, store_id, sku, name, vat_rate_id, vat_pricing_mode,
+               price_excl_vat_cents, price_incl_vat_cents, is_service, costing_method)
+             VALUES ('b2-new', '{STORE_ID}', 'SKU-NEW', 'New item', '{VAT_STD_ID}',
+                     'inclusive', 100, 111, 1, 'recipe')"
+        ))
+        .await;
+    assert!(e.contains("published recipe"), "{e}");
+    // Manual Cost's two rules survive 022 unchanged.
+    let e = db
+        .exec_err("UPDATE products SET costing_method='standard' WHERE id='b2-bun'")
+        .await;
+    assert!(e.contains("needs a cost"), "{e}");
+}
+
+/// The GUARDS migration 022 must be carrying after the P1 correction, named
+/// one by one against `sqlite_master`.
+///
+/// A trigger that is supposed to exist and does not is the whole class of
+/// defect this correction is answering: the first cut of 022 shipped an
+/// evidence-completeness guard that checked for ONE row, and an INSERT-only
+/// coherence rule on `sale_items`. Nothing in the suite asserted which guards
+/// were present, so the gap could only be found by reading the SQL. This test
+/// is what makes a silently dropped or weakened guard a failing test instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_022_installs_every_recipe_integrity_guard() {
+    let db = populated_v21_database().await;
+    db.migrate_again().await.expect("migration 022 must apply");
+
+    for name in [
+        // The evidence table's three seals.
+        "trg_sale_item_recipe_costs_no_insert_after_post",
+        "trg_sale_item_recipe_costs_no_update",
+        "trg_sale_item_recipe_costs_no_delete",
+        // Per-row coherence, membership, physics and arithmetic.
+        "trg_sale_item_recipe_costs_coherence",
+        // The line's own identity rules, on BOTH paths. The `_upd` arm is the
+        // P1-B correction: without it a draft line was an ordinary updatable
+        // row between construction and promotion.
+        "trg_sale_items_recipe_coherence",
+        "trg_sale_items_recipe_coherence_upd",
+        // Set completeness at promotion.
+        "trg_sales_recipe_evidence_complete",
+        // Configuration, and the P2 retirement guard.
+        "trg_products_costing_coherence_ins",
+        "trg_products_costing_coherence_upd",
+        "trg_recipes_no_retire_while_product_depends",
+        // The component bound Rust has always had and migration 021 did not.
+        "trg_recipe_components_max_count",
+        // The posting state machine: `status` and `posted_at` are two markers
+        // of one fact, and 001 never tied them together.
+        "trg_sales_born_a_draft",
+        "trg_sales_posting_state_coherent",
+    ] {
+        assert_eq!(
+            db.count(&format!(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='trigger' AND name='{name}'"
+            ))
+            .await,
+            1,
+            "migration 022 must install {name}"
+        );
+    }
+
+    // The completeness guard must be about the SET, not about the presence of
+    // one row. Asserted against the trigger's own text, because that is the
+    // only thing that distinguishes the corrected version from the first cut
+    // at the schema level — and the first cut passed every behavioural test
+    // that existed.
+    let completeness = db
+        .scalar_string(
+            "SELECT sql FROM sqlite_master
+              WHERE type='trigger' AND name='trg_sales_recipe_evidence_complete'",
+        )
+        .await;
+    for fragment in [
+        "recipe_components",         // it consults the recipe's component set
+        "incomplete recipe-cost",    // a missing ingredient is named as such
+        "exactly one row",           // and the count is asserted
+        "contribution_microcents",   // the arithmetic is reconciled
+        "yield_quantity_base",       // against the published batch yield
+        // The three P1 corrections, each identifiable in the trigger's own
+        // text — which is the only thing that tells the corrected version from
+        // a cut that passed every behavioural test then in existence.
+        "r.status = 'active'",       // P1-A: only a published version may cost
+        "+ 500000) / 1000000",       // P1-B: the exact Rust rounding rule
+        "cogs_total_cents <> (",     // P1-B: the header is the sum of its lines
+        "> 64",                      // P1-C: the component bound, before SUM
+        "typeof(",                   // P1-C: integer storage, not affinity
+    ] {
+        assert!(
+            completeness.contains(fragment),
+            "the completeness guard must reference {fragment:?}"
+        );
+    }
+
+    // ...and the ROUNDING rule must not be SQLite's floating-point `ROUND()`.
+    // A float is not a rounding rule, and `cost.rs` is half away from zero.
+    // Comment lines are stripped first: the trigger's own prose SAYS it does
+    // not use `ROUND()`, and a test that cannot tell a comment from an
+    // expression would be satisfied by the opposite claim just as readily.
+    let executable: String = completeness
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("
+");
+    assert!(
+        !executable.to_uppercase().contains("ROUND("),
+        "the cent reconciliation must not use SQLite's ROUND()"
+    );
+
+    assert!(
+        !completeness.contains("UPDATE OF posted_at"),
+        "finalization must not be keyed on one column: `UPDATE sales SET          status='posted'` changes no column that form watches"
+    );
+    assert!(
+        completeness.contains("NEW.status = 'posted'")
+            && completeness.contains("NEW.posted_at IS NOT NULL AND OLD.posted_at IS NULL"),
+        "finalization must fire on EITHER marker moving into the posted state, so it is          correct independently of the state trigger's firing order"
+    );
+
+    // The per-row guard carries the same three preconditions, in the same
+    // order: storage class, then range, then the magnitude gate. Asserted on
+    // POSITION, because an ordering mistake here is exactly how an overflowed
+    // product reaches a comparison.
+    let per_row = db
+        .scalar_string(
+            "SELECT sql FROM sqlite_master
+              WHERE type='trigger' AND name='trg_sale_item_recipe_costs_coherence'",
+        )
+        .await;
+    let at = |needle: &str| {
+        per_row
+            .find(needle)
+            .unwrap_or_else(|| panic!("the per-row guard must reference {needle:?}"))
+    };
+    assert!(
+        at("typeof(NEW.quantity_num)") < at("NEW.quantity_num        < 1"),
+        "storage class is checked before range"
+    );
+    assert!(
+        at("NEW.quantity_num        < 1") < at("4000000000000000000"),
+        "range is checked before the magnitude gate"
+    );
+    assert!(
+        at("4000000000000000000") < at("ABS("),
+        "the magnitude gate is checked before the arithmetic it protects"
+    );
+}
+
+/// Re-running 022 changes nothing, and an upgraded database is identical to a
+/// fresh one — or a bug reproduces on only one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_v21_upgrade_converges_on_the_same_schema_as_a_fresh_install() {
+    let fresh = TempDb::new().await;
+    let upgraded = populated_v21_database().await;
+    upgraded.migrate_again().await.expect("migration 022 must apply");
+    upgraded.migrate_again().await.expect("second run must be a no-op");
+
+    let schema_sql = "SELECT COALESCE(GROUP_CONCAT(sql, ';'), '') FROM \
+                      (SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type, name)";
+    assert_eq!(
+        fresh.scalar_string(schema_sql).await,
+        upgraded.scalar_string(schema_sql).await,
+        "a v21 upgrade and a fresh install must have identical schemas"
+    );
+}
+
+/// 022 touches no table but `sale_items`, and adds only the two columns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migration_022_adds_only_two_columns_and_only_to_sale_items() {
+    let v22 = TempDb::new().await;
+    let v21 = TempDb::at_schema_version(21).await;
+
+    for table in [
+        "products",
+        "product_uoms",
+        "sales",
+        "sale_payments",
+        "inventory_movements",
+        "recipes",
+        "recipe_components",
+    ] {
+        let sql = format!(
+            "SELECT COALESCE(GROUP_CONCAT(name, ','), '') FROM
+               (SELECT name FROM pragma_table_info('{table}') ORDER BY name)"
+        );
+        assert_eq!(
+            v22.scalar_string(&sql).await,
+            v21.scalar_string(&sql).await,
+            "{table} must be identical at v21 and v22"
+        );
+    }
+
+    let cols = "SELECT COALESCE(GROUP_CONCAT(name, ','), '') FROM
+                  (SELECT name FROM pragma_table_info('sale_items') ORDER BY name)";
+    let before = v21.scalar_string(cols).await;
+    let after = v22.scalar_string(cols).await;
+    let added: Vec<&str> = after
+        .split(',')
+        .filter(|c| !before.split(',').any(|b| b == *c))
+        .collect();
+    assert_eq!(added, vec!["recipe_id", "recipe_version"]);
 }

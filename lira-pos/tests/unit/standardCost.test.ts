@@ -16,6 +16,7 @@ import {
   SELECTABLE_COSTING_METHODS,
   cogsSourceLabelKey,
   costConfigurationStatus,
+  costSourceShortKey,
   costStatusLabelKey,
   effectiveUnitCostMicrocents,
   formatManualCostInput,
@@ -127,12 +128,20 @@ describe("formatManualCostInput", () => {
 
 describe("costing method vocabulary", () => {
   it("states the schema's whole domain, and the selectable subset separately", () => {
-    // `recipe` is in migration 020's CHECK so that shipping WP-B2 needs no
-    // `products` table rebuild — SQLite cannot ALTER a CHECK and that table
-    // is referenced by every posted document family. It is not offered.
+    // `recipe` was in migration 020's CHECK so that shipping WP-B2 would need
+    // no `products` table rebuild — SQLite cannot ALTER a CHECK and that table
+    // is referenced by every posted document family. WP-B2-B (migration 022)
+    // made it selectable, under two conditions this list does not express:
+    // the item must be non-stock and must have a published recipe, both of
+    // which are questions about a particular product rather than about the
+    // vocabulary.
     expect(COSTING_METHODS).toEqual(["purchase_average", "standard", "recipe"]);
-    expect(SELECTABLE_COSTING_METHODS).toEqual(["purchase_average", "standard"]);
-    expect(isSelectableCostingMethod("recipe")).toBe(false);
+    expect(SELECTABLE_COSTING_METHODS).toEqual([
+      "purchase_average",
+      "standard",
+      "recipe",
+    ]);
+    expect(isSelectableCostingMethod("recipe")).toBe(true);
     expect(isSelectableCostingMethod("standard")).toBe(true);
   });
 
@@ -257,6 +266,83 @@ describe("costConfigurationStatus", () => {
   it("names a label key for every status", () => {
     expect(costStatusLabelKey("manual_zero")).toBe("costing.status.manual_zero");
   });
+
+  // -------------------------------------------------------------------------
+  // WP-B2-B P2: a recipe-costed item reads from its RECIPE, not from an
+  // average it never consults.
+  // -------------------------------------------------------------------------
+
+  const recipeItem = {
+    costingMethod: "recipe" as const,
+    standardCostExclVatMicrocents: null,
+    isService: true,
+    avgCostExclVatMicrocents: 0,
+  };
+
+  it("reports a properly configured recipe-costed item as costed from its recipe", () => {
+    // The defect this closes: with no recipe branch at all, this product fell
+    // through to `service_uncosted` — "no cost configured, margins read as
+    // 100%" — about the one item whose cost the owner had built a recipe for.
+    expect(
+      costConfigurationStatus(recipeItem, {
+        hasActive: true,
+        perBaseUnitMicrocents: 173_875_000,
+      }),
+    ).toBe("recipe");
+  });
+
+  it("separates NO published recipe from a recipe that cannot be costed", () => {
+    // Two different problems with two different remedies, so two statuses.
+    expect(
+      costConfigurationStatus(recipeItem, { hasActive: false, perBaseUnitMicrocents: null }),
+    ).toBe("recipe_missing");
+    expect(
+      costConfigurationStatus(recipeItem, { hasActive: true, perBaseUnitMicrocents: null }),
+    ).toBe("recipe_uncosted");
+  });
+
+  it("errs towards 'no recipe' when a caller supplies no recipe information", () => {
+    // The safe direction: it invites the owner to look, where the reverse
+    // would print a cost for an item that cannot be sold at all.
+    expect(costConfigurationStatus(recipeItem)).toBe("recipe_missing");
+  });
+
+  it("ignores an inert Manual Cost and a zero average under recipe costing", () => {
+    // A previously typed Manual Cost is carried through rather than wiped, so
+    // it is still on the row — and it must never be printed as the item's
+    // cost while the method says `recipe`.
+    expect(
+      costConfigurationStatus(
+        { ...recipeItem, standardCostExclVatMicrocents: 999_000_000 },
+        { hasActive: true, perBaseUnitMicrocents: 173_875_000 },
+      ),
+    ).toBe("recipe");
+    expect(
+      effectiveUnitCostMicrocents(
+        { ...recipeItem, standardCostExclVatMicrocents: 999_000_000 },
+        { hasActive: true, perBaseUnitMicrocents: 173_875_000 },
+      ),
+    ).toBe(173_875_000);
+  });
+
+  it("treats both recipe gaps as gaps", () => {
+    expect(isUncostedStatus("recipe_missing")).toBe(true);
+    expect(isUncostedStatus("recipe_uncosted")).toBe(true);
+    expect(isUncostedStatus("recipe")).toBe(false);
+  });
+
+  it("labels the source under the figure from the STATUS, never the method alone", () => {
+    expect(costSourceShortKey("recipe")).toBe("costing.sourceShort.recipe");
+    // A method with no usable figure behind it must not advertise itself as
+    // the source of one.
+    expect(costSourceShortKey("recipe_missing")).toBe("costing.sourceShort.uncosted");
+    expect(costSourceShortKey("recipe_uncosted")).toBe("costing.sourceShort.uncosted");
+    expect(costSourceShortKey("manual")).toBe("costing.sourceShort.standard");
+    expect(costSourceShortKey("manual_zero")).toBe("costing.sourceShort.standard");
+    expect(costSourceShortKey("purchase")).toBe("costing.sourceShort.purchase_average");
+    expect(costSourceShortKey("purchase_uncosted")).toBe("costing.sourceShort.uncosted");
+    expect(costSourceShortKey("service_uncosted")).toBe("costing.sourceShort.uncosted");
+  });
 });
 
 describe("effectiveUnitCostMicrocents", () => {
@@ -282,6 +368,39 @@ describe("effectiveUnitCostMicrocents", () => {
         isService: true,
       }),
     ).toBeNull();
+  });
+
+  it("shows a recipe-costed item its recipe's rate, and ABSENCE as null", () => {
+    expect(
+      effectiveUnitCostMicrocents(
+        {
+          costingMethod: "recipe",
+          standardCostExclVatMicrocents: null,
+          avgCostExclVatMicrocents: 0,
+          isService: true,
+        },
+        { hasActive: true, perBaseUnitMicrocents: 8_693_750 },
+      ),
+    ).toBe(8_693_750);
+    // No active recipe, and a recipe whose ingredients cannot be costed: both
+    // are `null`, never 0. A zero here reads as a real cost and prints a 100%
+    // margin.
+    for (const recipe of [
+      { hasActive: false, perBaseUnitMicrocents: null },
+      { hasActive: true, perBaseUnitMicrocents: null },
+    ]) {
+      expect(
+        effectiveUnitCostMicrocents(
+          {
+            costingMethod: "recipe",
+            standardCostExclVatMicrocents: null,
+            avgCostExclVatMicrocents: 0,
+            isService: true,
+          },
+          recipe,
+        ),
+      ).toBeNull();
+    }
   });
 
   it("shows a stocked product's weighted average, and its zero as a zero", () => {

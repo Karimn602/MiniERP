@@ -3659,6 +3659,14 @@ struct ResolvedLine {
     /// one the owner typed — and, above all, to stop presenting an uncosted
     /// line's zero as a verified 100% margin.
     cogs_source: &'static str,
+    /// WP-B2-B: present only when `cogs_source == "recipe"`. Carries the recipe
+    /// identity and version the line was costed from, and the per-ingredient
+    /// evidence written beside the line in the same transaction.
+    ///
+    /// Derived from the database like the rate above it, so a replay cannot
+    /// carry a conflicting recipe and this stays out of the canonical content
+    /// comparison — the same reasoning `cogs_source` itself follows.
+    recipe: Option<crate::recipe_sale_cost::PostedRecipeCost>,
 }
 
 /// Does this product have a persisted VALUATION BASIS — evidence that somebody
@@ -4128,7 +4136,56 @@ pub(crate) async fn post_sale_tx(
         // Every basis is read from the microcent columns, so a cost that is a
         // fraction of a cent per base unit is costed at that fraction and not
         // at zero.
-        let (unit_excl_mc, unit_incl_mc, cogs_source) = if costing_method == "standard" {
+        // WP-B2-B: the recipe branch sits FIRST among the product-level methods
+        // and fills this slot, which the line's `sale_items` columns and its
+        // evidence rows are both written from.
+        let mut line_recipe: Option<crate::recipe_sale_cost::PostedRecipeCost> = None;
+
+        let (unit_excl_mc, unit_incl_mc, cogs_source) = if costing_method == "recipe" {
+            // A RECIPE-DERIVED COST (WP-B2-B).
+            //
+            // Restricted to non-stock items, and refused here as well as by
+            // migration 022's trigger, for the reason WP-B1 restricted Manual
+            // Cost: a recipe rate on a stocked line would be stamped onto the
+            // sale's `inventory_movements` row while the cost pool those goods
+            // left says something else, and that table is append-only.
+            if !is_service {
+                return Err(format!(
+                    "Line {}: \"{}\" {}",
+                    i + 1,
+                    line.product_name_snapshot,
+                    crate::recipe_sale_cost::RECIPE_COSTING_NEEDS_SERVICE
+                ));
+            }
+            // Resolved from the DATABASE inside this transaction: the active
+            // recipe's frozen quantities and conversions, and its ingredients'
+            // rates as they stand today. There is no field for a recipe, an
+            // ingredient or a rate on the wire, so no cashier-controlled
+            // request data can set one.
+            //
+            // A refusal here — no published recipe, an ingredient with no cost
+            // basis, a figure outside the proven arithmetic envelope — returns
+            // Err and rolls the whole transaction back, which un-consumes the
+            // receipt number taken above with everything else. Nothing partial
+            // is left behind.
+            let costed = crate::recipe_sale_cost::cost_sale_line_from_active_recipe(
+                &mut tx,
+                &payload.store_id,
+                &line.product_id,
+                &line.product_name_snapshot,
+            )
+            .await
+            .map_err(|e| format!("Line {}: {e}", i + 1))?;
+            let rate = costed.per_base_unit_microcents;
+            line_recipe = Some(costed);
+            // Stated EXCLUSIVE of VAT with no inclusive sibling, exactly as a
+            // manual standard cost is: every COGS figure any report reads is
+            // net, and an ingredient-derived cost has no single VAT rate to
+            // gross up by. The incl slot is carried at the same value and
+            // reaches no row — a service line writes no movement, and the
+            // movement is the only place `unit_cogs_incl_mc` is persisted.
+            (rate, rate, "recipe")
+        } else if costing_method == "standard" {
             // A MANUAL STANDARD COST (WP-B1).
             //
             // Restricted to non-stock items, and refused here as well as by
@@ -4250,6 +4307,7 @@ pub(crate) async fn post_sale_tx(
             unit_cogs_incl_mc: unit_incl_mc,
             line_cogs_cents,
             cogs_source,
+            recipe: line_recipe,
         });
     }
 
@@ -4312,8 +4370,9 @@ pub(crate) async fn post_sale_tx(
                  quantity_in_uom, uom_code_snapshot,
                  factor_num_snapshot, factor_den_snapshot,
                  kitchen_note,
-                 cogs_source
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 cogs_source,
+                 recipe_id, recipe_version
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&line.sale_item_id)
         .bind(&payload.sale_id)
@@ -4346,9 +4405,70 @@ pub(crate) async fn post_sale_tx(
         // product row, so it describes how this line was costed and not what
         // the caller hoped.
         .bind(r.cogs_source)
+        // WP-B2-B: WHICH recipe, and WHICH VERSION. NULL on every line not
+        // costed from one, which is every line a v21 database ever wrote.
+        // Migration 022's `trg_sale_items_recipe_coherence` refuses the three
+        // ways these and `cogs_source` could disagree.
+        .bind(r.recipe.as_ref().map(|rc| rc.recipe_id.as_str()))
+        .bind(r.recipe.as_ref().map(|rc| rc.version))
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("insert sale_item: {e}"))?;
+
+        // ---- The evidence that explains a recipe-costed line (WP-B2-B) ----
+        //
+        // Written in the SAME transaction as the line it explains and before
+        // the sale is promoted, so `trg_sales_recipe_evidence_complete` can
+        // make "a posted sale never references missing evidence" a property of
+        // the engine rather than a property of this function. A failure here
+        // rolls back the sale, its lines, its tender, its movements and its
+        // receipt number together.
+        //
+        // No `inventory_movements` row is written for any ingredient, and no
+        // ingredient's `quantity_on_hand` or `avg_cost_*` is touched. That is
+        // WP-B3's job, and B2-B deliberately does not do half of it.
+        if let Some(rc) = &r.recipe {
+            for component in &rc.components {
+                sqlx::query(
+                    r#"INSERT INTO sale_item_recipe_costs (
+                         id, sale_id, sale_item_id, store_id,
+                         recipe_id, recipe_version,
+                         component_product_id, component_name_snapshot,
+                         uom_code, quantity_num, quantity_den,
+                         factor_num_snapshot, factor_den_snapshot,
+                         waste_bps,
+                         unit_cost_excl_vat_microcents, cost_source,
+                         contribution_microcents, sort_order
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&payload.sale_id)
+                .bind(&line.sale_item_id)
+                .bind(&payload.store_id)
+                .bind(&rc.recipe_id)
+                .bind(rc.version)
+                .bind(&component.component_product_id)
+                .bind(&component.component_name_snapshot)
+                .bind(&component.uom_code)
+                .bind(component.quantity_num)
+                .bind(component.quantity_den)
+                .bind(component.factor_num_snapshot)
+                .bind(component.factor_den_snapshot)
+                .bind(component.waste_bps)
+                .bind(component.unit_cost_excl_vat_microcents)
+                .bind(component.cost_source)
+                .bind(component.contribution_microcents)
+                .bind(component.sort_order)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "insert recipe cost evidence for \"{}\": {e}",
+                        component.component_name_snapshot
+                    )
+                })?;
+            }
+        }
 
         // Services don't move stock or generate inventory_movements rows.
         // The DB's is_service decides, never the payload's (GP-A05).

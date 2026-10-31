@@ -299,7 +299,23 @@ pub(crate) fn validate_save_product(payload: &SaveProductPayload) -> Result<(), 
                 return Err(MANUAL_COST_NEEDS_SERVICE.into());
             }
         }
-        Some("recipe") => return Err(RECIPE_COSTING_UNIMPLEMENTED.into()),
+        Some("recipe") => {
+            // WP-B2-B. Only the SHAPE half is decidable here: whether the item
+            // is stocked is on the payload, and the financial argument is the
+            // same one Manual Cost makes one branch up — a recipe-derived rate
+            // on a stocked line would be stamped onto the sale's
+            // `inventory_movements` row while the pool those goods left from
+            // says something else, and that table is append-only.
+            //
+            // The other condition — that a published recipe exists to cost the
+            // item from — is not shape: it is a question about the database,
+            // and it is asked in `save_product_tx`, inside the transaction that
+            // writes the row. Migration 022's trigger pair holds both against
+            // every other writer.
+            if !payload.is_service {
+                return Err(RECIPE_COSTING_NEEDS_SERVICE.into());
+            }
+        }
         Some(other) => return Err(format!("Invalid costing method: {other}")),
     }
     if payload.standard_cost_excl_vat_microcents.is_some_and(|c| c < 0) {
@@ -342,10 +358,23 @@ pub const MANUAL_COST_NEEDS_SERVICE: &str =
      purchases, so a typed cost would contradict the inventory movements its sales write. \
      Mark the item as a service (no stock tracking), or leave it on purchase valuation.";
 
-/// Recipe costing is WP-B2. The enum value exists in the schema so that
-/// shipping it needs no `products` table rebuild; nothing honours it yet.
-pub const RECIPE_COSTING_UNIMPLEMENTED: &str =
-    "Recipe costing is not implemented yet. Choose purchase valuation or Manual Cost.";
+/// Recipe costing was chosen for a stocked product (WP-B2-B).
+pub const RECIPE_COSTING_NEEDS_SERVICE: &str =
+    "Recipe costing applies to non-stock menu items only. A stocked product is valued from its \
+     purchases, so a recipe-derived cost would contradict the inventory movements its sales \
+     write. Mark the item as a service (no stock tracking), or leave it on purchase valuation.";
+
+/// Recipe costing was chosen for a product with no published recipe (WP-B2-B).
+///
+/// Refused when the method is SET rather than at the till, because a product
+/// configured this way cannot be sold at all: `post_sale` would have nothing to
+/// cost it from and would stop in front of a customer for a mistake made days
+/// earlier on another screen. B2-A's `retire_recipe` refuses to retire the
+/// active version while the product is recipe-costed, so the two guards close
+/// the loop from both ends.
+pub const RECIPE_COSTING_NEEDS_ACTIVE_RECIPE: &str =
+    "Recipe costing needs a published recipe. Open this item's Recipe, add its ingredients and \
+     publish it, then set the costing method.";
 
 #[tauri::command]
 pub async fn save_product(
@@ -400,6 +429,16 @@ pub(crate) async fn save_product_tx(
         .to_string();
 
     if payload.mode == "create" {
+        // ---- Recipe costing needs a recipe, and a new product has none ----
+        //
+        // Not a special case so much as the general rule arriving early: a
+        // recipe belongs to a product, so a product being created cannot yet
+        // have a published one. Said in the same words the update path uses,
+        // because from the operator's side it is the same mistake.
+        if created_costing_method(&payload) == "recipe" {
+            return Err(RECIPE_COSTING_NEEDS_ACTIVE_RECIPE.into());
+        }
+
         // ---- Stock and cost are NOT this command's to set (GZ-HI-10) ----
         //
         // A new product starts with nothing on the shelf and no cost basis,
@@ -598,6 +637,35 @@ pub(crate) async fn save_product_tx(
                     (method.to_string(), new_cost, set_at)
                 }
             };
+
+        // ---- Recipe costing needs a PUBLISHED recipe (WP-B2-B) ----
+        //
+        // The half of 022's rule that is a question about the database rather
+        // than about the payload, asked inside the writing transaction so the
+        // answer cannot change between the check and the UPDATE. Migration
+        // 022's trigger holds the same rule against every other writer; this is
+        // the half that can explain itself in a sentence the operator can act
+        // on, and it names the screen they need.
+        //
+        // Scoped by product AND store, because a recipe of another branch is
+        // not this product's recipe — the mistake 021's `activate_recipe` was
+        // written to avoid one level up.
+        if costing_method == "recipe" {
+            let published: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(
+                   SELECT 1 FROM recipes
+                    WHERE product_id = ? AND store_id = ? AND status = 'active'
+                 )",
+            )
+            .bind(&payload.product_id)
+            .bind(&payload.store_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| format!("read published recipe for {}: {e}", payload.product_id))?;
+            if published == 0 {
+                return Err(RECIPE_COSTING_NEEDS_ACTIVE_RECIPE.into());
+            }
+        }
 
         // ---- Stocked -> service, with stock on the shelf, is REFUSED ----
         //

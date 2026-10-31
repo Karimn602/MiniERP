@@ -73,6 +73,8 @@ interface SaleItemRow {
   factor_den_snapshot: number | null;
   kitchen_note: string | null;
   cogs_source: string | null;
+  recipe_id: string | null;
+  recipe_version: number | null;
 }
 
 interface SalePaymentRow {
@@ -157,6 +159,12 @@ function toSaleItem(r: SaleItemRow): SaleItem {
     // pre-020 database carries — reads as `null`, which is exactly what
     // "costed before this feature existed" means (WP-B1).
     cogsSource: normalizeCogsSource(r.cogs_source),
+    // WP-B2-B. WHICH published recipe version costed this line, so the figure
+    // above stays explainable after version 2 is published and version 1
+    // retired. `null` on every line not costed from a recipe, which is every
+    // line any database wrote before migration 022.
+    recipeId: r.recipe_id ?? null,
+    recipeVersion: r.recipe_version ?? null,
   };
 }
 

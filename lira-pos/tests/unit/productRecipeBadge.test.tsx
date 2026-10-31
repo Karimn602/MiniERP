@@ -136,6 +136,8 @@ function summary(over: Partial<RecipeSummary> & { productId: string }): RecipeSu
     hasActive: false,
     activeVersion: null,
     retiredCount: 0,
+    activeYieldQuantityBase: null,
+    activeCostPerBaseUnitMicrocents: null,
     ...over,
   };
 }
@@ -217,7 +219,7 @@ describe("the recipe badge on a product row", () => {
     expect(screen.queryByText("retired")).toBeNull();
     expect(screen.queryByText(/^v\d*$/)).toBeNull();
     // The action itself is still offered, because every item may acquire one.
-    expect(screen.getByText("Recipe")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Recipe" })).toBeTruthy();
   });
 
   it("shows nothing active for a summary row that is somehow empty", async () => {
@@ -230,5 +232,121 @@ describe("the recipe badge on a product row", () => {
     await waitFor(() => expect(screen.getByText("Empty summary")).toBeTruthy());
     expect(screen.queryByText("retired")).toBeNull();
     expect(screen.queryByText("draft")).toBeNull();
+  });
+});
+
+// ===========================================================================
+// WP-B2-B P2 — THE COST CELL ON A RECIPE-COSTED ROW
+//
+// The defect: `effectiveUnitCostMicrocents` and `costConfigurationStatus` had
+// no `recipe` branch, so a correctly configured recipe-costed burger fell
+// through to a stocked product's zero average and the list printed "—" over
+// the word "None" — the catalogue telling the owner nobody had costed the one
+// item they had built a recipe for. The source label was computed inline from
+// a two-branch ternary with no recipe arm at all.
+// ===========================================================================
+
+function recipeItem(id: string, name: string): ProductWithUoms {
+  return { ...item(id, name), costingMethod: "recipe" };
+}
+
+describe("the cost cell on a recipe-costed product row", () => {
+  it("prints the recipe's estimated rate and names the recipe as the source", async () => {
+    await renderProducts(
+      [recipeItem("p-recipe", "Recipe burger")],
+      [
+        summary({
+          productId: "p-recipe",
+          hasActive: true,
+          activeVersion: 1,
+          activeYieldQuantityBase: 1,
+          activeCostPerBaseUnitMicrocents: 173_875_000,
+        }),
+      ],
+    );
+    expect(await screen.findByText("$1.73875")).toBeTruthy();
+    // The source label under the figure now says Recipe. Before the
+    // correction it said "None" — the catalogue telling the owner nobody had
+    // costed the one item they had built a recipe for. The row's own Recipe
+    // BUTTON carries a version badge, so it is addressed by role and the
+    // label by text.
+    expect(screen.getAllByText("Recipe")).toHaveLength(2);
+    // And it says what kind of figure it is, on the row rather than only in a
+    // panel the owner may never open.
+    expect(screen.getByText("estimated from the recipe")).toBeTruthy();
+    expect(screen.queryByText("None")).toBeNull();
+    expect(screen.queryByText("Purchases")).toBeNull();
+  });
+
+  it("says NOTHING rather than zero when no recipe is published", async () => {
+    // `recipe_missing`: the item cannot be sold at all, so a figure here would
+    // be worse than a dash.
+    await renderProducts(
+      [recipeItem("p-norecipe", "Unpublished burger")],
+      [summary({ productId: "p-norecipe" })],
+    );
+    expect(await screen.findByText("None")).toBeTruthy();
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+    expect(screen.queryByText("estimated from the recipe")).toBeNull();
+  });
+
+  it("says nothing when the recipe exists but an ingredient has no cost", async () => {
+    // `recipe_uncosted`: a different problem with a different remedy, and
+    // never a zero, which would print a 100% margin.
+    await renderProducts(
+      [recipeItem("p-uncosted", "Uncostable burger")],
+      [
+        summary({
+          productId: "p-uncosted",
+          hasActive: true,
+          activeVersion: 1,
+          activeYieldQuantityBase: 1,
+          activeCostPerBaseUnitMicrocents: null,
+        }),
+      ],
+    );
+    expect(await screen.findByText("None")).toBeTruthy();
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+  });
+
+  it("ignores an inert Manual Cost left on a recipe-costed row", async () => {
+    // A previously typed Manual Cost is carried through rather than wiped, so
+    // it is still in the row — and it must never be printed as the item's
+    // cost while the method says `recipe`.
+    await renderProducts(
+      [
+        {
+          ...recipeItem("p-inert", "Switched burger"),
+          standardCostExclVatMicrocents: 999_000_000,
+        },
+      ],
+      [
+        summary({
+          productId: "p-inert",
+          hasActive: true,
+          activeVersion: 1,
+          activeYieldQuantityBase: 1,
+          activeCostPerBaseUnitMicrocents: 173_875_000,
+        }),
+      ],
+    );
+    expect(await screen.findByText("$1.73875")).toBeTruthy();
+    expect(screen.queryByText("$9.99")).toBeNull();
+  });
+
+  it("leaves a purchase-valued row exactly as it was", async () => {
+    // The control. Nothing about the other two methods changed.
+    await renderProducts(
+      [
+        {
+          ...item("p-stock", "Coffee 250g"),
+          isService: false,
+          avgCostExclVatMicrocents: 200_000_000,
+        },
+      ],
+      [],
+    );
+    expect(await screen.findByText("$2.00")).toBeTruthy();
+    expect(screen.getByText("Purchases")).toBeTruthy();
   });
 });

@@ -560,6 +560,54 @@ describe("recipesRepo read models", () => {
     expect(map.has(BUN)).toBe(false);
   });
 
+  // -------------------------------------------------------------------------
+  // WP-B2-B P2: the summary carries the ACTIVE version's estimated cost, so
+  // the Products list can print a recipe-costed item's rate without a per-row
+  // round trip — and print nothing rather than a zero when it cannot.
+  // -------------------------------------------------------------------------
+
+  it("carries the active version's estimated per-unit cost and its batch yield", async () => {
+    const r = recipe("y", BURGER, 1, 20);
+    componentRow(r, BUN, 1, 1, "each", 1, 1);
+    componentRow(r, PATTY, 3, 20, "kg", 1_000, 1, 500);
+    publish(r);
+
+    const map = await recipesRepo.summaries(STORE_ID);
+    // bun 220,000 + patty (0.15 kg = 150 g at 8,500 with 5% waste) 1,338,750
+    // = 1,558,750 a batch, over a yield of 20.
+    expect(map.get(BURGER)).toMatchObject({
+      hasActive: true,
+      activeYieldQuantityBase: 20,
+      activeCostPerBaseUnitMicrocents: Math.round(1_558_750 / 20),
+    });
+  });
+
+  it("reports ABSENCE as null when an ingredient has no cost on file", async () => {
+    // Never 0: a cost that cannot be worked out is missing, and a zero here
+    // would print a 100% margin on the Products list.
+    const r = recipe("z", BURGER, 1);
+    componentRow(r, UNPRICED, 1, 1, "each", 1, 1);
+    publish(r);
+
+    const map = await recipesRepo.summaries(STORE_ID);
+    expect(map.get(BURGER)).toMatchObject({
+      hasActive: true,
+      activeCostPerBaseUnitMicrocents: null,
+    });
+  });
+
+  it("states no cost for a product whose only versions are a draft or retired", async () => {
+    const d = recipe("d", BURGER, 1);
+    componentRow(d, BUN, 1, 1, "each", 1, 1);
+
+    const map = await recipesRepo.summaries(STORE_ID);
+    expect(map.get(BURGER)).toMatchObject({
+      hasActive: false,
+      activeYieldQuantityBase: null,
+      activeCostPerBaseUnitMicrocents: null,
+    });
+  });
+
   it("offers only ELIGIBLE ingredients, with their units and rates", async () => {
     const picks = await recipesRepo.eligibleIngredients({
       storeId: STORE_ID,
@@ -601,17 +649,38 @@ describe("recipesRepo read models", () => {
 // 6. The WP-B2-A boundary
 // ===========================================================================
 
-describe("the WP-B2-A boundary", () => {
-  it("still refuses costing_method = 'recipe'", () => {
-    // Migration 020's refusal STANDS. Creating the recipe tables must not, by
-    // itself, make recipe costing selectable; WP-B2-B replaces that trigger
-    // pair in the same migration that teaches post_sale.
+describe("the recipe-costing boundary", () => {
+  it("accepts costing_method = 'recipe' once a recipe is PUBLISHED", () => {
+    // WP-B2-B (migration 022) turned 020's blanket refusal into a conditional
+    // one. The condition is a published recipe for that product in that store,
+    // which is the thing this file exists to produce.
     recipe("r", BURGER, 1);
     componentRow("r", BUN, 1, 1, "each", 1, 1);
     publish("r");
+    db.exec(`UPDATE products SET costing_method='recipe' WHERE id='${BURGER}'`);
+    expect(
+      (
+        db
+          .prepare(`SELECT costing_method AS m FROM products WHERE id='${BURGER}'`)
+          .get() as { m: string }
+      ).m,
+    ).toBe("recipe");
+  });
+
+  it("refuses it without one, and refuses it for a stocked item", () => {
+    // The two conditions, separated: a DRAFT is not a publication, and the
+    // financial argument against a stocked item is the one Manual Cost makes.
+    recipe("r", BURGER, 1);
+    componentRow("r", BUN, 1, 1, "each", 1, 1);
     expect(() =>
       db.exec(`UPDATE products SET costing_method='recipe' WHERE id='${BURGER}'`),
-    ).toThrow(/not implemented/);
+    ).toThrow(/published recipe/);
+
+    publish("r");
+    db.exec(`UPDATE products SET is_service=0 WHERE id='${BURGER}'`);
+    expect(() =>
+      db.exec(`UPDATE products SET costing_method='recipe' WHERE id='${BURGER}'`),
+    ).toThrow(/non-stock menu items only/);
   });
 
   it("writes no inventory movement and moves no stock", () => {

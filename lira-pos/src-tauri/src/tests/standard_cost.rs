@@ -21,7 +21,7 @@
 
 use crate::catalog::{
     save_product_with_pool, SaveProductPayload, MANUAL_COST_NEEDS_SERVICE, MANUAL_COST_REQUIRED,
-    RECIPE_COSTING_UNIMPLEMENTED,
+    RECIPE_COSTING_NEEDS_ACTIVE_RECIPE, RECIPE_COSTING_NEEDS_SERVICE,
 };
 use crate::cost::cents_to_microcents;
 use crate::posting::{post_credit_memo_with_pool, post_sale_with_pool};
@@ -934,18 +934,22 @@ async fn the_engine_refuses_manual_cost_with_no_figure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_engine_refuses_recipe_costing_until_wp_b2() {
-    // The enum value exists so WP-B2 needs no `products` table rebuild. The
-    // trigger is what makes it unreachable in the meantime, so no row can be
-    // configured into a state `post_sale` would not know how to cost.
+async fn the_engine_refuses_recipe_costing_with_no_published_recipe() {
+    // WP-B2-B admits `'recipe'` under two conditions and refuses it otherwise,
+    // and the engine holds both against every writer — which is the same job
+    // 020's refusal was doing, now stated as a rule rather than a blanket NO.
+    //
+    // `P_BURGER` here has no recipe at all, so a row configured this way would
+    // be a product `post_sale` could not cost: the refusal belongs at the
+    // moment the configuration is made, not in front of a customer.
     let db = shop().await;
     let err = db
         .try_exec(&format!(
             "UPDATE products SET costing_method='recipe' WHERE id='{P_BURGER}'"
         ))
         .await
-        .expect_err("recipe costing is not implemented");
-    assert!(err.to_string().contains("not implemented"), "{err}");
+        .expect_err("recipe costing needs a published recipe");
+    assert!(err.to_string().contains("published recipe"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1154,13 +1158,36 @@ async fn save_product_refuses_manual_cost_on_a_stocked_item() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn save_product_refuses_recipe_costing() {
+async fn save_product_refuses_recipe_costing_on_a_new_product() {
+    // A recipe belongs to a product, so a product being CREATED cannot already
+    // have a published one. WP-B2-B says so in the operator's own terms and
+    // names the screen they need, rather than letting migration 022's trigger
+    // answer with a constraint message.
     let db = TempDb::new().await;
     let mut payload = service_create(P_BURGER, "SKU-B1", "Greaz Burger");
     payload.costing_method = Some("recipe".to_string());
 
     let err = save_product_with_pool(db.pool(), payload).await.unwrap_err();
-    assert_eq!(err, RECIPE_COSTING_UNIMPLEMENTED);
+    assert_eq!(err, RECIPE_COSTING_NEEDS_ACTIVE_RECIPE);
+    assert_eq!(
+        db.count(&format!("SELECT COUNT(*) FROM products WHERE id='{P_BURGER}'")).await,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn save_product_refuses_recipe_costing_on_a_stocked_product() {
+    // The same financial argument Manual Cost makes, one method along: a
+    // recipe-derived rate on a stocked line would be stamped onto the sale's
+    // `inventory_movements` row while the pool those goods left says something
+    // else, and that table is append-only.
+    let db = TempDb::new().await;
+    let mut payload = service_create(P_BURGER, "SKU-B1", "Greaz Burger");
+    payload.is_service = false;
+    payload.costing_method = Some("recipe".to_string());
+
+    let err = save_product_with_pool(db.pool(), payload).await.unwrap_err();
+    assert_eq!(err, RECIPE_COSTING_NEEDS_SERVICE);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

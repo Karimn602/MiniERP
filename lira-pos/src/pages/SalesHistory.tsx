@@ -1,6 +1,6 @@
 // src/pages/SalesHistory.tsx
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
 import { salesRepo } from "../db/repos/sales";
 import { creditMemosRepo } from "../db/repos/creditMemos";
@@ -28,6 +28,8 @@ import { driversRepo } from "../db/repos/drivers";
 import { CreateReturnModal } from "../components/CreateReturnModal";
 import { useTranslation } from "../lib/i18n";
 import { cogsSourceLabelKey, isCostBearingLine } from "../lib/standardCost";
+import { recipesRepo, type PostedRecipeCostRow } from "../db/repos/recipes";
+import { formatQuantity } from "../lib/recipeQuantity";
 import clsx from "clsx";
 
 function isoToTime(iso: string): string {
@@ -567,6 +569,10 @@ function DetailRow({ label, value }: { label: string; value: string }) {
 }
 
 function LinesTable({ lines }: { lines: SaleItem[] }) {
+  // WP-B2-B: which line's frozen recipe breakdown is open, by sale-line id.
+  // One at a time, and closed by default: it explains a figure rather than
+  // being part of reading the receipt.
+  const [recipeBreakdownFor, setRecipeBreakdownFor] = useState<string | null>(null);
   const { t } = useTranslation();
   return (
     <div className="overflow-x-auto rounded-md border border-slate-200">
@@ -663,7 +669,31 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
                     )}
                   >
                     {t(cogsSourceLabelKey(line.cogsSource))}
+                    {/* WP-B2-B: WHICH published version. A recipe-costed line
+                        says "Recipe" either way, and after version 2 is
+                        published that label alone no longer identifies what
+                        the figure above was worked out from. */}
+                    {line.recipeVersion !== null && (
+                      <> · v{line.recipeVersion}</>
+                    )}
                   </div>
+                  {line.recipeVersion !== null && (
+                    <button
+                      type="button"
+                      className="mt-0.5 text-[11px] underline decoration-dotted text-fg-muted hover:text-slate-900"
+                      onClick={() =>
+                        setRecipeBreakdownFor(
+                          recipeBreakdownFor === line.id ? null : line.id,
+                        )
+                      }
+                    >
+                      {recipeBreakdownFor === line.id
+                        ? t("common.hide")
+                        : t("costing.recipeBreakdown.title", {
+                            version: String(line.recipeVersion),
+                          })}
+                    </button>
+                  )}
                 </td>
 
                 <td className="px-4 py-2 text-end tabular-nums font-medium text-slate-900">
@@ -685,9 +715,199 @@ function LinesTable({ lines }: { lines: SaleItem[] }) {
               </tr>
             );
           })}
+          {/* The frozen explanation of whichever recipe-costed line is open.
+              A row of its own spanning the table, so the figures above keep
+              their columns. */}
+          {recipeBreakdownFor !== null && (
+            <RecipeBreakdownRow
+              saleItemId={recipeBreakdownFor}
+              colSpan={8}
+              unitCogsExclVatMicrocents={
+                lines.find((l) => l.id === recipeBreakdownFor)
+                  ?.unitCogsExclVatMicrocents ?? 0
+              }
+            />
+          )}
         </tbody>
       </table>
     </div>
+  );
+}
+
+/**
+ * The frozen per-ingredient explanation of one posted recipe-costed line.
+ *
+ * Loaded on demand and LATEST-REQUEST-ONLY, the WP-A1 rule: the row this
+ * belongs to changes by ordinary clicking, two answers are routinely in
+ * flight, and nothing promises they return in order — so a superseded request
+ * writes nothing, not the rows and not the error.
+ *
+ * Every figure comes out of `sale_item_recipe_costs` exactly as it was
+ * written. Nothing is recomputed from today's rates, today's recipe or today's
+ * units, which is the whole reason the table exists.
+ */
+function RecipeBreakdownRow({
+  saleItemId,
+  colSpan,
+  unitCogsExclVatMicrocents,
+}: {
+  saleItemId: string;
+  colSpan: number;
+  /**
+   * The LINE's own posted rate, per selling unit. Passed in rather than
+   * re-read, because it is already on the row above and because it is the
+   * figure the batch below has to be reconciled against by eye.
+   */
+  unitCogsExclVatMicrocents: number;
+}) {
+  const { t } = useTranslation();
+  const [rows, setRows] = useState<PostedRecipeCostRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const generation = useRef(0);
+
+  useEffect(() => {
+    const mine = ++generation.current;
+    setRows(null);
+    setError(null);
+    void (async () => {
+      try {
+        const got = await recipesRepo.postedCostBreakdown({ saleItemId });
+        if (mine !== generation.current) return;
+        setRows(got);
+      } catch (e) {
+        if (mine !== generation.current) return;
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => {
+      generation.current += 1;
+    };
+  }, [saleItemId]);
+
+  const version = rows?.[0]?.recipeVersion ?? null;
+  const yieldBase = rows?.[0]?.yieldQuantityBase ?? null;
+  // The batch, as the sum of what the evidence says each ingredient
+  // contributed to it. Summed for DISPLAY only and labelled as a batch: the
+  // authoritative figure is the per-unit rate on the line, which
+  // `recipe_cost.rs` derives from the accumulator and not from these rounded
+  // microcents. Showing it is what makes a multi-serving recipe readable —
+  // without it the four ingredient figures read as if they all belonged to one
+  // plate, which overstates a twenty-portion sauce twentyfold.
+  const batchMicrocents =
+    rows === null
+      ? null
+      : rows.reduce((sum, r) => sum + r.contributionMicrocents, 0);
+
+  return (
+    <tr className="bg-slate-50/60">
+      <td colSpan={colSpan} className="px-4 py-3">
+        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          {version === null
+            ? t("costing.recipeBreakdown.title", { version: "—" })
+            : t("costing.recipeBreakdown.title", { version: String(version) })}
+        </div>
+        <div className="mt-0.5 text-[11px] text-fg-muted">
+          {t("costing.recipeBreakdown.subtitle")}
+        </div>
+
+        {/* THREE DIFFERENT NUMBERS, named. The quantities below are for one
+            BATCH; a batch yields `yieldBase` selling units; and the line was
+            costed at the third figure, which is the first divided by the
+            second. Before this the panel showed only the first and called the
+            whole thing the item's recipe cost. */}
+        {yieldBase !== null && batchMicrocents !== null && (
+          <dl className="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-[11px]">
+            <div>
+              <dt className="inline text-fg-muted">
+                {t("costing.recipeBreakdown.batchYield")}
+              </dt>{" "}
+              <dd className="inline font-medium tabular-nums text-slate-700">
+                {yieldBase}
+              </dd>
+            </div>
+            <div>
+              <dt className="inline text-fg-muted">
+                {t("costing.recipeBreakdown.batchCost")}
+              </dt>{" "}
+              <dd className="inline font-medium tabular-nums text-slate-700">
+                {formatUnitCostUsd(batchMicrocents)}
+              </dd>
+            </div>
+            <div>
+              <dt className="inline text-fg-muted">
+                {t("costing.recipeBreakdown.perSellingUnit")}
+              </dt>{" "}
+              <dd className="inline font-medium tabular-nums text-slate-900">
+                {formatUnitCostUsd(unitCogsExclVatMicrocents)}
+              </dd>
+            </div>
+          </dl>
+        )}
+        {yieldBase !== null && yieldBase > 1 && (
+          <div className="mt-1 text-[11px] text-warn-fg">
+            {t("costing.recipeBreakdown.batchNote", { yield: String(yieldBase) })}
+          </div>
+        )}
+
+        {error !== null && (
+          <div className="mt-2 text-xs text-danger-fg">{error}</div>
+        )}
+        {error === null && rows === null && (
+          <div className="mt-2 text-xs text-fg-muted">{t("common.loading")}</div>
+        )}
+        {error === null && rows !== null && rows.length === 0 && (
+          <div className="mt-2 text-xs text-fg-muted">
+            {t("costing.recipeBreakdown.none")}
+          </div>
+        )}
+        {error === null && rows !== null && rows.length > 0 && (
+          <table className="mt-2 min-w-full text-xs">
+            <thead className="text-start text-[11px] uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="py-1 pe-4 text-start">
+                  {t("costing.recipeBreakdown.colIngredient")}
+                </th>
+                <th className="py-1 pe-4 text-start">
+                  {t("costing.recipeBreakdown.colQuantity")}
+                </th>
+                <th className="py-1 pe-4 text-end">
+                  {t("costing.recipeBreakdown.colRate")}
+                </th>
+                <th className="py-1 text-end">
+                  {t("costing.recipeBreakdown.colContribution")}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.componentProductId} className="border-t border-slate-200">
+                  <td className="py-1 pe-4">
+                    {r.componentName}
+                    <span className="ms-1 text-fg-muted">
+                      ({t(`costing.sourceShort.${r.costSource}`)})
+                    </span>
+                  </td>
+                  <td className="py-1 pe-4 tabular-nums">
+                    {formatQuantity(r.quantity)} {r.uomCode}
+                    {r.wasteBps > 0 && (
+                      <span className="ms-1 text-fg-muted">
+                        +{(r.wasteBps / 100).toFixed(2).replace(/\.?0+$/, "")}%
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-1 pe-4 text-end tabular-nums">
+                    {formatUnitCostUsd(r.unitCostExclVatMicrocents)}
+                  </td>
+                  <td className="py-1 text-end tabular-nums">
+                    {formatUnitCostUsd(r.contributionMicrocents)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </td>
+    </tr>
   );
 }
 

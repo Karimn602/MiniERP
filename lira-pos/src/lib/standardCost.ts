@@ -32,12 +32,14 @@ import { COST_SCALE, formatUnitCostUsd, type Microcents } from "./cost";
 /**
  * The costing methods `products.costing_method` may hold.
  *
- * `"recipe"` is in the schema's CHECK so that shipping WP-B2 needs no
- * `products` table rebuild — SQLite cannot ALTER a CHECK, and that table is
- * referenced by every posted document family. It is NOT selectable: migration
- * 020's trigger pair refuses it on insert and update, and `save_product`
- * refuses it earlier with a sentence. It is listed here for the same reason it
- * is in the CHECK: the domain is stated once.
+ * `"recipe"` was in the schema's CHECK from migration 020 so that shipping
+ * WP-B2 would need no `products` table rebuild — SQLite cannot ALTER a CHECK,
+ * and that table is referenced by every posted document family. WP-B2-B
+ * (migration 022) turned 020's blanket refusal into a CONDITIONAL one, so it
+ * is selectable now, but only for a non-stock item that has a published
+ * recipe. Those two conditions are enforced by `save_product` with a sentence
+ * the operator can act on and by 022's trigger pair against every other
+ * writer; this list states the domain, not the eligibility.
  */
 export const COSTING_METHODS = ["purchase_average", "standard", "recipe"] as const;
 export type CostingMethod = (typeof COSTING_METHODS)[number];
@@ -46,6 +48,7 @@ export type CostingMethod = (typeof COSTING_METHODS)[number];
 export const SELECTABLE_COSTING_METHODS = [
   "purchase_average",
   "standard",
+  "recipe",
 ] as const satisfies readonly CostingMethod[];
 export type SelectableCostingMethod = (typeof SELECTABLE_COSTING_METHODS)[number];
 
@@ -225,7 +228,40 @@ export type CostConfigurationStatus =
   /** Purchase valuation, no basis yet: a sale would cost nothing. */
   | "purchase_uncosted"
   /** A non-stock item on purchase valuation: it can never acquire a basis. */
-  | "service_uncosted";
+  | "service_uncosted"
+  /** Recipe costing, with a published recipe that costs out. */
+  | "recipe"
+  /** Recipe costing selected with no published recipe: it cannot be sold. */
+  | "recipe_missing"
+  /**
+   * Recipe costing, a recipe published, and one of its ingredients has no cost
+   * on file — so `post_sale` would refuse the line by name.
+   *
+   * Reachable only by RECONFIGURING an ingredient after publication:
+   * `activate_recipe` refuses to publish a recipe whose ingredients cannot all
+   * be costed, and a purchase basis is monotone. It is a distinct status
+   * because the remedy is different from `recipe_missing` — there is a recipe,
+   * and it is an ingredient that needs attention.
+   */
+  | "recipe_uncosted";
+
+/**
+ * What a screen needs to know about a product's ACTIVE recipe to say anything
+ * about its costing.
+ *
+ * `perBaseUnitMicrocents` is `null` when the recipe cannot be costed today —
+ * never 0, for WP-B1's reason one level down: returning zero is how a
+ * catalogue of 100% margins stops looking like a problem.
+ *
+ * Both functions below take this as an OPTIONAL argument. Omitted, a
+ * recipe-costed product reads as `recipe_missing` with no rate, which is the
+ * safe direction: it invites the owner to look, where the reverse would print
+ * a cost for an item that cannot be sold.
+ */
+export interface ActiveRecipeCost {
+  hasActive: boolean;
+  perBaseUnitMicrocents: Microcents | null;
+}
 
 /**
  * The costing status of one product, for the Products list and form.
@@ -247,12 +283,25 @@ export type CostConfigurationStatus =
  * what a sale is costed at remains the posted line's own `cogs_source`, which
  * Sales History and the coverage panel read.
  */
-export function costConfigurationStatus(product: {
-  costingMethod: CostingMethod;
-  standardCostExclVatMicrocents: Microcents | null;
-  isService: boolean;
-  avgCostExclVatMicrocents: Microcents;
-}): CostConfigurationStatus {
+export function costConfigurationStatus(
+  product: {
+    costingMethod: CostingMethod;
+    standardCostExclVatMicrocents: Microcents | null;
+    isService: boolean;
+    avgCostExclVatMicrocents: Microcents;
+  },
+  recipe?: ActiveRecipeCost,
+): CostConfigurationStatus {
+  // WP-B2-B. The PRODUCT's method decides first, exactly as `post_sale`
+  // resolves it, and `recipe` is checked before the other two for the same
+  // reason: it is the one that does not read `avg_cost_*` or
+  // `standard_cost_*` at all. Omitting this branch is what printed "None" and
+  // a dash over a correctly configured recipe-costed burger — a stocked zero
+  // average reported as `service_uncosted`, which is the one thing it was not.
+  if (product.costingMethod === "recipe") {
+    if (!recipe?.hasActive) return "recipe_missing";
+    return recipe.perBaseUnitMicrocents === null ? "recipe_uncosted" : "recipe";
+  }
   if (product.costingMethod === "standard") {
     // A `standard` product with no figure cannot post a sale at all
     // (`post_sale` refuses it by name) and migration 020 forbids the row, so
@@ -277,12 +326,21 @@ export function costConfigurationStatus(product: {
  * `null` rather than 0 for the uncosted case, so a caller is forced to decide
  * what to print instead of inheriting a zero that reads as a real cost.
  */
-export function effectiveUnitCostMicrocents(product: {
-  costingMethod: CostingMethod;
-  standardCostExclVatMicrocents: Microcents | null;
-  avgCostExclVatMicrocents: Microcents;
-  isService: boolean;
-}): Microcents | null {
+export function effectiveUnitCostMicrocents(
+  product: {
+    costingMethod: CostingMethod;
+    standardCostExclVatMicrocents: Microcents | null;
+    avgCostExclVatMicrocents: Microcents;
+    isService: boolean;
+  },
+  recipe?: ActiveRecipeCost,
+): Microcents | null {
+  // WP-B2-B. A recipe-costed item is valued from its recipe and from nothing
+  // else — never from `avg_cost_*`, which for a non-stock item is zero for
+  // ever, and never from a Manual Cost it may still be carrying inertly.
+  if (product.costingMethod === "recipe") {
+    return recipe?.hasActive ? recipe.perBaseUnitMicrocents : null;
+  }
   if (product.costingMethod === "standard") {
     return product.standardCostExclVatMicrocents;
   }
@@ -295,7 +353,39 @@ export function effectiveUnitCostMicrocents(product: {
 
 /** Does this status mean "no cost has been configured"? */
 export function isUncostedStatus(status: CostConfigurationStatus): boolean {
-  return status === "purchase_uncosted" || status === "service_uncosted";
+  return (
+    status === "purchase_uncosted" ||
+    status === "service_uncosted" ||
+    // Both recipe gaps are the same kind of problem as the two above: a sale
+    // today would have no cost behind it. They differ only in the remedy, and
+    // `costStatusLabelKey` is what says which.
+    status === "recipe_missing" ||
+    status === "recipe_uncosted"
+  );
+}
+
+/**
+ * The `costing.sourceShort.*` key for where a product's cost would come from
+ * TODAY — the compact label under the figure in the Products list.
+ *
+ * Derived from the STATUS rather than from `costingMethod` alone, because a
+ * method with no usable figure behind it must not advertise itself as the
+ * source of one. The list used to compute this inline with a two-branch
+ * ternary that had no `recipe` arm at all, so a recipe-costed item was labelled
+ * "None" or "Purchases" depending on an average it never reads.
+ */
+export function costSourceShortKey(status: CostConfigurationStatus): string {
+  switch (status) {
+    case "manual":
+    case "manual_zero":
+      return "costing.sourceShort.standard";
+    case "recipe":
+      return "costing.sourceShort.recipe";
+    case "purchase":
+      return "costing.sourceShort.purchase_average";
+    default:
+      return "costing.sourceShort.uncosted";
+  }
 }
 
 /** The i18n key for a costing status label. */

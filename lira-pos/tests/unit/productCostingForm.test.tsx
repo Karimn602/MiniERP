@@ -52,6 +52,15 @@ vi.mock("../../src/db/repos/uoms", () => ({
 vi.mock("../../src/components/BarcodeManager", () => ({
   BarcodeManager: () => null,
 }));
+// WP-B2-B: whether the item has a PUBLISHED recipe is one of the two
+// conditions the form checks before a round trip, so the harness has to be
+// able to answer it both ways.
+const recipeSummaries = vi.fn();
+vi.mock("../../src/db/repos/recipes", () => ({
+  recipesRepo: {
+    summaries: (...a: unknown[]) => recipeSummaries(...a),
+  },
+}));
 vi.mock("../../src/components/ProductImportDialog", () => ({
   ProductImportDialog: () => null,
 }));
@@ -122,7 +131,27 @@ function burger(over: Partial<ProductWithUoms> = {}): ProductWithUoms {
   };
 }
 
-async function renderProducts(products: ProductWithUoms[]) {
+async function renderProducts(products: ProductWithUoms[], publishedRecipe = false) {
+  // `summaries` returns a MAP keyed by product id, which is what the page
+  // calls `.get` on. An array here renders as a crash, not as "no recipe".
+  recipeSummaries.mockResolvedValue(
+    new Map(
+      publishedRecipe
+        ? [
+            [
+              "prod-burger",
+              {
+                productId: "prod-burger",
+                hasDraft: false,
+                hasActive: true,
+                activeVersion: 1,
+                retiredCount: 0,
+              },
+            ],
+          ]
+        : [],
+    ),
+  );
   listEnriched.mockResolvedValue(products);
   findByIdEnriched.mockResolvedValue(products[0] ?? null);
   nextAutoSku.mockResolvedValue("SKU-AUTO");
@@ -165,15 +194,16 @@ afterEach(() => {
 });
 
 describe("the costing section", () => {
-  it("offers purchase valuation and manual cost, and NOT recipe costing", async () => {
-    // `recipe` is in the schema so WP-B2 needs no `products` table rebuild. It
-    // is refused by `save_product` and by migration 020's trigger, so offering
-    // it would be offering a configuration the till cannot honour.
+  it("offers all three costing methods", async () => {
+    // WP-B2-B made `recipe` selectable. Its two conditions — a non-stock item
+    // and a published recipe — are checked when the form is SAVED and stated
+    // inline beneath the select, not by hiding the option: an owner who cannot
+    // find the setting cannot be told why it does not apply.
     await renderProducts([burger()]);
     await openEdit();
 
     const values = Array.from(costingSelect().options).map((o) => o.value);
-    expect(values).toEqual(["purchase_average", "standard"]);
+    expect(values).toEqual(["purchase_average", "standard", "recipe"]);
   });
 
   it("loads a stored cost back into the field it was typed in", async () => {
@@ -309,5 +339,106 @@ describe("what the form saves", () => {
 
     await waitFor(() => expect(save).toHaveBeenCalled());
     expect(save.mock.calls[0]?.[0]?.costingMethod).toBe("purchase_average");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Recipe costing (WP-B2-B)
+//
+// The option is OFFERED unconditionally and REFUSED conditionally, which is a
+// deliberate choice: hiding a setting from an owner who does not qualify for
+// it leaves them with no way to find out why. Both conditions are stated
+// inline, beneath the select, and again as a refusal if they try to save.
+// ---------------------------------------------------------------------------
+
+describe("recipe costing in the form", () => {
+  it("explains what is missing when there is no published recipe", async () => {
+    await renderProducts([burger()], false);
+    await openEdit();
+
+    fireEvent.change(costingSelect(), { target: { value: "recipe" } });
+
+    expect(
+      await screen.findByText(/Recipe costing needs a published recipe/i),
+    ).toBeTruthy();
+  });
+
+  it("refuses to save without one, before any round trip", async () => {
+    await renderProducts([burger()], false);
+    await openEdit();
+
+    fireEvent.change(costingSelect(), { target: { value: "recipe" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText(/Recipe costing needs a published recipe/i).length,
+      ).toBeGreaterThan(0);
+    });
+    // THE assertion: nothing was sent. A refusal that still calls the command
+    // is not a refusal, it is a race.
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("refuses it for a stocked item, for the Manual Cost reason", async () => {
+    // A recipe-derived rate on a stocked line would be stamped onto the sale's
+    // inventory movement while the pool those goods left says something else.
+    await renderProducts([burger({ isService: false })], true);
+    await openEdit();
+
+    fireEvent.change(costingSelect(), { target: { value: "recipe" } });
+
+    expect(
+      await screen.findByText(/Recipe costing applies to non-stock items only/i),
+    ).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => {
+      expect(
+        screen.getAllByText(/Recipe costing applies to non-stock items only/i).length,
+      ).toBeGreaterThan(0);
+    });
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("sends the method through once both conditions are met", async () => {
+    await renderProducts([burger()], true);
+    await openEdit();
+
+    fireEvent.change(costingSelect(), { target: { value: "recipe" } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    const sent = save.mock.calls[0]![0] as Record<string, unknown>;
+    expect(sent).toMatchObject({ costingMethod: "recipe" });
+
+    // A previously typed Manual Cost is carried through rather than wiped,
+    // which is the behaviour switching to purchase valuation already has: the
+    // figure is INERT under `recipe` (nothing reads it, and 022's trigger only
+    // requires it when the method is `standard`), and destroying it would lose
+    // the owner's number the moment they tried the other setting.
+    expect(sent.standardCostExclVatMicrocents).toBe(185_000_000);
+
+    // And NO recipe, ingredient or rate rides along: the cost is resolved in
+    // the posting transaction from the database, and there is no field for one
+    // on this payload. This assertion is the one that must never be relaxed.
+    for (const key of Object.keys(sent)) {
+      expect(key).not.toMatch(/recipe|ingredient|component/i);
+    }
+  });
+
+  it("loads a recipe-costed product back as recipe-costed", async () => {
+    // Before WP-B2-B the form read the stored method as
+    // `=== "standard" ? "standard" : "purchase_average"`, which would now
+    // silently rewrite a recipe-costed item to purchase valuation on any
+    // unrelated edit of it.
+    await renderProducts(
+      [burger({ costingMethod: "recipe", standardCostExclVatMicrocents: null })],
+      true,
+    );
+    await openEdit();
+
+    expect(costingSelect().value).toBe("recipe");
   });
 });
