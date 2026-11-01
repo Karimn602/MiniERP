@@ -4,6 +4,24 @@ Scope: one small restaurant, one terminal, cash only. This is the whole policy,
 deliberately. WP-07 assessed automatic backup and did not build one — see
 *Why there is no automatic backup* at the end.
 
+**Two audiences, and the split matters.** There is exactly ONE backup procedure
+for a restaurant operator — *The one supported backup procedure (closed
+database)* — and it needs nothing but Windows. Everything under *For support
+personnel only* requires tools Greaz does not ship, or judgement about why the
+machine is in the state it is in, and must not be handed to a manager as a
+routine step. The operator's step-by-step version, with keystrokes and the
+sign-off record the pilot requires, is **`docs/OPERATOR-BACKUP-RUNBOOK.md`** —
+tracked, release-intended, and the document that is printed and handed to the
+shop. See *How this document reaches the shop* at the end of it: the installer
+does not deliver it on its own.
+
+Qualified by the Gate 1 backup rehearsal, verdict **CONDITIONAL PASS**. The two
+unmet conditions are unchanged and are both sign-offs rather than engineering:
+**a restore onto a second physical computer has not been tested** (stated under
+*Rehearse it once* below, and in the runbook's Part 10), and **no named backup
+owner has been recorded** (the runbook's Part 10 exists for exactly that, and
+is not complete until it is filled in and signed).
+
 ## Where the database is
 
 One file, named in one place:
@@ -59,89 +77,138 @@ closed straight after a sale kept its `-wal` as if it had crashed. If you are
 running a build from before that correction, treat step 3 below as unreliable
 and expect the companions to still be there.
 
-## Backing up — the one supported procedure
+## The one supported backup procedure (closed database)
+
+**This is the only backup procedure a restaurant operator should perform.**
+There is exactly one, it requires no tools beyond Windows itself, and it is the
+procedure qualified by the Gate 1 rehearsal. Anything else on this page is for
+support personnel.
+
+The step-by-step version for a manager, with the exact Windows keystrokes, is
+`docs/OPERATOR-BACKUP-RUNBOOK.md`. This section is the authoritative summary;
+where the two differ, this page is correct.
 
 1. **Close Greaz POS completely.** Not minimised, not left in the tray —
-   closed.
-2. **Confirm it is no longer running.** On Windows, open Task Manager and check
-   there is no Greaz POS (or `greaz-pos.exe`) process. A second window you
-   forgot about is still writing to the database.
-3. **Confirm SQLite has finished.** In the app config folder, check that
-   `greaz-pos.db-wal` and `greaz-pos.db-shm` are **gone**. SQLite checkpoints
-   the WAL into the main file and deletes both on a clean shutdown, so their
-   absence is the signal that `greaz-pos.db` is complete and self-contained.
-   If they are still there, see *If the WAL files will not go away* below.
-4. **Copy `greaz-pos.db`** out of the app config folder (the path in the table
-   above). That single file is the whole database.
-5. **Keep timestamped copies, externally.** Name each one for the day —
-   `greaz-pos-2026-10-05.db` — and keep them somewhere that is not the same
-   machine: a USB stick, or a synced folder. Retain the last several days.
-   "Externally" is the part that matters: a copy beside the original survives a
-   deleted file but not a dead disk.
-6. **Restore only while the app is closed** (see below).
-7. **Restore to the exact canonical path**, with the exact name
-   `greaz-pos.db`.
-8. **Start the app and check it.** Open Sales History and Shift Summary and
-   confirm the recent figures look like the day you backed up. That ten-second
-   check is the only thing that distinguishes a backup from a file.
+   closed, with the window gone.
+2. **Confirm the process has exited.** Open Task Manager
+   (`Ctrl`+`Shift`+`Esc`) and confirm there is no **Greaz POS** or
+   `greaz-pos.exe` process. A second window somebody forgot about is still
+   writing to the database.
+3. **Confirm the WAL companions are absent.** In the app config folder, check
+   that `greaz-pos.db-wal` and `greaz-pos.db-shm` are **both gone**. SQLite
+   checkpoints the WAL into the main file and deletes both on a clean shutdown,
+   so their absence is the signal that `greaz-pos.db` is complete and
+   self-contained. **If either is still there, STOP — do not copy anything.**
+   See *If the WAL companions remain after closing* below.
+4. **Copy `greaz-pos.db` to external storage.** That single file is the whole
+   database. Copy it to a USB stick or a synced folder — somewhere that is
+   **not this machine**. A copy beside the original survives a deleted file but
+   not a dead disk, a theft or a fire, and those are the reasons for doing this.
+5. **Verify the filename, the size and the destination.** The copy must be
+   named for the day — `greaz-pos-2026-10-05.db`, always `YYYY-MM-DD` so the
+   list sorts into date order — it must be on the external destination you
+   intended, its size must be within a few percent of `greaz-pos.db`, and it
+   must never be 0 KB or smaller than yesterday's. Read the next section before
+   trusting what this step proves.
+6. **Preserve the historical copies.** Do not overwrite yesterday's. Keep every
+   daily copy for 14 days, one per week for 3 months, one per month for a year.
+   A year of this fits on the cheapest USB stick sold, and a backup from before
+   a mistake nobody noticed is the only way to see what the figures used to say.
+7. **Restore and inspect it on an isolated installation, once.** A backup is
+   not qualified until it has been restored — see *Rehearse it once* below.
 
-Do this once at close of business. The database is a few megabytes, so a week
-of daily copies costs almost nothing.
+Do this once at close of business, after the shift is closed.
 
-### Do not copy the database while the app is running
+### What step 5 proves, and what it does not
 
-There is no supported live-copy procedure, and in particular **do not copy
-`greaz-pos.db`, `-wal` and `-shm` one after another while the app is open.**
-Each file is read at a different instant, and the WAL moves between them, so the
-set you end up with can represent no state the database was ever in. It will
-usually still open, which is what makes it dangerous: you find out it was
-unusable on the day you need it.
+Checking the filename, the size and the destination confirms that **a file was
+copied to the right place**. It does not confirm that the file can be restored.
 
-There is a worked example of the danger in
-`src-tauri/src/tests/lifecycle.rs`: a sale the application has already reported
-as posted, and which every screen shows, is simply absent from a copy of
-`greaz-pos.db` taken while the app is open — because it was still in the WAL.
-Nothing warns you. The copy opens and looks like a slightly older database.
+These are different claims and only one of them is cheap. A database can be the
+right name and the right size and still be unusable: the Gate 1 rehearsal
+produced a copy that was within a few percent of the correct size, opened
+without complaint, and contained **none** of the posted sales — and a corrupted
+or truncated file is only detected by reading the database itself, not by
+looking at its directory entry.
 
-If a backup is genuinely needed WITHOUT closing the app, the supported tool is
-SQLite's own snapshot, not a file copy:
+So:
 
-```
-sqlite3 greaz-pos.db "VACUUM INTO 'greaz-pos-2026-10-11.db'"
-```
+* **Step 5 is a daily smoke check.** It catches the backup that plainly failed —
+  a 0 KB file, a copy that went to the wrong folder, a stick that was not
+  plugged in. That is worth doing every day, and it is all an operator can do
+  in a minute.
+* **Only an actual restore proves a backup is restorable.** That is step 7, and
+  it is why it exists as its own step rather than a footnote.
 
-That produces one self-contained file with every committed transaction in it,
-WAL included, while the till keeps trading — verified in
-`lifecycle.rs::vacuum_into_snapshots_a_live_database_including_wal_commits`. It
-is a manual tool for whoever supports the shop; it is deliberately not wired
-into the application, because an automatic backup nobody verifies is worse than
-a routine somebody performs.
+Never record "backup verified" on the strength of a filename and a size. The
+honest wording is "backup copied and checked"; "verified" belongs to the day
+somebody restored one.
 
-### If the WAL files will not go away
+### NEVER copy the database while Greaz POS is running
 
-`greaz-pos.db-wal` and `greaz-pos.db-shm` remaining after shutdown means the
-app did not exit cleanly — it was killed, or it crashed, or a process is still
-holding the file.
+**Prohibited. There is no supported live-copy procedure for an operator.**
+
+Do not copy `greaz-pos.db` while the application is open, and in particular do
+not copy `greaz-pos.db`, `-wal` and `-shm` one after another. Each file is read
+at a different instant and the WAL moves between them, so the set can represent
+no state the database was ever in.
+
+**This silently loses posted transactions.** The Gate 1 rehearsal copied
+`greaz-pos.db` from a running till holding two posted sales — one of them a
+recipe-costed sale with its frozen cost evidence — and the copy contained
+**0 of the 2 sales and 0 of the 2 evidence rows**. One sale was present in the
+copy as an unposted *draft*, a state the application had already reported as
+posted and printed a receipt for. The copy opened cleanly, passed
+`PRAGMA integrity_check`, and looked like a slightly older database. **Nothing
+warned.** That is what makes it dangerous rather than merely wrong: you find
+out on the day you need it.
+
+The same loss is demonstrated in the automated suite —
+`lifecycle.rs::copying_only_the_main_file_while_the_wal_is_live_loses_the_sale`
+— and reproduced operationally by the Gate 1 backup rehearsal (an internal
+qualification artefact under `lira-pos/dev/`, not part of the release).
+
+If a backup is genuinely needed without closing the till, that is a technician
+task and needs a tool Greaz does not ship. See *Optional: live snapshot (support
+personnel only)*.
+
+### If the WAL companions remain after closing
+
+`greaz-pos.db-wal` or `greaz-pos.db-shm` still present after the application has
+closed means it did not exit cleanly — it was killed, it crashed, the machine
+was switched off at the wall, or a process is still holding the file.
 
 **It does not mean the database is damaged.** A WAL left behind holds committed
-transactions that SQLite replays the next time the database is opened, which it
-does automatically and correctly; nothing is lost and nothing is corrupt. The
-only problem it causes is the one this page is about — `greaz-pos.db` on its own
-is not the whole database yet, so a copy of it would be incomplete.
+transactions that SQLite replays automatically and correctly the next time the
+database is opened; nothing is lost and nothing is corrupt. Gate 1 confirmed
+this operationally: a committed sale left in an abandoned `-wal` survived
+reopening and the database passed `PRAGMA integrity_check`.
 
-Safe action, in order:
+The only problem it causes is the one this page is about — `greaz-pos.db` on its
+own is not the whole database yet, so a copy of it would be incomplete.
 
-1. Make sure no Greaz POS process is running (Task Manager).
-2. Start the app and close it again, normally. A clean shutdown checkpoints the
-   WAL and removes both files. **This is the fix** — SQLite does the merge
-   itself, correctly.
-3. Re-check that both files are gone, then take the backup.
+**Operator action: STOP and contact support.**
 
-Do **not** delete a `-wal` file by hand: it can hold committed transactions that
-are not yet in the main file, and deleting it discards them — potentially a
-whole evening's sales. And do not copy a `.db` whose `-wal` is still present,
-for the same reason: the copy is an older database than the one you are looking
-at.
+1. **Do not take a backup.** A copy taken now would be missing transactions.
+2. **Do not delete, move or rename `greaz-pos.db-wal` or `greaz-pos.db-shm`,
+   and do not delete, move or rename `greaz-pos.db` either.** A `-wal` can hold
+   committed sales that are not yet in the main file, so deleting one discards
+   real money — potentially a whole evening's trade — and separating the files
+   is how a database gets damaged by hand.
+
+   *This is not a contradiction of* Restoring *step 2, which does move all three
+   files together into a dated folder.* That is a deliberate recovery: the
+   decision to go back to a backup has already been made, and the set is moved
+   **as a group** so it stays intact and reversible. Here you are trying to take
+   a backup of data you intend to keep using — so change nothing at all.
+3. **Leave all three files exactly where they are** and contact whoever supports
+   the shop. The data is safe while it is left alone.
+4. Greaz can keep trading in the meantime. The next time the app opens, SQLite
+   replays the WAL itself; the till is not at risk, only tonight's backup is.
+
+The remedy is a one-line SQLite operation, but it requires judgement about *why*
+the companions are there, so it belongs to support: see *If the WAL companions
+remain — remedy* under the support section.
 
 ## Restoring
 
@@ -158,25 +225,131 @@ at.
 4. Start the app. It will run any migrations the backup has not seen, which is
    expected and safe — a failing migration rolls back and leaves the schema
    untouched (`hardening.rs::a_failing_migration_rolls_back_and_leaves_the_schema_untouched`).
-5. Verify as in step 8 above before trading on it.
+   Gate 1 confirmed this operationally: a backup predating migration 022
+   upgraded forward cleanly on first open.
+5. **Inspect it in the application before trading on it.** Open Sales History
+   and confirm the recent receipts and totals are the day you backed up; check
+   that the newest receipt number looks right; open Shift Summary (or Shift
+   History) and confirm the drawer figures and any open shift; check Products
+   for the right menu and prices. If anything looks wrong, close the app, move
+   the restored file aside and put the old set back from the folder in step 2 —
+   nothing has been lost, which is why that folder exists.
 
 A restore loses everything rung up after the backup was taken. There is no
 merge: never try to combine two databases.
 
 ### Rehearse it once, before you need it
 
-**A backup is not qualified until it has been restored.** Copy a recent backup
-onto a spare machine — or into any folder, opened with the `sqlite3` tool — and
-confirm the last day's receipts, both drawer figures and the open shift are
-there. Doing that once, calmly, is what tells you the routine works; the
-alternative is finding out during an emergency, which is the one moment the
-answer cannot be "it didn't".
+**A backup is not qualified until it has been restored**, and a restore is the
+only thing that proves it (see *What step 5 proves, and what it does not*).
 
-`lifecycle.rs::a_restored_backup_preserves_sales_payment_legs_movements_and_counters`
-rehearses exactly this in the test suite — take a backup, restore it, and check
-that the sale, both payment legs, the inventory movement and the receipt-number
-sequence all survive, and that the restored database carries on numbering from
-where it left off rather than colliding.
+Do it on an **isolated installation** — a spare Windows computer with Greaz
+installed, started once and closed so the folder exists. Restore a recent
+backup onto that machine following *Restoring* below, then confirm in the
+application itself that the last day's receipts, both drawer figures and the
+open shift are all there. The check is made through Greaz's own screens, which
+needs no extra tools; it does not require `sqlite3` and must not be made
+dependent on it.
+
+Delete the test database from the spare machine afterwards, so nobody trades on
+it by mistake.
+
+Doing that once, calmly, is what tells you the routine works; the alternative is
+finding out during an emergency, which is the one moment the answer cannot be
+"it didn't".
+
+Two different things have now been rehearsed, and they are not
+interchangeable:
+
+* `lifecycle.rs::a_restored_backup_preserves_sales_payment_legs_movements_and_counters`
+  rehearses it in the test suite — take a backup, restore it, and check that the
+  sale, both payment legs, the inventory movement and the receipt-number
+  sequence all survive, and that the restored database carries on numbering from
+  where it left off rather than colliding.
+* The Gate 1 rehearsal exercised it operationally against WP-B2-B data (record
+  under `lira-pos/dev/`, internal, not part of the release): a published
+  recipe, a recipe-costed
+  posted sale with its frozen `sale_item_recipe_costs` evidence, a kitchen note,
+  split USD/LBP tender, an open shift and live inventory all survived
+  close → copy → restore byte-for-byte, the restored database passed
+  `integrity_check` and `foreign_key_check`, trade resumed at the next receipt
+  number, and a duplicate receipt number was refused by the engine.
+
+**Neither covers a second physical computer.** Gate 1 restored into a second
+clean application identity on **one** machine. The database file is
+self-contained and holds no machine-specific data, so there is no technical
+reason a cross-machine restore should fail — but that is an argument, not a
+test. **OFF-MACHINE RESTORE IS UNVERIFIED**, and nobody should state that Greaz
+recovers from machine loss until the rehearsal above has been done on a
+genuinely separate computer.
+
+## For support personnel only
+
+Everything in this section needs tools Greaz does not ship, or judgement about
+*why* something is in the state it is in. **None of it is part of the operator
+procedure, and none of it should be given to a restaurant manager as a routine
+step.** The operator procedure is the closed-database copy above, and it is
+complete on its own.
+
+### Optional: live snapshot (requires separately installed tools)
+
+> **Not an application feature.** Greaz does **not** include, bundle, install or
+> expose this. It is an optional procedure for a technician who has separately
+> installed the SQLite command-line tool on the machine.
+
+**Prerequisite:** `sqlite3.exe`, obtained from <https://sqlite.org/download.html>
+and placed on `PATH`. It is **not shipped with Greaz and is not present on a
+default Greaz machine** — Gate 1 confirmed it absent on the pilot machine. If
+`sqlite3 --version` does not answer, this procedure is unavailable and the
+closed-database copy is the only option.
+
+With the tool installed, SQLite's own snapshot takes a consistent copy while the
+till keeps trading:
+
+```
+sqlite3 greaz-pos.db "VACUUM INTO 'greaz-pos-2026-10-11.db'"
+```
+
+That produces one self-contained file with every committed transaction in it,
+WAL included. Verified two ways: in the suite by
+`lifecycle.rs::vacuum_into_snapshots_a_live_database_including_wal_commits`, and
+operationally by the Gate 1 live-snapshot probe (internal, under
+`lira-pos/dev/`), which snapshotted
+a live database holding a sale that existed **only** in the WAL plus a
+recipe-costed sale's frozen evidence, and got back one file with `integrity ok`,
+no foreign-key violations, the WAL-only sale present and no companion files.
+
+It is deliberately **not** wired into the application, for the same reason there
+is no automatic backup: a backup nobody verifies is worse than a routine
+somebody performs, because it is trusted.
+
+Note the asymmetry, because it is the whole point of the prohibition above: a
+plain **file copy** of a running database silently loses transactions, while
+`VACUUM INTO` against the same running database does not. The difference is that
+SQLite is doing the reading in the second case. It is not a reason to relax the
+operator rule — it is a reason the operator rule says "closed".
+
+### If the WAL companions remain — remedy
+
+When an operator reports that `greaz-pos.db-wal` / `-shm` survived a clean
+close, establish *why* before doing anything: a crash and a still-running
+process are different problems, and a process still holding the file will simply
+recreate the companions.
+
+1. Confirm no `greaz-pos.exe` is running (Task Manager, or `tasklist`).
+2. If one is, end it, and find out what started it — a second window, a stuck
+   process, or an installer.
+3. **Start Greaz and close it again, normally.** A clean shutdown checkpoints
+   the WAL into the main file and removes both companions; SQLite performs the
+   merge itself, correctly, and this is the remedy. `close_db_pool_on_exit`
+   closing the posting pool on `RunEvent::Exit` is what makes it work — a build
+   predating that correction leaves the WAL behind even on a clean close.
+4. Re-check that both companions are gone, then take the backup.
+5. If they survive a reboot and a clean open/close cycle, treat it as a disk or
+   permissions fault on that folder and stop touching the files.
+
+**Never delete, move or rename a `-wal` file**, and never separate the three
+files. A `-wal` holds committed transactions that are not yet in the main file.
 
 ## Why there is no automatic backup
 
