@@ -30,6 +30,7 @@ use crate::cost::{
     unit_cost_in_uom_to_base_microcents,
 };
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, SqlitePool};
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
@@ -72,12 +73,73 @@ pub(crate) const PRODUCTION_DB_FILENAME: &str = "greaz-pos.db";
 ///
 /// It is fixed here rather than left to luck. The plugin's choice is the one
 /// that has to be matched, because the plugin owns the migrations.
-fn resolve_db_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+pub(crate) fn resolve_db_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app
         .path()
         .app_config_dir()
         .map_err(|e| format!("cannot resolve app_config_dir: {e}"))?;
     Ok(dir.join(PRODUCTION_DB_FILENAME))
+}
+
+/// Open THE writable pool, with foreign keys enforced on every connection.
+///
+/// WHY THIS IS A SEPARATE FUNCTION, AND WHY IT TAKES A PATH.
+///
+/// Extracted so the regression tests build the pool the same way production
+/// does, rather than a lookalike that could drift from it — the same reason
+/// `read_api::open_read_only_pool` is extracted. A test that re-types the
+/// connection SQL proves only that the test is correct, which is exactly how
+/// the defect below survived: `test_support::TempDb::rival_pool` carried a
+/// hand-copied version of this function, commented "configured exactly as
+/// `posting::pool` configures production", and it was — bug included.
+///
+/// FOREIGN KEYS ARE A PROPERTY OF THE CONNECTION, NOT OF THE POOL.
+///
+/// This used to be `SqlitePool::connect(url)` followed by one
+/// `PRAGMA foreign_keys = ON` executed *through the pool*. `PRAGMA
+/// foreign_keys` is per-connection and resets to SQLite's default on every new
+/// one, while executing a statement through a pool acquires ONE connection —
+/// so that statement configured whichever connection happened to serve it and
+/// said nothing about the other nine. A later connection, opened under load,
+/// would then be free to accept a row whose parent does not exist:
+/// `shifts.store_id` and `shifts.opened_by_user_id` are both
+/// `NOT NULL REFERENCES`, and `open_shift_tx` inserts without first proving
+/// either, so an orphan shift was the reachable case.
+///
+/// It is now set in `SqliteConnectOptions`, which sqlx applies while
+/// ESTABLISHING each connection, so every connection the pool ever creates —
+/// the first, the tenth, and each one handed back out after being returned —
+/// has it on before any statement of ours runs on it.
+///
+/// Stated explicitly rather than leaned on: sqlx 0.8 happens to default this
+/// pragma to `ON` (`sqlx-sqlite-0.8.6/src/options/mod.rs:185`), and the
+/// measured behaviour of the old code was therefore already correct. That is
+/// luck, not a contract — a default can change, and a URL is parsed into the
+/// same options struct that a future caller might build differently. The
+/// enforcement this application's integrity rests on should be visible in the
+/// code that opens the connection, and it should be the thing the tests assert
+/// against. `tests::fk_enforcement` asserts it per connection, across
+/// concurrent checkouts and after reuse.
+///
+/// Nothing else about the connection changes. `create_if_missing(true)` is the
+/// `?mode=rwc` the URL used to ask for, `max_connections(10)` is the sqlx
+/// default this pool has always run with — pinned here so a future change to
+/// that default cannot silently resize the till's pool — and `journal_mode` is
+/// deliberately NOT set, because WAL is `db_init`'s decision and sqlx does not
+/// touch it (`options/mod.rs:180`).
+pub(crate) async fn open_write_pool(path: &std::path::Path) -> Result<SqlitePool, String> {
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
+        // The `?mode=rwc` the old URL asked for.
+        .create_if_missing(true)
+        // PER CONNECTION, applied at establish time. The whole point.
+        .foreign_keys(true);
+
+    SqlitePoolOptions::new()
+        .max_connections(10)
+        .connect_with(opts)
+        .await
+        .map_err(|e| format!("failed to open db pool at {}: {e}", path.display()))
 }
 
 /// The one lazily-opened pool every transactional command shares — the posting
@@ -91,14 +153,7 @@ pub(crate) async fn pool(
         return Ok(p.clone());
     }
     let path = resolve_db_path(app)?;
-    let url = format!("sqlite://{}?mode=rwc", path.display());
-    let p = SqlitePool::connect(&url)
-        .await
-        .map_err(|e| format!("failed to open db pool at {}: {e}", path.display()))?;
-    sqlx::query("PRAGMA foreign_keys = ON;")
-        .execute(&p)
-        .await
-        .map_err(|e| format!("PRAGMA foreign_keys failed: {e}"))?;
+    let p = open_write_pool(&path).await?;
     *guard = Some(p.clone());
     Ok(p)
 }

@@ -56,6 +56,7 @@ import {
 } from "../lib/remittanceStore";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
+import { describeBackendError } from "../lib/backendError";
 
 type Tab = "balances" | "people";
 
@@ -396,8 +397,9 @@ export default function Drivers() {
       await reload();
     } catch (e) {
       // A duplicate name lands here: one driver must have one balance, so the
-      // unique index refuses a second "Ali" in the same store.
-      setFormError(e instanceof Error ? e.message : String(e));
+      // unique index refuses a second "Ali" in the same store. Since Gate 2A
+      // the named refusals from `driver_save` arrive as translatable codes.
+      setFormError(describeBackendError(e, t));
     }
   }
 

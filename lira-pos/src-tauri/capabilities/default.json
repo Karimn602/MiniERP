@@ -1,14 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for the desktop app",
+  "description": "Default capabilities for the desktop app. Gate 2A: the renderer has NO SQL plugin permissions. Every read goes through the read_api::db_select command, which is backed by a read_only(true) SQLite pool, and every write goes through a named Rust command. Granting any sql:* permission here reopens the write boundary — sql:allow-select is NOT read-only, because tauri-plugin-sql's select is sqlx::query(..).fetch_all(..) with no statement-type check, so an UPDATE passed to it executes. See src-tauri/src/read_api.rs and src-tauri/src/tests/sql_boundary.rs.",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "sql:default",
-    "sql:allow-execute",
-    "sql:allow-select",
-    "sql:allow-load",
-    "sql:allow-close"
-  ]
+  "permissions": ["core:default"]
 }

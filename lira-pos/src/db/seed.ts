@@ -1,6 +1,27 @@
-import { execute, query } from "./client";
-import { newId } from "../lib/ids";
-import { normalizeBarcode, type BarcodeType } from "../lib/barcode";
+import { query } from "./client";
+import { barcodesRepo } from "./repos/barcodes";
+import type { BarcodeType } from "../lib/barcode";
+
+/**
+ * Development seeding helpers.
+ *
+ * Nothing in the application imports this module. It is kept because it is
+ * occasionally useful from `_Dev.tsx` while working, and migration 019
+ * deliberately retired the demo catalogue that used to be created for every
+ * installation, so `seedDemoProducts` is a stub that creates nothing: a test
+ * that wants a demonstration catalogue calls
+ * `test_support::activate_demo_catalogue` instead, which is the one visible
+ * place a fixture gets made.
+ *
+ * GATE 2A. `addProductBarcode` used to be a raw `INSERT INTO product_barcodes`
+ * issued straight from here. That was the last `execute()` caller in the
+ * frontend and it was also a second writer to a table the catalog commands
+ * own: it skipped `add_product_barcode`'s normalisation, its EAN-13 check
+ * digit, its uniqueness proof and its primary-barcode handling, so a row
+ * written this way could be one no supported path would accept. It now
+ * delegates to `barcodesRepo`, which invokes that command — same effect where
+ * the data was valid, a refusal where it was not.
+ */
 
 const STORE_ID = "00000000-0000-0000-0000-000000000001";
 
@@ -23,23 +44,10 @@ export async function addProductBarcode(args: {
   barcodeType: BarcodeType;
   isPrimary: boolean;
 }): Promise<{ id: string }> {
-  const id = newId();
-  const lookup = normalizeBarcode(args.barcode);
-
-  await execute(
-    `INSERT INTO product_barcodes
-       (id, store_id, product_id, barcode, lookup_value, barcode_type, is_primary, is_active)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
-    [
-      id,
-      STORE_ID,
-      args.productId,
-      args.barcode,
-      lookup,
-      args.barcodeType,
-      args.isPrimary ? 1 : 0,
-    ],
-  );
-
-  return { id };
+  return barcodesRepo.addBarcode({
+    productId: args.productId,
+    barcode: args.barcode,
+    barcodeType: args.barcodeType,
+    makePrimary: args.isPrimary,
+  });
 }

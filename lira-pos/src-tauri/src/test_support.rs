@@ -242,11 +242,11 @@ impl TempDb {
             .await
             .expect("open temporary sqlite database");
 
-        // Mirror production, which sets this pragma explicitly on the pool.
-        sqlx::query("PRAGMA foreign_keys = ON;")
-            .execute(&pool)
-            .await
-            .expect("enable foreign keys");
+        // No pool-level `PRAGMA foreign_keys` here, and none in production
+        // either since the GZ-G2A-P1 correction: the pragma is per-connection
+        // and `foreign_keys(true)` above applies it while each connection is
+        // established. Executing it through a pool would configure only
+        // whichever connection served the statement.
 
         Self {
             pool: Some(pool),
@@ -282,21 +282,24 @@ impl TempDb {
     /// commands on it could never actually contend. A separate pool contends for
     /// real, through the engine.
     ///
-    /// Configured exactly as `posting::pool` configures production: the same
-    /// `sqlite://<path>?mode=rwc` URL through `SqlitePool::connect`, and the same
-    /// `PRAGMA foreign_keys = ON`. Nothing is made more forgiving than the real
-    /// application, so a lock error a test sees here is one a cashier could see.
+    /// Built by `posting::open_write_pool` — THE production function, called
+    /// rather than imitated.
+    ///
+    /// It used to hand-copy production's connection SQL, under a comment
+    /// claiming it was "configured exactly as `posting::pool` configures
+    /// production". That was true, and it is why GZ-G2A-P1 went unnoticed for
+    /// as long as it did: production ran one `PRAGMA foreign_keys = ON` through
+    /// a ten-connection pool, this copy did the same, and the copy could never
+    /// contradict the original. A test helper that re-types the code under test
+    /// proves the helper correct and nothing else, so this one now calls it.
+    ///
+    /// Nothing is made more forgiving than the real application, so a lock
+    /// error a test sees here is one a cashier could see.
     pub async fn rival_pool(&self) -> SqlitePool {
         assert_not_production_db(&self.path);
-        let url = format!("sqlite://{}?mode=rwc", self.path.display());
-        let pool = SqlitePool::connect(&url)
+        crate::posting::open_write_pool(&self.path)
             .await
-            .unwrap_or_else(|e| panic!("open rival pool on {}: {e}", self.path.display()));
-        sqlx::query("PRAGMA foreign_keys = ON;")
-            .execute(&pool)
-            .await
-            .expect("enable foreign keys on the rival pool");
-        pool
+            .unwrap_or_else(|e| panic!("open rival pool on {}: {e}", self.path.display()))
     }
 
     /// Re-run the migrator against this database (idempotency checks).

@@ -26,6 +26,11 @@
     "csp": null
   }
 },
+  "plugins": {
+    "sql": {
+      "preload": ["sqlite:greaz-pos.db"]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

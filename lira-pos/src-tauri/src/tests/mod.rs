@@ -32,3 +32,6 @@ mod standard_cost;
 mod supplier_ap;
 mod supplier_payments;
 mod tenders;
+mod admin_commands;
+mod fk_enforcement;
+mod sql_boundary;

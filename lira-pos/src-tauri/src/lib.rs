@@ -1,13 +1,17 @@
 // src-tauri/src/lib.rs
 use tauri_plugin_sql::{Migration, MigrationKind};
 
+mod admin;
 mod catalog;
 mod cost;
+mod db_init;
 mod posting;
+mod read_api;
 mod recipe_cost;
 mod recipe_sale_cost;
 mod recipes;
 use posting::DbState;
+use read_api::ReadPool;
 
 #[cfg(test)]
 mod test_support;
@@ -190,12 +194,42 @@ fn close_db_pool_on_exit(app: &tauri::AppHandle) {
     });
 }
 
+/// Close the READ-ONLY pool on exit, and close it FIRST.
+///
+/// SQLite folds the WAL back into the main file and removes `-wal` / `-shm`
+/// when the LAST connection closes, and `docs/BACKUP.md` step 3 has the
+/// operator read the absence of those two files as the signal that
+/// `greaz-pos.db` is complete and safe to copy. Gate 2A adds a third pool to
+/// this process; leaving it open would leave the companions behind on every
+/// clean shutdown and silently break the backup procedure — which is precisely
+/// the defect `close_db_pool_on_exit` exists to fix for the second pool.
+///
+/// ORDER IS LOAD-BEARING, AND THE FIRST CUT OF GATE 2A HAD IT WRONG. Only a
+/// connection that may WRITE can perform that final checkpoint: a read-only
+/// handle has no authority to modify the main database, so it closes quietly
+/// and leaves both companions on disk. Closing this pool AFTER the posting pool
+/// therefore reintroduced the exact defect it was written to avoid — observed
+/// on the desktop under a disposable identity, where a cleanly closed Greaz
+/// left a 1.8 MB `-wal` beside a 4 KB main file holding none of the evening's
+/// sales. So the read-only pool is retired first and a writable pool closes
+/// last. Pinned by `tests::lifecycle::a_read_only_pool_closed_last_leaves_the_wal_behind`
+/// and `::closing_the_read_only_pool_first_checkpoints_the_wal`.
+fn close_read_pool_on_exit(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let state = app.state::<ReadPool>();
+    tauri::async_runtime::block_on(async move {
+        read_api::close_read_pool(&state).await;
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = migrations();
 
     tauri::Builder::default()
         .manage(DbState::new())
+        .manage(ReadPool::new())
         .plugin(
             tauri_plugin_sql::Builder::default()
                 .add_migrations("sqlite:greaz-pos.db", migrations)
@@ -217,11 +251,49 @@ pub fn run() {
             recipes::save_recipe_draft,
             recipes::activate_recipe,
             recipes::retire_recipe,
+            // Gate 2A — the renderer's only database access, read-only by
+            // construction (`read_api`), plus the master-data writes that used
+            // to be direct `execute()` calls from TypeScript (`admin`).
+            read_api::db_select,
+            admin::exchange_rate_save,
+            admin::driver_save,
+            admin::driver_set_active,
+            admin::supplier_save,
+            admin::supplier_set_active,
         ])
+        .setup(|app| {
+            // The journal mode the Gate 1 backup procedure depends on. Was a
+            // frontend PRAGMA until Gate 2A removed `sql:allow-execute`; see
+            // `db_init` for why it is not optional.
+            let handle = app.handle().clone();
+            tauri::async_runtime::block_on(async move {
+                use tauri::Manager;
+                let state = handle.state::<DbState>();
+                match db_init::ensure_production_pragmas(&handle, &state).await {
+                    Ok(mode) if mode == "wal" => {
+                        println!("[db] ready, journal_mode = {mode}");
+                    }
+                    Ok(mode) => {
+                        // Not fatal — the till must still open — but the
+                        // documented backup procedure no longer describes this
+                        // application, so it is said loudly.
+                        eprintln!(
+                            "[db] journal_mode is {mode}, expected wal: the documented backup procedure assumes WAL"
+                        );
+                    }
+                    Err(e) => eprintln!("[db] startup PRAGMA failed: {e}"),
+                }
+            });
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
+                // Read-only FIRST: it cannot checkpoint, so it must not be the
+                // last connection holding the file. See the note on
+                // `close_read_pool_on_exit`.
+                close_read_pool_on_exit(app_handle);
                 close_db_pool_on_exit(app_handle);
             }
         });

@@ -933,3 +933,132 @@ async fn a_restored_backup_preserves_sales_payment_legs_movements_and_counters()
         .expect("remove restore-rehearsal backup");
     db.cleanup().await.expect("remove restore-rehearsal TempDb");
 }
+
+// ---------------------------------------------------------------------------
+// Gate 2A — the THIRD pool, and why the order it closes in is not cosmetic.
+// ---------------------------------------------------------------------------
+
+/// A READ-ONLY connection cannot perform SQLite's final checkpoint, so if it is
+/// the last one closed the WAL survives a clean shutdown.
+///
+/// This is the Gate 2A topology: THREE pools against one file — the plugin's
+/// (read-write, closed by the plugin on `RunEvent::Exit`), `posting::DbState`
+/// (read-write), and `read_api`'s (opened `read_only(true)`). SQLite folds the
+/// WAL back into the main database and unlinks `-wal` / `-shm` when the last
+/// connection closes, but only a connection that may WRITE can do it: a
+/// read-only handle has no authority to modify the main file, so it closes
+/// quietly and leaves both companions behind.
+///
+/// `docs/BACKUP.md` step 3 has the operator read the absence of those two files
+/// as the signal that `greaz-pos.db` is complete and safe to copy. With the
+/// read-only pool closing last, that signal never arrives — and a single-file
+/// copy taken anyway omits every sale still in the WAL, which is the loss
+/// `copying_only_the_main_file_while_the_wal_is_live_loses_the_sale` measures.
+#[tokio::test]
+async fn a_read_only_pool_closed_last_leaves_the_wal_behind() {
+    let db = store_with_coffee().await;
+    let path = db.path().to_path_buf();
+
+    let greaz_pool = db.rival_pool().await;
+    let sale_id = post_one_sale(&greaz_pool).await;
+
+    // The read-only pool, built by the SAME function the command uses, so this
+    // cannot drift from production.
+    let read_pool = crate::read_api::open_read_only_pool(&path)
+        .await
+        .expect("open the read-only pool");
+    // Give it a live connection, as a running application would have.
+    sqlx::query("SELECT COUNT(*) FROM sales")
+        .fetch_one(&read_pool)
+        .await
+        .expect("the read-only pool can read");
+
+    // Production exit order: plugin first, then posting, then read-only.
+    close_sqlite_pool_checked(db.pool(), "plugin pool")
+        .await
+        .expect("close plugin pool");
+    close_sqlite_pool_checked(&greaz_pool, "posting pool")
+        .await
+        .expect("close posting pool");
+
+    assert!(
+        wal_of(&path).exists(),
+        "with the read-only pool still open the WAL is expected to survive"
+    );
+
+    read_pool.close().await;
+
+    assert!(
+        wal_of(&path).exists(),
+        "REPRODUCED: a read-only connection cannot checkpoint, so closing it \
+         last leaves greaz-pos.db-wal on disk after a clean shutdown"
+    );
+    assert!(shm_of(&path).exists(), "REPRODUCED: the SHM survives too");
+
+    // And the main file is NOT self-contained, which is the harm: the sale is
+    // only in the WAL, so the backup the operator is told to take loses it.
+    let copy = scratch_path("read-only-last-main-file-only");
+    std::fs::copy(&path, &copy).expect("copy the main file alone");
+    let copied = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", copy.display()))
+        .await
+        .expect("open the copy");
+    let found: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sales WHERE id = ?")
+        .bind(&sale_id)
+        .fetch_one(&copied)
+        .await
+        .expect("count the sale in the copy");
+    copied.close().await;
+    let _ = std::fs::remove_file(&copy);
+    assert_eq!(
+        found, 0,
+        "the sale is still only in the WAL, so a single-file copy omits it"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// Closing the read-only pool FIRST, so a writable connection is last, is what
+/// restores the Gate 1 signal.
+///
+/// Same three pools, same sale, only the order changes — which is the whole
+/// content of the fix in `lib.rs`.
+#[tokio::test]
+async fn closing_the_read_only_pool_first_checkpoints_the_wal() {
+    let db = store_with_coffee().await;
+    let path = db.path().to_path_buf();
+
+    let greaz_pool = db.rival_pool().await;
+    let sale_id = post_one_sale(&greaz_pool).await;
+
+    let read_pool = crate::read_api::open_read_only_pool(&path)
+        .await
+        .expect("open the read-only pool");
+    sqlx::query("SELECT COUNT(*) FROM sales")
+        .fetch_one(&read_pool)
+        .await
+        .expect("the read-only pool can read");
+
+    // CORRECTED order: the read-only pool goes first, so the last connection
+    // to close is one that may write and can therefore checkpoint.
+    read_pool.close().await;
+    close_sqlite_pool_checked(db.pool(), "plugin pool")
+        .await
+        .expect("close plugin pool");
+    close_sqlite_pool_checked(&greaz_pool, "posting pool")
+        .await
+        .expect("close posting pool");
+
+    assert_self_contained_after_shutdown(
+        &path,
+        ExpectedCommittedSale {
+            id: &sale_id,
+            payment_count: 1,
+            movement_count: 1,
+        },
+        "FIX: with a writable connection closing last, the WAL is checkpointed \
+         into the main file and both companions are gone",
+    )
+    .await;
+
+    db.cleanup().await.expect("remove TempDb");
+}

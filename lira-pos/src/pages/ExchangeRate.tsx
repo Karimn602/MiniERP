@@ -15,6 +15,7 @@ import { Button } from "../components/ui/Button";
 import { PageHeader } from "../components/ui/PageHeader";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
+import { describeBackendError } from "../lib/backendError";
 
 export default function ExchangeRate() {
   const { storeId, userId } = useActiveContext();
@@ -121,7 +122,10 @@ export default function ExchangeRate() {
       setTimeout(() => setJustSaved(false), 2500);
       await reload();
     } catch (e) {
-      setFormError(e instanceof Error ? e.message : String(e));
+      // The rate now posts through `exchange_rate_save`, which refuses a bad
+      // figure with a stable code rather than prose, so the operator gets a
+      // sentence in their own language instead of a Rust error.
+      setFormError(describeBackendError(e, t));
     } finally {
       setSubmitting(false);
     }

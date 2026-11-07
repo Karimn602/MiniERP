@@ -13,6 +13,7 @@ import { formatUsd } from "../lib/money";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
+import { describeBackendError } from "../lib/backendError";
 
 type SupplierBalanceSummary = {
   balanceCents: number;
@@ -264,7 +265,7 @@ function NewSupplierForm({
 
       onCreated();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeBackendError(e, t));
     } finally {
       setSubmitting(false);
     }

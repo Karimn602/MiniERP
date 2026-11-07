@@ -977,23 +977,49 @@ async fn the_supplier_ledger_stays_append_only_and_still_takes_adjustments() {
 // 5. SQLite / runtime
 // ============================================================================
 
-/// The one canonical Greaz database name, asserted in the one place both sides
-/// of the application agree on it.
+/// The one canonical Greaz database name, asserted everywhere it is still
+/// named.
 ///
-/// `src/db/client.ts` opens `sqlite:greaz-pos.db` and `posting.rs` joins
-/// `PRODUCTION_DB_FILENAME` onto the same directory the plugin resolves
-/// against. The old `lira-pos.db` name must appear nowhere in production code.
+/// WHAT GATE 2A CHANGED HERE. This test used to require that
+/// `src/db/client.ts` contained `sqlite:greaz-pos.db`, because the frontend
+/// opened the database itself through tauri-plugin-sql and a typo there would
+/// have split the application in half — migrations and reads in one file,
+/// every posting command writing to another.
+///
+/// The frontend no longer opens anything. `client.ts` holds no database name
+/// at all now, which is strictly better than holding the right one: there is
+/// no second place for the name to drift. The URL moved to the `preload` entry
+/// in `tauri.conf.json`, which is what makes the plugin connect and migrate
+/// during Rust setup, and `posting.rs` joins `PRODUCTION_DB_FILENAME` onto the
+/// same directory the plugin resolves that URL against.
+///
+/// So the assertion follows the name rather than being deleted: the two places
+/// that DO name it must agree, and `client.ts` must not name a database at all.
 #[test]
 fn the_production_database_has_one_canonical_name() {
     assert_eq!(crate::posting::PRODUCTION_DB_FILENAME, PRODUCTION_DB_FILENAME);
     assert_eq!(PRODUCTION_DB_FILENAME, "greaz-pos.db");
 
-    // The TypeScript side names it too, and drift there would split the app in
-    // half just as surely as a mismatched directory would.
+    // The config names it, and that entry is what triggers the migrations.
+    let conf = include_str!("../../tauri.conf.json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(conf).expect("tauri.conf.json parses");
+    let preload = parsed["plugins"]["sql"]["preload"]
+        .as_array()
+        .expect("plugins.sql.preload must exist: without it no migration runs");
+    let urls: Vec<&str> = preload.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        urls,
+        vec![format!("sqlite:{PRODUCTION_DB_FILENAME}").as_str()],
+        "exactly one preloaded database, under the canonical name"
+    );
+
+    // And the frontend names none, so it cannot drift from the above.
     let client_ts = include_str!("../../../src/db/client.ts");
     assert!(
-        client_ts.contains("sqlite:greaz-pos.db"),
-        "src/db/client.ts must open the canonical database"
+        !client_ts.contains("sqlite:"),
+        "src/db/client.ts must not open a database: reads go through db_select \
+         and the path is resolved in Rust"
     );
     assert!(
         !client_ts.contains("lira-pos.db"),

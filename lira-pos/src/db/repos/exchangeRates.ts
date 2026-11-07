@@ -1,4 +1,6 @@
-import { execute, query } from "../client";
+import { invoke } from "@tauri-apps/api/core";
+
+import { query } from "../client";
 import { newId } from "../../lib/ids";
 import { todayLocalDate } from "../../lib/dates";
 import type { ExchangeRate } from "../types";
@@ -70,7 +72,22 @@ export const exchangeRatesRepo = {
     return rate;
   },
 
-  /** Upsert by (store_id, effective_date). Preserves existing row id on update. */
+  /**
+   * Upsert by (store_id, effective_date). Preserves the existing row id.
+   *
+   * Goes through `exchange_rate_save` (Gate 2A). This used to be a SELECT and
+   * then an UPDATE-or-INSERT as three separate round trips from here, which is
+   * two problems in one: the read and the write could interleave with another
+   * caller and race on the unique index, and - the reason it had to move - the
+   * renderer could write the very row `post_sale` validates a sale's locked
+   * rate against. The validator and its reference sat on the same side of the
+   * boundary, so a favourable rate could be typed in and every check would
+   * still pass. The backend now resolves and writes it in ONE transaction.
+   *
+   * Refusals arrive as stable codes: EXCHANGE_RATE_MUST_BE_POSITIVE,
+   * EXCHANGE_RATE_OUT_OF_RANGE, EXCHANGE_RATE_BAD_EFFECTIVE_DATE,
+   * EXCHANGE_RATE_BAD_SOURCE, UNKNOWN_STORE.
+   */
   async upsert(args: {
     storeId: string;
     effectiveDate: string;
@@ -79,46 +96,24 @@ export const exchangeRatesRepo = {
     notes?: string | null;
     createdByUserId?: string | null;
   }): Promise<{ id: string }> {
+    // Kept here as well as in Rust: a local throw gives the Exchange Rate
+    // screen an immediate, specific message. It is not a guarantee about
+    // anything - the backend refuses the same figure again.
     if (!Number.isInteger(args.rateLbpPerUsd) || args.rateLbpPerUsd <= 0) {
       throw new Error(`Invalid rate: ${args.rateLbpPerUsd}`);
     }
 
-    const existing = await query<{ id: string }>(
-      `SELECT id FROM exchange_rates
-       WHERE store_id = ? AND effective_date = ?`,
-      [args.storeId, args.effectiveDate],
-    );
-
-    if (existing[0]) {
-      await execute(
-        `UPDATE exchange_rates
-            SET rate_lbp_per_usd = ?, source = ?, notes = ?
-          WHERE id = ?`,
-        [
-          args.rateLbpPerUsd,
-          args.source ?? "manual",
-          args.notes ?? null,
-          existing[0].id,
-        ],
-      );
-      return { id: existing[0].id };
-    }
-
-    const id = newId();
-    await execute(
-      `INSERT INTO exchange_rates
-         (id, store_id, effective_date, rate_lbp_per_usd, source, notes, created_by_user_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        args.storeId,
-        args.effectiveDate,
-        args.rateLbpPerUsd,
-        args.source ?? "manual",
-        args.notes ?? null,
-        args.createdByUserId ?? null,
-      ],
-    );
+    const id = await invoke<string>("exchange_rate_save", {
+      args: {
+        id: newId(),
+        storeId: args.storeId,
+        effectiveDate: args.effectiveDate,
+        rateLbpPerUsd: args.rateLbpPerUsd,
+        source: args.source ?? "manual",
+        notes: args.notes ?? null,
+        createdByUserId: args.createdByUserId ?? null,
+      },
+    });
     return { id };
   },
 };

@@ -21,7 +21,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import { execute, query } from "../client";
+import { query } from "../client";
 import { newId } from "../../lib/ids";
 import type {
   Driver,
@@ -234,33 +234,54 @@ export const driversRepo = {
   // Master data
   // -------------------------------------------------------------------------
 
+  /**
+   * Create a driver. Goes through `driver_save` (Gate 2A).
+   *
+   * Refusals: DRIVER_NAME_REQUIRED, DRIVER_NAME_TOO_LONG,
+   * DRIVER_STORE_REQUIRED, UNKNOWN_STORE.
+   */
   async create(args: {
     storeId: string;
     name: string;
     phone?: string | null;
     notes?: string | null;
   }): Promise<string> {
-    const id = newId();
-    await execute(
-      `INSERT INTO drivers (id, store_id, name, phone, notes) VALUES (?, ?, ?, ?, ?)`,
-      [id, args.storeId, args.name.trim(), args.phone?.trim() || null, args.notes?.trim() || null],
-    );
-    return id;
+    return invoke<string>("driver_save", {
+      args: {
+        id: newId(),
+        storeId: args.storeId,
+        name: args.name,
+        phone: args.phone ?? null,
+        notes: args.notes ?? null,
+      },
+    });
   },
 
+  /**
+   * Rename a driver, or change his phone or notes.
+   *
+   * `storeId` is deliberately not sent: a driver never moves store. His
+   * ledger, his collections and the sales naming him are all scoped to one
+   * store and migration 015's triggers prove it per row, so moving him would
+   * leave a balance filed against one branch and the receipts behind it
+   * against another. The backend ignores the field on an update for the same
+   * reason.
+   */
   async update(args: {
     id: string;
     name: string;
     phone?: string | null;
     notes?: string | null;
   }): Promise<void> {
-    await execute(
-      `UPDATE drivers
-          SET name = ?, phone = ?, notes = ?,
-              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ?`,
-      [args.name.trim(), args.phone?.trim() || null, args.notes?.trim() || null, args.id],
-    );
+    await invoke<string>("driver_save", {
+      args: {
+        id: args.id,
+        storeId: null,
+        name: args.name,
+        phone: args.phone ?? null,
+        notes: args.notes ?? null,
+      },
+    });
   },
 
   /**
@@ -269,12 +290,7 @@ export const driversRepo = {
    * structural rather than a convention.
    */
   async setActive(id: string, isActive: boolean): Promise<void> {
-    await execute(
-      `UPDATE drivers
-          SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ?`,
-      [isActive ? 1 : 0, id],
-    );
+    await invoke("driver_set_active", { args: { id, isActive } });
   },
 
   // -------------------------------------------------------------------------

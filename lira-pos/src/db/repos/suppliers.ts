@@ -1,4 +1,6 @@
-import { execute, query } from "../client";
+import { invoke } from "@tauri-apps/api/core";
+
+import { query } from "../client";
 import { newId } from "../../lib/ids";
 import type { Supplier } from "../types";
 
@@ -81,30 +83,26 @@ export const suppliersRepo = {
     email?: string | null;
     notes?: string | null;
   }): Promise<Supplier> {
-    const id = newId();
-    await execute(
-      `INSERT INTO suppliers
-         (id, store_id, name, contact_name, phone, email, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        args.storeId,
-        args.name.trim(),
-        args.contactName ?? null,
-        args.phone ?? null,
-        args.email ?? null,
-        args.notes ?? null,
-      ],
-    );
+    // Goes through `supplier_save` (Gate 2A). Refusals:
+    // SUPPLIER_NAME_REQUIRED, SUPPLIER_NAME_TOO_LONG,
+    // SUPPLIER_STORE_REQUIRED, UNKNOWN_STORE.
+    const id = await invoke<string>("supplier_save", {
+      args: {
+        id: newId(),
+        storeId: args.storeId,
+        name: args.name,
+        contactName: args.contactName ?? null,
+        phone: args.phone ?? null,
+        email: args.email ?? null,
+        notes: args.notes ?? null,
+      },
+    });
     const created = await this.findById(id);
     if (!created) throw new Error("Supplier vanished after insert");
     return created;
   },
 
   async setActive(id: string, active: boolean): Promise<void> {
-    await execute(`UPDATE suppliers SET is_active = ? WHERE id = ?`, [
-      active ? 1 : 0,
-      id,
-    ]);
+    await invoke("supplier_set_active", { args: { id, isActive: active } });
   },
 };
