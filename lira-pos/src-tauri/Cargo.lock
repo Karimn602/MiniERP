@@ -2208,6 +2208,7 @@ name = "lira-pos"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
  "sqlx",

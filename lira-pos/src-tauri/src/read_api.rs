@@ -211,6 +211,17 @@ pub(crate) async fn open_read_only_pool(
 
     SqlitePoolOptions::new()
         .max_connections(4)
+        // (4) THE CONFIDENTIALITY BOUNDARY (GZ-A0). `read_only(true)` above
+        // stops the renderer WRITING; nothing stopped it READING a credential
+        // hash. `read_guard::install` puts SQLite's own authorizer on every
+        // physical connection and proves it took effect before the connection
+        // is usable, so a protected (table, column) is unreadable however the
+        // query is spelled. On this hook returning `Err`, sqlx discards the
+        // connection and pool creation fails — so there is no renderer read
+        // channel that is not covered. See `read_guard`'s module header.
+        .after_connect(|conn, _meta| {
+            Box::pin(async move { crate::read_guard::install(conn).await })
+        })
         .connect_with(opts)
         .await
         .map_err(|e| {

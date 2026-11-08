@@ -369,7 +369,17 @@ async fn legitimate_reads_still_work_and_keep_their_types() {
 /// The read interface names no database: the path is resolved in Rust from
 /// `app_config_dir()`, so there is no parameter through which a caller could
 /// ask for another file. `ATTACH` is the one statement that could reach around
-/// that, and it is refused twice.
+/// that, and it is now refused by BOTH layers.
+///
+/// GZ-A0 CHANGED THE SECOND HALF OF THIS TEST, and the change is a
+/// strengthening rather than an adjustment. Gate 2A recorded an honest
+/// residual here: the statement guard was the ONLY thing refusing `ATTACH`, and
+/// a read-only connection reached out-of-band would accept one and read the
+/// other file. The confidentiality authorizer installed by `read_guard` denies
+/// `SQLITE_ATTACH` outright, so that residual is closed and the second half of
+/// this test now asserts the refusal instead of documenting the gap. The
+/// original assertions are kept in the comments below, because what a test used
+/// to prove is part of why it looks the way it does.
 #[tokio::test]
 async fn no_other_database_can_be_reached() {
     let db = store_with_a_priced_product().await;
@@ -378,7 +388,7 @@ async fn no_other_database_can_be_reached() {
 
     let attach = format!("ATTACH DATABASE '{}' AS other", other.path().display());
 
-    // The statement guard is the ONLY thing refusing ATTACH, and it does.
+    // Layer one: the statement guard refuses the shape, with a readable message.
     let err = run_select(&ro, &attach, vec![])
         .await
         .expect_err("ATTACH must be refused");
@@ -397,48 +407,64 @@ async fn no_other_database_can_be_reached() {
     );
 
     // ---------------------------------------------------------------------
-    // Now the honest part, out-of-band: what the CONNECTION permits, which is
-    // more than the guard does. This is documented as a residual rather than
-    // claimed as a defence.
+    // Layer two, out-of-band: what the CONNECTION permits. Until GZ-A0 this
+    // was MORE than the guard did, and it was documented as a residual:
+    //
+    //     assert!(conn.fetch_all(sqlx::query(&attach)).await.is_ok(),
+    //             "a read-only connection accepts ATTACH");
+    //     assert!(conn.fetch_all(sqlx::query(
+    //         "SELECT COUNT(*) FROM other.products")).await.is_ok(),
+    //             "the attached file is readable on the connection that attached it");
+    //
+    // Both of those are now false, which is the point of the change. The
+    // confidentiality authorizer denies SQLITE_ATTACH, so the renderer's read
+    // channel cannot reach another file even if the statement guard were
+    // removed tomorrow.
     // ---------------------------------------------------------------------
 
-    // Everything below runs on ONE PINNED CONNECTION. An ATTACH binds to a
-    // single connection, and which connection serves the next statement is
-    // sqlx's choice, so doing this through the pool gives a non-deterministic
-    // answer — both outcomes were observed while writing this test. Pinning is
-    // what makes the claim checkable rather than lucky.
+    // Still on ONE PINNED CONNECTION. An ATTACH binds to a single connection
+    // and sqlx chooses which connection serves the next statement, so going
+    // through the pool gives a non-deterministic answer — both outcomes were
+    // observed while writing the Gate 2A version of this test. Pinning is what
+    // makes the claim checkable rather than lucky.
     let mut conn = ro.acquire().await.expect("acquire one connection");
 
-    // A read-only handle ACCEPTS ATTACH. The guard is the only thing stopping
-    // it, which is why `db_select` also takes no database name as a parameter:
-    // the path is resolved in Rust and there is nothing on the wire to point
-    // elsewhere.
-    assert!(
-        conn.fetch_all(sqlx::query(&attach)).await.is_ok(),
-        "a read-only connection accepts ATTACH"
-    );
-
-    // Once attached, that connection can READ the other file. Asserted rather
-    // than wished away: this is the residual if the guard were ever widened.
-    assert!(
-        conn.fetch_all(sqlx::query("SELECT COUNT(*) FROM other.products"))
-            .await
-            .is_ok(),
-        "the attached file is readable on the connection that attached it"
-    );
-
-    // But it can never be WRITTEN: the attachment inherits the read-only
-    // handle. This is the clause that matters — even the residual is read
-    // access to another file, never a write to one.
-    let write_attached = conn
-        .fetch_all(sqlx::query("UPDATE other.products SET name = 'x'"))
+    // THE RESIDUAL IS CLOSED. The authorizer refuses the attach itself, so
+    // there is never an attached database to read from.
+    let denied = conn
+        .fetch_all(sqlx::query(&attach))
         .await
         .err()
         .map(|e| e.to_string())
-        .expect("writing to an attached database must not succeed");
+        .expect(
+            "GZ-A0: the confidentiality authorizer must refuse ATTACH on a              renderer read connection, with or without the shape guard",
+        );
     assert!(
-        write_attached.contains("readonly database"),
-        "an attached database inherits the read-only handle: {write_attached}"
+        denied.to_ascii_lowercase().contains("not authorized")
+            || denied.to_ascii_lowercase().contains("prohibited"),
+        "refused by the authorizer rather than by something else: {denied}"
+    );
+
+    // And nothing is reachable under that name, because nothing was attached.
+    assert!(
+        conn.fetch_all(sqlx::query("SELECT COUNT(*) FROM other.products"))
+            .await
+            .is_err(),
+        "no database was attached, so `other` must not resolve"
+    );
+
+    // The write clause still holds for the same reason it always did: the
+    // handle cannot write. Asserted against `main`, since there is no attached
+    // database left to try it on.
+    let write_main = conn
+        .fetch_all(sqlx::query("UPDATE products SET name = 'x'"))
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .expect("writing through the read-only handle must not succeed");
+    assert!(
+        write_main.contains("readonly database"),
+        "the read-only handle is still the integrity boundary: {write_main}"
     );
     drop(conn);
 

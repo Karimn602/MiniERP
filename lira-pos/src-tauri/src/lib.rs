@@ -7,6 +7,7 @@ mod cost;
 mod db_init;
 mod posting;
 mod read_api;
+mod read_guard;
 mod recipe_cost;
 mod recipe_sale_cost;
 mod recipes;

@@ -28,6 +28,16 @@ tauri-plugin-sql = { version = "2.4.0", features = ["sqlite"] }
 # tauri-plugin-sql brings sqlx 0.8 as a transitive dep; we pin to the same
 # major to share the underlying SQLite driver and avoid two copies.
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# GZ-A0 — SQLite's authorizer callback, for the renderer read pool's
+# confidentiality boundary (`src/read_guard.rs`). This is NOT a new SQLite:
+# sqlx's `sqlite` feature already pulls `libsqlite3-sys` with `bundled`, and
+# cargo unifies features, so declaring it here binds to the SAME crate instance
+# and the SAME compiled engine. Pinned to the exact version sqlx 0.8.6 resolves
+# (0.30.1) because two libsqlite3-sys majors in one graph would link two copies
+# of SQLite, and `as_raw_handle()`'s `sqlite3` type must be the one this crate
+# defines or the handle cannot be passed at all.
+libsqlite3-sys = { version = "0.30.1", default-features = false }
 tokio = { version = "1", features = ["sync"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
