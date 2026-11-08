@@ -143,6 +143,13 @@ const PROTECTED_TABLES: &[&str] = &[
     // The credential stores.
     "owner_recovery",
     "auth_audit",
+    // Migration 023's enrollment state machine. It holds the hash of the
+    // one-time installation enrollment code, and its `state` plus attempt
+    // counters tell a would-be owner exactly how close the ceremony is to being
+    // available and how many guesses remain. The login and bootstrap screens
+    // get what they need from the trusted `auth_status` command, never from a
+    // query, so the whole table is denied.
+    "auth_enrollment",
     // Surfaces that reflect the CONTENT of other tables and so would route
     // around every rule below. See the module note above.
     "dbstat",
@@ -218,12 +225,14 @@ const MUST_NEVER_BE_READABLE: &[(&str, &str)] = &[
     // lockout they are trying to avoid.
     ("users", "failed_attempts"),
     ("users", "locked_until"),
-    // Enrollment and credential lifecycle state (023). Readable by the
-    // authenticated session through a trusted command, not by an arbitrary
-    // query.
+    // Credential lifecycle state (023). Readable by the authenticated session
+    // through a trusted command, not by an arbitrary query.
     ("users", "must_change_pin"),
-    ("users", "enrollment_state"),
-    ("users", "enrollment_expires_at"),
+    // Migration 023 put enrollment state in its own table rather than on
+    // `users`, so the names this list carried for it were wrong. The table is
+    // denied in full by `PROTECTED_TABLES`; these two entries record the
+    // credential-adjacent columns that DO live on `users`.
+    ("users", "credential_version"),
 ];
 
 /// SQL functions the renderer may not call.

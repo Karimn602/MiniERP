@@ -2,6 +2,7 @@
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 mod admin;
+mod auth;
 mod catalog;
 mod cost;
 mod db_init;
@@ -158,6 +159,12 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/022_recipe_sale_costing.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 23,
+            description: "authentication",
+            sql: include_str!("../../src/db/migrations/023_authentication.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -228,6 +235,7 @@ pub fn run() {
     match tauri::Builder::default()
         .manage(DbState::new())
         .manage(ReadPool::new())
+        .manage(auth::SessionState::new())
         .plugin(
             tauri_plugin_sql::Builder::default()
                 .add_migrations("sqlite:greaz-pos.db", migrations)
@@ -258,6 +266,19 @@ pub fn run() {
             admin::driver_set_active,
             admin::supplier_save,
             admin::supplier_set_active,
+            // Gate 2B Stage A.1 - offline authentication. `auth_status` is the
+            // ONLY command callable with no session; it is what the pre-login
+            // boot runs on, so the read channel can be session-gated without
+            // an allowlist of "harmless" pre-login queries.
+            auth::auth_status,
+            auth::auth_enroll_owner,
+            auth::auth_login,
+            auth::auth_logout,
+            auth::auth_lock,
+            auth::auth_unlock,
+            auth::auth_touch,
+            auth::auth_change_credential,
+            auth::auth_recover_owner,
         ])
         .setup(|app| {
             // MANDATORY DATABASE VALIDATION, AND IT FAILS CLOSED.

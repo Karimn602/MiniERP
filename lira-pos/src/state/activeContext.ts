@@ -1,12 +1,45 @@
 import { create } from "zustand";
-import { query } from "../db/client";
 
 /**
- * Active context — the "who/where" of the running session. Hydrated once
- * on app boot, then read freely via useActiveContext().
+ * Active context — the "who/where" of the running session.
  *
- * Components READ from this store. They DO NOT mutate it; only
- * hydrateActiveContext() does.
+ * WHAT CHANGED IN GATE 2B STAGE A.1, AND WHY IT MATTERED
+ *
+ * This module used to decide who was using the application, with two queries at
+ * boot. The second one was the entire identity model:
+ *
+ * ```sql
+ *     SELECT id FROM users
+ *      WHERE store_id = ? AND active = 1
+ *      ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, created_at ASC
+ *      LIMIT 1
+ * ```
+ *
+ * So the application always ran as the oldest active owner. It took no input,
+ * could not be changed from the UI, and every actor on every posted document —
+ * `sales.cashier_user_id`, `shifts.opened_by_user_id`,
+ * `inventory_movements.created_by_user_id`, all eight columns — was that one
+ * seeded row, asserted by the caller. On a shop with two owner rows the
+ * application simply picked one.
+ *
+ * **BOTH QUERIES ARE GONE.** The identity now comes from the authenticated
+ * session that Rust holds (`state/session.ts`, backed by `auth_status`), and
+ * this store is hydrated FROM it rather than from the database. That is what
+ * removes the automatic owner selection: there is no longer any code anywhere
+ * that chooses a user.
+ *
+ * It also had to change for a second, duller reason: those two queries were
+ * `db_select` calls, and `db_select` now requires a session. They ran before
+ * login, so they would be refused.
+ *
+ * WHAT THIS STORE IS NOW: a convenience read of `storeId` and `userId` for the
+ * ~15 screens that pass them into command payloads. It is NOT an authority.
+ * From Stage B the backend resolves the actor from the session itself and treats
+ * a payload's `cashierUserId` / `createdByUserId` as a cross-check to be
+ * refused on mismatch — the same pattern this codebase already applies to
+ * `quantity_base` and `factor_*_snapshot`. Until then these values are what the
+ * payloads carry, and the honest description of them is "the signed-in user's
+ * id", which is a great deal better than "whichever owner sorted first".
  */
 
 interface ActiveContextState {
@@ -25,29 +58,35 @@ export const useActiveContext = create<ActiveContextState>((set) => ({
   _set: (s) => set(s),
 }));
 
-export async function hydrateActiveContext(): Promise<void> {
-  const settingsRows = await query<{ value: string }>(
-    `SELECT value FROM app_settings WHERE key = 'active_store_id'`,
-  );
-  const storeId = settingsRows[0]?.value ?? null;
-  if (!storeId) {
-    throw new Error("No active_store_id in app_settings — schema corrupt");
-  }
-
-  const userRows = await query<{ id: string }>(
-    `SELECT id FROM users
-     WHERE store_id = ? AND active = 1
-     ORDER BY CASE role WHEN 'owner' THEN 0 ELSE 1 END, created_at ASC
-     LIMIT 1`,
-    [storeId],
-  );
-  const userId = userRows[0]?.id ?? null;
-
+/**
+ * Adopt the authenticated session as the active context.
+ *
+ * Called by `App.tsx` once a session exists, and again whenever it changes, so
+ * a user switch cannot leave the previous person's id in the payloads. There is
+ * no database access here at all — which is the point.
+ */
+export function adoptSessionContext(args: {
+  storeId: string;
+  userId: string;
+}): void {
   useActiveContext.getState()._set({
-    storeId,
-    userId,
-    deviceId: null, // Phase 6 will create/persist a device row
+    storeId: args.storeId,
+    userId: args.userId,
+    // Phase 6 will create and persist a `devices` row. Until then this is NULL
+    // in the schema too, and inventing an id here would put an unverifiable
+    // value on every posted document.
+    deviceId: null,
     hydrated: true,
+  });
+}
+
+/** Clear it on sign-out, so nothing is left pointing at the previous user. */
+export function clearActiveContext(): void {
+  useActiveContext.getState()._set({
+    storeId: null,
+    userId: null,
+    deviceId: null,
+    hydrated: false,
   });
 }
 

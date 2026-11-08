@@ -43,6 +43,26 @@ use crate::posting::{
     pool_for_state, CloseShiftPayload, DbState, OpenShiftPayload, StartupStatus,
 };
 use crate::read_api::{read_pool_for_state, run_select, ReadPool};
+
+/// A session that is signed in, so these tests exercise the STARTUP gate rather
+/// than Stage A.1's session gate.
+///
+/// `pool_for_state` now consults two gates in order — startup, then session —
+/// and every test in this file predates the second one and is about the first.
+/// Giving each of them an open session keeps each test measuring exactly what
+/// it was written to measure; the session gate has its own file.
+async fn signed_in() -> crate::auth::SessionState {
+    let sessions = crate::auth::SessionState::new();
+    sessions
+        .open_for_tests(
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000001",
+            crate::auth::Role::Owner,
+        )
+        .await;
+    sessions
+}
+
 use crate::test_support::*;
 use crate::tests::builders::*;
 
@@ -361,7 +381,7 @@ async fn a_failed_startup_refuses_the_write_pool_and_creates_nothing() {
     assert_not_production_db(&ghost);
     assert!(!ghost.exists(), "precondition");
 
-    let err = pool_for_state(&state, &ghost)
+    let err = pool_for_state(&state, &signed_in().await, &ghost)
         .await
         .expect_err("a failed startup must refuse the pool");
 
@@ -386,7 +406,7 @@ async fn a_pending_startup_refuses_trading() {
     assert_eq!(state.startup_status().await, StartupStatus::Pending);
 
     let db = TempDb::new().await;
-    let err = pool_for_state(&state, db.path())
+    let err = pool_for_state(&state, &signed_in().await, db.path())
         .await
         .expect_err("pending must refuse as firmly as failed");
     assert!(
@@ -410,7 +430,7 @@ async fn a_failed_startup_refuses_the_renderer_read_channel_too() {
     let reads = ReadPool::new();
 
     // Pending first.
-    let pending = read_pool_for_state(&state, &reads, db.path())
+    let pending = read_pool_for_state(&state, &signed_in().await, &reads, db.path())
         .await
         .expect_err("pending must refuse the read channel");
     assert!(pending.contains("still checking the database"), "{pending}");
@@ -418,7 +438,7 @@ async fn a_failed_startup_refuses_the_renderer_read_channel_too() {
     state
         .mark_startup_failed("TEST FAULT: the schema is incomplete")
         .await;
-    let failed = read_pool_for_state(&state, &reads, db.path())
+    let failed = read_pool_for_state(&state, &signed_in().await, &reads, db.path())
         .await
         .expect_err("a failed startup must refuse the read channel");
     assert_eq!(failed, "TEST FAULT: the schema is incomplete");
@@ -457,7 +477,7 @@ async fn a_validated_startup_trades_normally() {
     state.mark_startup_ready().await;
     assert_eq!(state.startup_status().await, StartupStatus::Ready);
 
-    let pool = pool_for_state(&state, db.path())
+    let pool = pool_for_state(&state, &signed_in().await, db.path())
         .await
         .expect("a validated startup must hand out the pool");
 
@@ -500,7 +520,7 @@ async fn a_validated_startup_trades_normally() {
 
     // And the renderer can read, through its own read-only pool.
     let reads = ReadPool::new();
-    let read_pool = read_pool_for_state(&state, &reads, db.path())
+    let read_pool = read_pool_for_state(&state, &signed_in().await, &reads, db.path())
         .await
         .expect("a validated startup must hand out the read pool");
     let rows = run_select(
@@ -553,7 +573,7 @@ async fn a_failed_startup_releases_the_pool_it_opened_to_validate() {
         state.pool.lock().await.is_none(),
         "the pool must be released, not merely closed and kept"
     );
-    let err = pool_for_state(&state, db.path())
+    let err = pool_for_state(&state, &signed_in().await, db.path())
         .await
         .expect_err("and it must not come back");
     assert!(err.contains("GREAZ CANNOT TRADE"), "{err}");

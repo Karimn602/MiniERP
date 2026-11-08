@@ -36,4 +36,7 @@ mod admin_commands;
 mod fk_enforcement;
 mod sql_boundary;
 mod read_guard;
+mod auth_credentials;
+mod auth_schema;
+mod auth_session;
 mod startup_gate;

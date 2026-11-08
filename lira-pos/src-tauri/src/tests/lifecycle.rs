@@ -954,6 +954,20 @@ async fn a_restored_backup_preserves_sales_payment_legs_movements_and_counters()
 /// read-only pool closing last, that signal never arrives — and a single-file
 /// copy taken anyway omits every sale still in the WAL, which is the loss
 /// `copying_only_the_main_file_while_the_wal_is_live_loses_the_sale` measures.
+/// A signed-in session, so this test exercises the STARTUP gate (Stage A.1
+/// added a second, session gate to `pool_for_state`; this file predates it).
+async fn lifecycle_session() -> crate::auth::SessionState {
+    let sessions = crate::auth::SessionState::new();
+    sessions
+        .open_for_tests(
+            "00000000-0000-0000-0000-000000000002",
+            "00000000-0000-0000-0000-000000000001",
+            crate::auth::Role::Owner,
+        )
+        .await;
+    sessions
+}
+
 #[tokio::test]
 async fn a_read_only_pool_closed_last_leaves_the_wal_behind() {
     let db = store_with_coffee().await;
@@ -1130,7 +1144,7 @@ async fn a_refused_startup_still_leaves_one_self_contained_file() {
     state.close_pool().await;
 
     // Nothing can trade, and nothing can re-open the file.
-    let refused = crate::posting::pool_for_state(&state, &path)
+    let refused = crate::posting::pool_for_state(&state, &lifecycle_session().await, &path)
         .await
         .expect_err("a refused startup must not hand out a pool");
     assert!(refused.contains("GREAZ CANNOT TRADE"), "{refused}");

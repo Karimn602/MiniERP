@@ -5,6 +5,7 @@ import { NetworkBadge } from "./NetworkBadge";
 import { LanguageSwitcher } from "./LanguageSwitcher";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import { SandboxBanner } from "./SandboxBanner";
+import { SessionBadge } from "./SessionBadge";
 import { IS_SANDBOX } from "../lib/appMode";
 import { useOnline } from "../lib/network";
 import { useLowStockCount } from "../state/lowStockBadge";
@@ -149,6 +150,7 @@ export function AppShell() {
             {t("common.workspace")}
           </h1>
           <div className="flex shrink-0 items-center gap-3">
+            <SessionBadge />
             <NetworkBadge />
             <ThemeSwitcher />
           </div>

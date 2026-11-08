@@ -38,6 +38,20 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 # of SQLite, and `as_raw_handle()`'s `sqlite3` type must be the one this crate
 # defines or the handle cannot be passed at all.
 libsqlite3-sys = { version = "0.30.1", default-features = false }
+
+# Gate 2B Stage A.1 — offline credentials.
+#
+# `argon2` is the memory-hard hash the credential policy is built on, in its
+# RustCrypto form: no C dependency, and it brings `password-hash`, whose PHC
+# string carries the salt and the cost parameters INSIDE the stored hash. That
+# is what makes raising the cost later a per-credential upgrade rather than a
+# migration — an old hash still verifies against its own recorded parameters.
+#
+# `rand` supplies the OS CSPRNG for the salt, the enrollment code and the
+# recovery code. `getrandom` is what actually reads the OS entropy source;
+# nothing here invents randomness.
+argon2 = { version = "0.5.3", features = ["std"] }
+rand = "0.8.5"
 tokio = { version = "1", features = ["sync"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

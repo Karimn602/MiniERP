@@ -29,32 +29,19 @@ const OWNER: &str = "00000000-0000-0000-0000-000000000002";
 /// result, something has leaked regardless of which assertion noticed.
 const SECRET: &str = "GZ-A0-SYNTHETIC-SECRET-argon2id-DO-NOT-LEAK";
 const RECOVERY_SECRET: &str = "GZ-A0-SYNTHETIC-RECOVERY-CODE-DO-NOT-LEAK";
+const ENROLLMENT_SECRET: &str = "GZ-A0-SYNTHETIC-ENROLLMENT-CODE-DO-NOT-LEAK";
 
-/// A disposable database carrying synthetic credentials in the shape migration
-/// 023 will create.
+/// A disposable database carrying SYNTHETIC credentials in the real migration
+/// 023 schema.
 ///
-/// The columns and the table are added here by hand rather than by a migration,
-/// deliberately: GZ-A0 ships BEFORE 023, and this harness is what lets the
-/// boundary be proven against the schema it is designed to protect before that
-/// schema exists. A real 023 database is protected by the same policy because
-/// the policy is by NAME.
+/// When GZ-A0 was written 023 did not exist, and this harness created the
+/// columns and tables by hand — which was the point: the policy is by NAME, so
+/// the boundary could be proven against the schema it protects before that
+/// schema existed. Now that 023 has landed the harness uses the real thing, so
+/// these tests exercise the actual credential store rather than a replica of
+/// it. The policy did not change; only the fixture did.
 async fn db_with_synthetic_credentials() -> TempDb {
     let db = TempDb::new().await;
-
-    // The 023-shaped credential columns on the existing `users` table.
-    // `pin_hash` is already there — migration 001 created it.
-    for ddl in [
-        "ALTER TABLE users ADD COLUMN credential_algo TEXT",
-        "ALTER TABLE users ADD COLUMN credential_version INTEGER",
-        "ALTER TABLE users ADD COLUMN credential_set_at TEXT",
-        "ALTER TABLE users ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN locked_until TEXT",
-        "ALTER TABLE users ADD COLUMN must_change_pin INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN enrollment_state TEXT",
-        "ALTER TABLE users ADD COLUMN enrollment_expires_at TEXT",
-    ] {
-        db.exec(ddl).await;
-    }
 
     db.exec(&format!(
         "UPDATE users
@@ -64,24 +51,11 @@ async fn db_with_synthetic_credentials() -> TempDb {
                 credential_set_at = '2026-11-08T00:00:00.000Z',
                 failed_attempts = 3,
                 locked_until = '2026-11-08T01:00:00.000Z',
-                must_change_pin = 1,
-                enrollment_state = 'initialized'
+                must_change_pin = 1
           WHERE id = '{OWNER}'"
     ))
     .await;
 
-    // The 023-shaped owner recovery table, protected in full.
-    db.exec(
-        "CREATE TABLE owner_recovery (
-           id TEXT PRIMARY KEY,
-           store_id TEXT NOT NULL REFERENCES stores(id),
-           code_hash TEXT NOT NULL,
-           code_algo TEXT NOT NULL,
-           issued_at TEXT NOT NULL,
-           used_at TEXT
-         )",
-    )
-    .await;
     db.exec(&format!(
         "INSERT INTO owner_recovery (id, store_id, code_hash, code_algo, issued_at)
          VALUES ('rec-1', '{STORE}', '{RECOVERY_SECRET}', 'argon2id',
@@ -89,24 +63,23 @@ async fn db_with_synthetic_credentials() -> TempDb {
     ))
     .await;
 
-    // The 024-shaped audit table, protected in full.
-    db.exec(
-        "CREATE TABLE auth_audit (
-           id TEXT PRIMARY KEY,
-           store_id TEXT NOT NULL REFERENCES stores(id),
-           at TEXT NOT NULL,
-           event TEXT NOT NULL,
-           user_id TEXT,
-           actor_user_id TEXT,
-           operation TEXT,
-           detail TEXT
-         )",
-    )
-    .await;
     db.exec(&format!(
         "INSERT INTO auth_audit (id, store_id, at, event, user_id, detail)
          VALUES ('aud-1', '{STORE}', '2026-11-08T00:00:00.000Z', 'login_failed',
                  '{OWNER}', 'three attempts from the counter')"
+    ))
+    .await;
+
+    // The enrollment row 023 seeds carries the hash of the one-time
+    // installation code, so it is protected too. Give it one, so the test
+    // battery below has something to try to read.
+    db.exec(&format!(
+        "UPDATE auth_enrollment
+            SET enrollment_code_hash = '{ENROLLMENT_SECRET}',
+                enrollment_code_algo = 'argon2id',
+                enrollment_code_issued_at = '2026-11-08T00:00:00.000Z',
+                enrollment_code_expires_at = '2026-11-09T00:00:00.000Z'
+          WHERE store_id = '{STORE}'"
     ))
     .await;
 
@@ -133,7 +106,7 @@ async fn must_be_refused(pool: &sqlx::SqlitePool, sql: &str) {
         }
         Err(e) => {
             assert!(
-                !e.contains(SECRET) && !e.contains(RECOVERY_SECRET),
+                !e.contains(SECRET) && !e.contains(RECOVERY_SECRET) && !e.contains(ENROLLMENT_SECRET),
                 "the refusal for `{sql}` leaked the secret in its own error message: {e}"
             );
         }
@@ -146,7 +119,7 @@ async fn must_be_answered(pool: &sqlx::SqlitePool, sql: &str) -> Vec<serde_json:
         Ok(rows) => {
             let dump = format!("{rows:?}");
             assert!(
-                !dump.contains(SECRET) && !dump.contains(RECOVERY_SECRET),
+                !dump.contains(SECRET) && !dump.contains(RECOVERY_SECRET) && !dump.contains(ENROLLMENT_SECRET),
                 "an ALLOWED query returned a secret:\n  {sql}\nrows: {dump}"
             );
             rows

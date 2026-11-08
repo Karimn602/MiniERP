@@ -144,8 +144,10 @@ async fn read_pool(
     db_state: &State<'_, crate::posting::DbState>,
     read_state: &State<'_, ReadPool>,
 ) -> Result<SqlitePool, String> {
+    use tauri::Manager;
     let path = crate::posting::resolve_db_path(app)?;
-    read_pool_for_state(db_state, read_state, &path).await
+    let sessions = app.state::<crate::auth::SessionState>();
+    read_pool_for_state(db_state, &sessions, read_state, &path).await
 }
 
 /// [`read_pool`] without the `AppHandle`, so `tests::startup_gate` can drive
@@ -158,10 +160,18 @@ async fn read_pool(
 /// the operator-facing message itself, which is how it reaches the screen.
 pub(crate) async fn read_pool_for_state(
     db_state: &crate::posting::DbState,
+    sessions: &crate::auth::SessionState,
     read_state: &ReadPool,
     path: &std::path::Path,
 ) -> Result<SqlitePool, String> {
     db_state.ensure_trading_allowed().await?;
+    // AND A SESSION (Stage A.1). A read is not harmless before login: every
+    // repo is a read, so a renderer that could still read would show a till
+    // full of takings, costs and customer history to somebody who has not
+    // identified themselves. The pre-login screens get everything they need
+    // from the `auth_status` command instead, which is why `App.tsx`'s boot no
+    // longer issues a single `db_select`.
+    sessions.ensure_signed_in().await?;
 
     {
         let guard = read_state.pool.lock().await;
@@ -171,7 +181,7 @@ pub(crate) async fn read_pool_for_state(
     }
 
     // Make sure the WAL companions exist before asking for a read-only handle.
-    crate::posting::pool_for_state(db_state, path).await?;
+    crate::posting::pool_for_state(db_state, sessions, path).await?;
 
     let p = open_read_only_pool(path).await?;
 

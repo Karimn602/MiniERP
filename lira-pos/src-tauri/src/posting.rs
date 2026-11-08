@@ -231,8 +231,15 @@ pub(crate) async fn pool(
     app: &tauri::AppHandle,
     state: &State<'_, DbState>,
 ) -> Result<SqlitePool, String> {
+    use tauri::Manager;
     let path = resolve_db_path(app)?;
-    pool_for_state(state, &path).await
+    // The session is fetched from the app handle rather than taken as a
+    // parameter, deliberately: it keeps the signature of all twenty
+    // transactional commands unchanged, so Stage A.1 adds the login
+    // requirement without a twenty-file edit that Stage B would then have to
+    // make again for `authorize()`.
+    let sessions = app.state::<crate::auth::SessionState>();
+    pool_for_state(state, &sessions, &path).await
 }
 
 /// [`pool`] without the `AppHandle`, so the startup gate can be driven by a
@@ -243,6 +250,41 @@ pub(crate) async fn pool(
 /// open would quietly re-create a handle to the file it was supposed to let go
 /// of.
 pub(crate) async fn pool_for_state(
+    state: &DbState,
+    sessions: &crate::auth::SessionState,
+    path: &std::path::Path,
+) -> Result<SqlitePool, String> {
+    // TWO GATES, IN THIS ORDER, AND THE ORDER IS NOT COSMETIC.
+    //
+    // A database that failed validation must report THAT, not "please log in":
+    // the first is a fact about the shop's records and needs a support call,
+    // the second is an instruction to the person at the till. Reporting the
+    // wrong one sends the operator down the wrong path at the worst moment.
+    state.ensure_trading_allowed().await?;
+    sessions.ensure_signed_in().await?;
+    pool_for_startup_validation(state, path).await
+}
+
+/// The AUTHENTICATION accessor: startup-gated, NOT session-gated.
+///
+/// Logging in necessarily needs the database before anybody is logged in, so
+/// exactly one accessor may bypass the session requirement — and it bypasses
+/// ONLY that. It still requires GZ-WAL-01's startup validation to have passed,
+/// because a credential verified against a database that failed its own
+/// integrity checks is a credential verified against nothing.
+///
+/// It is deliberately NOT [`pool_for_startup_validation`], which bypasses the
+/// startup gate as well. Reusing that one for the public authentication
+/// commands would hand an unauthenticated caller the one accessor that opens a
+/// database the application has refused to trade on, and would re-create the
+/// file after a failed startup released it (`open_write_pool` carries
+/// `create_if_missing(true)`).
+///
+/// `tests::auth_session` asserts that `auth.rs` is its only non-test caller.
+/// There is no arbitrary-SQL path behind it: the authentication commands are
+/// fixed Rust with fixed, parameterised statements, and the renderer reaches
+/// them only by name.
+pub(crate) async fn pool_for_authentication(
     state: &DbState,
     path: &std::path::Path,
 ) -> Result<SqlitePool, String> {
