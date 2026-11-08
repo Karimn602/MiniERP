@@ -303,9 +303,33 @@ impl SessionState {
         self.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Take the credential gate for the duration of one attempt. See the field.
-    pub(crate) async fn credential_attempt(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.credential_gate.lock().await
+    /// Take the credential gate for one attempt, or REFUSE if one is already
+    /// in progress.
+    ///
+    /// GZ-A1-R2-P2 (independent review, round 2). The first version of this
+    /// awaited the mutex, which serialised attempts correctly and introduced a
+    /// denial of service in their place: the wait queue was unbounded, and a
+    /// renderer can enqueue thousands of `auth_login` calls naming accounts
+    /// that do not exist. Each one still performs a full ~250 ms dummy
+    /// verification — that is deliberate, so the response time is not an
+    /// account oracle — so a few thousand queued calls put the legitimate owner
+    /// several minutes behind a queue of other people's guesses. Locking the
+    /// owner out of their own till is a worse outcome than the counter race the
+    /// gate was added to close.
+    ///
+    /// `try_lock` makes the queue depth ONE. A second concurrent attempt is
+    /// refused immediately, with a message that says nothing about the account
+    /// it named, and the refusal costs no hashing at all — so flooding buys the
+    /// attacker nothing and the owner is never more than one attempt behind.
+    ///
+    /// The cost is that a genuine double-submit is refused rather than queued.
+    /// That is the right trade at a till: the operator sees "wait a moment",
+    /// which is true, and the UI already disables its button while a request is
+    /// in flight.
+    pub(crate) fn credential_attempt(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, String> {
+        self.credential_gate.try_lock().map_err(|_| ATTEMPT_IN_PROGRESS.to_string())
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -535,6 +559,10 @@ impl SessionState {
 
 pub(crate) const NOT_SIGNED_IN: &str =
     "GREAZ IS LOCKED — nobody is signed in. Sign in to use the till.";
+/// Deliberately says nothing about the account the refused call named, and
+/// costs no hashing at all — see [`SessionState::credential_attempt`].
+pub(crate) const ATTEMPT_IN_PROGRESS: &str =
+    "Another sign-in attempt is already being checked. Wait a moment and try again.";
 pub(crate) const SESSION_LOCKED: &str =
     "GREAZ IS LOCKED — enter your passphrase to carry on. Nothing has been lost.";
 
@@ -1109,21 +1137,26 @@ pub(crate) async fn status_inner(
             // last would leave its plaintext beside the OTHER one's hash — a
             // code the installer can read and the database will not accept, for
             // the next twenty-four hours.
-            let _issuing = sessions.credential_attempt().await;
-            // Re-read under the gate: the other caller may have issued one
-            // while we were waiting, and issuing a second would invalidate the
-            // first operator's code mid-ceremony.
-            let still_needed: Option<String> = sqlx::query_scalar(
-                "SELECT enrollment_code_expires_at FROM auth_enrollment WHERE store_id = ?",
-            )
-            .bind(&store_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("cannot re-check the enrollment code: {e}"))?
-            .flatten();
+            // A REFUSAL HERE IS NOT AN ERROR. It means another caller is
+            // already issuing, so this one simply does not — reporting a
+            // failure would turn a harmless race into a broken first-run
+            // screen, and the next status call will find the live code.
+            if let Ok(_issuing) = sessions.credential_attempt() {
+                // Re-read under the gate: the other caller may have issued one
+                // while we were waiting, and issuing a second would invalidate
+                // the first operator's code mid-ceremony.
+                let still_live: Option<String> = sqlx::query_scalar(
+                    "SELECT enrollment_code_expires_at FROM auth_enrollment WHERE store_id = ?",
+                )
+                .bind(&store_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| format!("cannot re-check the enrollment code: {e}"))?
+                .flatten();
 
-            if !still_needed.as_deref().is_some_and(still_in_future) {
-                issue_enrollment_code(ctx, pool, &store_id).await?;
+                if !still_live.as_deref().is_some_and(still_in_future) {
+                    issue_enrollment_code(ctx, pool, &store_id).await?;
+                }
             }
         }
         enrollment_code_file = Some(ctx.code_file.display().to_string());
@@ -1284,7 +1317,7 @@ pub(crate) async fn enroll_owner_inner(
     // ONE ATTEMPT AT A TIME. Held across read-count -> verify -> write-count
     // so a fan-out of simultaneous guesses cannot all read the same counter.
     // See `SessionState::credential_gate`.
-    let _attempt = sessions.credential_attempt().await;
+    let _attempt = sessions.credential_attempt()?;
     let pool = ctx.pool;
     let (store_id, _) = active_store(pool).await?;
 
@@ -1543,7 +1576,7 @@ pub(crate) async fn login_inner(
     // ONE ATTEMPT AT A TIME. Held across read-count -> verify -> write-count
     // so a fan-out of simultaneous guesses cannot all read the same counter.
     // See `SessionState::credential_gate`.
-    let _attempt = sessions.credential_attempt().await;
+    let _attempt = sessions.credential_attempt()?;
     // LOGIN CREATES A SESSION ONLY WHEN NONE EXISTS. Switching user is a
     // deliberate logout followed by a login, never a silent replacement:
     // replacing a live session would strand whatever the previous user was
@@ -1790,7 +1823,7 @@ pub(crate) async fn unlock_inner(
     // ONE ATTEMPT AT A TIME. Held across read-count -> verify -> write-count
     // so a fan-out of simultaneous guesses cannot all read the same counter.
     // See `SessionState::credential_gate`.
-    let _attempt = sessions.credential_attempt().await;
+    let _attempt = sessions.credential_attempt()?;
     let locked_user = sessions.locked_user().await?;
 
     let pool = ctx.pool;
@@ -1888,7 +1921,7 @@ pub(crate) async fn change_credential_inner(
     // ONE ATTEMPT AT A TIME. Held across read-count -> verify -> write-count
     // so a fan-out of simultaneous guesses cannot all read the same counter.
     // See `SessionState::credential_gate`.
-    let _attempt = sessions.credential_attempt().await;
+    let _attempt = sessions.credential_attempt()?;
     // The gate, so a locked or idle session cannot change a credential — which
     // is the one change that would let somebody lock the real owner out.
     sessions.ensure_signed_in().await?;
@@ -1979,7 +2012,7 @@ pub(crate) async fn recover_owner_inner(
     // ONE ATTEMPT AT A TIME. Held across read-count -> verify -> write-count
     // so a fan-out of simultaneous guesses cannot all read the same counter.
     // See `SessionState::credential_gate`.
-    let _attempt = sessions.credential_attempt().await;
+    let _attempt = sessions.credential_attempt()?;
     let pool = ctx.pool;
     let (store_id, _) = active_store(pool).await?;
 

@@ -1028,8 +1028,7 @@ fn the_idle_limit_is_evaluated_in_exactly_one_place() {
     }
 }
 
-/// Credential attempts are SERIALISED, so a fan-out of guesses cannot outrun
-/// the persisted counter.
+/// A CONCURRENT BURST CANNOT BUY MORE GUESSES THAN IT RECORDS.
 ///
 /// GZ-A1-P2 (independent review). Each attempt reads the count, spends ~250 ms
 /// in Argon2id, then writes count + 1. Twenty simultaneous wrong guesses all
@@ -1041,7 +1040,7 @@ fn the_idle_limit_is_evaluated_in_exactly_one_place() {
 /// Pinned with a multi-thread runtime, because this is the one test here that
 /// would pass by accident on a single-threaded one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_wrong_passphrases_are_all_counted() {
+async fn no_concurrent_burst_buys_more_guesses_than_it_records() {
     let db = TempDb::new().await;
     let scratch = Scratch::new();
     let sessions = std::sync::Arc::new(enrolled(&db, &scratch).await);
@@ -1061,36 +1060,82 @@ async fn concurrent_wrong_passphrases_are_all_counted() {
             login_inner(&ctx, &sessions, OWNER.to_string(), format!("wrong-{n}")).await
         }));
     }
+
+    // Classify every outcome. Two refusals are possible and the difference is
+    // the whole point: one of them VERIFIED a passphrase and must therefore be
+    // counted, the other never got that far and cost nothing.
+    let mut verified = 0i64;
+    let mut turned_away = 0i64;
     for h in handles {
         let outcome = h.await.expect("task");
-        assert!(outcome.is_err(), "a wrong passphrase must never sign in");
+        let message = outcome.expect_err("a wrong passphrase must never sign in");
+        if message.contains("already being checked") {
+            turned_away += 1;
+        } else {
+            verified += 1;
+        }
     }
+    assert_eq!(
+        verified + turned_away,
+        attempts,
+        "every attempt must be one of the two refusals, not something else"
+    );
 
-    // THE COUNTER REACHED THE LOCKOUT THRESHOLD AND STOPPED THERE, which is
-    // the property, and it is worth being exact about why 5 is the right answer
-    // and not 20.
+    // THE INVARIANT: no burst yields more VERIFICATIONS than it leaves
+    // RECORDED FAILURES. That is the property the race broke, and it is what
+    // the counter exists to express.
     //
-    // Serialised, the attempts queue: each reads the counter the previous one
-    // wrote. The fifth trips the lockout, and attempts six to twenty are then
-    // refused by the lockout check BEFORE they verify anything or touch the
-    // counter — which is correct, and is what a lockout is for.
+    // The original defect: all twenty read count 0, all twenty verified, all
+    // twenty wrote 1. Twenty guesses, one recorded failure, lockout never
+    // reached — so the attacker could repeat the burst indefinitely.
     //
-    // UNSERIALISED, all twenty would read 0, all twenty would verify, and all
-    // twenty would write 1. The account would never lock and the attacker would
-    // have had twenty free guesses. So the assertion that distinguishes the two
-    // is "the counter reached the threshold", not "the counter equals twenty".
-    let limit = testing::max_failed_attempts();
+    // Now exactly one attempt holds the gate and the other nineteen are turned
+    // away BEFORE verifying anything. So the counter lands at the number of
+    // attempts that actually got a credential answer, and the ratio the
+    // attacker cares about is one-to-one rather than twenty-to-one.
     let counted = db
         .scalar_i64(&format!(
             "SELECT failed_attempts FROM users WHERE id = '{OWNER}'"
         ))
         .await;
     assert_eq!(
-        counted, limit,
-        "{attempts} concurrent failures must drive the counter to the lockout \
-         threshold ({limit}); a value near 1 means they all read the same \
-         counter and lapped it"
+        counted, verified,
+        "every attempt that verified a passphrase must leave a recorded \
+         failure: {verified} verified, {counted} recorded. A counter below the \
+         verification count is the race this gate closes."
     );
+    assert!(
+        turned_away > 0,
+        "with {attempts} simultaneous attempts, some must have been turned away \
+         by the gate — otherwise this test is not exercising concurrency at all"
+    );
+
+    // The turned-away ones are NOT audited as failed logins, deliberately: they
+    // are not failed logins. Nobody's credential was checked, so recording them
+    // would fill the owner's security log with an attacker's rate-limiting.
+    let audited = db
+        .count("SELECT count(*) AS n FROM auth_audit WHERE event = 'login_failed'")
+        .await;
+    assert_eq!(
+        audited, verified,
+        "the audit log records the attempts that were checked ({verified}), not \
+         the ones the gate turned away"
+    );
+
+    // AND A SEQUENTIAL BURST STILL LOCKS OUT, which is what proves the gate has
+    // not quietly disabled the lockout by refusing everything. Five attempts,
+    // one at a time, the way a person at the counter makes them.
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+    let limit = testing::max_failed_attempts();
+    while db
+        .scalar_i64(&format!(
+            "SELECT failed_attempts FROM users WHERE id = '{OWNER}'"
+        ))
+        .await
+        < limit
+    {
+        let _ = login_inner(&ctx, &sessions, OWNER.to_string(), "wrong".to_string()).await;
+    }
     assert_eq!(
         db.count(&format!(
             "SELECT count(*) AS n FROM users
@@ -1098,26 +1143,84 @@ async fn concurrent_wrong_passphrases_are_all_counted() {
         ))
         .await,
         1,
-        "and the account must be locked, which is the thing the race postponed"
+        "sequential wrong attempts must still reach the lockout"
+    );
+    assert!(
+        db.count("SELECT count(*) AS n FROM auth_audit WHERE event = 'locked_out'")
+            .await
+            >= 1,
+        "and the lockout must be recorded"
     );
 
-    // Every attempt that got as far as verifying is audited, and every one that
-    // was refused by the lockout is audited too — so the owner can see a
-    // twenty-guess burst in the log rather than a single failure.
-    let audited = db
-        .count("SELECT count(*) AS n FROM auth_audit WHERE event = 'login_failed'")
-        .await;
-    assert_eq!(
-        audited, attempts,
-        "all {attempts} attempts must appear in the audit log, including the \
-         ones the lockout refused"
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// THE CREDENTIAL GATE IS BOUNDED: a second concurrent attempt is REFUSED, not
+/// queued.
+///
+/// GZ-A1-R2-P2 (independent review, round 2). The gate that closed the counter
+/// race was an `await` on a mutex, which replaced one problem with another: the
+/// wait queue was unbounded, and a renderer can enqueue thousands of logins
+/// naming accounts that do not exist. Each one still performs a full ~250 ms
+/// dummy verification — deliberately, so the response time is not an account
+/// oracle — so a flood puts the legitimate owner minutes behind a queue of
+/// other people's guesses. Locking the owner out of their own till is worse
+/// than the race.
+///
+/// `try_lock` makes the queue depth one. This asserts the refusal is immediate,
+/// costs no hashing, and says nothing about the account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_concurrent_attempt_is_refused_rather_than_queued() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+
+    // Hold the gate, as an in-progress attempt does.
+    let held = sessions
+        .credential_attempt()
+        .expect("the gate is free to begin with");
+
+    let start = Instant::now();
+    let refused = sessions
+        .credential_attempt()
+        .expect_err("a second concurrent attempt must be refused");
+    let waited = start.elapsed();
+
+    assert!(
+        refused.contains("already being checked"),
+        "the refusal must be the neutral in-progress one: {refused}"
     );
-    assert_eq!(
-        db.count("SELECT count(*) AS n FROM auth_audit WHERE event = 'locked_out'")
-            .await,
-        1,
-        "and the lockout itself is recorded exactly once"
+    // It must not name the account, hint at existence, or look like a wrong
+    // passphrase — all three would make a flood informative.
+    assert!(!refused.contains("not right"), "{refused}");
+    assert!(!refused.to_lowercase().contains("owner"), "{refused}");
+
+    // IMMEDIATE. A queueing implementation would block here for as long as the
+    // holder kept the gate; a hashing one would cost ~250 ms. 50 ms is far
+    // below either and far above the real cost.
+    assert!(
+        waited.as_millis() < 50,
+        "the refusal must be immediate and cost no hashing, took {waited:?}"
     );
+
+    // And the gate is reusable once released, so a refused attempt has not
+    // broken sign-in for the owner.
+    drop(held);
+    let after = sessions
+        .credential_attempt()
+        .expect("the gate must be free again once the attempt finishes");
+    drop(after);
+
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+    logout_inner(&ctx, &sessions).await.expect("logout");
+    login_inner(
+        &ctx,
+        &sessions,
+        OWNER.to_string(),
+        GOOD_PASSPHRASE.to_string(),
+    )
+    .await
+    .expect("the owner can still sign in after a refused concurrent attempt");
 
     db.cleanup().await.expect("remove TempDb");
 }
