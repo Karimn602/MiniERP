@@ -1673,7 +1673,16 @@ async fn second_store(db: &TempDb) -> (String, String, String) {
     const P2_BUN: &str = "00000000-0000-0000-0000-00000000c101";
     const P2_SPARE: &str = "00000000-0000-0000-0000-00000000c102";
     db.exec(&format!(
-        "INSERT INTO stores (id, name, default_currency) VALUES ('{S2}', 'Branch B', 'USD')"
+        "INSERT INTO stores (id, name, default_currency) VALUES ('{S2}', 'Branch B', 'USD')",
+    ))
+    .await;
+    // AND AN OWNER FOR IT. Since Stage B every write is authorized against a
+    // real, active user of the DOCUMENT's own store, so a branch with no staff
+    // is a branch no command can build a recipe in. These tests need branch B's
+    // recipe to exist in order to prove branch A cannot reach it.
+    db.exec(&format!(
+        "INSERT INTO users (id, store_id, full_name, role)
+         VALUES ('owner-of-{S2}', '{S2}', 'Branch B Owner', 'owner')"
     ))
     .await;
     for (id, sku, name, service, rate) in [
@@ -1705,8 +1714,14 @@ async fn second_store(db: &TempDb) -> (String, String, String) {
 
     // Branch B's own active recipe, through the real command.
     let b_recipe = rid("b0001");
-    save_recipe_draft_with_pool(
+    let b_owner = crate::auth::Actor::for_tests(
+        &format!("owner-of-{S2}"),
+        S2,
+        crate::auth::Role::Owner,
+    );
+    crate::recipes::save_recipe_draft_as(
         db.pool(),
+        &b_owner,
         SaveRecipeDraftPayload {
             store_id: S2.to_string(),
             product_id: P2_BURGER.to_string(),
@@ -1724,8 +1739,9 @@ async fn second_store(db: &TempDb) -> (String, String, String) {
     )
     .await
     .expect("branch B's draft");
-    activate_recipe_with_pool(
+    crate::recipes::activate_recipe_as(
         db.pool(),
+        &b_owner,
         ActivateRecipePayload {
             store_id: S2.to_string(),
             recipe_id: b_recipe.clone(),
@@ -1872,8 +1888,17 @@ async fn store_b_keeps_its_incumbent_when_store_a_submits_a_corrupted_recipe() {
     .expect_err("the row no longer belongs to branch A");
     assert!(a.contains("does not belong to the store"), "{a}");
 
-    let b = activate_recipe_with_pool(
+    // ACTING AS THE OTHER BRANCH'S OWN OWNER, so Stage B's store check passes
+    // and the refusal under test is the deeper one this test was written for.
+    // Acting as branch A would be refused earlier — correctly, but that proves
+    // something else, and it is covered in `tests::authorization`.
+    let b = crate::recipes::activate_recipe_as(
         db.pool(),
+        &crate::auth::Actor::for_tests(
+            &crate::test_support::seeded_owner_of(&s2),
+            &s2,
+            crate::auth::Role::Owner,
+        ),
         ActivateRecipePayload {
             store_id: s2.clone(),
             recipe_id: r.clone(),

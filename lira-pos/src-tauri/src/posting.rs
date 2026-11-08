@@ -1431,6 +1431,11 @@ pub(crate) async fn post_purchase_tx(
     // `post_credit_memo` to the drawer. It runs before any number is consumed,
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostPurchase).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // ---- THE ACTOR IS THE SESSION'S ----
     //
@@ -2082,6 +2087,11 @@ pub(crate) async fn post_adjustment_tx(
     // read inside the transaction that commits. It runs before anything is
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostAdjustment).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // ---- THE ACTOR IS THE SESSION'S ----
     //
@@ -2559,6 +2569,11 @@ pub(crate) async fn post_supplier_payment_tx(
     // `post_credit_memo` to the drawer. It runs before any number is consumed,
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::SupplierPayment).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // ---- THE ACTOR IS THE SESSION'S ----
     //
@@ -4165,6 +4180,24 @@ pub(crate) async fn post_sale_tx(
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostSale).await?;
 
+    // AND THE LARGE-DISCOUNT DECISION, re-checked here for the same reason the
+    // base one is: the boundary check ran before this transaction opened. Note
+    // what this does and does not reach — see `authz::DISCOUNT_CONTROL_LIMIT`
+    // and the recorded residual GZ-B-P1.
+    if payload.discount_cents > crate::authz::DISCOUNT_WITHOUT_APPROVAL_CENTS {
+        crate::authz::authorize_tx(
+            &mut tx,
+            actor,
+            crate::authz::Operation::PostSaleLargeDiscount,
+        )
+        .await?;
+    }
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
+
     // ---- THE ACTOR IS THE SESSION'S ----
     //
     // Every `*_user_id` column on this document used to be bound straight from
@@ -5482,6 +5515,11 @@ pub(crate) async fn open_shift_tx(
     // read inside the transaction that commits. It runs before anything is
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::OpenShift).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // ---- THE ACTOR IS THE SESSION'S ----
     //
@@ -5653,6 +5691,34 @@ pub(crate) async fn close_shift_tx(
     // read inside the transaction that commits. It runs before anything is
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::CloseOwnShift).await?;
+
+    // AND WHOSE SHIFT IT IS, decided here rather than only at the boundary. The
+    // boundary read the opener on a separate connection before this transaction
+    // opened; this reads it inside the transaction that is about to seal the
+    // reconciliation, so the supervision permission holds at COMMIT.
+    {
+        let opened_by: Option<String> =
+            sqlx::query_scalar("SELECT opened_by_user_id FROM shifts WHERE id = ?")
+                .bind(&payload.shift_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| format!("cannot read the shift's opener: {e}"))?;
+        if let Some(opened_by) = opened_by {
+            if opened_by != actor.user_id {
+                crate::authz::authorize_tx(
+                    &mut tx,
+                    actor,
+                    crate::authz::Operation::CloseAnotherShift,
+                )
+                .await?;
+            }
+        }
+    }
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // ---- THE ACTOR IS THE SESSION'S ----
     //
@@ -6577,6 +6643,11 @@ pub(crate) async fn post_credit_memo_tx(
     // `post_credit_memo` to the drawer. It runs before any number is consumed,
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostCreditMemo).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // ---- THE ACTOR IS THE SESSION'S ----
     //
@@ -8080,6 +8151,27 @@ fn driver_entry_replay_difference(
     None
 }
 
+/// Which permission a `driver_ledger` write needs, decided by WHAT IT IS.
+///
+/// One function so the boundary check and the in-transaction check cannot drift
+/// apart — which is how the original defect would come back: two call sites,
+/// one of them updated.
+///
+/// `collection` and `return_credit` never reach here at all: they are
+/// consequences of a sale or a return, written by the commands that post those
+/// documents in the same transaction, and `validate_driver_remittance_payload`
+/// refuses them.
+fn driver_entry_operation(
+    payload: &PostDriverRemittancePayload,
+) -> crate::authz::Operation {
+    if payload.entry_type == "adjustment" {
+        crate::authz::Operation::DriverLedgerAdjustment
+    } else {
+        crate::authz::Operation::DriverRemittance
+    }
+}
+
+
 /// Record a driver handing money back, or a signed-off correction to what he
 /// owes. Writes exactly one `driver_ledger` row, inside one transaction.
 #[tauri::command]
@@ -8090,13 +8182,23 @@ pub async fn post_driver_remittance(
     payload: PostDriverRemittancePayload,
 ) -> Result<PostDriverRemittanceResult, String> {
     let amount_cents = validate_driver_remittance_payload(&payload)?;
-    let (pool, actor) = crate::authz::begin(
-        &app,
-        &window,
-        &state,
-        crate::authz::Operation::DriverRemittance,
-    )
-    .await?;
+
+    // GZ-B-P1 (independent review). THIS COMMAND POSTS TWO DIFFERENT THINGS and
+    // the matrix answers them differently, so the permission is selected from
+    // the entry type rather than from the command's name.
+    //
+    // Taking a driver's hand-over is front-of-house work and the amount is
+    // bounded by what he owes, so a cashier may do it. Writing a balance down
+    // by hand is a CORRECTION, and corrections are supervision. Authorizing
+    // every payload as `DriverRemittance` let a cashier post an adjustment with
+    // any direction and amount — writing off a driver's debt — which is exactly
+    // the hole `DriverLedgerAdjustment` was put in the matrix to close.
+    //
+    // Safe to read here because `validate_driver_remittance_payload` above has
+    // already proved the entry type is one of the two this command accepts.
+    let operation = driver_entry_operation(&payload);
+
+    let (pool, actor) = crate::authz::begin(&app, &window, &state, operation).await?;
     post_driver_remittance_tx(&pool, &actor, payload, amount_cents).await
 }
 
@@ -8188,7 +8290,12 @@ pub(crate) async fn post_driver_remittance_tx(
     // discipline `post_supplier_payment` applies to the payable and
     // `post_credit_memo` to the drawer. It runs before any number is consumed,
     // so a refusal costs the sequence nothing.
-    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::DriverRemittance).await?;
+    crate::authz::authorize_tx(&mut tx, actor, driver_entry_operation(&payload)).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // ---- THE ACTOR IS THE SESSION'S ----
     //

@@ -424,6 +424,11 @@ pub(crate) async fn save_recipe_draft_as(
     // what every future sale of that item is COSTED at, which reaches
     // every margin figure in the business.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::RecipeDraft).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // ---- The product this recipe makes ----
     let product = sqlx::query(
@@ -773,6 +778,11 @@ pub(crate) async fn activate_recipe_as(
     // what every future sale of that item is COSTED at, which reaches
     // every margin figure in the business.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::RecipeActivate).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     // Read the row by ID ALONE, then prove its ownership, rather than filtering
     // by the caller's store and treating a miss as "not found". The two differ
@@ -1116,6 +1126,11 @@ pub(crate) async fn retire_recipe_as(
     // what every future sale of that item is COSTED at, which reaches
     // every margin figure in the business.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::RecipeRetire).await?;
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
 
     let header = sqlx::query(
         "SELECT r.product_id AS product_id,

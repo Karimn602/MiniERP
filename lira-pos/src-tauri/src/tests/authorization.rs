@@ -748,3 +748,207 @@ async fn an_unauthenticated_caller_never_reaches_the_permission_check() {
     state.close_pool().await;
     db.cleanup().await.expect("remove TempDb");
 }
+
+// ===========================================================================
+// The four corrections independent review raised against Stage B
+// ===========================================================================
+
+/// GZ-B-P1 — A DRIVER LEDGER ADJUSTMENT IS NOT A REMITTANCE.
+///
+/// `post_driver_remittance` posts two different things, and the matrix answers
+/// them differently: taking a driver's hand-over is front-of-house work bounded
+/// by what he owes, so a cashier may do it, while writing a balance down by
+/// hand is a correction and corrections are supervision.
+///
+/// The command authorized every payload as `DriverRemittance`, so a cashier
+/// could post an adjustment with any direction and amount — writing off a
+/// driver's debt. Both checks now select the permission from the validated
+/// entry type, through ONE shared function so they cannot drift apart.
+#[test]
+fn a_driver_adjustment_needs_the_adjustment_permission_not_the_remittance_one() {
+    assert!(authz::permits(Role::Cashier, Operation::DriverRemittance));
+    assert!(!authz::permits(Role::Cashier, Operation::DriverLedgerAdjustment));
+    assert!(authz::permits(Role::Manager, Operation::DriverLedgerAdjustment));
+
+    let src = include_str!("../posting.rs");
+    assert!(
+        src.contains("fn driver_entry_operation("),
+        "the permission must be derived by one shared function"
+    );
+    assert_eq!(
+        src.matches("driver_entry_operation(&payload)").count(),
+        2,
+        "both the boundary check and the in-transaction check must use it"
+    );
+
+    let derivation = src
+        .split("fn driver_entry_operation(")
+        .nth(1)
+        .expect("the derivation");
+    let body = &derivation[..derivation.find("\n}").expect("end")];
+    assert!(
+        body.contains("adjustment") && body.contains("DriverLedgerAdjustment"),
+        "an adjustment must map to the adjustment permission: {body}"
+    );
+}
+
+/// GZ-B-P2 — THE DOCUMENT MUST BELONG TO THE ACTOR'S OWN SHOP.
+///
+/// Both authorization checks confirm the actor still belongs to the store on
+/// their own `users` row. Neither looked at the store on the DOCUMENT, so a
+/// cashier of branch A could name branch B's products, shift and rate and post
+/// a branch B sale attributed to a branch A user: every individual check
+/// passed, and nothing compared the two.
+#[test]
+fn the_store_check_compares_the_actor_with_the_document() {
+    let who = Actor::for_tests(CASHIER, STORE, Role::Cashier);
+
+    authz::require_same_store(&who, STORE).expect("their own shop is allowed");
+
+    let refused = authz::require_same_store(&who, "store-2")
+        .expect_err("another shop's document must be refused");
+    assert!(refused.contains("another shop"), "{refused}");
+    assert!(refused.contains("Nothing has been changed"), "{refused}");
+
+    // Every module with transactional implementations performs it.
+    for (name, src) in [
+        ("posting.rs", include_str!("../posting.rs")),
+        ("catalog.rs", include_str!("../catalog.rs")),
+        ("recipes.rs", include_str!("../recipes.rs")),
+    ] {
+        assert!(
+            src.contains("require_same_store("),
+            "{name} performs no store check at all"
+        );
+    }
+}
+
+/// GZ-B-P2 — THE ADMINISTRATIVE COMMANDS AUTHORIZE AT COMMIT TOO, and the two
+/// with no transaction scope their write by store.
+#[test]
+fn the_administrative_commands_authorize_at_commit_and_scope_by_store() {
+    let src = include_str!("../admin.rs");
+
+    assert_eq!(
+        src.matches("crate::authz::authorize_tx(&mut tx, &actor,").count(),
+        3,
+        "exchange_rate_save, driver_save and supplier_save must each \
+         re-authorize inside their transaction"
+    );
+
+    // The two single-statement ones scope the UPDATE itself, which is stronger
+    // than checking first: the scoping IS the write, so there is no window.
+    assert_eq!(
+        src.matches("AND store_id = ?").count(),
+        2,
+        "both activation commands must scope their UPDATE by store"
+    );
+    assert_eq!(
+        src.matches(".bind(&actor.store_id)").count(),
+        2,
+        "and bind the actor's store to do it"
+    );
+}
+
+/// GZ-B-P2 — THE CONDITIONAL DECISIONS HOLD AT COMMIT, not only at the
+/// boundary.
+///
+/// Each of the three was checked once, before its transaction opened. So a user
+/// demoted in between could still commit the thing the second permission was
+/// meant to stop: an owner demoted to manager committing a cost change, a
+/// cashier committing a large discount, a cashier closing somebody else's
+/// shift.
+#[test]
+fn every_conditional_permission_is_re_evaluated_inside_the_transaction() {
+    let posting = include_str!("../posting.rs");
+    let catalog = include_str!("../catalog.rs");
+
+    let window_of = |src: &'static str, name: &str| -> &'static str {
+        let after = src
+            .split(name)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} not found"));
+        &after[..after.len().min(14_000)]
+    };
+
+    let sale_tx = window_of(posting, "pub(crate) async fn post_sale_tx(");
+    assert!(
+        sale_tx.contains("Operation::PostSaleLargeDiscount"),
+        "post_sale_tx must re-check the large-discount permission"
+    );
+
+    let close_tx = window_of(posting, "pub(crate) async fn close_shift_tx(");
+    assert!(
+        close_tx.contains("Operation::CloseAnotherShift"),
+        "close_shift_tx must re-check whose shift it is"
+    );
+    assert!(
+        close_tx.contains("SELECT opened_by_user_id FROM shifts"),
+        "and must read the opener inside its own transaction"
+    );
+
+    let save_tx = window_of(catalog, "pub(crate) async fn save_product_tx(");
+    assert!(
+        save_tx.contains("Operation::SaveProductCost"),
+        "save_product_tx must re-check the cost permission"
+    );
+    assert!(
+        save_tx.contains("cost_fields_would_change_tx("),
+        "and must compare against the stored costing pair inside the transaction"
+    );
+}
+
+/// The boundary and in-transaction cost comparisons apply the SAME rule.
+///
+/// They are two functions because their callers want different lifetimes, so
+/// this is what stops them answering differently — which would mean a manager
+/// blocked at the boundary and allowed at commit, or the reverse.
+#[test]
+fn the_two_cost_comparisons_agree() {
+    let src = include_str!("../catalog.rs");
+
+    for name in ["cost_fields_would_change(", "cost_fields_would_change_tx("] {
+        let after = src
+            .split(&format!("async fn {name}"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} not found"));
+        let body = &after[..after.find("\n}").expect("end")];
+        assert!(
+            body.contains("costing_method, standard_cost_excl_vat_microcents"),
+            "{name} must read the same two columns"
+        );
+        assert!(
+            body.contains("purchase_average"),
+            "{name} must apply the same default"
+        );
+        assert!(
+            body.contains("method_moves || cost_moves"),
+            "{name} must apply the same rule"
+        );
+    }
+}
+
+/// And the recorded residual is recorded: the discount control's limit is named
+/// in the policy, and the gap has a measured test rather than a sentence.
+#[test]
+fn the_discount_controls_limit_is_written_down_and_measured() {
+    let authz_src = include_str!("../authz.rs");
+    assert!(
+        authz_src.contains("DISCOUNT_CONTROL_LIMIT"),
+        "the limit of the discount control must be named in the policy"
+    );
+    assert!(
+        authz_src.contains("GZ-B-P1"),
+        "and attributed to the finding that raised it"
+    );
+
+    let defects = include_str!("known_defects.rs");
+    assert!(
+        defects.contains("gz_b_p1_a_sale_price_cannot_be_used_to_give_an_unapproved_discount"),
+        "the gap must have a test in the known-defect register, not just prose"
+    );
+    assert!(
+        defects.contains("#[ignore = \"GZ-B-P1"),
+        "and it must be registered as a defect the implementation still has"
+    );
+}

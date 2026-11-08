@@ -159,6 +159,15 @@ pub async fn exchange_rate_save(
         .begin()
         .await
         .map_err(|e| format!("cannot begin exchange-rate transaction: {e}"))?;
+    // ---- Authorization, INSIDE the transaction (GZ-B-P2) ----
+    //
+    // The boundary check ran before this transaction opened, and a role can
+    // change in between — so the decision that has to hold at COMMIT is read
+    // inside the transaction that commits, as it is for every posting
+    // command. Without this an administrator demoted mid-request could still
+    // commit a change to the exchange rate, a driver or a supplier.
+    crate::authz::authorize_tx(&mut tx, &actor, crate::authz::Operation::ExchangeRateSave).await?;
+
 
     // The store must exist. Without this an unknown store_id is either a
     // foreign-key error the operator cannot read, or — worse, if the FK is ever
@@ -289,7 +298,7 @@ pub async fn driver_save(
     let phone = clean_opt(args.phone);
     let notes = clean_opt(args.notes);
 
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
@@ -300,6 +309,15 @@ pub async fn driver_save(
         .begin()
         .await
         .map_err(|e| format!("cannot begin driver transaction: {e}"))?;
+    // ---- Authorization, INSIDE the transaction (GZ-B-P2) ----
+    //
+    // The boundary check ran before this transaction opened, and a role can
+    // change in between — so the decision that has to hold at COMMIT is read
+    // inside the transaction that commits, as it is for every posting
+    // command. Without this an administrator demoted mid-request could still
+    // commit a change to the exchange rate, a driver or a supplier.
+    crate::authz::authorize_tx(&mut tx, &actor, crate::authz::Operation::DriverSave).await?;
+
 
     let existing: i64 = sqlx::query("SELECT COUNT(*) AS n FROM drivers WHERE id = ?")
         .bind(&id)
@@ -381,20 +399,28 @@ pub async fn driver_set_active(
     if id.is_empty() {
         return Err("DRIVER_MISSING_ID".into());
     }
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::DriverSave,
     )
     .await?;
+    // SCOPED BY THE ACTOR'S OWN SHOP (GZ-B-P2). Nothing in the arguments
+    // names a store, so without this a manager of one branch could retire
+    // another branch's driver. Scoping the WHERE clause rather than
+    // checking first is deliberate: the scoping IS the write, so there is no
+    // window between the check and the update, and a row of another shop is
+    // simply not found — which returns the refusal below and discloses
+    // nothing about whether it exists elsewhere.
     let affected = sqlx::query(
         "UPDATE drivers
             SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-          WHERE id = ?",
+          WHERE id = ? AND store_id = ?",
     )
     .bind(i64::from(args.is_active))
     .bind(&id)
+    .bind(&actor.store_id)
     .execute(&pool)
     .await
     .map_err(|e| format!("cannot update the driver: {e}"))?
@@ -452,7 +478,7 @@ pub async fn supplier_save(
     let email = clean_opt(args.email);
     let notes = clean_opt(args.notes);
 
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
@@ -463,6 +489,15 @@ pub async fn supplier_save(
         .begin()
         .await
         .map_err(|e| format!("cannot begin supplier transaction: {e}"))?;
+    // ---- Authorization, INSIDE the transaction (GZ-B-P2) ----
+    //
+    // The boundary check ran before this transaction opened, and a role can
+    // change in between — so the decision that has to hold at COMMIT is read
+    // inside the transaction that commits, as it is for every posting
+    // command. Without this an administrator demoted mid-request could still
+    // commit a change to the exchange rate, a driver or a supplier.
+    crate::authz::authorize_tx(&mut tx, &actor, crate::authz::Operation::SupplierSave).await?;
+
 
     let existing: i64 = sqlx::query("SELECT COUNT(*) AS n FROM suppliers WHERE id = ?")
         .bind(&id)
@@ -546,16 +581,26 @@ pub async fn supplier_set_active(
     if id.is_empty() {
         return Err("SUPPLIER_MISSING_ID".into());
     }
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::SupplierSave,
     )
     .await?;
-    let affected = sqlx::query("UPDATE suppliers SET is_active = ? WHERE id = ?")
+    // SCOPED BY THE ACTOR'S OWN SHOP (GZ-B-P2). Nothing in the arguments names
+    // a store, so without this a manager of one branch could retire another
+    // branch's supplier. Scoping the WHERE clause rather than checking first is
+    // deliberate: the scoping IS the write, so there is no window between the
+    // check and the update, and a row of another shop is simply not found —
+    // which returns the refusal below and discloses nothing about whether it
+    // exists elsewhere.
+    let affected = sqlx::query(
+        "UPDATE suppliers SET is_active = ? WHERE id = ? AND store_id = ?",
+    )
         .bind(i64::from(args.is_active))
         .bind(&id)
+        .bind(&actor.store_id)
         .execute(&pool)
         .await
         .map_err(|e| format!("cannot update the supplier: {e}"))?

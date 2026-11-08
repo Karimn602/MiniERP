@@ -353,3 +353,110 @@ async fn gp_a07_line_discounts_must_sum_to_the_header_discount() {
         }
     }
 }
+
+// ============================================================================
+// GZ-B-P1 — a sale's PRICES are not authoritative, so the large-discount
+//           permission binds only the DECLARED discount.
+// ============================================================================
+//
+// Reported by independent review of Gate 2B Stage B. Owned by a later work
+// package: "make sale prices authoritative".
+//
+// Stage B gives a cashier permission to post a sale and withholds permission to
+// give a discount above `authz::DISCOUNT_WITHOUT_APPROVAL_CENTS`. That check
+// reads `payload.discount_cents`. It cannot read the ECONOMIC discount, because
+// `post_sale` does not prove a line's unit price against the catalogue:
+// `PostSaleLine` carries `unit_price_excl_vat_cents` /
+// `unit_price_incl_vat_cents` and the command persists them.
+//
+// So a caller that shapes a request may sell a $10.00 item for $0.01 while
+// declaring no discount at all. The sale reconciles perfectly — every line
+// total, every VAT figure and the header sum agree, because they are all
+// derived from the same understated price — and the permission is never
+// consulted.
+//
+// WHAT THIS IS AND IS NOT. It is not reachable from the register, which sends
+// the catalogue price and puts every reduction in the discount field; the
+// control does bind that path. It IS reachable by a hand-built request, a
+// future screen, an import or a script — and "an argument about one screen,
+// not about the data" is a line this codebase has drawn before (see CLAUDE.md
+// on `post_sale`'s delivery shape). So the honest claim is the smaller one:
+// the permission binds the declared discount.
+//
+// THE FIX, when it is done, is not an extra check. It is to resolve each line's
+// price from the product and its resolved `product_uoms` row INSIDE the posting
+// transaction, derive the economic discount, and authorize on that — the same
+// treatment `post_purchase` already gives a supplier's unit cost and
+// `post_sale` already gives the UoM conversion and the COGS rate. It needs a
+// product decision first: may a till sell at an overridden price at all, and if
+// so is that override a discount for reporting?
+//
+// The test is `#[ignore]`d, which in this file means "a defect the current
+// implementation still has". Remove the attribute when the fix lands; do not
+// weaken the assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "GZ-B-P1: sale prices are not authoritative; owned by a later work package"]
+async fn gz_b_p1_a_sale_price_cannot_be_used_to_give_an_unapproved_discount() {
+    use crate::auth::{Actor, Role};
+    use crate::posting::{post_sale_tx, prepare_sale};
+
+    const CASHIER: &str = "00000000-0000-0000-0000-0000000000a2";
+    const STORE: &str = "00000000-0000-0000-0000-000000000001";
+
+    let db = TempDb::new().await;
+    db.exec(&format!(
+        "INSERT INTO users (id, store_id, full_name, role)
+         VALUES ('{CASHIER}', '{STORE}', 'Sami', 'cashier')"
+    ))
+    .await;
+    seed_exchange_rate(&db).await;
+    seed_product(
+        &db,
+        &ProductSpec {
+            quantity_on_hand: 10,
+            // A $10.00 item.
+            ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee")
+        },
+    )
+    .await;
+    db.exec(&format!(
+        "UPDATE products SET price_incl_vat_cents = 1000, price_excl_vat_cents = 901
+          WHERE id = '{P_COFFEE}'"
+    ))
+    .await;
+
+    let shift = uuid();
+    db.exec(&format!(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opened_at, status,
+                             opening_cash_usd_cents, opening_cash_lbp)
+         VALUES ('{shift}', '{STORE}', '{CASHIER}', '2026-11-08T08:00:00.000Z', 'open', 0, 0)"
+    ))
+    .await;
+
+    // One unit at ONE CENT, with no declared discount. The economic discount is
+    // $9.99 — far above the threshold a cashier may give unaided.
+    let line = SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_incl(1).build();
+    let mut payload = sale_payload(vec![line], vec![cash_usd(1)]);
+    payload.shift_id = Some(shift);
+    payload.cashier_user_id = Some(CASHIER.to_string());
+    payload.discount_cents = 0;
+
+    let prepared = prepare_sale(&payload).expect("the payload reconciles with itself");
+    let outcome = post_sale_tx(
+        db.pool(),
+        &Actor::for_tests(CASHIER, STORE, Role::Cashier),
+        payload,
+        prepared,
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "GZ-B-P1: a cashier sold a $10.00 item for $0.01 while declaring no \
+         discount, so the large-discount permission was never consulted. The \
+         economic discount must be derived from the catalogue price and \
+         authorized."
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}

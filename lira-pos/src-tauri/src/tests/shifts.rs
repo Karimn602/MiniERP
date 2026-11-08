@@ -528,11 +528,36 @@ async fn closing_a_shift_of_another_store_or_an_unknown_one_is_refused() {
     let db = store_with_coffee().await;
     open_shift_with_pool(db.pool(), open_payload(SHIFT_A, 10_000, 0)).await.unwrap();
 
+    // A SHIFT BELONGS TO ITS OWN STORE, and there are now two refusals that
+    // say so. Stage B's store check refuses a payload naming a shop the actor
+    // is not in — asserted here, because it is the one the operator meets —
+    // and `close_shift_tx`'s own lookup refuses a shift that is not the named
+    // store's, which is the deeper guarantee and is exercised below with a
+    // real user of that store.
     let mut wrong_store = close_payload(SHIFT_A, 0, 0);
     wrong_store.store_id = "some-other-store".to_string();
     let err = close_shift_with_pool(db.pool(), wrong_store)
         .await
         .expect_err("a shift belongs to its own store");
+    assert!(err.contains("another shop"), "got: {err}");
+
+    // The engine-level half: a real owner of branch B cannot close branch A's
+    // shift, because the shift is not one of branch B's.
+    crate::test_support::seed_store(&db, "store-b", "Branch B").await;
+    let mut as_branch_b = close_payload(SHIFT_A, 0, 0);
+    as_branch_b.store_id = "store-b".to_string();
+    as_branch_b.closed_by_user_id = crate::test_support::seeded_owner_of("store-b");
+    let err = crate::posting::close_shift_tx(
+        db.pool(),
+        &crate::auth::Actor::for_tests(
+            &crate::test_support::seeded_owner_of("store-b"),
+            "store-b",
+            crate::auth::Role::Owner,
+        ),
+        as_branch_b,
+    )
+    .await
+    .expect_err("branch A's shift is not branch B's to close");
     assert!(err.contains("No open shift found"), "got: {err}");
 
     let err = close_shift_with_pool(db.pool(), close_payload("no-such-shift", 0, 0))

@@ -1990,9 +1990,22 @@ async fn a_return_needs_a_posted_sale_of_its_own_store() {
     seed_store(&db, "store-b", "Branch B").await;
     let mut foreign = cash_return(&db, &sale, &item, 2, 1_000).await;
     foreign.store_id = "store-b".to_string();
-    let err = post_credit_memo_with_pool(db.pool(), foreign)
-        .await
-        .expect_err("another store's books are not ours");
+    foreign.cashier_user_id = Some(seeded_owner_of("store-b"));
+    // ACTING AS THE OTHER BRANCH'S OWN OWNER, so Stage B's store check passes
+    // and the refusal under test is the deeper one this test was written for.
+    // Acting as branch A would be refused earlier — correctly, but that proves
+    // something else, and it is covered in `tests::authorization`.
+    let err = crate::posting::post_credit_memo_tx(
+        db.pool(),
+        &crate::auth::Actor::for_tests(
+            &seeded_owner_of("store-b"),
+            "store-b",
+            crate::auth::Role::Owner,
+        ),
+        foreign,
+    )
+    .await
+    .expect_err("another store's books are not ours");
     assert!(err.contains("is not a sale of store"), "got: {err}");
 
     // And a sale that does not exist at all.

@@ -964,6 +964,34 @@ pub async fn seed_store(db: &TempDb, id: &str, name: &str) {
         .execute(db.pool())
         .await
         .expect("seed store");
+
+    // AND AN OWNER FOR IT (Gate 2B).
+    //
+    // A second store with no staff is not a shop any command can act in: since
+    // Stage B every write is authorized against a real, active user, and since
+    // the store check that user must belong to the document's own store. A test
+    // that builds a second branch in order to prove a CROSS-STORE guard needs
+    // somebody there to act as — otherwise the only thing it can prove is that
+    // the store check works, which is covered on its own and is not what those
+    // tests were written to show.
+    sqlx::query(
+        "INSERT INTO users (id, store_id, full_name, role)
+         VALUES (?, ?, ?, 'owner')",
+    )
+    .bind(seeded_owner_of(id))
+    .bind(id)
+    .bind(format!("{name} Owner"))
+    .execute(db.pool())
+    .await
+    .expect("seed the store's owner");
+}
+
+/// The id `seed_store` gives a seeded store's owner, so a test can act as them.
+///
+/// Derived from the store id rather than random, so a test can name the actor
+/// without threading a value back out of the seeding call.
+pub fn seeded_owner_of(store_id: &str) -> String {
+    format!("owner-of-{store_id}")
 }
 
 /// A supplier's outstanding payable, read the way every read model reads it:

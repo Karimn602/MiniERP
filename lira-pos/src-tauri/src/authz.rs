@@ -71,8 +71,9 @@ use crate::auth::{Actor, Role};
 pub(crate) enum Operation {
     // --- front of house -------------------------------------------------
     PostSale,
-    /// A discount above [`DISCOUNT_WITHOUT_APPROVAL_CENTS`]. See the constant
-    /// for why this is an amount and not a role.
+    /// A DECLARED discount above [`DISCOUNT_WITHOUT_APPROVAL_CENTS`]. See the
+    /// constant for why this is an amount and not a role, and
+    /// [`DISCOUNT_CONTROL_LIMIT`] for what it does NOT reach.
     PostSaleLargeDiscount,
     OpenShift,
     CloseOwnShift,
@@ -217,6 +218,45 @@ impl Operation {
 /// that is a feature. Making it configurable later changes this line and adds
 /// those two things; leaving it hard-coded now does not have to be undone.
 pub(crate) const DISCOUNT_WITHOUT_APPROVAL_CENTS: i64 = 500;
+
+/// WHAT THE DISCOUNT CONTROL DOES NOT REACH, stated here rather than left to be
+/// discovered.
+///
+/// GZ-B-P1 (independent review). The permission is checked against
+/// `payload.discount_cents`, which is the discount the request DECLARES. It is
+/// not checked against the economic discount, because `post_sale` does not
+/// prove a sale's unit prices against the catalogue: `PostSaleLine` carries
+/// `unit_price_excl_vat_cents` / `unit_price_incl_vat_cents` and the posting
+/// command persists them. So a caller that can shape a request may sell a
+/// $10.00 item for $0.01 with `discount_cents = 0`, and the sale reconciles
+/// internally — every line total, VAT figure and header sum agrees — while
+/// never meeting this permission.
+///
+/// THE CONTROL IS THEREFORE HONEST ABOUT ITS REACH: it binds the DECLARED
+/// discount, which is the only discount the register can produce, and it does
+/// not bind a hand-built request. That is a smaller claim than "a cashier
+/// cannot give a large discount", and the smaller claim is the true one. This
+/// codebase has a name for the alternative — see
+/// `posting::UNVERIFIED_APPROVAL_PREFIX`, which exists because a control that
+/// looks stronger than it is, is worse than no control.
+///
+/// WHY IT IS NOT FIXED HERE. The sound correction is to make sale prices
+/// AUTHORITATIVE — resolve each line's price from the product and its resolved
+/// `product_uoms` row inside the posting transaction, derive the economic
+/// discount, and authorize on that. That is the same treatment `post_purchase`
+/// already gives a supplier's unit cost and `post_sale` already gives the UoM
+/// conversion and the COGS rate. It is a change to what `post_sale` ACCEPTS,
+/// not an addition to what it checks, and it needs a product decision first:
+/// whether a till may sell at an overridden price at all, and if so whether
+/// that override is a discount for reporting. Inventing price arithmetic for a
+/// permission check, in a codebase this careful about money, is not a thing to
+/// do at the end of a work package.
+///
+/// The gap is recorded as a measured, failing-by-design test in
+/// `tests::known_defects` rather than as prose, so it cannot be forgotten and
+/// cannot be claimed closed without the test changing.
+pub(crate) const DISCOUNT_CONTROL_LIMIT: &str =
+    "binds the declared discount only; sale prices are not authoritative (GZ-B-P1)";
 
 /// THE MATRIX.
 ///
@@ -476,6 +516,37 @@ pub(crate) async fn authorize_tx(
         Ok(())
     } else {
         Err(operation.refusal(role))
+    }
+}
+
+/// THE DOCUMENT MUST BELONG TO THE ACTOR'S OWN SHOP.
+///
+/// GZ-B-P2 (independent review). [`authorize`] and [`authorize_tx`] confirm the
+/// actor still belongs to the store recorded on their own `users` row — but
+/// neither looked at the store on the DOCUMENT. So a cashier of branch A could
+/// name branch B's products, shift and exchange rate and post a branch B sale,
+/// attributed to a branch A user. Every individual check passed: the user is
+/// real, active, and of the store their row says; the document is coherent; the
+/// foreign keys are satisfied. Nothing compared the two.
+///
+/// Greaz ships single-store today — `app_settings.active_store_id` names one
+/// and the UI offers no switch — so this is not presently reachable from the
+/// application. But `stores` is a real table with a real primary key, every
+/// financial table is scoped by it, and the schema has been multi-store ready
+/// since migration 001. The shape a command accepts is the shape the database
+/// can hold, and this is cheap to close.
+///
+/// Called in each transactional implementation beside the authorization, on the
+/// document's own `store_id`.
+pub(crate) fn require_same_store(actor: &Actor, document_store: &str) -> Result<(), String> {
+    if actor.store_id == document_store {
+        Ok(())
+    } else {
+        Err(
+            "This request belongs to another shop. Nothing has been changed. \
+             Sign out and sign in again, then try once more."
+                .to_string(),
+        )
     }
 }
 

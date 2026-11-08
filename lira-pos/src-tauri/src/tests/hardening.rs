@@ -261,9 +261,24 @@ async fn an_adjustment_against_an_unknown_product_or_another_store_is_refused() 
     let mut payload =
         adjustment_payload("count", vec![adjustment_line_in_uom(P_COFFEE, "each", 1, 1, 1)]);
     payload.store_id = "store-b".to_string();
-    let err = post_adjustment_with_pool(db.pool(), payload)
-        .await
-        .expect_err("another store's inventory is not ours to adjust");
+    payload.created_by_user_id = Some(seeded_owner_of("store-b"));
+    // ACTING AS BRANCH B'S OWN OWNER, so Stage B's store check passes and the
+    // refusal under test is the one this test was written for: the product
+    // belongs to branch A, so branch B's books cannot adjust it. Acting as
+    // branch A's owner would be refused earlier, by the store check, which is
+    // correct but proves something else (and is covered in
+    // `tests::authorization`).
+    let err = crate::posting::post_adjustment_tx(
+        db.pool(),
+        &crate::auth::Actor::for_tests(
+            &seeded_owner_of("store-b"),
+            "store-b",
+            crate::auth::Role::Owner,
+        ),
+        payload,
+    )
+    .await
+    .expect_err("another store's inventory is not ours to adjust");
     assert!(err.contains("not found in store"), "got: {err}");
     assert_eq!(movement_count(&db).await, 0);
 }

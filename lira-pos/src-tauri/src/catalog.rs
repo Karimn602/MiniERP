@@ -418,6 +418,41 @@ pub async fn save_product(
     save_product_tx(&pool, &actor, payload).await
 }
 
+/// The same comparison, inside a transaction.
+///
+/// Duplicated rather than generalised over an executor because the two callers
+/// want different lifetimes and the body is four statements; a generic
+/// `Executor` bound here would be more machinery than the thing it carries.
+/// Both read the same two columns and apply the same rule, and
+/// `tests::authorization` asserts they agree.
+async fn cost_fields_would_change_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    payload: &SaveProductPayload,
+) -> Result<bool, String> {
+    let stored: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT costing_method, standard_cost_excl_vat_microcents
+           FROM products WHERE id = ? AND store_id = ?",
+    )
+    .bind(&payload.product_id)
+    .bind(&payload.store_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("cannot read the product's costing: {e}"))?;
+
+    let (stored_method, stored_cost) =
+        stored.unwrap_or_else(|| ("purchase_average".to_string(), None));
+
+    let method_moves = payload
+        .costing_method
+        .as_deref()
+        .is_some_and(|m| m != stored_method);
+    let cost_moves = payload
+        .standard_cost_excl_vat_microcents
+        .is_some_and(|c| Some(c) != stored_cost);
+
+    Ok(method_moves || cost_moves)
+}
+
 /// Would this save move the product's cost or its costing method?
 ///
 /// For a NEW product, anything other than the schema's own defaults
@@ -497,6 +532,26 @@ pub(crate) async fn save_product_tx(
     // read inside the transaction that commits. It runs before anything is
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::SaveProduct).await?;
+
+    // AND THE COST DECISION, re-evaluated here. The boundary compared the
+    // payload against the stored costing pair on a separate connection before
+    // this transaction opened; an owner demoted to manager in between would
+    // otherwise commit a cost change on a permission they no longer have. The
+    // comparison is against what is STORED, not against the presence of the
+    // fields, so a manager who only touched the price is still not stopped.
+    if cost_fields_would_change_tx(&mut tx, &payload).await? {
+        crate::authz::authorize_tx(
+            &mut tx,
+            actor,
+            crate::authz::Operation::SaveProductCost,
+        )
+        .await?;
+    }
+    // And the DOCUMENT must belong to the actor's own shop. Every check
+    // above confirms the actor is who they say and may do this; this is
+    // the one that confirms they may do it HERE. See
+    // `authz::require_same_store`.
+    crate::authz::require_same_store(actor, &payload.store_id)?;
     let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
     // Only `standard_cost_set_at` uses this: every other timestamp on a
     // product row is written by the schema's own DEFAULT or by
@@ -1014,6 +1069,19 @@ pub(crate) async fn add_product_barcode_tx(
     // read inside the transaction that commits. It runs before anything is
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::ProductBarcode).await?;
+    // And the DOCUMENT must belong to the actor's own shop. A barcode payload
+    // names only a product, so the shop is whichever shop owns that product —
+    // resolved here rather than taken from the request, which is the same
+    // reason the UoM conversion and the COGS rate are resolved rather than
+    // taken. See `authz::require_same_store`.
+    let product_store: String =
+        sqlx::query_scalar("SELECT store_id FROM products WHERE id = ?")
+            .bind(&payload.product_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("read the product's store: {e}"))?
+            .ok_or_else(|| format!("Product not found: {}", payload.product_id))?;
+    crate::authz::require_same_store(actor, &product_store)?;
 
     let store_id: String = sqlx::query("SELECT store_id FROM products WHERE id = ?")
         .bind(&payload.product_id)
@@ -1097,6 +1165,19 @@ pub(crate) async fn set_primary_product_barcode_tx(
     // read inside the transaction that commits. It runs before anything is
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::ProductBarcode).await?;
+    // And the DOCUMENT must belong to the actor's own shop. A barcode payload
+    // names only a product, so the shop is whichever shop owns that product —
+    // resolved here rather than taken from the request, which is the same
+    // reason the UoM conversion and the COGS rate are resolved rather than
+    // taken. See `authz::require_same_store`.
+    let product_store: String =
+        sqlx::query_scalar("SELECT store_id FROM products WHERE id = ?")
+            .bind(&payload.product_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("read the product's store: {e}"))?
+            .ok_or_else(|| format!("Product not found: {}", payload.product_id))?;
+    crate::authz::require_same_store(actor, &product_store)?;
 
     let exists = sqlx::query(
         "SELECT 1 AS ok FROM product_barcodes
@@ -1177,6 +1258,19 @@ pub(crate) async fn remove_product_barcode_tx(
     // read inside the transaction that commits. It runs before anything is
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::ProductBarcode).await?;
+    // And the DOCUMENT must belong to the actor's own shop. A barcode payload
+    // names only a product, so the shop is whichever shop owns that product —
+    // resolved here rather than taken from the request, which is the same
+    // reason the UoM conversion and the COGS rate are resolved rather than
+    // taken. See `authz::require_same_store`.
+    let product_store: String =
+        sqlx::query_scalar("SELECT store_id FROM products WHERE id = ?")
+            .bind(&payload.product_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("read the product's store: {e}"))?
+            .ok_or_else(|| format!("Product not found: {}", payload.product_id))?;
+    crate::authz::require_same_store(actor, &product_store)?;
 
     let row = sqlx::query(
         "SELECT is_primary FROM product_barcodes
