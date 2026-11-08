@@ -373,18 +373,31 @@ pub async fn save_recipe_draft(
     state: State<'_, DbState>,
     payload: SaveRecipeDraftPayload,
 ) -> Result<SaveRecipeDraftResult, String> {
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::RecipeDraft,
     )
     .await?;
-    save_recipe_draft_with_pool(&pool, payload).await
+    save_recipe_draft_as(&pool, &actor, payload).await
 }
 
-pub async fn save_recipe_draft_with_pool(
+/// The pre-Stage-B seam, kept so the ninety-odd existing recipe tests
+/// need no edit: they are about versioning, costing and the lifecycle,
+/// and have no opinion about who is signed in. Tests that are ABOUT
+/// authorization call `save_recipe_draft_as` with an actor of their own.
+#[cfg(test)]
+pub(crate) async fn save_recipe_draft_with_pool(
     pool: &SqlitePool,
+    payload: SaveRecipeDraftPayload,
+) -> Result<SaveRecipeDraftResult, String> {
+    save_recipe_draft_as(pool, &crate::auth::Actor::test_owner(), payload).await
+}
+
+pub(crate) async fn save_recipe_draft_as(
+    pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: SaveRecipeDraftPayload,
 ) -> Result<SaveRecipeDraftResult, String> {
     if payload.components.is_empty() {
@@ -402,6 +415,15 @@ pub async fn save_recipe_draft_with_pool(
         .begin()
         .await
         .map_err(|e| format!("begin save_recipe_draft tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can
+    // change in between. A recipe write moves no money, but it decides
+    // what every future sale of that item is COSTED at, which reaches
+    // every margin figure in the business.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::RecipeDraft).await?;
 
     // ---- The product this recipe makes ----
     let product = sqlx::query(
@@ -711,24 +733,46 @@ pub async fn activate_recipe(
     state: State<'_, DbState>,
     payload: ActivateRecipePayload,
 ) -> Result<ActivateRecipeResult, String> {
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::RecipeActivate,
     )
     .await?;
-    activate_recipe_with_pool(&pool, payload).await
+    activate_recipe_as(&pool, &actor, payload).await
 }
 
-pub async fn activate_recipe_with_pool(
+/// The pre-Stage-B seam, kept so the ninety-odd existing recipe tests
+/// need no edit: they are about versioning, costing and the lifecycle,
+/// and have no opinion about who is signed in. Tests that are ABOUT
+/// authorization call `activate_recipe_as` with an actor of their own.
+#[cfg(test)]
+pub(crate) async fn activate_recipe_with_pool(
     pool: &SqlitePool,
+    payload: ActivateRecipePayload,
+) -> Result<ActivateRecipeResult, String> {
+    activate_recipe_as(pool, &crate::auth::Actor::test_owner(), payload).await
+}
+
+pub(crate) async fn activate_recipe_as(
+    pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: ActivateRecipePayload,
 ) -> Result<ActivateRecipeResult, String> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| format!("begin activate_recipe tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can
+    // change in between. A recipe write moves no money, but it decides
+    // what every future sale of that item is COSTED at, which reaches
+    // every margin figure in the business.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::RecipeActivate).await?;
 
     // Read the row by ID ALONE, then prove its ownership, rather than filtering
     // by the caller's store and treating a miss as "not found". The two differ
@@ -1032,24 +1076,46 @@ pub async fn retire_recipe(
     state: State<'_, DbState>,
     payload: RetireRecipePayload,
 ) -> Result<RetireRecipeResult, String> {
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::RecipeRetire,
     )
     .await?;
-    retire_recipe_with_pool(&pool, payload).await
+    retire_recipe_as(&pool, &actor, payload).await
 }
 
-pub async fn retire_recipe_with_pool(
+/// The pre-Stage-B seam, kept so the ninety-odd existing recipe tests
+/// need no edit: they are about versioning, costing and the lifecycle,
+/// and have no opinion about who is signed in. Tests that are ABOUT
+/// authorization call `retire_recipe_as` with an actor of their own.
+#[cfg(test)]
+pub(crate) async fn retire_recipe_with_pool(
     pool: &SqlitePool,
+    payload: RetireRecipePayload,
+) -> Result<RetireRecipeResult, String> {
+    retire_recipe_as(pool, &crate::auth::Actor::test_owner(), payload).await
+}
+
+pub(crate) async fn retire_recipe_as(
+    pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: RetireRecipePayload,
 ) -> Result<RetireRecipeResult, String> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| format!("begin retire_recipe tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can
+    // change in between. A recipe write moves no money, but it decides
+    // what every future sale of that item is COSTED at, which reaches
+    // every margin figure in the business.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::RecipeRetire).await?;
 
     let header = sqlx::query(
         "SELECT r.product_id AS product_id,

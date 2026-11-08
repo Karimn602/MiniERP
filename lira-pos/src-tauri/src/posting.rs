@@ -1340,14 +1340,14 @@ pub async fn post_purchase(
 ) -> Result<PostPurchaseResult, String> {
     let prepared = prepare_purchase(&payload)?;
 
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::PostPurchase,
     )
     .await?;
-    post_purchase_tx(&pool, payload, prepared).await
+    post_purchase_tx(&pool, &actor, payload, prepared).await
 }
 
 /// Validate-then-post against an already-resolved pool. Preserves the command's
@@ -1358,12 +1358,13 @@ pub(crate) async fn post_purchase_with_pool(
     payload: PostPurchasePayload,
 ) -> Result<PostPurchaseResult, String> {
     let prepared = prepare_purchase(&payload)?;
-    post_purchase_tx(pool, payload, prepared).await
+    post_purchase_tx(pool, &crate::auth::Actor::test_owner(), payload, prepared).await
 }
 
 /// The transactional body of `post_purchase`.
 pub(crate) async fn post_purchase_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: PostPurchasePayload,
     prepared: PreparedPurchase,
 ) -> Result<PostPurchaseResult, String> {
@@ -1410,6 +1411,26 @@ pub(crate) async fn post_purchase_tx(
         tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
         return Ok(result);
     }
+
+    // ---- Authorization, INSIDE the transaction, AFTER the replay ----
+    //
+    // The order is load-bearing and is the same one the shift, driver and
+    // delivery-shape checks already use.
+    //
+    // A REPLAY returned above and never reaches this. That is the point: the
+    // frozen request is replayed by whoever is at the till when the application
+    // comes back, which may be the next shift's cashier, and refusing it on a
+    // permission the original operator had and this one does not would turn the
+    // one defence against a double charge into a double charge.
+    //
+    // A NEW document is authorized here rather than only at the command
+    // boundary, because the boundary check ran before this transaction opened
+    // and a role can change in between. This is the decision that has to hold
+    // at COMMIT, so it is read inside the transaction that commits — the
+    // discipline `post_supplier_payment` applies to the payable and
+    // `post_credit_memo` to the drawer. It runs before any number is consumed,
+    // so a refusal costs the sequence nothing.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostPurchase).await?;
 
     // ---- The supplier is this store's supplier ----
     //
@@ -1959,14 +1980,14 @@ pub async fn post_adjustment(
 ) -> Result<PostAdjustmentResult, String> {
     validate_adjustment_payload(&payload)?;
 
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::PostAdjustment,
     )
     .await?;
-    post_adjustment_tx(&pool, payload).await
+    post_adjustment_tx(&pool, &actor, payload).await
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).
@@ -1976,7 +1997,7 @@ pub(crate) async fn post_adjustment_with_pool(
     payload: PostAdjustmentPayload,
 ) -> Result<PostAdjustmentResult, String> {
     validate_adjustment_payload(&payload)?;
-    post_adjustment_tx(pool, payload).await
+    post_adjustment_tx(pool, &crate::auth::Actor::test_owner(), payload).await
 }
 
 /// One adjustment line after the database has had its say: the authoritative
@@ -2033,9 +2054,19 @@ struct ResolvedAdjustmentLine {
 /// `post_purchase` and `post_credit_memo` use.
 pub(crate) async fn post_adjustment_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: PostAdjustmentPayload,
 ) -> Result<PostAdjustmentResult, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can change
+    // in between. This is the decision that has to hold at COMMIT, so it is
+    // read inside the transaction that commits. It runs before anything is
+    // written, so a refusal leaves nothing behind.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostAdjustment).await?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
@@ -2406,14 +2437,14 @@ pub async fn post_supplier_payment(
 ) -> Result<PostSupplierPaymentResult, String> {
     let amount_cents = validate_supplier_payment_payload(&payload)?;
 
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::SupplierPayment,
     )
     .await?;
-    post_supplier_payment_tx(&pool, payload, amount_cents).await
+    post_supplier_payment_tx(&pool, &actor, payload, amount_cents).await
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).
@@ -2423,7 +2454,7 @@ pub(crate) async fn post_supplier_payment_with_pool(
     payload: PostSupplierPaymentPayload,
 ) -> Result<PostSupplierPaymentResult, String> {
     let amount_cents = validate_supplier_payment_payload(&payload)?;
-    post_supplier_payment_tx(pool, payload, amount_cents).await
+    post_supplier_payment_tx(pool, &crate::auth::Actor::test_owner(), payload, amount_cents).await
 }
 
 /// The transactional body of `post_supplier_payment`.
@@ -2432,6 +2463,7 @@ pub(crate) async fn post_supplier_payment_with_pool(
 /// derived. The payload's own `amount_cents` is never written.
 pub(crate) async fn post_supplier_payment_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: PostSupplierPaymentPayload,
     amount_cents: i64,
 ) -> Result<PostSupplierPaymentResult, String> {
@@ -2477,6 +2509,26 @@ pub(crate) async fn post_supplier_payment_tx(
             new_balance_cents: new_balance,
         });
     }
+
+    // ---- Authorization, INSIDE the transaction, AFTER the replay ----
+    //
+    // The order is load-bearing and is the same one the shift, driver and
+    // delivery-shape checks already use.
+    //
+    // A REPLAY returned above and never reaches this. That is the point: the
+    // frozen request is replayed by whoever is at the till when the application
+    // comes back, which may be the next shift's cashier, and refusing it on a
+    // permission the original operator had and this one does not would turn the
+    // one defence against a double charge into a double charge.
+    //
+    // A NEW document is authorized here rather than only at the command
+    // boundary, because the boundary check ran before this transaction opened
+    // and a role can change in between. This is the decision that has to hold
+    // at COMMIT, so it is read inside the transaction that commits — the
+    // discipline `post_supplier_payment` applies to the payable and
+    // `post_credit_memo` to the drawer. It runs before any number is consumed,
+    // so a refusal costs the sequence nothing.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::SupplierPayment).await?;
 
     // ---- The supplier is this store's supplier ----
     //
@@ -3881,7 +3933,7 @@ pub async fn post_sale(
         .map_err(PostSaleFailure::refused)?;
     }
 
-    post_sale_tx(&pool, payload, prepared).await.map_err(PostSaleFailure::refused)
+    post_sale_tx(&pool, &actor, payload, prepared).await.map_err(PostSaleFailure::refused)
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).
@@ -3891,7 +3943,7 @@ pub(crate) async fn post_sale_with_pool(
     payload: PostSalePayload,
 ) -> Result<PostSaleResult, String> {
     let prepared = prepare_sale(&payload)?;
-    post_sale_tx(pool, payload, prepared).await
+    post_sale_tx(pool, &crate::auth::Actor::test_owner(), payload, prepared).await
 }
 
 /// One sale line after the database has had its say: the authoritative base
@@ -4015,6 +4067,7 @@ async fn purchase_valuation_basis(
 /// The transactional body of `post_sale`.
 pub(crate) async fn post_sale_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: PostSalePayload,
     prepared: PreparedSale,
 ) -> Result<PostSaleResult, String> {
@@ -4046,6 +4099,26 @@ pub(crate) async fn post_sale_tx(
         tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
         return Ok(result);
     }
+
+    // ---- Authorization, INSIDE the transaction, AFTER the replay ----
+    //
+    // The order is load-bearing and is the same one the shift, driver and
+    // delivery-shape checks already use.
+    //
+    // A REPLAY returned above and never reaches this. That is the point: the
+    // frozen request is replayed by whoever is at the till when the application
+    // comes back, which may be the next shift's cashier, and refusing it on a
+    // permission the original operator had and this one does not would turn the
+    // one defence against a double charge into a double charge.
+    //
+    // A NEW document is authorized here rather than only at the command
+    // boundary, because the boundary check ran before this transaction opened
+    // and a role can change in between. This is the decision that has to hold
+    // at COMMIT, so it is read inside the transaction that commits — the
+    // discipline `post_supplier_payment` applies to the payable and
+    // `post_credit_memo` to the drawer. It runs before any number is consumed,
+    // so a refusal costs the sequence nothing.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostSale).await?;
 
     // ---- The locked exchange rate is the DATABASE's, not the payload's (WP-04) ----
     //
@@ -5303,14 +5376,14 @@ pub async fn open_shift(
     payload: OpenShiftPayload,
 ) -> Result<ShiftSnapshot, String> {
     validate_open_shift_payload(&payload)?;
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::OpenShift,
     )
     .await?;
-    open_shift_tx(&pool, payload).await
+    open_shift_tx(&pool, &actor, payload).await
 }
 
 /// Validate-then-open against an already-resolved pool (test seam).
@@ -5320,7 +5393,7 @@ pub(crate) async fn open_shift_with_pool(
     payload: OpenShiftPayload,
 ) -> Result<ShiftSnapshot, String> {
     validate_open_shift_payload(&payload)?;
-    open_shift_tx(pool, payload).await
+    open_shift_tx(pool, &crate::auth::Actor::test_owner(), payload).await
 }
 
 /// The transactional body of `open_shift`.
@@ -5336,9 +5409,19 @@ pub(crate) async fn open_shift_with_pool(
 /// deterministic way.
 pub(crate) async fn open_shift_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: OpenShiftPayload,
 ) -> Result<ShiftSnapshot, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can change
+    // in between. This is the decision that has to hold at COMMIT, so it is
+    // read inside the transaction that commits. It runs before anything is
+    // written, so a refusal leaves nothing behind.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::OpenShift).await?;
 
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -5453,7 +5536,7 @@ pub async fn close_shift(
         }
     }
 
-    close_shift_tx(&pool, payload).await
+    close_shift_tx(&pool, &actor, payload).await
 }
 
 /// Validate-then-close against an already-resolved pool (test seam).
@@ -5463,7 +5546,7 @@ pub(crate) async fn close_shift_with_pool(
     payload: CloseShiftPayload,
 ) -> Result<ShiftSnapshot, String> {
     validate_close_shift_payload(&payload)?;
-    close_shift_tx(pool, payload).await
+    close_shift_tx(pool, &crate::auth::Actor::test_owner(), payload).await
 }
 
 /// The transactional body of `close_shift`.
@@ -5482,9 +5565,19 @@ pub(crate) async fn close_shift_with_pool(
 /// true for any caller, not just this one.
 pub(crate) async fn close_shift_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: CloseShiftPayload,
 ) -> Result<ShiftSnapshot, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can change
+    // in between. This is the decision that has to hold at COMMIT, so it is
+    // read inside the transaction that commits. It runs before anything is
+    // written, so a refusal leaves nothing behind.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::CloseOwnShift).await?;
 
     let row = sqlx::query(
         "SELECT status, closed_at, opening_cash_usd_cents, opening_cash_lbp
@@ -6308,14 +6401,14 @@ pub async fn post_credit_memo(
     payload: PostCreditMemoPayload,
 ) -> Result<PostCreditMemoResult, String> {
     validate_credit_memo_payload(&payload)?;
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::PostCreditMemo,
     )
     .await?;
-    post_credit_memo_tx(&pool, payload).await
+    post_credit_memo_tx(&pool, &actor, payload).await
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).
@@ -6325,12 +6418,13 @@ pub(crate) async fn post_credit_memo_with_pool(
     payload: PostCreditMemoPayload,
 ) -> Result<PostCreditMemoResult, String> {
     validate_credit_memo_payload(&payload)?;
-    post_credit_memo_tx(pool, payload).await
+    post_credit_memo_tx(pool, &crate::auth::Actor::test_owner(), payload).await
 }
 
 /// The transactional body of `post_credit_memo`.
 pub(crate) async fn post_credit_memo_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: PostCreditMemoPayload,
 ) -> Result<PostCreditMemoResult, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
@@ -6373,6 +6467,26 @@ pub(crate) async fn post_credit_memo_tx(
         tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
         return Ok(result);
     }
+
+    // ---- Authorization, INSIDE the transaction, AFTER the replay ----
+    //
+    // The order is load-bearing and is the same one the shift, driver and
+    // delivery-shape checks already use.
+    //
+    // A REPLAY returned above and never reaches this. That is the point: the
+    // frozen request is replayed by whoever is at the till when the application
+    // comes back, which may be the next shift's cashier, and refusing it on a
+    // permission the original operator had and this one does not would turn the
+    // one defence against a double charge into a double charge.
+    //
+    // A NEW document is authorized here rather than only at the command
+    // boundary, because the boundary check ran before this transaction opened
+    // and a role can change in between. This is the decision that has to hold
+    // at COMMIT, so it is read inside the transaction that commits — the
+    // discipline `post_supplier_payment` applies to the payable and
+    // `post_credit_memo` to the drawer. It runs before any number is consumed,
+    // so a refusal costs the sequence nothing.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostCreditMemo).await?;
 
     // ---- The original sale: this store's, posted, and an actual sale ----
     let sale_row = sqlx::query(
@@ -7871,14 +7985,14 @@ pub async fn post_driver_remittance(
     payload: PostDriverRemittancePayload,
 ) -> Result<PostDriverRemittanceResult, String> {
     let amount_cents = validate_driver_remittance_payload(&payload)?;
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::DriverRemittance,
     )
     .await?;
-    post_driver_remittance_tx(&pool, payload, amount_cents).await
+    post_driver_remittance_tx(&pool, &actor, payload, amount_cents).await
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).
@@ -7888,11 +8002,12 @@ pub(crate) async fn post_driver_remittance_with_pool(
     payload: PostDriverRemittancePayload,
 ) -> Result<PostDriverRemittanceResult, String> {
     let amount_cents = validate_driver_remittance_payload(&payload)?;
-    post_driver_remittance_tx(pool, payload, amount_cents).await
+    post_driver_remittance_tx(pool, &crate::auth::Actor::test_owner(), payload, amount_cents).await
 }
 
 pub(crate) async fn post_driver_remittance_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: PostDriverRemittancePayload,
     amount_cents: i64,
 ) -> Result<PostDriverRemittanceResult, String> {
@@ -7949,6 +8064,26 @@ pub(crate) async fn post_driver_remittance_tx(
             amount_cents: existing.canonical.amount_cents,
         });
     }
+
+    // ---- Authorization, INSIDE the transaction, AFTER the replay ----
+    //
+    // The order is load-bearing and is the same one the shift, driver and
+    // delivery-shape checks already use.
+    //
+    // A REPLAY returned above and never reaches this. That is the point: the
+    // frozen request is replayed by whoever is at the till when the application
+    // comes back, which may be the next shift's cashier, and refusing it on a
+    // permission the original operator had and this one does not would turn the
+    // one defence against a double charge into a double charge.
+    //
+    // A NEW document is authorized here rather than only at the command
+    // boundary, because the boundary check ran before this transaction opened
+    // and a role can change in between. This is the decision that has to hold
+    // at COMMIT, so it is read inside the transaction that commits — the
+    // discipline `post_supplier_payment` applies to the payable and
+    // `post_credit_memo` to the drawer. It runs before any number is consumed,
+    // so a refusal costs the sequence nothing.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::DriverRemittance).await?;
 
     // ---- The driver is this store's driver ----
     //

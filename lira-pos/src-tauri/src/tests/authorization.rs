@@ -629,6 +629,13 @@ fn no_production_path_can_manufacture_a_privileged_actor() {
         );
     }
 
+    // EVERY USE of the test actor must sit inside a `#[cfg(test)]` item.
+    //
+    // Merely counting mentions is not the check: the `*_with_pool` seams
+    // legitimately supply it, and they are themselves `#[cfg(test)]`. What must
+    // not exist is a use inside something that COMPILES INTO A RELEASE BINARY —
+    // a command, a helper, a `_tx`. So for each use, walk back to the function
+    // that encloses it and require the gate above that function.
     for (name, src) in [
         ("posting.rs", include_str!("../posting.rs")),
         ("catalog.rs", include_str!("../catalog.rs")),
@@ -637,16 +644,39 @@ fn no_production_path_can_manufacture_a_privileged_actor() {
         ("read_api.rs", include_str!("../read_api.rs")),
         ("authz.rs", include_str!("../authz.rs")),
     ] {
-        // The only mentions outside a cfg(test) item would be in a command, and
-        // a command calling it would be the defect.
-        for line in src.lines() {
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("//") || trimmed.starts_with('*') {
                 continue;
             }
+            if !trimmed.contains("Actor::test_owner") {
+                continue;
+            }
+
+            // The enclosing item: the nearest preceding line that declares a
+            // function at the top level of the module.
+            let declaration = (0..i).rev().find(|&j| {
+                let l = lines[j];
+                !l.starts_with(' ') && l.contains("fn ")
+            });
+            let declaration = declaration.unwrap_or_else(|| {
+                panic!("{name}:{} uses the test actor outside any function", i + 1)
+            });
+
+            // Attributes sit directly above it.
+            let gated = (0..declaration).rev().take_while(|&j| {
+                let l = lines[j].trim();
+                l.starts_with("#[") || l.starts_with("///") || l.starts_with("//") || l.is_empty()
+            }).any(|j| lines[j].trim() == "#[cfg(test)]");
+
             assert!(
-                !trimmed.contains("Actor::test_owner"),
-                "{name} references the test actor in code: {line}"
+                gated,
+                "{name}:{} uses the test actor inside `{}`, which is NOT \
+                 #[cfg(test)] — that function compiles into a release binary and \
+                 would manufacture a privileged owner",
+                i + 1,
+                lines[declaration].trim()
             );
         }
     }

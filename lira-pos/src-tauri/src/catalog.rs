@@ -415,7 +415,7 @@ pub async fn save_product(
         .await?;
     }
 
-    save_product_tx(&pool, payload).await
+    save_product_tx(&pool, &actor, payload).await
 }
 
 /// Would this save move the product's cost or its costing method?
@@ -461,7 +461,7 @@ pub(crate) async fn save_product_with_pool(
     payload: SaveProductPayload,
 ) -> Result<SaveProductResult, String> {
     validate_save_product(&payload)?;
-    save_product_tx(pool, payload).await
+    save_product_tx(pool, &crate::auth::Actor::test_owner(), payload).await
 }
 
 /// Clear every `is_default_sale_uom` flag on a product.
@@ -484,9 +484,19 @@ async fn clear_default_sale_uom(
 /// The transactional body of `save_product`.
 pub(crate) async fn save_product_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: SaveProductPayload,
 ) -> Result<SaveProductResult, String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can change
+    // in between. This is the decision that has to hold at COMMIT, so it is
+    // read inside the transaction that commits. It runs before anything is
+    // written, so a refusal leaves nothing behind.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::SaveProduct).await?;
     let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
     // Only `standard_cost_set_at` uses this: every other timestamp on a
     // product row is written by the schema's own DEFAULT or by
@@ -968,14 +978,14 @@ pub async fn add_product_barcode(
     state: State<'_, DbState>,
     payload: AddBarcodePayload,
 ) -> Result<AddBarcodeResult, String> {
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::ProductBarcode,
     )
     .await?;
-    add_product_barcode_tx(&pool, payload).await
+    add_product_barcode_tx(&pool, &actor, payload).await
 }
 
 #[cfg(test)]
@@ -983,17 +993,27 @@ pub(crate) async fn add_product_barcode_with_pool(
     pool: &SqlitePool,
     payload: AddBarcodePayload,
 ) -> Result<AddBarcodeResult, String> {
-    add_product_barcode_tx(pool, payload).await
+    add_product_barcode_tx(pool, &crate::auth::Actor::test_owner(), payload).await
 }
 
 pub(crate) async fn add_product_barcode_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: AddBarcodePayload,
 ) -> Result<AddBarcodeResult, String> {
     if normalize_barcode(&payload.barcode).is_empty() {
         return Err("A barcode cannot be blank.".into());
     }
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can change
+    // in between. This is the decision that has to hold at COMMIT, so it is
+    // read inside the transaction that commits. It runs before anything is
+    // written, so a refusal leaves nothing behind.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::ProductBarcode).await?;
 
     let store_id: String = sqlx::query("SELECT store_id FROM products WHERE id = ?")
         .bind(&payload.product_id)
@@ -1043,14 +1063,14 @@ pub async fn set_primary_product_barcode(
     state: State<'_, DbState>,
     payload: BarcodeRefPayload,
 ) -> Result<(), String> {
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::ProductBarcode,
     )
     .await?;
-    set_primary_product_barcode_tx(&pool, payload).await
+    set_primary_product_barcode_tx(&pool, &actor, payload).await
 }
 
 #[cfg(test)]
@@ -1058,15 +1078,25 @@ pub(crate) async fn set_primary_product_barcode_with_pool(
     pool: &SqlitePool,
     payload: BarcodeRefPayload,
 ) -> Result<(), String> {
-    set_primary_product_barcode_tx(pool, payload).await
+    set_primary_product_barcode_tx(pool, &crate::auth::Actor::test_owner(), payload).await
 }
 
 /// Demote the current primary and promote the chosen one, as one step.
 pub(crate) async fn set_primary_product_barcode_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: BarcodeRefPayload,
 ) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can change
+    // in between. This is the decision that has to hold at COMMIT, so it is
+    // read inside the transaction that commits. It runs before anything is
+    // written, so a refusal leaves nothing behind.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::ProductBarcode).await?;
 
     let exists = sqlx::query(
         "SELECT 1 AS ok FROM product_barcodes
@@ -1110,14 +1140,14 @@ pub async fn remove_product_barcode(
     state: State<'_, DbState>,
     payload: BarcodeRefPayload,
 ) -> Result<(), String> {
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::ProductBarcode,
     )
     .await?;
-    remove_product_barcode_tx(&pool, payload).await
+    remove_product_barcode_tx(&pool, &actor, payload).await
 }
 
 #[cfg(test)]
@@ -1125,7 +1155,7 @@ pub(crate) async fn remove_product_barcode_with_pool(
     pool: &SqlitePool,
     payload: BarcodeRefPayload,
 ) -> Result<(), String> {
-    remove_product_barcode_tx(pool, payload).await
+    remove_product_barcode_tx(pool, &crate::auth::Actor::test_owner(), payload).await
 }
 
 /// Deactivate a barcode and, if it was the primary, promote the oldest
@@ -1134,9 +1164,19 @@ pub(crate) async fn remove_product_barcode_with_pool(
 /// `barcodesRepo.remove` already had.
 pub(crate) async fn remove_product_barcode_tx(
     pool: &SqlitePool,
+    actor: &crate::auth::Actor,
     payload: BarcodeRefPayload,
 ) -> Result<(), String> {
     let mut tx = pool.begin().await.map_err(|e| format!("begin tx: {e}"))?;
+
+    // ---- Authorization, INSIDE the transaction ----
+    //
+    // Re-checked here and not only at the command boundary, because the
+    // boundary check ran before this transaction opened and a role can change
+    // in between. This is the decision that has to hold at COMMIT, so it is
+    // read inside the transaction that commits. It runs before anything is
+    // written, so a refusal leaves nothing behind.
+    crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::ProductBarcode).await?;
 
     let row = sqlx::query(
         "SELECT is_primary FROM product_barcodes
