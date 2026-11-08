@@ -3818,9 +3818,27 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
     }
 
     // ---- Totals from lines ----
-    let subtotal: i64 = payload.lines.iter().map(|l| l.line_subtotal_excl_vat_cents).sum();
-    let vat_total: i64 = payload.lines.iter().map(|l| l.line_vat_cents).sum();
-    let total: i64 = payload.lines.iter().map(|l| l.line_total_incl_vat_cents).sum();
+    //
+    // EVERY AGGREGATE HERE IS CHECKED. `i64::sum()` wraps in a release build
+    // and panics only in debug, so an unchecked fold over caller-supplied line
+    // figures is a figure the machine may already have lost by the time it is
+    // compared. Independent review found that route against the discount
+    // reconciliation below; the same argument applies to every total on the
+    // way to a posted row, so they are all folded with `checked_add`.
+    let sum_lines = |pick: fn(&PostSaleLine) -> i64, what: &str| -> Result<i64, String> {
+        payload
+            .lines
+            .iter()
+            .try_fold(0i64, |acc, l| acc.checked_add(pick(l)))
+            .ok_or_else(|| {
+                format!(
+                    "The {what} figures on this sale are too large to add up.                      Nothing has been changed."
+                )
+            })
+    };
+    let subtotal = sum_lines(|l| l.line_subtotal_excl_vat_cents, "subtotal")?;
+    let vat_total = sum_lines(|l| l.line_vat_cents, "VAT")?;
+    let total = sum_lines(|l| l.line_total_incl_vat_cents, "line total")?;
     if total <= 0 {
         return Err("Sale total must be positive.".into());
     }
@@ -3839,7 +3857,27 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
     // allocation we were handed instead of trusting it: a sale whose line
     // discounts do not add up to its header discount makes every downstream
     // report disagree with itself, and it is immutable once posted.
-    let line_discount_total: i64 = payload.lines.iter().map(|l| l.line_discount_cents).sum();
+    //
+    // SUMMED WITH `checked_add`, and that is not tidiness (GZ-B-R2-P1,
+    // independent review). `i64::sum()` WRAPS in a release build — debug
+    // panics, release does not — so a shaped payload could carry line
+    // discounts that total 2^64 + 1, wrap to 1, reconcile against a declared
+    // `discount_cents` of 1, and thereby pass BOTH this check and the
+    // large-discount permission that reads the same field. The reconciliation
+    // was doing its job on a number the machine had already lost.
+    //
+    // This is the same discipline `recipe_cost.rs` applies to every multiply in
+    // its envelope, and for the same reason: a silently wrapped figure is a
+    // wrong number that looks like a right one.
+    let line_discount_total: i64 =
+        payload
+            .lines
+            .iter()
+            .try_fold(0i64, |acc, l| acc.checked_add(l.line_discount_cents))
+            .ok_or(
+                "The line discounts on this sale are too large to add up. Nothing has been \
+                 changed.",
+            )?;
     if line_discount_total != payload.discount_cents {
         return Err(format!(
             "Discount does not reconcile: the line discounts total {} cents but the sale header \
@@ -3852,8 +3890,10 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
     let total_paid_usd: i64 = payload
         .payments
         .iter()
-        .map(|p| p.amount_usd_cents_equivalent)
-        .sum();
+        .try_fold(0i64, |acc, p| acc.checked_add(p.amount_usd_cents_equivalent))
+        .ok_or(
+            "The tender on this sale is too large to add up. Nothing has been changed.",
+        )?;
     if total_paid_usd < total {
         return Err(format!(
             "Underpayment: tendered {} USD-cents, total {} USD-cents.",
@@ -3885,8 +3925,10 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
         .payments
         .iter()
         .filter(|p| !is_cash_method(&p.method))
-        .map(|p| p.amount_usd_cents_equivalent)
-        .sum();
+        .try_fold(0i64, |acc, p| acc.checked_add(p.amount_usd_cents_equivalent))
+        .ok_or(
+            "The non-cash tender on this sale is too large to add up. Nothing has been              changed.",
+        )?;
     if non_cash_usd > total {
         return Err(format!(
             "Non-cash tender of {} USD-cents exceeds the {} USD-cents due. A card, transfer or \
@@ -3931,8 +3973,10 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
             .payments
             .iter()
             .filter(|p| is_cash_method(&p.method))
-            .map(|p| p.amount_usd_cents_equivalent)
-            .sum();
+            .try_fold(0i64, |acc, p| acc.checked_add(p.amount_usd_cents_equivalent))
+            .ok_or(
+                "The cash tender on this sale is too large to add up. Nothing has been                  changed.",
+            )?;
         if change_total_usd > cash_usd {
             return Err(format!(
                 "Change of {} USD-cents exceeds the {} USD-cents of cash tendered.",

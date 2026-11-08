@@ -831,22 +831,30 @@ fn the_administrative_commands_authorize_at_commit_and_scope_by_store() {
 
     assert_eq!(
         src.matches("crate::authz::authorize_tx(&mut tx, &actor,").count(),
-        3,
-        "exchange_rate_save, driver_save and supplier_save must each \
-         re-authorize inside their transaction"
+        5,
+        "all five administrative commands must re-authorize inside a \
+         transaction — including the two activations, which had no transaction \
+         at all until round 2 of the review"
     );
 
     // The two single-statement ones scope the UPDATE itself, which is stronger
     // than checking first: the scoping IS the write, so there is no window.
-    assert_eq!(
-        src.matches("AND store_id = ?").count(),
-        2,
-        "both activation commands must scope their UPDATE by store"
+    // Every statement that addresses a row by id is scoped by store: the two
+    // activations, and both save commands' existence probe and update.
+    assert!(
+        src.matches("AND store_id = ?").count() >= 6,
+        "every id-addressed statement must be scoped by store, found {}",
+        src.matches("AND store_id = ?").count()
     );
+    assert!(
+        src.matches(".bind(&actor.store_id)").count() >= 6,
+        "and each must bind the actor's store"
+    );
+    // The create branches compare the named store with the actor's.
     assert_eq!(
-        src.matches(".bind(&actor.store_id)").count(),
-        2,
-        "and bind the actor's store to do it"
+        src.matches("require_same_store(&actor,").count(),
+        3,
+        "the exchange rate and both save commands must require the actor's own shop"
     );
 }
 
@@ -951,4 +959,446 @@ fn the_discount_controls_limit_is_written_down_and_measured() {
         defects.contains("#[ignore = \"GZ-B-P1"),
         "and it must be registered as a defect the implementation still has"
     );
+}
+
+// ===========================================================================
+// Round 2 of the review: the administrative commands, behaviourally
+// ===========================================================================
+
+/// `authz::begin` IS THE ONLY ROUTE TO A POOL.
+///
+/// Every command used to open with `posting::pool(&app, &state)`. That function
+/// now has exactly ONE caller in the whole crate — `authz::begin` — which is
+/// what makes "the window is checked, the gates run, the actor is resolved and
+/// the operation is authorized" true of every command rather than of the
+/// twenty somebody edited. The modules that used to import it no longer can.
+#[test]
+fn the_command_boundary_is_the_only_route_to_a_pool() {
+    let mut callers = Vec::new();
+    for (name, src) in [
+        ("authz.rs", include_str!("../authz.rs")),
+        ("posting.rs", include_str!("../posting.rs")),
+        ("catalog.rs", include_str!("../catalog.rs")),
+        ("recipes.rs", include_str!("../recipes.rs")),
+        ("admin.rs", include_str!("../admin.rs")),
+        ("read_api.rs", include_str!("../read_api.rs")),
+        ("auth.rs", include_str!("../auth.rs")),
+    ] {
+        for line in src.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with('*') || t.starts_with("///") {
+                continue;
+            }
+            if t.contains("crate::posting::pool(") || t.contains(" pool(&app, &state)") {
+                callers.push(format!("{name}: {}", t.trim()));
+            }
+        }
+    }
+    assert_eq!(
+        callers.len(),
+        1,
+        "exactly one function may open the shared pool, found: {callers:?}"
+    );
+    assert!(callers[0].starts_with("authz.rs"), "{:?}", callers[0]);
+}
+
+/// AN ADMINISTRATIVE COMMAND CANNOT REACH ANOTHER SHOP — driven through the
+/// real commands, not through a copy of their SQL.
+///
+/// Round 2 of the review noted that the previous coverage was a source count,
+/// which cannot tell a scoped statement from one that merely mentions a store.
+/// These are behavioural, and they are possible because the five commands now
+/// have `*_as` seams — which also closes the Gate 2A P2 that
+/// `tests::admin_commands` had been working around by re-implementing their
+/// statements.
+#[tokio::test]
+async fn an_administrative_command_cannot_reach_another_shop() {
+    use crate::admin::*;
+
+    let db = staffed().await;
+    crate::test_support::seed_store(&db, "store-b", "Branch B").await;
+
+    let ours = Actor::for_tests(MANAGER, STORE, Role::Manager);
+    let theirs = Actor::for_tests(
+        &crate::test_support::seeded_owner_of("store-b"),
+        "store-b",
+        Role::Owner,
+    );
+
+    // --- a driver of branch B -------------------------------------------
+    driver_save_as(
+        db.pool(),
+        &theirs,
+        DriverSaveArgs {
+            id: "driver-b".to_string(),
+            store_id: Some("store-b".to_string()),
+            name: "Branch B Driver".to_string(),
+            phone: None,
+            notes: None,
+        },
+    )
+    .await
+    .expect("branch B's own owner may add branch B's driver");
+
+    // Our manager cannot RENAME it. The row is addressable by id, and before
+    // the fix nothing compared its store with theirs.
+    driver_save_as(
+        db.pool(),
+        &ours,
+        DriverSaveArgs {
+            id: "driver-b".to_string(),
+            store_id: None,
+            name: "Renamed By Branch A".to_string(),
+            phone: None,
+            notes: None,
+        },
+    )
+    .await
+    .expect_err("another branch's driver is not ours to rename");
+    assert_eq!(
+        db.scalar_string("SELECT name FROM drivers WHERE id = 'driver-b'")
+            .await,
+        "Branch B Driver",
+        "and the name must not have moved"
+    );
+
+    // Nor RETIRE it.
+    driver_set_active_as(
+        db.pool(),
+        &ours,
+        DriverSetActiveArgs {
+            id: "driver-b".to_string(),
+            is_active: false,
+        },
+    )
+    .await
+    .expect_err("another branch's driver is not ours to retire");
+    assert_eq!(
+        db.scalar_i64("SELECT is_active FROM drivers WHERE id = 'driver-b'")
+            .await,
+        1,
+        "and it must still be active"
+    );
+
+    // Nor CREATE one in their shop.
+    driver_save_as(
+        db.pool(),
+        &ours,
+        DriverSaveArgs {
+            id: "driver-b2".to_string(),
+            store_id: Some("store-b".to_string()),
+            name: "Planted".to_string(),
+            phone: None,
+            notes: None,
+        },
+    )
+    .await
+    .expect_err("a driver may not be added to another shop");
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM drivers WHERE id = 'driver-b2'")
+            .await,
+        0
+    );
+
+    // --- and the exchange rate, which reaches a posted figure ------------
+    exchange_rate_save_as(
+        db.pool(),
+        &ours,
+        ExchangeRateSaveArgs {
+            id: crate::tests::builders::uuid(),
+            store_id: "store-b".to_string(),
+            effective_date: "2026-11-08".to_string(),
+            rate_lbp_per_usd: 1,
+            source: None,
+            notes: None,
+            created_by_user_id: None,
+        },
+    )
+    .await
+    .expect_err("another shop's exchange rate is not ours to set");
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM exchange_rates WHERE store_id = 'store-b'")
+            .await,
+        0,
+        "a lira must not be revalued in a shop we have no claim on"
+    );
+
+    // Our OWN shop still works, so the scoping is not a wall.
+    exchange_rate_save_as(
+        db.pool(),
+        &ours,
+        ExchangeRateSaveArgs {
+            id: crate::tests::builders::uuid(),
+            store_id: STORE.to_string(),
+            effective_date: "2026-11-08".to_string(),
+            rate_lbp_per_usd: 89_500,
+            source: None,
+            notes: None,
+            created_by_user_id: Some(MANAGER.to_string()),
+        },
+    )
+    .await
+    .expect("our own shop's rate is ours to set");
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A CASHIER CANNOT USE AN ADMINISTRATIVE COMMAND AT ALL, and the refusal
+/// happens inside the transaction as well as at the boundary.
+#[tokio::test]
+async fn a_cashier_cannot_use_an_administrative_command() {
+    use crate::admin::*;
+
+    let db = staffed().await;
+    let cashier = Actor::for_tests(CASHIER, STORE, Role::Cashier);
+
+    let refused = exchange_rate_save_as(
+        db.pool(),
+        &cashier,
+        ExchangeRateSaveArgs {
+            id: crate::tests::builders::uuid(),
+            store_id: STORE.to_string(),
+            effective_date: "2026-11-08".to_string(),
+            rate_lbp_per_usd: 1,
+            source: None,
+            notes: None,
+            created_by_user_id: Some(CASHIER.to_string()),
+        },
+    )
+    .await
+    .expect_err("a cashier may not set the exchange rate");
+    assert!(refused.contains("set the exchange rate"), "{refused}");
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM exchange_rates").await,
+        0,
+        "and nothing may be written"
+    );
+
+    for outcome in [
+        driver_save_as(
+            db.pool(),
+            &cashier,
+            DriverSaveArgs {
+                id: crate::tests::builders::uuid(),
+                store_id: Some(STORE.to_string()),
+                name: "Nope".to_string(),
+                phone: None,
+                notes: None,
+            },
+        )
+        .await
+        .err(),
+        supplier_save_as(
+            db.pool(),
+            &cashier,
+            SupplierSaveArgs {
+                id: crate::tests::builders::uuid(),
+                store_id: Some(STORE.to_string()),
+                name: "Nope".to_string(),
+                contact_name: None,
+                phone: None,
+                email: None,
+                notes: None,
+            },
+        )
+        .await
+        .err(),
+    ] {
+        let message = outcome.expect("a cashier may not change master data");
+        assert!(message.contains("Ask a manager or the owner"), "{message}");
+    }
+    assert_eq!(db.count("SELECT count(*) AS n FROM drivers").await, 0);
+    assert_eq!(db.count("SELECT count(*) AS n FROM suppliers").await, 0);
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A DEMOTION BETWEEN THE BOUNDARY AND THE COMMIT IS HONOURED by an
+/// administrative command too.
+///
+/// The `_as` seam enters BELOW the boundary check, so calling it with an actor
+/// whose stored role no longer permits the operation is exactly the state the
+/// window produces — and the in-transaction check is what must catch it.
+#[tokio::test]
+async fn an_administrative_command_honours_a_demotion_at_commit() {
+    use crate::admin::*;
+
+    let db = staffed().await;
+    let was_manager = Actor::for_tests(MANAGER, STORE, Role::Manager);
+
+    authz::authorize(db.pool(), &was_manager, Operation::ExchangeRateSave)
+        .await
+        .expect("the boundary passes while they are still a manager");
+
+    db.exec(&format!(
+        "UPDATE users SET role = 'cashier' WHERE id = '{MANAGER}'"
+    ))
+    .await;
+
+    let refused = exchange_rate_save_as(
+        db.pool(),
+        &was_manager,
+        ExchangeRateSaveArgs {
+            id: crate::tests::builders::uuid(),
+            store_id: STORE.to_string(),
+            effective_date: "2026-11-08".to_string(),
+            rate_lbp_per_usd: 1,
+            source: None,
+            notes: None,
+            created_by_user_id: Some(MANAGER.to_string()),
+        },
+    )
+    .await
+    .expect_err("the in-transaction check must honour the demotion");
+    assert!(refused.contains("set the exchange rate"), "{refused}");
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM exchange_rates").await,
+        0
+    );
+
+    // And the two activation commands, which had no transaction at all before
+    // round 2 of the review.
+    db.exec(&format!(
+        "UPDATE users SET role = 'manager' WHERE id = '{MANAGER}'"
+    ))
+    .await;
+    driver_save_as(
+        db.pool(),
+        &was_manager,
+        DriverSaveArgs {
+            id: "driver-a".to_string(),
+            store_id: Some(STORE.to_string()),
+            name: "Ours".to_string(),
+            phone: None,
+            notes: None,
+        },
+    )
+    .await
+    .expect("a manager may add a driver");
+
+    db.exec(&format!(
+        "UPDATE users SET role = 'cashier' WHERE id = '{MANAGER}'"
+    ))
+    .await;
+    driver_set_active_as(
+        db.pool(),
+        &was_manager,
+        DriverSetActiveArgs {
+            id: "driver-a".to_string(),
+            is_active: false,
+        },
+    )
+    .await
+    .expect_err("a demoted user must not retire a driver");
+    assert_eq!(
+        db.scalar_i64("SELECT is_active FROM drivers WHERE id = 'driver-a'")
+            .await,
+        1,
+        "and the driver must still be active, so the transaction rolled back"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// THE DECLARED DISCOUNT CANNOT BE WRAPPED PAST THE PERMISSION.
+///
+/// GZ-B-R2-P1 (round 2). `i64::sum()` wraps in a release build and panics only
+/// in debug, so an unchecked fold over caller-supplied line discounts was a
+/// figure the machine could already have lost: line discounts totalling
+/// 2^64 + 1 wrap to 1, reconcile against a declared `discount_cents` of 1, and
+/// pass both the reconciliation and the large-discount permission that reads
+/// the same field.
+///
+/// Every aggregate in `prepare_sale` is now folded with `checked_add`, not just
+/// the discount — the same argument applies to the subtotal, the VAT total, the
+/// line total and the tender, all of which end up on a posted row.
+#[test]
+fn an_overflowing_sale_aggregate_is_refused_rather_than_wrapped() {
+    let src = include_str!("../posting.rs");
+    let prepare = src
+        .split("pub(crate) fn prepare_sale(")
+        .nth(1)
+        .expect("prepare_sale");
+    let body = &prepare[..prepare.len().min(14_000)];
+
+    // No unchecked aggregation survives over caller-supplied figures.
+    for forbidden in [
+        ".map(|l| l.line_discount_cents).sum()",
+        ".map(|l| l.line_subtotal_excl_vat_cents).sum()",
+        ".map(|l| l.line_vat_cents).sum()",
+        ".map(|l| l.line_total_incl_vat_cents).sum()",
+        ".map(|p| p.amount_usd_cents_equivalent)\n        .sum()",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "prepare_sale still folds caller figures without checking: `{forbidden}`"
+        );
+    }
+
+    assert!(
+        body.matches("checked_add").count() >= 2,
+        "the aggregates must be folded with checked_add"
+    );
+    assert!(
+        body.contains("too large to add up"),
+        "and overflow must be refused with something an operator can read"
+    );
+}
+
+/// The same, behaviourally: a sale whose line discounts overflow is refused.
+///
+/// Debug builds panic on overflow, so the arithmetic itself cannot be driven to
+/// wrap here — which is precisely why the release-build route was invisible.
+/// What CAN be driven is the refusal, by handing it figures whose sum does not
+/// fit, and asserting it comes back as a sentence rather than as a wrapped
+/// number that reconciles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sale_whose_discounts_do_not_fit_is_refused() {
+    let db = staffed().await;
+    crate::test_support::seed_exchange_rate(&db).await;
+    crate::test_support::seed_product(
+        &db,
+        &crate::test_support::ProductSpec {
+            quantity_on_hand: 100,
+            ..crate::test_support::ProductSpec::stocked(
+                "00000000-0000-0000-0000-0000000000c1",
+                "SKU-C1",
+                "Coffee",
+            )
+        },
+    )
+    .await;
+
+    let mut payload = crate::tests::builders::sale_payload(
+        vec![
+            crate::tests::builders::SaleLineBuilder::new(
+                "00000000-0000-0000-0000-0000000000c1",
+                "Coffee",
+            )
+            .qty(1)
+            .unit_incl(999)
+            .discount(i64::MAX)
+            .build(),
+            crate::tests::builders::SaleLineBuilder::new(
+                "00000000-0000-0000-0000-0000000000c1",
+                "Coffee",
+            )
+            .qty(1)
+            .unit_incl(999)
+            .discount(i64::MAX)
+            .build(),
+        ],
+        vec![crate::tests::builders::cash_usd(1)],
+    );
+    payload.discount_cents = 1;
+
+    let refused = crate::posting::prepare_sale(&payload)
+        .expect_err("a discount total that does not fit must be refused");
+    assert!(
+        refused.contains("too large to add up"),
+        "it must be refused as an overflow, not reconciled against a wrapped \
+         figure: {refused}"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
 }

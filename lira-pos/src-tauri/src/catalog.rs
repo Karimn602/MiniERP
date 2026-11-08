@@ -46,7 +46,13 @@
 // `save_product`'s own note. Reads are untouched: the repos still query
 // directly, because a read cannot leave a half-state.
 
-use crate::posting::{pool, DbState};
+//  is no longer imported here: since Stage B every command
+// reaches the database through `authz::begin`, which runs the startup gate, the
+// session gate, the window check and the authorization in one place. Nothing in
+// this module may open a pool on its own, and
+// `tests::authorization::the_command_boundary_is_the_only_route_to_a_pool`
+// asserts that for the whole crate.
+use crate::posting::DbState;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, Sqlite, SqlitePool};
 use tauri::State;

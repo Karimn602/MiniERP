@@ -36,10 +36,16 @@
 //! listed in `src/db/repos/*.ts` beside the call that can raise them.
 
 use serde::Deserialize;
-use sqlx::Row;
+use sqlx::{Row, SqlitePool};
 use tauri::State;
 
-use crate::posting::{pool, DbState};
+//  is no longer imported here: since Stage B every command
+// reaches the database through `authz::begin`, which runs the startup gate, the
+// session gate, the window check and the authorization in one place. Nothing in
+// this module may open a pool on its own, and
+// `tests::authorization::the_command_boundary_is_the_only_route_to_a_pool`
+// asserts that for the whole crate.
+use crate::posting::DbState;
 
 /// `YYYY-MM-DD`, the shape `exchange_rates.effective_date` holds and the one
 /// `findApplicableOn` compares with `<=`. Validated rather than trusted: a
@@ -128,6 +134,32 @@ pub async fn exchange_rate_save(
     state: State<'_, DbState>,
     args: ExchangeRateSaveArgs,
 ) -> Result<String, String> {
+    let (pool, actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::ExchangeRateSave,
+    )
+    .await?;
+    exchange_rate_save_as(&pool, &actor, args).await
+}
+
+/// The pre-authorization seam, extracted so the administrative commands can
+/// be DRIVEN BY A TEST with an actor of its own choosing.
+///
+/// This also closes a Gate 2A P2 that has been outstanding since the
+/// commands were written: they had no `*_with_pool` sibling, so
+/// `tests::admin_commands` re-implemented their SQL instead of calling them,
+/// and a test that re-implements the thing it is testing proves only that
+/// two copies of a statement agree. Independent review of Stage B asked for
+/// behavioural cross-store tests and could not have them without this.
+///
+/// The command above is now thin: window, gates, actor, authorize, delegate.
+pub(crate) async fn exchange_rate_save_as(
+    pool: &SqlitePool,
+    actor: &crate::auth::Actor,
+    args: ExchangeRateSaveArgs,
+) -> Result<String, String> {
     // Integer lira per dollar, strictly positive. `post_sale` divides by this
     // when converting a lira tender, so zero or negative is not a bad figure,
     // it is an arithmetic fault waiting to happen.
@@ -146,13 +178,6 @@ pub async fn exchange_rate_save(
     }
     let notes = clean_opt(args.notes);
 
-    let (pool, actor) = crate::authz::begin(
-        &app,
-        &window,
-        &state,
-        crate::authz::Operation::ExchangeRateSave,
-    )
-    .await?;
     let actor_user_id =
         crate::authz::attribute(&actor, args.created_by_user_id.as_deref())?;
     let mut tx = pool
@@ -183,6 +208,13 @@ pub async fn exchange_rate_save(
     if store_exists == 0 {
         return Err("UNKNOWN_STORE".into());
     }
+
+    // AND IT MUST BE THE ACTOR'S OWN SHOP (GZ-B-R2-P2). The rate is the one
+    // setting that reaches a posted figure — `post_sale` validates a lira
+    // tender against this row — so a manager of one branch setting another
+    // branch's rate would decide what a lira is worth in a shop they have no
+    // claim on.
+    crate::authz::require_same_store(&actor, &args.store_id)?;
 
     let existing: Option<String> = sqlx::query(
         "SELECT id FROM exchange_rates WHERE store_id = ? AND effective_date = ?",
@@ -284,6 +316,32 @@ pub async fn driver_save(
     state: State<'_, DbState>,
     args: DriverSaveArgs,
 ) -> Result<String, String> {
+    let (pool, actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::DriverSave,
+    )
+    .await?;
+    driver_save_as(&pool, &actor, args).await
+}
+
+/// The pre-authorization seam, extracted so the administrative commands can
+/// be DRIVEN BY A TEST with an actor of its own choosing.
+///
+/// This also closes a Gate 2A P2 that has been outstanding since the
+/// commands were written: they had no `*_with_pool` sibling, so
+/// `tests::admin_commands` re-implemented their SQL instead of calling them,
+/// and a test that re-implements the thing it is testing proves only that
+/// two copies of a statement agree. Independent review of Stage B asked for
+/// behavioural cross-store tests and could not have them without this.
+///
+/// The command above is now thin: window, gates, actor, authorize, delegate.
+pub(crate) async fn driver_save_as(
+    pool: &SqlitePool,
+    actor: &crate::auth::Actor,
+    args: DriverSaveArgs,
+) -> Result<String, String> {
     let id = args.id.trim().to_string();
     if id.is_empty() {
         return Err("DRIVER_MISSING_ID".into());
@@ -298,13 +356,6 @@ pub async fn driver_save(
     let phone = clean_opt(args.phone);
     let notes = clean_opt(args.notes);
 
-    let (pool, actor) = crate::authz::begin(
-        &app,
-        &window,
-        &state,
-        crate::authz::Operation::DriverSave,
-    )
-    .await?;
     let mut tx = pool
         .begin()
         .await
@@ -319,8 +370,17 @@ pub async fn driver_save(
     crate::authz::authorize_tx(&mut tx, &actor, crate::authz::Operation::DriverSave).await?;
 
 
-    let existing: i64 = sqlx::query("SELECT COUNT(*) AS n FROM drivers WHERE id = ?")
+    // SCOPED BY THE ACTOR'S OWN SHOP (GZ-B-R2-P2). Without this a manager of
+    // one branch could rename another branch's driver: the id is globally
+    // addressable and nothing compared the row's store with theirs. The PROBE is
+    // scoped as well as the update, so the two branches stay consistent — an
+    // out-of-shop id reads as "does not exist", and the create branch below
+    // then refuses it on the store check rather than writing a duplicate.
+    let existing: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM drivers WHERE id = ? AND store_id = ?",
+    )
         .bind(&id)
+        .bind(&actor.store_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| format!("cannot check the driver: {e}"))?
@@ -344,6 +404,10 @@ pub async fn driver_save(
         if store_exists == 0 {
             return Err("UNKNOWN_STORE".into());
         }
+        // AND IT MUST BE THE ACTOR'S OWN SHOP. A real store that is not
+        // theirs is exactly the case the store check exists for: a manager may
+        // add a driver or a supplier to their own branch and not to another.
+        crate::authz::require_same_store(&actor, store_id)?;
         sqlx::query("INSERT INTO drivers (id, store_id, name, phone, notes) VALUES (?,?,?,?,?)")
             .bind(&id)
             .bind(store_id)
@@ -358,12 +422,13 @@ pub async fn driver_save(
             "UPDATE drivers
                 SET name = ?, phone = ?, notes = ?,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-              WHERE id = ?",
+              WHERE id = ? AND store_id = ?",
         )
         .bind(&name)
         .bind(&phone)
         .bind(&notes)
         .bind(&id)
+        .bind(&actor.store_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("cannot update the driver: {e}"))?;
@@ -395,10 +460,6 @@ pub async fn driver_set_active(
     state: State<'_, DbState>,
     args: DriverSetActiveArgs,
 ) -> Result<(), String> {
-    let id = args.id.trim().to_string();
-    if id.is_empty() {
-        return Err("DRIVER_MISSING_ID".into());
-    }
     let (pool, actor) = crate::authz::begin(
         &app,
         &window,
@@ -406,6 +467,29 @@ pub async fn driver_set_active(
         crate::authz::Operation::DriverSave,
     )
     .await?;
+    driver_set_active_as(&pool, &actor, args).await
+}
+
+/// The pre-authorization seam, extracted so the administrative commands can
+/// be DRIVEN BY A TEST with an actor of its own choosing.
+///
+/// This also closes a Gate 2A P2 that has been outstanding since the
+/// commands were written: they had no `*_with_pool` sibling, so
+/// `tests::admin_commands` re-implemented their SQL instead of calling them,
+/// and a test that re-implements the thing it is testing proves only that
+/// two copies of a statement agree. Independent review of Stage B asked for
+/// behavioural cross-store tests and could not have them without this.
+///
+/// The command above is now thin: window, gates, actor, authorize, delegate.
+pub(crate) async fn driver_set_active_as(
+    pool: &SqlitePool,
+    actor: &crate::auth::Actor,
+    args: DriverSetActiveArgs,
+) -> Result<(), String> {
+    let id = args.id.trim().to_string();
+    if id.is_empty() {
+        return Err("DRIVER_MISSING_ID".into());
+    }
     // SCOPED BY THE ACTOR'S OWN SHOP (GZ-B-P2). Nothing in the arguments
     // names a store, so without this a manager of one branch could retire
     // another branch's driver. Scoping the WHERE clause rather than
@@ -413,6 +497,16 @@ pub async fn driver_set_active(
     // window between the check and the update, and a row of another shop is
     // simply not found — which returns the refusal below and discloses
     // nothing about whether it exists elsewhere.
+    // IN A TRANSACTION, so the authorization holds at COMMIT (GZ-B-R2-P2). The
+    // boundary check ran before this statement; a manager demoted in between
+    // would otherwise still retire a driver. One statement is atomic, but the
+    // PERMISSION was not re-read, and that is what this transaction is for.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("cannot begin driver activation transaction: {e}"))?;
+    crate::authz::authorize_tx(&mut tx, &actor, crate::authz::Operation::DriverSave).await?;
+
     let affected = sqlx::query(
         "UPDATE drivers
             SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -421,14 +515,22 @@ pub async fn driver_set_active(
     .bind(i64::from(args.is_active))
     .bind(&id)
     .bind(&actor.store_id)
-    .execute(&pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| format!("cannot update the driver: {e}"))?
     .rows_affected();
 
+    // Nothing matched: either no such driver, or one of another shop — and the
+    // message is deliberately the same for both, because telling the caller
+    // which it was would say whether a driver exists in a branch they have no
+    // claim on. Returning before the commit rolls the transaction back.
     if affected == 0 {
         return Err("UNKNOWN_DRIVER".into());
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("cannot commit the driver activation: {e}"))?;
     Ok(())
 }
 
@@ -462,6 +564,32 @@ pub async fn supplier_save(
     state: State<'_, DbState>,
     args: SupplierSaveArgs,
 ) -> Result<String, String> {
+    let (pool, actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::SupplierSave,
+    )
+    .await?;
+    supplier_save_as(&pool, &actor, args).await
+}
+
+/// The pre-authorization seam, extracted so the administrative commands can
+/// be DRIVEN BY A TEST with an actor of its own choosing.
+///
+/// This also closes a Gate 2A P2 that has been outstanding since the
+/// commands were written: they had no `*_with_pool` sibling, so
+/// `tests::admin_commands` re-implemented their SQL instead of calling them,
+/// and a test that re-implements the thing it is testing proves only that
+/// two copies of a statement agree. Independent review of Stage B asked for
+/// behavioural cross-store tests and could not have them without this.
+///
+/// The command above is now thin: window, gates, actor, authorize, delegate.
+pub(crate) async fn supplier_save_as(
+    pool: &SqlitePool,
+    actor: &crate::auth::Actor,
+    args: SupplierSaveArgs,
+) -> Result<String, String> {
     let id = args.id.trim().to_string();
     if id.is_empty() {
         return Err("SUPPLIER_MISSING_ID".into());
@@ -478,13 +606,6 @@ pub async fn supplier_save(
     let email = clean_opt(args.email);
     let notes = clean_opt(args.notes);
 
-    let (pool, actor) = crate::authz::begin(
-        &app,
-        &window,
-        &state,
-        crate::authz::Operation::SupplierSave,
-    )
-    .await?;
     let mut tx = pool
         .begin()
         .await
@@ -499,8 +620,12 @@ pub async fn supplier_save(
     crate::authz::authorize_tx(&mut tx, &actor, crate::authz::Operation::SupplierSave).await?;
 
 
-    let existing: i64 = sqlx::query("SELECT COUNT(*) AS n FROM suppliers WHERE id = ?")
+    // Scoped by the actor's own shop, for the reason given on `driver_save`.
+    let existing: i64 = sqlx::query(
+        "SELECT COUNT(*) AS n FROM suppliers WHERE id = ? AND store_id = ?",
+    )
         .bind(&id)
+        .bind(&actor.store_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| format!("cannot check the supplier: {e}"))?
@@ -524,6 +649,10 @@ pub async fn supplier_save(
         if store_exists == 0 {
             return Err("UNKNOWN_STORE".into());
         }
+        // AND IT MUST BE THE ACTOR'S OWN SHOP. A real store that is not
+        // theirs is exactly the case the store check exists for: a manager may
+        // add a driver or a supplier to their own branch and not to another.
+        crate::authz::require_same_store(&actor, store_id)?;
         sqlx::query(
             "INSERT INTO suppliers
                (id, store_id, name, contact_name, phone, email, notes)
@@ -543,7 +672,7 @@ pub async fn supplier_save(
         sqlx::query(
             "UPDATE suppliers
                 SET name = ?, contact_name = ?, phone = ?, email = ?, notes = ?
-              WHERE id = ?",
+              WHERE id = ? AND store_id = ?",
         )
         .bind(&name)
         .bind(&contact)
@@ -551,6 +680,7 @@ pub async fn supplier_save(
         .bind(&email)
         .bind(&notes)
         .bind(&id)
+        .bind(&actor.store_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("cannot update the supplier: {e}"))?;
@@ -577,10 +707,6 @@ pub async fn supplier_set_active(
     state: State<'_, DbState>,
     args: SupplierSetActiveArgs,
 ) -> Result<(), String> {
-    let id = args.id.trim().to_string();
-    if id.is_empty() {
-        return Err("SUPPLIER_MISSING_ID".into());
-    }
     let (pool, actor) = crate::authz::begin(
         &app,
         &window,
@@ -588,6 +714,29 @@ pub async fn supplier_set_active(
         crate::authz::Operation::SupplierSave,
     )
     .await?;
+    supplier_set_active_as(&pool, &actor, args).await
+}
+
+/// The pre-authorization seam, extracted so the administrative commands can
+/// be DRIVEN BY A TEST with an actor of its own choosing.
+///
+/// This also closes a Gate 2A P2 that has been outstanding since the
+/// commands were written: they had no `*_with_pool` sibling, so
+/// `tests::admin_commands` re-implemented their SQL instead of calling them,
+/// and a test that re-implements the thing it is testing proves only that
+/// two copies of a statement agree. Independent review of Stage B asked for
+/// behavioural cross-store tests and could not have them without this.
+///
+/// The command above is now thin: window, gates, actor, authorize, delegate.
+pub(crate) async fn supplier_set_active_as(
+    pool: &SqlitePool,
+    actor: &crate::auth::Actor,
+    args: SupplierSetActiveArgs,
+) -> Result<(), String> {
+    let id = args.id.trim().to_string();
+    if id.is_empty() {
+        return Err("SUPPLIER_MISSING_ID".into());
+    }
     // SCOPED BY THE ACTOR'S OWN SHOP (GZ-B-P2). Nothing in the arguments names
     // a store, so without this a manager of one branch could retire another
     // branch's supplier. Scoping the WHERE clause rather than checking first is
@@ -595,19 +744,37 @@ pub async fn supplier_set_active(
     // check and the update, and a row of another shop is simply not found —
     // which returns the refusal below and discloses nothing about whether it
     // exists elsewhere.
+    // IN A TRANSACTION, so the authorization holds at COMMIT (GZ-B-R2-P2). The
+    // boundary check ran before this statement; a manager demoted in between
+    // would otherwise still retire a supplier. One statement is atomic, but the
+    // PERMISSION was not re-read, and that is what this transaction is for.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("cannot begin supplier activation transaction: {e}"))?;
+    crate::authz::authorize_tx(&mut tx, &actor, crate::authz::Operation::SupplierSave).await?;
+
     let affected = sqlx::query(
         "UPDATE suppliers SET is_active = ? WHERE id = ? AND store_id = ?",
     )
         .bind(i64::from(args.is_active))
         .bind(&id)
         .bind(&actor.store_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("cannot update the supplier: {e}"))?
         .rows_affected();
 
+    // Nothing matched: either no such supplier, or one of another shop — the
+    // same message for both, because saying which would disclose whether it
+    // exists in a branch the caller has no claim on. Returning before the
+    // commit rolls the transaction back.
     if affected == 0 {
         return Err("UNKNOWN_SUPPLIER".into());
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("cannot commit the supplier activation: {e}"))?;
     Ok(())
 }
