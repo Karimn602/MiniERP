@@ -369,10 +369,17 @@ async fn resolve_ingredient(
 #[tauri::command]
 pub async fn save_recipe_draft(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: SaveRecipeDraftPayload,
 ) -> Result<SaveRecipeDraftResult, String> {
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::RecipeDraft,
+    )
+    .await?;
     save_recipe_draft_with_pool(&pool, payload).await
 }
 
@@ -700,10 +707,17 @@ pub async fn save_recipe_draft_with_pool(
 #[tauri::command]
 pub async fn activate_recipe(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: ActivateRecipePayload,
 ) -> Result<ActivateRecipeResult, String> {
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::RecipeActivate,
+    )
+    .await?;
     activate_recipe_with_pool(&pool, payload).await
 }
 
@@ -1014,10 +1028,17 @@ pub async fn activate_recipe_with_pool(
 #[tauri::command]
 pub async fn retire_recipe(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: RetireRecipePayload,
 ) -> Result<RetireRecipeResult, String> {
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::RecipeRetire,
+    )
+    .await?;
     retire_recipe_with_pool(&pool, payload).await
 }
 

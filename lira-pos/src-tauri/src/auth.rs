@@ -190,7 +190,7 @@ impl Role {
     /// Only ever called on a string READ FROM THE DATABASE, never on one from
     /// the wire — which is the point. A caller-supplied role label is not a
     /// role, and there is no path in this module by which one becomes one.
-    fn from_db(value: &str) -> Result<Self, String> {
+    pub(crate) fn from_db(value: &str) -> Result<Self, String> {
         match value {
             "owner" => Ok(Role::Owner),
             "manager" => Ok(Role::Manager),
@@ -221,11 +221,42 @@ impl Role {
 /// Stage A.1 carries it; Stage B is where every `*_user_id` column starts
 /// coming from it.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct Actor {
     pub user_id: String,
     pub store_id: String,
     pub role: Role,
+}
+
+impl Actor {
+    /// A privileged actor for tests ONLY.
+    ///
+    /// `#[cfg(test)]`, and that is a requirement rather than tidiness: the
+    /// mandate for this work is explicit that there must be no
+    /// production-reachable default privileged test owner. Every `*_with_pool`
+    /// seam in this crate is also `#[cfg(test)]`, so the pair of them means a
+    /// release binary contains no path that manufactures an owner.
+    ///
+    /// Tests that are ABOUT authorization use `*_as(pool, &actor, payload)`
+    /// with an actor they build themselves; this is for the ~993 existing call
+    /// sites that are about posting, costing and returns and have no opinion
+    /// about who is signed in.
+    #[cfg(test)]
+    pub(crate) fn test_owner() -> Self {
+        Self {
+            user_id: "00000000-0000-0000-0000-000000000002".to_string(),
+            store_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            role: Role::Owner,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(user_id: &str, store_id: &str, role: Role) -> Self {
+        Self {
+            user_id: user_id.to_string(),
+            store_id: store_id.to_string(),
+            role,
+        }
+    }
 }
 
 // ===========================================================================
@@ -715,6 +746,13 @@ fn normalise_code(typed: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_uppercase())
         .collect()
+}
+
+/// The project's canonical fixed-width UTC timestamp, for `authz` to stamp an
+/// audit row with. Exposed rather than duplicated: two timestamp formats in one
+/// table is how a lexicographic range query starts missing rows.
+pub(crate) fn now_iso_for_audit() -> String {
+    now_iso()
 }
 
 fn now_iso() -> String {

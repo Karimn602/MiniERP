@@ -1334,12 +1334,19 @@ const SUPPLIER_REFERENCE_KEY_SQL: &str =
 #[tauri::command]
 pub async fn post_purchase(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: PostPurchasePayload,
 ) -> Result<PostPurchaseResult, String> {
     let prepared = prepare_purchase(&payload)?;
 
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::PostPurchase,
+    )
+    .await?;
     post_purchase_tx(&pool, payload, prepared).await
 }
 
@@ -1946,12 +1953,19 @@ pub(crate) fn validate_adjustment_payload(payload: &PostAdjustmentPayload) -> Re
 #[tauri::command]
 pub async fn post_adjustment(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: PostAdjustmentPayload,
 ) -> Result<PostAdjustmentResult, String> {
     validate_adjustment_payload(&payload)?;
 
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::PostAdjustment,
+    )
+    .await?;
     post_adjustment_tx(&pool, payload).await
 }
 
@@ -2386,12 +2400,19 @@ fn ledger_replay_difference(
 #[tauri::command]
 pub async fn post_supplier_payment(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: PostSupplierPaymentPayload,
 ) -> Result<PostSupplierPaymentResult, String> {
     let amount_cents = validate_supplier_payment_payload(&payload)?;
 
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::SupplierPayment,
+    )
+    .await?;
     post_supplier_payment_tx(&pool, payload, amount_cents).await
 }
 
@@ -3821,6 +3842,7 @@ pub(crate) fn prepare_sale(payload: &PostSalePayload) -> Result<PreparedSale, St
 #[tauri::command]
 pub async fn post_sale(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: PostSalePayload,
 ) -> Result<PostSaleResult, PostSaleFailure> {
@@ -3829,8 +3851,36 @@ pub async fn post_sale(
     // its signature. See `PostSaleFailure` for why wrapping here is sound.
     let prepared = prepare_sale(&payload).map_err(PostSaleFailure::refused)?;
 
-    // ---- Open transaction ----
-    let pool = pool(&app, &state).await.map_err(PostSaleFailure::refused)?;
+    // ---- Authorize, then open the transaction ----
+    let (pool, actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::PostSale,
+    )
+    .await
+    .map_err(PostSaleFailure::refused)?;
+
+    // A LARGE DISCOUNT IS A SEPARATE DECISION, and it is decided on the amount
+    // rather than on the role. A cashier rounding thirty cents off a cold
+    // coffee is daily practice in a restaurant, and sending them to find a
+    // manager for it is how the manager's passphrase comes to be shared within
+    // a week. Thirty per cent off is not daily practice. So the threshold is
+    // what the role governs — see `authz::DISCOUNT_WITHOUT_APPROVAL_CENTS`.
+    //
+    // Taken from the payload's own total, which `prepare_sale` has already
+    // proved equals the sum of the line allocations, so there is no second
+    // figure a caller could understate the discount with.
+    if payload.discount_cents > crate::authz::DISCOUNT_WITHOUT_APPROVAL_CENTS {
+        crate::authz::authorize(
+            &pool,
+            &actor,
+            crate::authz::Operation::PostSaleLargeDiscount,
+        )
+        .await
+        .map_err(PostSaleFailure::refused)?;
+    }
+
     post_sale_tx(&pool, payload, prepared).await.map_err(PostSaleFailure::refused)
 }
 
@@ -5248,11 +5298,18 @@ pub(crate) fn validate_open_shift_payload(payload: &OpenShiftPayload) -> Result<
 #[tauri::command]
 pub async fn open_shift(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: OpenShiftPayload,
 ) -> Result<ShiftSnapshot, String> {
     validate_open_shift_payload(&payload)?;
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::OpenShift,
+    )
+    .await?;
     open_shift_tx(&pool, payload).await
 }
 
@@ -5354,11 +5411,48 @@ pub(crate) fn validate_close_shift_payload(payload: &CloseShiftPayload) -> Resul
 #[tauri::command]
 pub async fn close_shift(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: CloseShiftPayload,
 ) -> Result<ShiftSnapshot, String> {
     validate_close_shift_payload(&payload)?;
-    let pool = pool(&app, &state).await?;
+
+    // Closing YOUR OWN shift is routine; closing SOMEBODY ELSE'S is
+    // supervision, and the matrix answers them differently. Which one this is
+    // depends on a row, so the cheap permission is taken first and the stricter
+    // one only when the shift turns out to belong to somebody else — both
+    // before any transaction opens, so a refusal reconciles nothing and
+    // consumes nothing.
+    let (pool, actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::CloseOwnShift,
+    )
+    .await?;
+
+    let opened_by: Option<String> =
+        sqlx::query_scalar("SELECT opened_by_user_id FROM shifts WHERE id = ?")
+            .bind(&payload.shift_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| format!("cannot read the shift: {e}"))?;
+
+    // An unknown shift is NOT an authorization question — `close_shift_tx`
+    // refuses it with a message about the shift, which is what the operator
+    // needs to hear. Only a shift that exists and belongs to somebody else
+    // needs the stricter permission.
+    if let Some(opened_by) = opened_by {
+        if opened_by != actor.user_id {
+            crate::authz::authorize(
+                &pool,
+                &actor,
+                crate::authz::Operation::CloseAnotherShift,
+            )
+            .await?;
+        }
+    }
+
     close_shift_tx(&pool, payload).await
 }
 
@@ -6209,11 +6303,18 @@ struct ResolvedReturnLine {
 #[tauri::command]
 pub async fn post_credit_memo(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: PostCreditMemoPayload,
 ) -> Result<PostCreditMemoResult, String> {
     validate_credit_memo_payload(&payload)?;
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::PostCreditMemo,
+    )
+    .await?;
     post_credit_memo_tx(&pool, payload).await
 }
 
@@ -7765,11 +7866,18 @@ fn driver_entry_replay_difference(
 #[tauri::command]
 pub async fn post_driver_remittance(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: PostDriverRemittancePayload,
 ) -> Result<PostDriverRemittanceResult, String> {
     let amount_cents = validate_driver_remittance_payload(&payload)?;
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::DriverRemittance,
+    )
+    .await?;
     post_driver_remittance_tx(&pool, payload, amount_cents).await
 }
 

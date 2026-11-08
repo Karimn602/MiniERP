@@ -3,6 +3,7 @@ use tauri_plugin_sql::{Migration, MigrationKind};
 
 mod admin;
 mod auth;
+mod authz;
 mod catalog;
 mod cost;
 mod db_init;

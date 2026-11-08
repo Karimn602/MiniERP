@@ -379,12 +379,79 @@ pub const RECIPE_COSTING_NEEDS_ACTIVE_RECIPE: &str =
 #[tauri::command]
 pub async fn save_product(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: SaveProductPayload,
 ) -> Result<SaveProductResult, String> {
     validate_save_product(&payload)?;
-    let pool = pool(&app, &state).await?;
+
+    let (pool, actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::SaveProduct,
+    )
+    .await?;
+
+    // CHANGING A COST IS A DIFFERENT DECISION FROM CHANGING A PRICE, and only
+    // the owner may do it — WP-B1's argument, one level up: a price is an
+    // operating decision a manager running the evening should be able to make,
+    // while a cost is the basis of every margin figure in the business and,
+    // under `costing_method = 'standard'`, has no document behind it at all. A
+    // manager who can type a cost can make any item look profitable.
+    //
+    // THE COMPARISON IS AGAINST WHAT IS STORED, not against the presence of the
+    // fields. The Products form sends the whole product on every save, so
+    // `costing_method` arrives populated even when the manager only touched the
+    // price — gating on "the payload mentions a cost" would have stopped a
+    // manager repricing anything. So the stored pair is read and the permission
+    // is required only if the payload would MOVE it.
+    if cost_fields_would_change(&pool, &payload).await? {
+        crate::authz::authorize(
+            &pool,
+            &actor,
+            crate::authz::Operation::SaveProductCost,
+        )
+        .await?;
+    }
+
     save_product_tx(&pool, payload).await
+}
+
+/// Would this save move the product's cost or its costing method?
+///
+/// For a NEW product, anything other than the schema's own defaults
+/// (`purchase_average`, no standard cost) counts as setting a cost. For an
+/// existing one, the stored pair is the comparison. A product that cannot be
+/// found is treated as new, which is the conservative direction: it requires
+/// the stricter permission rather than skipping the check.
+async fn cost_fields_would_change(
+    pool: &SqlitePool,
+    payload: &SaveProductPayload,
+) -> Result<bool, String> {
+    let stored: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT costing_method, standard_cost_excl_vat_microcents
+           FROM products WHERE id = ? AND store_id = ?",
+    )
+    .bind(&payload.product_id)
+    .bind(&payload.store_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("cannot read the product's costing: {e}"))?;
+
+    let (stored_method, stored_cost) = stored.unwrap_or_else(|| ("purchase_average".to_string(), None));
+
+    // An omitted field means "leave it alone" — `save_product_tx` preserves the
+    // stored value — so an omission can never be a change.
+    let method_moves = payload
+        .costing_method
+        .as_deref()
+        .is_some_and(|m| m != stored_method);
+    let cost_moves = payload
+        .standard_cost_excl_vat_microcents
+        .is_some_and(|c| Some(c) != stored_cost);
+
+    Ok(method_moves || cost_moves)
 }
 
 /// Validate-then-save against an already-resolved pool (test seam).
@@ -897,10 +964,17 @@ pub struct AddBarcodeResult {
 #[tauri::command]
 pub async fn add_product_barcode(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: AddBarcodePayload,
 ) -> Result<AddBarcodeResult, String> {
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::ProductBarcode,
+    )
+    .await?;
     add_product_barcode_tx(&pool, payload).await
 }
 
@@ -965,10 +1039,17 @@ pub struct BarcodeRefPayload {
 #[tauri::command]
 pub async fn set_primary_product_barcode(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: BarcodeRefPayload,
 ) -> Result<(), String> {
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::ProductBarcode,
+    )
+    .await?;
     set_primary_product_barcode_tx(&pool, payload).await
 }
 
@@ -1025,10 +1106,17 @@ pub(crate) async fn set_primary_product_barcode_tx(
 #[tauri::command]
 pub async fn remove_product_barcode(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     payload: BarcodeRefPayload,
 ) -> Result<(), String> {
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::ProductBarcode,
+    )
+    .await?;
     remove_product_barcode_tx(&pool, payload).await
 }
 

@@ -421,11 +421,24 @@ fn column_to_json(row: &SqliteRow, i: usize, name: &str) -> Result<Value, String
 #[tauri::command]
 pub async fn db_select(
     app: tauri::AppHandle,
+    window: tauri::Window,
     db_state: State<'_, crate::posting::DbState>,
     read_state: State<'_, ReadPool>,
     sql: String,
     params: Vec<Value>,
 ) -> Result<Vec<Map<String, Value>>, String> {
+    // THE WINDOW, for the same reason the twenty writable commands check it
+    // (Stage B): a session is authority granted to whoever is at the primary
+    // window, and a second webview must not inherit the right to read the
+    // shop's takings any more than the right to write them.
+    //
+    // WHAT THIS COMMAND STILL DOES NOT DO is check a ROLE. It accepts arbitrary
+    // SELECT text, so a cashier can read every cost and margin in the business
+    // through it. That is Stage C, and it is the largest remaining
+    // confidentiality gap — `read_guard` protects the credentials and nothing
+    // else.
+    crate::auth::require_primary_window_label(window.label())?;
+
     // The shape guard runs first so a mistaken write gets a useful sentence
     // rather than a SQLite error, but it is the pool that enforces read-only.
     let pool = read_pool(&app, &db_state, &read_state).await?;

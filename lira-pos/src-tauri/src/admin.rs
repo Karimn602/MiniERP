@@ -124,6 +124,7 @@ pub struct ExchangeRateSaveArgs {
 #[tauri::command]
 pub async fn exchange_rate_save(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     args: ExchangeRateSaveArgs,
 ) -> Result<String, String> {
@@ -145,7 +146,13 @@ pub async fn exchange_rate_save(
     }
     let notes = clean_opt(args.notes);
 
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::ExchangeRateSave,
+    )
+    .await?;
     let mut tx = pool
         .begin()
         .await
@@ -258,6 +265,7 @@ pub struct DriverSaveArgs {
 #[tauri::command]
 pub async fn driver_save(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     args: DriverSaveArgs,
 ) -> Result<String, String> {
@@ -275,7 +283,13 @@ pub async fn driver_save(
     let phone = clean_opt(args.phone);
     let notes = clean_opt(args.notes);
 
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::DriverSave,
+    )
+    .await?;
     let mut tx = pool
         .begin()
         .await
@@ -353,6 +367,7 @@ pub struct DriverSetActiveArgs {
 #[tauri::command]
 pub async fn driver_set_active(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     args: DriverSetActiveArgs,
 ) -> Result<(), String> {
@@ -360,7 +375,13 @@ pub async fn driver_set_active(
     if id.is_empty() {
         return Err("DRIVER_MISSING_ID".into());
     }
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::DriverSave,
+    )
+    .await?;
     let affected = sqlx::query(
         "UPDATE drivers
             SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -405,6 +426,7 @@ pub struct SupplierSaveArgs {
 #[tauri::command]
 pub async fn supplier_save(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     args: SupplierSaveArgs,
 ) -> Result<String, String> {
@@ -424,7 +446,13 @@ pub async fn supplier_save(
     let email = clean_opt(args.email);
     let notes = clean_opt(args.notes);
 
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::SupplierSave,
+    )
+    .await?;
     let mut tx = pool
         .begin()
         .await
@@ -504,6 +532,7 @@ pub struct SupplierSetActiveArgs {
 #[tauri::command]
 pub async fn supplier_set_active(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: State<'_, DbState>,
     args: SupplierSetActiveArgs,
 ) -> Result<(), String> {
@@ -511,7 +540,13 @@ pub async fn supplier_set_active(
     if id.is_empty() {
         return Err("SUPPLIER_MISSING_ID".into());
     }
-    let pool = pool(&app, &state).await?;
+    let (pool, _actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::SupplierSave,
+    )
+    .await?;
     let affected = sqlx::query("UPDATE suppliers SET is_active = ? WHERE id = ?")
         .bind(i64::from(args.is_active))
         .bind(&id)
