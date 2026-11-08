@@ -731,9 +731,14 @@ impl SessionState {
     /// command that wrote it. A credential changed by anybody ELSE never reaches
     /// here, and still ends the session.
     ///
-    /// `must_change_credential` is cleared in the same breath, because the same
-    /// statement clears `must_change_pin` in the database and a prompt that
-    /// outlived the thing it asks for would keep asking.
+    /// `must_change_credential` is cleared in the same breath, because the
+    /// change path's own statement clears `must_change_pin` in the database and
+    /// a prompt that outlived the thing it asks for would keep asking.
+    ///
+    /// THE UNLOCK PATH THEREFORE CALLS THIS BEFORE `unlock`, not after:
+    /// `unlock` sets the flag from the row it just read, and an unlock does not
+    /// clear `must_change_pin` — somebody whose passphrase was reset still has
+    /// to change it. Reversing the two would drop that prompt.
     async fn restamp_credential(&self, user_id: &str, pin_hash: &str) {
         let mut guard = self.inner.lock().await;
         if let Some(session) = guard.as_mut() {
@@ -2335,6 +2340,25 @@ pub(crate) async fn unlock_inner(
         .execute(pool)
         .await
         .map_err(|e| format!("cannot clear the attempt counter: {e}"))?;
+
+    // AN UNLOCK IS A FRESH PROOF OF THE CURRENT CREDENTIAL, so it re-stamps.
+    //
+    // The verification a few lines above read `user.pin_hash` fresh from the
+    // database and matched the typed secret against it. So whoever got through
+    // has just proved the credential that is on file NOW — which may not be the
+    // one this session was opened against, if the owner reset it while the till
+    // was locked (the ordinary reason to reset one: somebody has left, or a
+    // secret is suspected).
+    //
+    // Without this, that person types the new passphrase, the lock screen
+    // accepts it, and the next status poll signs them out, because the session's
+    // fingerprint still names the credential it opened with. Re-stamping records
+    // what was actually proved. It is not a way around the revocation rule: the
+    // rule ends a session whose credential changed WITHOUT the holder proving
+    // the new one, and getting past this point is exactly that proof.
+    if let Some(hash) = user.pin_hash.as_deref() {
+        sessions.restamp_credential(&user.id, hash).await;
+    }
 
     sessions.unlock(user.must_change_pin).await?;
     audit(pool, &store_id, "unlock", Some(&user.id), None, None).await;

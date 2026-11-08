@@ -2597,3 +2597,178 @@ fn the_session_fingerprint_drops_the_hash_output() {
     assert_eq!(testing::fingerprint(Some("")), None);
     assert_eq!(testing::fingerprint(Some("   ")), None);
 }
+
+/// A PASSPHRASE RESET WHILE THE TILL WAS LOCKED IS UNLOCKED WITH, NOT SIGNED
+/// OUT OF.
+///
+/// The boundary of the revocation rule, on the one path that proves the current
+/// credential rather than remembering an old one. Resetting somebody's
+/// passphrase while they are away is the ORDINARY reason to reset one, and the
+/// till is very often locked when it happens. The verification inside
+/// `unlock_inner` reads `pin_hash` fresh and matches the typed secret against
+/// it, so getting through the lock screen IS the proof the revocation rule
+/// wants — and without re-stamping, the next status poll would sign out
+/// somebody who had just given the new passphrase correctly.
+///
+/// The old one must of course stop working, which is the other half.
+#[tokio::test]
+async fn a_passphrase_reset_while_locked_is_unlocked_with_the_new_one() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    sessions.lock_for_tests().await.expect("lock the till");
+
+    // The owner's credential is replaced while the screen is locked.
+    let replacement = testing::hash(OTHER_PASSPHRASE);
+    db.exec(&format!(
+        "UPDATE users
+            SET pin_hash = '{replacement}', credential_algo = 'argon2id',
+                credential_version = {}, credential_set_at = '2026-01-01T00:00:00.000Z',
+                must_change_pin = 1
+          WHERE id = '{OWNER}'",
+        testing::credential_version()
+    ))
+    .await;
+
+    // THE OLD ONE NO LONGER OPENS IT.
+    let refused = unlock_inner(&ctx, &sessions, GOOD_PASSPHRASE.to_string())
+        .await
+        .expect_err("the replaced passphrase must not unlock the screen");
+    assert!(!refused.is_empty());
+
+    // THE NEW ONE DOES, and the session survives the status call that follows.
+    let unlocked = unlock_inner(&ctx, &sessions, OTHER_PASSPHRASE.to_string())
+        .await
+        .expect("the current passphrase must unlock the screen");
+    let session = unlocked.session.expect("still signed in");
+    assert!(!session.locked);
+    assert_eq!(session.user_id, OWNER);
+    assert!(
+        session.must_change_credential,
+        "a reset passphrase still has to be changed — the unlock proves it, it \
+         does not clear the obligation"
+    );
+
+    // AND THE NEXT POLL DOES NOT SIGN THEM OUT. This is the assertion the fix
+    // exists for: `reconcile` compares the session's fingerprint, and the unlock
+    // re-stamped it with the credential it just proved.
+    let after = status_inner(&ctx, &sessions).await.expect("status");
+    assert!(
+        after.session.is_some(),
+        "the poll after a successful unlock must not revoke the session"
+    );
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM auth_audit WHERE event = 'session_revoked'")
+            .await,
+        0
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// AND A RESET THE HOLDER NEVER PROVES STILL ENDS THE SESSION.
+///
+/// The test above could be satisfied by a rule that never revokes at all, so
+/// the same setup WITHOUT the unlock is asserted here: locked, credential
+/// replaced, no proof given, next poll ends it. The pair is what makes either
+/// one mean anything.
+#[tokio::test]
+async fn a_reset_nobody_proves_still_ends_the_locked_session() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    sessions.lock_for_tests().await.expect("lock the till");
+
+    let replacement = testing::hash(OTHER_PASSPHRASE);
+    db.exec(&format!(
+        "UPDATE users
+            SET pin_hash = '{replacement}', credential_algo = 'argon2id',
+                credential_version = {}, credential_set_at = '2026-01-01T00:00:00.000Z'
+          WHERE id = '{OWNER}'",
+        testing::credential_version()
+    ))
+    .await;
+
+    let after = status_inner(&ctx, &sessions).await.expect("status");
+    assert!(
+        after.session.is_none(),
+        "a locked session whose credential was replaced must end"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT count(*) AS n FROM auth_audit
+              WHERE event = 'session_revoked' AND user_id = '{OWNER}'"
+        ))
+        .await,
+        1
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// THE FATAL STARTUP DIALOG EXISTS AND IS ONLY REACHABLE FROM THE ONE PLACE
+/// THAT HAS NO WINDOW (GZ-WAL-R1).
+///
+/// A structural assertion, because the thing itself cannot be tested: it is a
+/// blocking native message box, and a test that opened one would hang the suite
+/// until somebody clicked it. What CAN be asserted is that it is called from
+/// exactly one site — the `build()` failure, which is the only startup failure
+/// with no webview to report itself in — and that the other failure path still
+/// goes to the startup gate rather than to a dialog.
+///
+/// The limitation is stated rather than hidden: **this has not been seen on
+/// screen.** Reaching it needs a corrupt or unopenable database file at launch,
+/// which no automated run in this repository creates.
+#[test]
+fn the_fatal_startup_dialog_is_wired_to_the_windowless_path_only() {
+    let src = include_str!("../lib.rs");
+
+    assert_eq!(
+        src.matches("show_fatal_startup_dialog(").count(),
+        3,
+        "two definitions (windows / not windows) and exactly ONE call site"
+    );
+    assert!(src.contains("#[cfg(windows)]\nfn show_fatal_startup_dialog("));
+    assert!(src.contains("#[cfg(not(windows))]\nfn show_fatal_startup_dialog(_message: &str) {}"));
+
+    // The one call site is in the `build()` failure arm, beside the console
+    // copy, before the exit — and it carries the SAME message.
+    let arm = src
+        .split("Err(e) => {")
+        .nth(1)
+        .expect("the build failure arm")
+        .split("\n        }")
+        .next()
+        .expect("the arm's body");
+    assert!(arm.contains("eprintln!(\"{message}\")"), "the console copy must stay");
+    assert!(arm.contains("show_fatal_startup_dialog(&message)"));
+    assert!(arm.contains("std::process::exit(1)"));
+
+    // The SETUP failure path must NOT show a dialog: there the window opens and
+    // `App.tsx` renders the operator text, which is scrollable, selectable and
+    // translated. A modal there would be a worse version of a better screen.
+    let setup = src
+        .split("let handle = app.handle().clone();")
+        .nth(1)
+        .expect("the setup hook")
+        .split("Ok(())")
+        .next()
+        .expect("the hook body");
+    assert!(
+        !setup.contains("show_fatal_startup_dialog"),
+        "the setup path has a window; it must use the startup gate, not a dialog"
+    );
+    assert!(setup.contains("mark_startup_failed"));
+
+    // No new dependency: the import is declared inline against user32.
+    assert!(src.contains("#[link(name = \"user32\")]"));
+    assert!(
+        !src.contains("tauri_plugin_dialog"),
+        "a dialog plugin needs an AppHandle, which is exactly what this path \
+         does not have"
+    );
+}

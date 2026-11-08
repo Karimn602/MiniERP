@@ -159,11 +159,11 @@ async fn require_another_usable_owner_remains(
         Ok(())
     } else {
         Err(
-            "This is the shop's only owner who can sign in. Make somebody else an — \
-             owner AND give them a passphrase first. An owner with no passphrase cannot \
-             sign in, so leaving only one of those would mean nobody could add staff, \
-             reset a passphrase or change a role, and getting back in would need
-             support to edit the database file directly. Nothing has been changed."
+            "This is the shop's only owner who can sign in. Make somebody else an owner \
+             AND give them a passphrase first — an owner with no passphrase cannot sign \
+             in, so leaving only one of those would mean nobody could add staff, reset a \
+             passphrase or change a role, and getting back in would need support to edit \
+             the database file directly. Nothing has been changed."
                 .to_string(),
         )
     }

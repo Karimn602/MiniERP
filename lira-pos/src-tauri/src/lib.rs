@@ -211,6 +211,101 @@ pub(crate) fn migrations() -> Vec<Migration> {
     ]
 }
 
+/// SHOW A FATAL STARTUP FAILURE WHERE A PERSON WILL ACTUALLY SEE IT.
+///
+/// GZ-WAL-R1. There is exactly one startup failure in this application that has
+/// no window to report itself in: `tauri::Builder::build()` returning `Err`.
+/// tauri-plugin-sql runs its preload connection AND the migrations inside its
+/// own setup, so a database that cannot be opened, a migration that errors and a
+/// migration whose checksum no longer matches all surface there — before any
+/// webview exists. Every other failure, including the startup gate refusing to
+/// trade, happens in the setup hook, where the window does open and `App.tsx`
+/// shows the operator text.
+///
+/// That case was already fail-closed and already printed the operator text. It
+/// was simply INVISIBLE: a packaged Windows GUI application has no console, so
+/// somebody who double-clicked the icon saw the splash vanish and nothing else.
+/// For a shop that is indistinguishable from "Greaz is broken", and the thing
+/// they would reach for next is deleting the database files — which the message
+/// exists to tell them not to do.
+///
+/// ## Why `MessageBoxW` and no new dependency
+///
+/// `tauri-plugin-dialog` needs an `AppHandle`, which is precisely what does not
+/// exist here. The Win32 `MessageBoxW` needs neither a window nor an
+/// initialised GUI framework; `user32` is already loaded in a GUI process.
+/// Declaring the one import directly costs no crate — and the mandate for this
+/// work is explicit that `Cargo.toml` is not to be touched without a deliberate,
+/// independently inspected reason, which a message box is not.
+///
+/// ## What it deliberately does
+///
+/// It BLOCKS until the operator dismisses it. That is the point: the process is
+/// about to exit, and a dialog that did not block would flash and disappear with
+/// everything else. `MB_SETFOREGROUND | MB_TOPMOST` because the window this
+/// replaces never appeared, so there is nothing for the box to sit in front of
+/// and no taskbar entry to find it behind.
+///
+/// It is a no-op off Windows, where this build does not ship and where the
+/// terminal the application was launched from is the right place for the text.
+#[cfg(windows)]
+fn show_fatal_startup_dialog(message: &str) {
+    use std::ffi::OsStr;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut core::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            utype: u32,
+        ) -> i32;
+    }
+
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    const MB_SETFOREGROUND: u32 = 0x0001_0000;
+    const MB_TOPMOST: u32 = 0x0004_0000;
+
+    fn wide(text: &str) -> Vec<u16> {
+        OsStr::new(text).encode_wide().chain(once(0)).collect()
+    }
+
+    // A message box sizes itself to its text and does not scroll, so a very long
+    // body can run off a small screen. The operator text is ~900 characters and
+    // fits comfortably at 1366x768; the bound is a guard against a driver error
+    // appended to it being pathological, and it keeps the ACTIONABLE part — the
+    // numbered steps are at the end, so the truncation notice points at the
+    // console copy rather than silently dropping them.
+    const MAX: usize = 1800;
+    let body = if message.chars().count() > MAX {
+        let kept: String = message.chars().take(MAX).collect();
+        format!("{kept}\n\n[This message was shortened to fit on screen.]")
+    } else {
+        message.to_string()
+    };
+
+    let body = wide(&body);
+    let caption = wide("Greaz POS - cannot start");
+
+    // SAFETY: both pointers are to NUL-terminated UTF-16 buffers that outlive
+    // the call, and a null owner window is documented as valid (the box is
+    // owned by the desktop). `MessageBoxW` takes no ownership of either buffer.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_fatal_startup_dialog(_message: &str) {}
+
 /// Close Greaz's own SQLite pool, in order, as the application exits.
 ///
 /// Greaz holds TWO pools against the one database file: tauri-plugin-sql's,
@@ -383,16 +478,25 @@ pub fn run() {
             // That was already fail-closed: the process cannot reach trading
             // mode. What it was not was legible. `.expect()` turned the one
             // startup failure that most needs explaining into a Rust panic, so
-            // this prints the operator text and exits non-zero instead. There
-            // is no window to show it in yet, and building a fallback window to
-            // carry it would be a new startup framework; that limitation is
-            // recorded in the handoff rather than papered over.
-            eprintln!(
-                "{}",
-                db_init::fatal_startup_message(&format!(
-                    "The database could not be opened or brought up to date: {e}"
-                ))
-            );
+            // this prints the operator text and exits non-zero instead.
+            //
+            // AND NOW IT IS ALSO ON SCREEN (GZ-WAL-R1). `eprintln!` alone was
+            // invisible in the case that matters: a packaged Windows GUI
+            // application has no console, so somebody who double-clicked the
+            // icon saw the splash vanish and nothing else — indistinguishable
+            // from "Greaz is broken", after which the thing they reach for is
+            // deleting the database files, which this very message exists to
+            // tell them not to do. `show_fatal_startup_dialog` is a native
+            // message box that needs no window and no AppHandle, and it blocks
+            // until it is dismissed because the process is about to exit.
+            //
+            // Both, not either: the console copy is what a support call can be
+            // read from and what a launcher's redirected output captures.
+            let message = db_init::fatal_startup_message(&format!(
+                "The database could not be opened or brought up to date: {e}"
+            ));
+            eprintln!("{message}");
+            show_fatal_startup_dialog(&message);
             std::process::exit(1);
         }
     }

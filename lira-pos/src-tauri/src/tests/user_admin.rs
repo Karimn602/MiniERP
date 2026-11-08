@@ -1178,3 +1178,177 @@ fn staff_administration_is_owner_only_in_the_matrix() {
         assert!(!permits(Role::Cashier, op));
     }
 }
+
+// ===========================================================================
+// What the operator actually reads
+// ===========================================================================
+
+/// EVERY REFUSAL IS ONE CLEAN PARAGRAPH, with no stray whitespace and no
+/// newline in the middle of a sentence.
+///
+/// Found on the desktop, which is the only place it could be found: the
+/// last-owner refusal reached a real screen reading
+/// "Make somebody else an — owner AND give them a passphrase first", with a
+/// hard line break and twelve spaces later in the same sentence. Rust's
+/// `BS`-at-end-of-line continuation strips the newline and the following
+/// indentation; a line that is missing it keeps both, and a line that keeps a
+/// fragment of the text it replaced keeps that too. Neither is visible in the
+/// source, because the source is laid out in exactly the shape that hides it.
+///
+/// Held for every message in the matrix, so this covers the thirty-odd
+/// refusals `authz.rs` can produce as well as the staff ones below — and so a
+/// new operation cannot arrive with a broken one.
+#[test]
+fn every_refusal_reads_as_one_paragraph() {
+    use crate::authz::{Operation, ALL_OPERATIONS, ALL_ROLES};
+
+    fn assert_clean(what: &str, message: &str) {
+        assert!(
+            !message.contains('\n'),
+            "{what} contains a newline, so it was written with a missing \
+             line continuation: {message:?}"
+        );
+        assert!(
+            !message.contains("  "),
+            "{what} contains a run of spaces, which is a stripped newline's \
+             indentation surviving: {message:?}"
+        );
+        assert!(
+            !message.contains(" — ,") && !message.contains("an — "),
+            "{what} contains a dangling dash from an edited line: {message:?}"
+        );
+        assert!(
+            message.trim() == message,
+            "{what} has leading or trailing whitespace: {message:?}"
+        );
+        assert!(
+            message.ends_with('.') || message.ends_with('?'),
+            "{what} does not end in a full stop, so it was probably truncated: \
+             {message:?}"
+        );
+    }
+
+    for &operation in ALL_OPERATIONS {
+        for &role in ALL_ROLES {
+            if crate::authz::permits(role, operation) {
+                continue;
+            }
+            assert_clean(
+                &format!("the refusal of {operation:?} to {role:?}"),
+                &operation.refusal(role),
+            );
+        }
+    }
+
+    // And the staff-administration refusals, which are written by hand rather
+    // than assembled from the matrix. Each is produced by actually calling the
+    // command, so this cannot drift from what the operator sees.
+    let _ = Operation::UserAdmin;
+}
+
+/// The staff refusals, the same way: produced by the commands, then read.
+#[tokio::test]
+async fn every_staff_refusal_reads_as_one_paragraph() {
+    let db = staffed().await;
+    give_credential(&db, OWNER).await;
+
+    let mut messages: Vec<(String, String)> = Vec::new();
+
+    // The last-owner refusal — the one the desktop run caught.
+    if let Err(e) = users_save_as(db.pool(), &owner(), save(OWNER, "Owner", "manager")).await {
+        messages.push(("the last-owner refusal".to_string(), e));
+    }
+    // Self-retirement.
+    if let Err(e) = users_set_active_as(
+        db.pool(),
+        &owner(),
+        UserSetActiveArgs {
+            user_id: OWNER.to_string(),
+            is_active: false,
+        },
+    )
+    .await
+    {
+        messages.push(("the self-retirement refusal".to_string(), e));
+    }
+    // Your own credential.
+    if let Err(e) = set_user_credential_as(
+        db.pool(),
+        &owner(),
+        SetUserCredentialArgs {
+            user_id: OWNER.to_string(),
+            secret: PASSPHRASE.to_string(),
+        },
+    )
+    .await
+    {
+        messages.push(("the own-credential refusal".to_string(), e));
+    }
+    // A retired account.
+    users_set_active_as(
+        db.pool(),
+        &owner(),
+        UserSetActiveArgs {
+            user_id: CASHIER.to_string(),
+            is_active: false,
+        },
+    )
+    .await
+    .expect("retire");
+    if let Err(e) = set_user_credential_as(
+        db.pool(),
+        &owner(),
+        SetUserCredentialArgs {
+            user_id: CASHIER.to_string(),
+            secret: "123456".to_string(),
+        },
+    )
+    .await
+    {
+        messages.push(("the retired-account refusal".to_string(), e));
+    }
+    // Another shop.
+    if let Err(e) = users_set_active_as(
+        db.pool(),
+        &owner(),
+        UserSetActiveArgs {
+            user_id: "nobody-here".to_string(),
+            is_active: false,
+        },
+    )
+    .await
+    {
+        messages.push(("the wrong-shop refusal".to_string(), e));
+    }
+    // A bad role and a missing name.
+    if let Err(e) = users_save_as(db.pool(), &owner(), save("x", "Rami", "admin")).await {
+        messages.push(("the bad-role refusal".to_string(), e));
+    }
+    if let Err(e) = users_save_as(db.pool(), &owner(), save("x", "", "cashier")).await {
+        messages.push(("the missing-name refusal".to_string(), e));
+    }
+
+    assert!(
+        messages.len() >= 7,
+        "every refusal under test must have been produced, got {}",
+        messages.len()
+    );
+
+    for (what, message) in &messages {
+        assert!(
+            !message.contains('\n'),
+            "{what} contains a newline: {message:?}"
+        );
+        assert!(
+            !message.contains("  "),
+            "{what} contains a run of spaces: {message:?}"
+        );
+        assert!(
+            !message.contains("an — "),
+            "{what} contains a dangling dash: {message:?}"
+        );
+        assert_eq!(message.trim(), message, "{what} has edge whitespace");
+    }
+
+    db.cleanup().await.expect("remove TempDb");
+}
