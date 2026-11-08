@@ -105,8 +105,36 @@ use crate::posting::DbState;
 // Policy
 // ===========================================================================
 
-/// Stage A.1 admits only the owner. See the module header.
-pub(crate) const LOGIN_RESTRICTED_TO_OWNER: bool = true;
+/// WHETHER STAFF MAY SIGN IN. Lifted in Stage B.3.
+///
+/// This was `true` through Stages A.1, B.1 and B.2, and the reason it stayed
+/// true is the reason it can now be lifted. A role that decides nothing is not
+/// a permission, so a staff login would have been an account with owner powers
+/// and a different name on it — which is worse than no staff account, because
+/// it creates the belief that a cashier cannot refund, and that is how an
+/// unexplained shortfall goes unlooked-for.
+///
+/// Three things had to be true before it could change, and all three now are:
+///
+///   1. **The roles decide something.** `authz::permits` is enforced at the
+///      command boundary AND inside the transaction that commits, on all
+///      twenty-four commands.
+///   2. **The attribution is trustworthy.** Every `*_user_id` on a new document
+///      comes from the session, and a request naming anybody else is refused.
+///      Without this a cashier's sale could still have carried the owner's
+///      name.
+///   3. **A staff account can be given a credential.** `users.rs` exists, so
+///      the owner can create the account and set its first passphrase. Lifting
+///      the restriction before that would have offered a login screen nobody
+///      but the owner could get through.
+///
+/// WHAT IS STILL NOT TRUE, so the claim stays the right size: a cashier can
+/// read every cost and margin in the business through `db_select`, which
+/// accepts arbitrary SELECT text. That is Stage C, and it is the largest
+/// remaining gap. `read_guard` protects the credentials and nothing else. So
+/// the honest statement after B.3 is that Greaz controls what staff may DO and
+/// records who did it, and does not yet control what they may SEE.
+pub(crate) const LOGIN_RESTRICTED_TO_OWNER: bool = false;
 
 /// The window a session belongs to.
 const PRIMARY_WINDOW: &str = "main";
@@ -276,11 +304,74 @@ struct Session {
     /// until the SAME person proves who they are again.
     locked: bool,
     must_change_credential: bool,
+    /// WHICH CREDENTIAL THIS SESSION WAS OPENED AGAINST.
+    ///
+    /// Not the credential, and not a secret: it is the PHC string's parameter
+    /// and SALT prefix with the hash output removed (`credential_fingerprint`).
+    /// Argon2id draws a fresh random salt on every hash, so the prefix changes
+    /// whenever the credential is set, reset or cleared, and comparing it is how
+    /// a live session finds out that the secret it authenticated against is no
+    /// longer the one on file.
+    ///
+    /// `None` means the account had no credential when the session opened,
+    /// which is only reachable for the enrollment path (the owner has just
+    /// chosen the passphrase, and the row is written before the session opens,
+    /// so in practice this is always `Some` in production).
+    credential_fingerprint: Option<String>,
     /// Which window the authority was granted to. Recorded so a future
     /// multi-window feature cannot quietly inherit it, and so a diagnostic can
     /// say where a session came from.
     #[allow(dead_code)]
     window_label: String,
+}
+
+/// WHICH CREDENTIAL A STORED HASH IS, without being the hash.
+///
+/// A PHC string is `$argon2id$v=19$m=..,t=..,p=..$<salt>$<output>`. This drops
+/// the final segment — the hash output, the part that verifies a guess — and
+/// keeps the algorithm, the parameters and the SALT. The salt is drawn fresh at
+/// random on every hash, so the prefix identifies the credential uniquely and
+/// changes whenever it is replaced. It is not secret (it is stored in the clear
+/// beside the output and is useless without it), and it is not usable to verify
+/// anything.
+///
+/// Compared rather than the whole string so that a session holds no part of the
+/// material an offline attack would need.
+fn credential_fingerprint(pin_hash: Option<&str>) -> Option<String> {
+    let stored = pin_hash?;
+    if stored.trim().is_empty() {
+        return None;
+    }
+    Some(match stored.rsplit_once('$') {
+        // The ordinary shape: everything up to and including the salt.
+        Some((head, _output)) if !head.is_empty() => head.to_string(),
+        // Anything else is not a PHC string this application wrote. Using the
+        // whole value is the conservative reading: it still changes when the
+        // credential changes, which is all this comparison needs.
+        _ => stored.to_string(),
+    })
+}
+
+/// What [`SessionState::reconcile`] found. A verdict rather than a silent
+/// mutation, because two of the three outcomes have to be AUDITED, and the
+/// audit needs a pool and a store that `SessionState` deliberately does not
+/// hold — it is session memory, not a database accessor.
+#[derive(Debug)]
+pub(crate) enum SessionOutcome {
+    Unchanged,
+    Updated { was: Role, now: Role },
+    Revoked { user_id: String, why: &'static str },
+}
+
+/// What a session was when a reconciliation started reading the database.
+///
+/// Captured TOGETHER, under one acquisition of the lock, and re-checked
+/// together under the second one. Either half alone is insufficient: the
+/// generation moves on a lock or a role adoption with the same user still
+/// signed in, and the user id repeats if the same person signs out and back in.
+struct SessionStamp {
+    user_id: String,
+    generation: u64,
 }
 
 pub struct SessionState {
@@ -409,6 +500,183 @@ impl SessionState {
         })
     }
 
+    /// WHAT THE LIVE SESSION SAYS ABOUT ITSELF, AGAINST WHAT THE DATABASE SAYS.
+    ///
+    /// The session caches the role, the name, the must-change flag and which
+    /// credential it was opened against, all as they were AT LOGIN, and an owner
+    /// can change every one of them underneath it. Writes were never at risk —
+    /// `authz::stored_identity` re-reads the row inside every authorization, so
+    /// a demoted manager is refused a refund on their next attempt and a retired
+    /// account is refused everything. What WAS at risk is the screen: the rail
+    /// and the route guard read the cached role, so a self-demoted owner kept
+    /// the owner's rail indefinitely rather than for one poll, and because the
+    /// read channel is not role-gated until Stage C, the screens that rail
+    /// offers still answer.
+    ///
+    /// Four outcomes, and the two that are not obvious are why this returns a
+    /// verdict instead of quietly mutating:
+    ///
+    ///   * the row AGREES — nothing happens;
+    ///   * the row has CHANGED — role, name or must-change is adopted and the
+    ///     generation is bumped, so the renderer treats it as new;
+    ///   * the account is GONE OR RETIRED — the session is ended. Not locked:
+    ///     locking invites the same person to unlock it and there is nothing
+    ///     left to unlock into, since every command refuses a retired account;
+    ///   * THE CREDENTIAL HAS CHANGED — the session is ended too. See below.
+    ///
+    /// ## A changed credential ends the session, and that is the P1 this fixed
+    ///
+    /// Independent review, round 2. A promotion out of the cashier tier clears
+    /// the stored credential, because a six-digit PIN set under the cashier rule
+    /// cannot be re-tested against the manager rule and there is no honest way
+    /// to keep it. But a LIVE session held the role in memory, and this function
+    /// adopted the new one — so the session that the weak PIN had opened became
+    /// a manager's or an owner's session, which is precisely the condition
+    /// clearing the credential existed to prevent. Sessions are process-local
+    /// and there is no single-instance guard (GZ-A1-R2), so an owner in one
+    /// instance can promote a cashier signed into another and never see it.
+    ///
+    /// So the fingerprint is compared BEFORE any role is adopted, and a
+    /// credential that has been replaced or cleared ends the session rather than
+    /// upgrading it. That is also the right answer for an ordinary reset: an
+    /// owner resetting somebody's passphrase because they have left the premises
+    /// should not leave that person's open session running on the old one.
+    ///
+    /// ## It is a LATEST-REQUEST-ONLY reconciliation
+    ///
+    /// The database read cannot hold the session mutex — it is an `await` on a
+    /// pool, and holding a session lock across it would serialise every status
+    /// poll behind it. So the state is captured before, re-checked after, and a
+    /// SUPERSEDED reconciliation writes NOTHING: not the role, not the removal,
+    /// not the audit. Without that, a concurrent logout-then-login could have an
+    /// in-flight reconciliation clear the NEW session, or copy the OLD user's
+    /// role and name onto it — and two concurrent polls could apply their
+    /// answers out of order or write the same `session_revoked` twice.
+    ///
+    /// The stamp is `(user_id, generation)` together. Either alone is
+    /// insufficient: the generation moves while the same person stays signed in
+    /// (a lock, a role adoption), and the user id repeats if the same person
+    /// signs out and back in. Both must still match, and the mutation happens
+    /// under the lock that checked them.
+    ///
+    /// Called from the status path only. Every authorized command already
+    /// re-reads the row, so putting this in the hot path would buy a query per
+    /// command for a guarantee already made — and the status call is what the
+    /// renderer polls, which is what makes the convergence bounded.
+    async fn reconcile(&self, pool: &SqlitePool) -> Result<SessionOutcome, String> {
+        // ---- capture -----------------------------------------------------
+        let Some(stamp) = ({
+            let guard = self.inner.lock().await;
+            guard.as_ref().map(|s| SessionStamp {
+                user_id: s.user_id.clone(),
+                // Read INSIDE the lock, so it cannot be a generation from
+                // before or after the session this stamp names.
+                generation: self.generation(),
+            })
+        }) else {
+            return Ok(SessionOutcome::Unchanged);
+        };
+
+        // ---- read, without the lock --------------------------------------
+        let row = sqlx::query(
+            "SELECT role, active, full_name, must_change_pin, pin_hash
+               FROM users WHERE id = ?",
+        )
+        .bind(&stamp.user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("cannot re-read the signed-in account: {e}"))?;
+
+        let fresh = match &row {
+            None => None,
+            Some(row) => {
+                let active = row.try_get::<i64, _>("active").unwrap_or(0) == 1;
+                let role_text: String = row
+                    .try_get("role")
+                    .map_err(|e| format!("cannot read the stored role: {e}"))?;
+                let full_name: String = row
+                    .try_get("full_name")
+                    .map_err(|e| format!("cannot read the stored name: {e}"))?;
+                Some((
+                    active,
+                    Role::from_db(&role_text)?,
+                    full_name,
+                    row.try_get::<i64, _>("must_change_pin").unwrap_or(0) == 1,
+                    credential_fingerprint(optional_text(row, "pin_hash")?.as_deref()),
+                ))
+            }
+        };
+
+        // ---- re-check and mutate, under one acquisition -------------------
+        let mut guard = self.inner.lock().await;
+        let superseded = match guard.as_ref() {
+            None => true,
+            Some(live) => {
+                live.user_id != stamp.user_id || self.generation() != stamp.generation
+            }
+        };
+        if superseded {
+            // Somebody signed out, signed in, locked, or a newer
+            // reconciliation already landed. Writing anything now would be
+            // writing an answer about a session that no longer exists.
+            return Ok(SessionOutcome::Unchanged);
+        }
+
+        let Some((active, role, full_name, must_change, fingerprint)) = fresh else {
+            *guard = None;
+            drop(guard);
+            self.bump();
+            return Ok(SessionOutcome::Revoked {
+                user_id: stamp.user_id,
+                why: "the account no longer exists",
+            });
+        };
+
+        if !active {
+            *guard = None;
+            drop(guard);
+            self.bump();
+            return Ok(SessionOutcome::Revoked {
+                user_id: stamp.user_id,
+                why: "the account was retired",
+            });
+        }
+
+        // THE CREDENTIAL CHECK COMES BEFORE ANY ROLE IS ADOPTED. Adopting first
+        // and checking after would be the defect itself, in a different order.
+        let session = guard.as_mut().expect("checked above");
+        if session.credential_fingerprint != fingerprint {
+            *guard = None;
+            drop(guard);
+            self.bump();
+            return Ok(SessionOutcome::Revoked {
+                user_id: stamp.user_id,
+                why: if fingerprint.is_none() {
+                    "the account's passphrase was cleared"
+                } else {
+                    "the account's passphrase was changed"
+                },
+            });
+        }
+
+        let changed = session.role != role
+            || session.full_name != full_name
+            || session.must_change_credential != must_change;
+        if !changed {
+            return Ok(SessionOutcome::Unchanged);
+        }
+        let was = session.role;
+        session.role = role;
+        session.full_name = full_name;
+        session.must_change_credential = must_change;
+        drop(guard);
+        // Exactly one bump. The renderer keys a refresh off the generation, so a
+        // role that moved has to look like a new session rather than the same
+        // one re-read.
+        self.bump();
+        Ok(SessionOutcome::Updated { was, now: role })
+    }
+
     async fn snapshot(&self) -> Option<SessionView> {
         let mut guard = self.inner.lock().await;
         let session = guard.as_mut()?;
@@ -446,6 +714,34 @@ impl SessionState {
     async fn clear(&self) {
         *self.inner.lock().await = None;
         self.bump();
+    }
+
+    /// THE LIVE SESSION NOW HOLDS THIS CREDENTIAL.
+    ///
+    /// Called by the two paths that legitimately replace the signed-in
+    /// person's OWN secret: `auth_change_credential` and `auth_recover_owner`.
+    /// Without it `reconcile` would compare the session's fingerprint against a
+    /// credential that the same operator deliberately replaced a moment ago,
+    /// find a mismatch, and sign them out — which for a cashier with a basket
+    /// open is a lost sale to fix a screen, and which would make the sensible
+    /// act of changing your passphrase the one thing a shift cannot survive.
+    ///
+    /// It is NOT a way around the revocation rule: it stamps the session with
+    /// the credential that the operator just proved and chose, from inside the
+    /// command that wrote it. A credential changed by anybody ELSE never reaches
+    /// here, and still ends the session.
+    ///
+    /// `must_change_credential` is cleared in the same breath, because the same
+    /// statement clears `must_change_pin` in the database and a prompt that
+    /// outlived the thing it asks for would keep asking.
+    async fn restamp_credential(&self, user_id: &str, pin_hash: &str) {
+        let mut guard = self.inner.lock().await;
+        if let Some(session) = guard.as_mut() {
+            if session.user_id == user_id {
+                session.credential_fingerprint = credential_fingerprint(Some(pin_hash));
+                session.must_change_credential = false;
+            }
+        }
     }
 
     async fn lock(&self) -> Result<(), String> {
@@ -582,6 +878,11 @@ impl SessionState {
             last_seen: Instant::now(),
             locked: false,
             must_change_credential: false,
+            // A test session opened without a database row behind it. `None`
+            // matches an account with no credential, so a reconciliation
+            // against such a row agrees rather than revoking; a test that wants
+            // the revocation path signs in properly, through `login_inner`.
+            credential_fingerprint: None,
             window_label: PRIMARY_WINDOW.to_string(),
         })
         .await;
@@ -751,6 +1052,43 @@ fn normalise_code(typed: &str) -> String {
 /// The project's canonical fixed-width UTC timestamp, for `authz` to stamp an
 /// audit row with. Exposed rather than duplicated: two timestamp formats in one
 /// table is how a lexicographic range query starts missing rows.
+/// The credential strength rule, for `users::set_user_credential_as` to apply
+/// when an owner sets somebody else's first passphrase.
+///
+/// Exposed rather than duplicated: a manager needs a passphrase and a cashier a
+/// six-character PIN, and two copies of that rule is how one of them comes to
+/// be the weaker.
+pub(crate) fn check_secret_strength_for_role(role: Role, secret: &str) -> Result<(), String> {
+    check_secret_strength(role, secret)
+}
+
+/// Hash a secret on an owner's behalf. Same Argon2id parameters as every other
+/// credential in the shop — there is one hasher and one policy.
+pub(crate) fn hash_secret_for_admin(secret: &str) -> Result<String, String> {
+    hash_secret(secret)
+}
+
+pub(crate) fn credential_version_for_admin() -> i64 {
+    CREDENTIAL_VERSION
+}
+
+/// `audit_tx` for the staff-administration commands.
+///
+/// A change to who may do what is the thing this gate establishes, so one that
+/// committed without a record would be the single change nobody could account
+/// for. Fails the transaction if the row cannot be written, exactly as the
+/// ownership-capture rows do.
+pub(crate) async fn audit_tx_for_users(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    store_id: &str,
+    event: &str,
+    user_id: Option<&str>,
+    actor_user_id: Option<&str>,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    audit_tx(tx, store_id, event, user_id, actor_user_id, detail).await
+}
+
 pub(crate) fn now_iso_for_audit() -> String {
     now_iso()
 }
@@ -1200,6 +1538,47 @@ pub(crate) async fn status_inner(
         enrollment_code_file = Some(ctx.code_file.display().to_string());
     }
 
+    // RECONCILE THE LIVE SESSION BEFORE REPORTING IT (independent review of
+    // Stage B.3). The role, the name and the must-change flag are cached from
+    // login and an owner can change all three underneath a signed-in person.
+    // Done here, in the call the renderer polls, so the screen converges within
+    // one poll interval instead of never.
+    match sessions.reconcile(pool).await? {
+        SessionOutcome::Unchanged => {}
+        SessionOutcome::Updated { was, now } => {
+            if was != now {
+                // A role change to a live session is a change in authority, and
+                // the one place it can be seen from is the log. The row for the
+                // administrative act itself is written by `users.rs`; this one
+                // records that a SESSION already in progress was affected.
+                audit(
+                    pool,
+                    &store_id,
+                    "role_changed",
+                    None,
+                    None,
+                    Some(&format!(
+                        "live session adopted {} -> {}",
+                        was.as_str(),
+                        now.as_str()
+                    )),
+                )
+                .await;
+            }
+        }
+        SessionOutcome::Revoked { user_id, why } => {
+            audit(
+                pool,
+                &store_id,
+                "session_revoked",
+                Some(&user_id),
+                None,
+                Some(why),
+            )
+            .await;
+        }
+    }
+
     let accounts = load_accounts(pool, &store_id).await?;
 
     Ok(AuthStatus {
@@ -1592,6 +1971,9 @@ pub(crate) async fn enroll_owner_inner(
             last_seen: Instant::now(),
             locked: false,
             must_change_credential: false,
+            // The credential this session is opened against is the one
+            // enrollment has just written, a few statements above.
+            credential_fingerprint: credential_fingerprint(Some(&credential_hash)),
             window_label: ctx.window_label.clone(),
         })
         .await;
@@ -1762,9 +2144,17 @@ pub(crate) async fn login_inner(
     }
 
     // Correct. Clear the counters and re-hash if the policy has moved on.
+    //
+    // THE SESSION RECORDS WHAT THE DATABASE ENDS UP HOLDING. A re-hash draws a
+    // new salt, so it changes the credential fingerprint; a session stamped
+    // with the OLD one would be revoked by the very next status poll, a few
+    // hundred milliseconds after a correct sign-in. The re-hash is also
+    // best-effort by design — a failure to write it leaves the old hash
+    // working — so the fingerprint follows the write, not the attempt.
+    let mut stored_hash = user.pin_hash.clone();
     if user.credential_version.unwrap_or(0) < CREDENTIAL_VERSION {
         if let Ok(fresh) = hash_secret(&secret) {
-            let _ = sqlx::query(
+            let written = sqlx::query(
                 "UPDATE users
                     SET pin_hash = ?, credential_algo = 'argon2id',
                         credential_version = ?, credential_set_at = ?
@@ -1776,6 +2166,9 @@ pub(crate) async fn login_inner(
             .bind(&user.id)
             .execute(pool)
             .await;
+            if written.is_ok() {
+                stored_hash = Some(fresh);
+            }
         }
     }
 
@@ -1795,6 +2188,7 @@ pub(crate) async fn login_inner(
             last_seen: Instant::now(),
             locked: false,
             must_change_credential: user.must_change_pin,
+            credential_fingerprint: credential_fingerprint(stored_hash.as_deref()),
             window_label: ctx.window_label.clone(),
         })
         .await;
@@ -2022,6 +2416,11 @@ pub(crate) async fn change_credential_inner(
         None,
     )
     .await;
+
+    // The session continues, on the NEW credential. Written before
+    // `status_inner`, which reconciles: the order is what keeps the operator
+    // signed in through their own change.
+    sessions.restamp_credential(&user.id, &hash).await;
 
     sessions.unlock(false).await?;
     status_inner(ctx, sessions).await
@@ -2322,5 +2721,8 @@ pub(crate) mod testing {
     }
     pub(crate) fn min_passphrase_len() -> usize {
         MIN_PASSPHRASE_LEN
+    }
+    pub(crate) fn fingerprint(pin_hash: Option<&str>) -> Option<String> {
+        credential_fingerprint(pin_hash)
     }
 }

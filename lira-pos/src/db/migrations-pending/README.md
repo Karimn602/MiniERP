@@ -11,7 +11,7 @@ that folder.
 Moving a file out of here is therefore the deliberate act of adopting it, and it
 means doing the work its adoption requires in the same change.
 
-## 024_actor_required.sql
+## 025_actor_required.sql
 
 **What it is.** `BEFORE INSERT` triggers requiring every new financial document
 — sale, credit memo, purchase, supplier ledger entry, driver ledger entry,
@@ -34,12 +34,12 @@ make a suite pass.
 about.** The application already takes every actor from the authenticated session
 and refuses a request naming anybody else (`authz::attribute`). That is proven
 against a real database by `src-tauri/src/tests/actor_attribution.rs`, including
-a structural guard that no actor column anywhere is written from a request. 024
+a structural guard that no actor column anywhere is written from a request. 025
 is defence in depth against a future writer, not a fix for a present hole.
 
 **To adopt it:**
 
-1. Move it to `../migrations/024_actor_required.sql`.
+1. Move it to `../migrations/025_actor_required.sql`.
 2. Register it in `src-tauri/src/lib.rs::migrations()` as version 24,
    description `actor_required` — the commented-out block is already there.
 3. Give every fixture that inserts into one of the seven tables an actor. Start
@@ -52,7 +52,7 @@ is defence in depth against a future writer, not a fix for a present hole.
    `tests/integration/`.
 4. Use the seeded owner `00000000-0000-0000-0000-000000000002` unless the test
    is about a specific person.
-5. Add the upgrade tests 024 deserves and does not yet have: a populated v23
+5. Add the upgrade tests 025 deserves and does not yet have: a populated v23
    database migrates cleanly; a historical NULL actor survives and still
    replays; a new document naming nobody, an inactive user, or another store's
    user is refused; and the one-way-door property is recorded (a pre-Stage-B

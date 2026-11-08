@@ -43,3 +43,5 @@ mod actor_attribution;
 mod auth_schema;
 mod auth_session;
 mod startup_gate;
+mod user_admin;
+mod audit_vocabulary;

@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { SandboxBanner } from "./components/SandboxBanner";
 import { LockScreen } from "./components/LockScreen";
+import { RequireRole } from "./components/RequireRole";
 import { IS_SANDBOX } from "./lib/appMode";
 import { adoptSessionContext, clearActiveContext } from "./state/activeContext";
 import { useSession } from "./state/session";
@@ -27,6 +28,7 @@ import LocalReports from "./pages/LocalReports";
 import ManagerDashboard from "./pages/ManagerDashboard";
 import DevProbe from "./pages/_Dev";
 import SupplierDetail from "./pages/SupplierDetail";
+import Users from "./pages/Users";
 
 /** Window title for the training build. Kept in step with the `app.windows[0].title`
  *  in `src-tauri/tauri.sandbox.conf.json`; this one also covers `npm run dev:sandbox`
@@ -132,22 +134,107 @@ export default function App() {
             <BrowserRouter>
               <Routes>
                 <Route element={<AppShell />}>
+                  {/* GUARDED BY ROLE — Gate 2B, Stage B.3. The rail already
+                      hides what a role is not offered; this stops the screen
+                      being MOUNTED, which is what matters for the ones that
+                      read costs and margins. Neither is the control: every
+                      write is authorized in Rust, twice, against the role on
+                      that user's own row. The register and the shift are
+                      unguarded because every role has them. */}
                   <Route index element={<PosRegister />} />
-
-                  <Route path="products" element={<Products />} />
-                  <Route path="inventory" element={<Inventory />} />
-                  <Route path="purchases" element={<Purchases />} />
-
-                  <Route path="suppliers" element={<Suppliers />} />
-                  <Route path="drivers" element={<Drivers />} />
-                  <Route path="suppliers/:id" element={<SupplierDetail />} />
-
-                  <Route path="exchange-rate" element={<ExchangeRate />} />
                   <Route path="shift" element={<ShiftSummary />} />
-                  <Route path="sales" element={<SalesHistory />} />
-                  <Route path="returns" element={<Returns />} />
-                  <Route path="reports" element={<LocalReports />} />
-                  <Route path="manager" element={<ManagerDashboard />} />
+                  <Route path="drivers" element={<Drivers />} />
+
+                  <Route
+                    path="products"
+                    element={
+                      <RequireRole screen="products">
+                        <Products />
+                      </RequireRole>
+                    }
+                  />
+                  <Route
+                    path="inventory"
+                    element={
+                      <RequireRole screen="inventory">
+                        <Inventory />
+                      </RequireRole>
+                    }
+                  />
+                  <Route
+                    path="purchases"
+                    element={
+                      <RequireRole screen="purchases">
+                        <Purchases />
+                      </RequireRole>
+                    }
+                  />
+
+                  <Route
+                    path="suppliers"
+                    element={
+                      <RequireRole screen="suppliers">
+                        <Suppliers />
+                      </RequireRole>
+                    }
+                  />
+                  <Route
+                    path="suppliers/:id"
+                    element={
+                      <RequireRole screen="suppliers">
+                        <SupplierDetail />
+                      </RequireRole>
+                    }
+                  />
+
+                  <Route
+                    path="exchange-rate"
+                    element={
+                      <RequireRole screen="exchangeRate">
+                        <ExchangeRate />
+                      </RequireRole>
+                    }
+                  />
+                  <Route
+                    path="sales"
+                    element={
+                      <RequireRole screen="sales">
+                        <SalesHistory />
+                      </RequireRole>
+                    }
+                  />
+                  <Route
+                    path="returns"
+                    element={
+                      <RequireRole screen="returns">
+                        <Returns />
+                      </RequireRole>
+                    }
+                  />
+                  <Route
+                    path="reports"
+                    element={
+                      <RequireRole screen="reports">
+                        <LocalReports />
+                      </RequireRole>
+                    }
+                  />
+                  <Route
+                    path="manager"
+                    element={
+                      <RequireRole screen="manager">
+                        <ManagerDashboard />
+                      </RequireRole>
+                    }
+                  />
+                  <Route
+                    path="users"
+                    element={
+                      <RequireRole screen="users">
+                        <Users />
+                      </RequireRole>
+                    }
+                  />
 
                   {import.meta.env.DEV && <Route path="_dev" element={<DevProbe />} />}
 

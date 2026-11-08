@@ -126,12 +126,22 @@ export default function Login({ onRecover }: { onRecover: () => void }) {
           </div>
 
           {/* Why a listed account cannot be used, said plainly rather than by
-              a greyed-out row the operator has to interpret. */}
+              a greyed-out row the operator has to interpret.
+
+              THE SECOND BRANCH IS KEYED ON THE FLAG ITSELF, not on the absence
+              of the first reason. Stage B.3 set `LOGIN_RESTRICTED_TO_OWNER` to
+              false, so `canSignIn` is now simply "has a credential", and the
+              owner-only sentence describes a build this no longer is. Keying it
+              on `loginRestrictedToOwner` means the copy can only appear while
+              it is true — and if a future reason to refuse an account arrives,
+              it gets its own sentence rather than inheriting this one. */}
           {selected && !selected.canSignIn ? (
             <div className="rounded-chip border border-line bg-paper p-3 text-xs leading-relaxed text-fg-muted">
               {!selected.hasCredential
                 ? t("auth.noCredentialYet")
-                : t("auth.ownerOnlyStage")}
+                : status?.loginRestrictedToOwner
+                  ? t("auth.ownerOnlyStage")
+                  : t("auth.cannotSignInUnexplained")}
             </div>
           ) : null}
         </div>

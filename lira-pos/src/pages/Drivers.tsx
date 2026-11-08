@@ -55,6 +55,8 @@ import {
   upsertAttempt,
 } from "../lib/remittanceStore";
 import { useTranslation } from "../lib/i18n";
+import { canDo } from "../lib/permissions";
+import { useActiveUser } from "../state/session";
 import clsx from "clsx";
 import { describeBackendError } from "../lib/backendError";
 
@@ -65,6 +67,20 @@ export default function Drivers() {
   const { t } = useTranslation();
 
   const [tab, setTab] = useState<Tab>("balances");
+
+  /**
+   * TAKING A HAND-OVER IS A CASHIER'S JOB; THE DRIVER RECORDS ARE NOT.
+   * Gate 2B, Stage B.3, round 2.
+   *
+   * `DriverRemittance` is a cashier's in the matrix — the driver walks up to the
+   * till with the food money and the person at the till takes it. `DriverSave`
+   * and `DriverLedgerAdjustment` are a manager's. So the screen is offered to
+   * everybody and the second tab is not: a cashier shown Add driver would be
+   * invited into a form whose Save is refused, and an adjustment is a
+   * hand-written movement of a balance.
+   */
+  const mayAdministerDrivers = canDo(useActiveUser()?.role, "driverAdmin");
+  const shownTab: Tab = mayAdministerDrivers ? tab : "balances";
   const [people, setPeople] = useState<Driver[]>([]);
   const [balances, setBalances] = useState<DriverBalance[]>([]);
   const [rate, setRate] = useState<ExchangeRate | null>(null);
@@ -491,26 +507,30 @@ export default function Drivers() {
         </Card>
       )}
 
-      <div role="tablist" aria-label={t("drivers.title")} className="flex gap-2">
-        <Button
-          role="tab"
-          aria-selected={tab === "balances"}
-          variant={tab === "balances" ? "primary" : "ghost"}
-          onClick={() => setTab("balances")}
-        >
-          {t("drivers.tabBalances")}
-        </Button>
-        <Button
-          role="tab"
-          aria-selected={tab === "people"}
-          variant={tab === "people" ? "primary" : "ghost"}
-          onClick={() => setTab("people")}
-        >
-          {t("drivers.tabPeople")}
-        </Button>
-      </div>
+      {/* A cashier gets no tab strip at all, because they have one tab. A
+          tablist with a single tab is a label pretending to be a control. */}
+      {mayAdministerDrivers && (
+        <div role="tablist" aria-label={t("drivers.title")} className="flex gap-2">
+          <Button
+            role="tab"
+            aria-selected={shownTab === "balances"}
+            variant={shownTab === "balances" ? "primary" : "ghost"}
+            onClick={() => setTab("balances")}
+          >
+            {t("drivers.tabBalances")}
+          </Button>
+          <Button
+            role="tab"
+            aria-selected={shownTab === "people"}
+            variant={shownTab === "people" ? "primary" : "ghost"}
+            onClick={() => setTab("people")}
+          >
+            {t("drivers.tabPeople")}
+          </Button>
+        </div>
+      )}
 
-      {tab === "balances" && (
+      {shownTab === "balances" && (
         <Card>
           <CardHeader
             title={t("drivers.outstandingTitle")}
@@ -623,7 +643,7 @@ export default function Drivers() {
         </Card>
       )}
 
-      {tab === "people" && (
+      {shownTab === "people" && (
         <Card>
           <CardHeader
             title={t("drivers.peopleTitle")}

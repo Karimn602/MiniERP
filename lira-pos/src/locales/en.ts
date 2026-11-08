@@ -15,6 +15,7 @@ const en = {
     groupFrontOfHouse: "Front of house",
     groupMenuAndStock: "Menu & stock",
     groupBackOffice: "Back office",
+    users: "Users",
   },
   backendErrors: {
     EXCHANGE_RATE_MUST_BE_POSITIVE: "The rate must be a whole number greater than zero.",
@@ -58,6 +59,8 @@ const en = {
     close: "Close",
     total: "Total",
     dismiss: "Dismiss",
+    saving: "Saving…",
+    actions: "Actions",
   },
   // --- Menu sections (WP-3). Ids are stable and stored; these are labels. ---
   menuCategory: {
@@ -516,6 +519,7 @@ const en = {
     closing: "Closing…",
     closingFieldsOptional:
       "Closing counted cash fields are optional — leave blank to record $0 / L.L. 0 and close with variance.",
+    closeNotYours: "Somebody else opened this shift. Only a manager or the owner can close another operator’s shift — ask one of them, or have the person who opened it close it.",
 
     cashRefunded: "Cash refunded",
 
@@ -720,6 +724,7 @@ const en = {
 
   products: {
     costingSection: "Costing",
+    costOwnerOnly: "Only the owner can set a manual cost or change how this item is costed. You can see the figure; changing these two is refused. A recipe-costed item’s cost does move when its recipe is republished, which a manager may do.",
     costingMethodLabel: "How is this item costed?",
     manualCostLabel: "Cost per unit, excluding VAT",
     manualCostHint:
@@ -1541,6 +1546,7 @@ const en = {
     forgotPassphrase: "I have forgotten the owner passphrase",
     noCredentialYet: "This account has no passphrase yet. The owner sets one before it can be used.",
     ownerOnlyStage: "This version of Greaz can only be used by the owner. Staff accounts will work once role permissions are switched on \u2014 until then there is nothing stopping a staff account doing everything the owner can, so they are not allowed to sign in.",
+    cannotSignInUnexplained: "This account cannot be signed into. Ask the owner to check it on the Users screen.",
     windowsAccountNote: "A passphrase protects Greaz, not the data on this computer. Give the till its own Windows account with its own password, and let nobody else sign in to Windows here.",
     role: {
       owner: "Owner",
@@ -1593,6 +1599,46 @@ const en = {
     signOutLosesScreen: "Only if the person who locked it has gone. Signing out clears what is on screen.",
     lockNow: "Lock",
     signOut: "Sign out",
+  },
+  users: {
+    title: "Users",
+    subtitle: "Who works here, what they may do, and whether they can sign in yet.",
+    addStaff: "Add a member of staff",
+    editStaff: "Change this member of staff",
+    newHasNoPassphrase: "A new account has no passphrase. You set one afterwards, and they change it once they are in.",
+    fullName: "Name",
+    fullNameHint: "The name that appears on their shift report and against every sale they ring.",
+    role: "Role",
+    roleExplainer: {
+      owner: "Everything, including costs, margins, the menu's prices and this screen.",
+      manager: "Refunds, stock counts, the menu, deliveries, suppliers, the rate, recipes, and the reports including costs and margins. They cannot set an item’s manual cost or change how it is costed, and cannot manage staff accounts. Note that publishing a recipe does change what a recipe-costed item costs from the next sale onwards.",
+      cashier: "Sell, open and close their own shift, and take a driver's hand-over. No refunds, no stock counts, no reports.",
+    },
+    whoWorksHere: "Who works here",
+    listNote: "Retiring somebody stops them using the till. Nothing they have done is removed — their name stays on every sale, shift and correction they made.",
+    nobodyYet: "Nobody has been added yet.",
+    canSignIn: "Can sign in",
+    you: "(you)",
+    yes: "Yes",
+    retired: "Retired",
+    noPassphraseYet: "No passphrase yet",
+    mustChange: "Must change passphrase",
+    retire: "Retire",
+    bringBack: "Bring back",
+    setPassphrase: "Set passphrase",
+    resetPassphrase: "Reset passphrase",
+    setPassphraseFor: "Set a passphrase for {{name}}",
+    resetPassphraseFor: "Reset {{name}}'s passphrase",
+    givePassphrase: "Give them this passphrase",
+    temporaryByConstruction: "You will know this passphrase, because you are about to tell them it — so Greaz asks them to change it once they are in.",
+    pinHint: "At least 6 characters. A cashier types this many times a day at the till.",
+    cannotRetireYourself: "You cannot retire the account you are signed in to.",
+    cannotRetireLastOwner: "This is the shop's only active owner. Make somebody else an owner first.",
+    created: "Added.",
+    saved: "Saved.",
+    credentialSet: "Passphrase set. Tell them to change it once they are in.",
+    retiredNotice: "{{name}} can no longer use the till. Everything they have done is still recorded.",
+    broughtBackNotice: "{{name}} can use the till again.",
   },
   managerDashboard: {
     title: "Manager Dashboard",

@@ -13,6 +13,7 @@ mod read_guard;
 mod recipe_cost;
 mod recipe_sale_cost;
 mod recipes;
+mod users;
 use posting::DbState;
 use read_api::ReadPool;
 
@@ -166,9 +167,15 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/023_authentication.sql"),
             kind: MigrationKind::Up,
         },
-        // MIGRATION 024 IS WRITTEN BUT NOT YET REGISTERED.
+        Migration {
+            version: 24,
+            description: "audit_vocabulary",
+            sql: include_str!("../../src/db/migrations/024_audit_vocabulary.sql"),
+            kind: MigrationKind::Up,
+        },
+        // MIGRATION 025 IS WRITTEN BUT NOT YET REGISTERED.
         //
-        // `src/db/migrations-pending/024_actor_required.sql` exists and is
+        // `src/db/migrations-pending/025_actor_required.sql` exists and is
         // complete: BEFORE INSERT triggers requiring every new financial
         // document to name an active user of its own store. It is the
         // ENGINE's half of Stage B.2's attribution rule, for a writer that
@@ -190,6 +197,14 @@ pub(crate) fn migrations() -> Vec<Migration> {
         // and a structural guard proving no actor column is written from
         // a request. 024 adds defence in depth against a FUTURE writer,
         // not a fix for a present hole.
+        //
+        // It was numbered 024 until Stage B.3's round-2 corrections needed
+        // 024 for the `auth_audit` vocabulary, which could not wait: the
+        // commands that write those events shipped in the same change. A
+        // pending file's number is free to move precisely because no database
+        // has recorded its checksum, and sqlx refuses a migration arriving
+        // BELOW the highest version a database already holds — so leaving a gap
+        // at 024 and filling it later was never an option.
         //
         // See that directory's README for the exact adoption steps, and
         // dev/AUTONOMOUS-COMPLETION-LEDGER.md for where it sits in the plan.
@@ -307,6 +322,13 @@ pub fn run() {
             auth::auth_touch,
             auth::auth_change_credential,
             auth::auth_recover_owner,
+            // Gate 2B Stage B.3 - staff administration, owner-only. Until these
+            // existed a staff account had no credential and no way to acquire
+            // one, which is why LOGIN_RESTRICTED_TO_OWNER could not be lifted.
+            users::users_list,
+            users::users_save,
+            users::users_set_active,
+            users::users_set_credential,
         ])
         .setup(|app| {
             // MANDATORY DATABASE VALIDATION, AND IT FAILS CLOSED.

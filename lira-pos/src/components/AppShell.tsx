@@ -8,6 +8,8 @@ import { SandboxBanner } from "./SandboxBanner";
 import { SessionBadge } from "./SessionBadge";
 import { IS_SANDBOX } from "../lib/appMode";
 import { useOnline } from "../lib/network";
+import { canSee } from "../lib/permissions";
+import { useActiveUser } from "../state/session";
 import { useLowStockCount } from "../state/lowStockBadge";
 import { useTranslation } from "../lib/i18n";
 
@@ -43,6 +45,7 @@ const icons = {
   returns: <Icon d="M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12H7" />,
   reports: <Icon d="M5 21V8m0 13h14M5 21H3m16 0V4m0 17h2M12 21v-9" />,
   manager: <Icon d="M3 13l9-9 9 9M5 11v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8M9 21v-6h6v6" />,
+  users: <Icon d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm13 10v-2a4 4 0 0 0-3-3.87M16 3.13A4 4 0 0 1 16 11" />,
 };
 
 /** Section label inside the rail. Quiet by design — it orients, it does not
@@ -59,6 +62,21 @@ export function AppShell() {
   const online = useOnline();
   const lowCount = useLowStockCount();
   const { t } = useTranslation();
+
+  // THE RAIL IS FILTERED BY ROLE — Gate 2B, Stage B.3.
+  //
+  // Presentation, not a control: `authz.rs` refuses a cashier a refund, a stock
+  // count, a reprice and an exchange rate whatever this rail shows, twice over,
+  // against the role on their own `users` row. What this changes is that a
+  // cashier is offered three screens that all work instead of eleven of which
+  // eight refuse them — and the refusal is what they would otherwise ring the
+  // owner about at eight in the evening.
+  //
+  // `useActiveUser()` is null while LOCKED, which is correct here: the lock is
+  // an overlay over a mounted router, and a locked till should not be
+  // advertising the office screens behind the glass.
+  const role = useActiveUser()?.role ?? null;
+  const show = (screen: Parameters<typeof canSee>[1]) => canSee(role, screen);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-page">
@@ -98,11 +116,29 @@ export function AppShell() {
             of house" is the till; everything below it is the office. */}
         <nav className="flex-1 space-y-1 overflow-y-auto py-3">
           <NavGroupLabel>{t("nav.groupFrontOfHouse")}</NavGroupLabel>
-          <NavLink to="/" icon={icons.register}>{t("nav.posRegister")}</NavLink>
-          <NavLink to="/shift" icon={icons.shift}>{t("nav.shiftSummary")}</NavLink>
+          {show("register") && (
+            <NavLink to="/" icon={icons.register}>{t("nav.posRegister")}</NavLink>
+          )}
+          {show("shift") && (
+            <NavLink to="/shift" icon={icons.shift}>{t("nav.shiftSummary")}</NavLink>
+          )}
+          {/* Drivers is front of house for a cashier: taking the hand-over is
+              their job (`DriverRemittance` is theirs in the matrix), while
+              adding a driver and adjusting a balance are not and the screen
+              refuses those itself. It is listed here for a cashier and left in
+              its usual place for everybody else, so a manager's rail does not
+              move about. */}
+          {role === "cashier" && show("drivers") && (
+            <NavLink to="/drivers" icon={icons.drivers}>{t("nav.drivers")}</NavLink>
+          )}
 
-          <NavGroupLabel>{t("nav.groupMenuAndStock")}</NavGroupLabel>
-          <NavLink to="/products" icon={icons.products}>{t("nav.products")}</NavLink>
+          {(show("products") || show("inventory") || show("purchases")) && (
+            <NavGroupLabel>{t("nav.groupMenuAndStock")}</NavGroupLabel>
+          )}
+          {show("products") && (
+            <NavLink to="/products" icon={icons.products}>{t("nav.products")}</NavLink>
+          )}
+          {show("inventory") && (
           <NavLink to="/inventory" icon={icons.inventory}>
             <span className="flex items-center justify-between">
               <span>{t("nav.inventory")}</span>
@@ -113,20 +149,47 @@ export function AppShell() {
               )}
             </span>
           </NavLink>
-          <NavLink to="/purchases" icon={icons.purchases}>{t("nav.purchases")}</NavLink>
-          <NavLink to="/suppliers" icon={icons.suppliers}>{t("nav.suppliers")}</NavLink>
+          )}
+          {show("purchases") && (
+            <NavLink to="/purchases" icon={icons.purchases}>{t("nav.purchases")}</NavLink>
+          )}
+          {show("suppliers") && (
+            <NavLink to="/suppliers" icon={icons.suppliers}>{t("nav.suppliers")}</NavLink>
+          )}
           {/* Drivers sits beside Suppliers: both are counterparties the shop
               runs a running balance with, one owed to and one owed by. */}
-          <NavLink to="/drivers" icon={icons.drivers}>{t("nav.drivers")}</NavLink>
+          {role !== "cashier" && show("drivers") && (
+            <NavLink to="/drivers" icon={icons.drivers}>{t("nav.drivers")}</NavLink>
+          )}
 
-          <NavGroupLabel>{t("nav.groupBackOffice")}</NavGroupLabel>
-          <NavLink to="/sales" icon={icons.sales}>{t("nav.salesHistory")}</NavLink>
-          <NavLink to="/returns" icon={icons.returns}>{t("nav.returns")}</NavLink>
-          <NavLink to="/reports" icon={icons.reports}>{t("nav.localReports")}</NavLink>
-          <NavLink to="/exchange-rate" icon={icons.rate}>{t("nav.exchangeRate")}</NavLink>
-          <NavLink to="/manager" icon={icons.manager} disabled={!online}>
-            {t("nav.managerDashboard")} {online ? "" : "🔒"}
-          </NavLink>
+          {(show("sales") ||
+            show("returns") ||
+            show("reports") ||
+            show("exchangeRate") ||
+            show("manager") ||
+            show("users")) && (
+            <NavGroupLabel>{t("nav.groupBackOffice")}</NavGroupLabel>
+          )}
+          {show("sales") && (
+            <NavLink to="/sales" icon={icons.sales}>{t("nav.salesHistory")}</NavLink>
+          )}
+          {show("returns") && (
+            <NavLink to="/returns" icon={icons.returns}>{t("nav.returns")}</NavLink>
+          )}
+          {show("reports") && (
+            <NavLink to="/reports" icon={icons.reports}>{t("nav.localReports")}</NavLink>
+          )}
+          {show("exchangeRate") && (
+            <NavLink to="/exchange-rate" icon={icons.rate}>{t("nav.exchangeRate")}</NavLink>
+          )}
+          {show("manager") && (
+            <NavLink to="/manager" icon={icons.manager} disabled={!online}>
+              {t("nav.managerDashboard")} {online ? "" : "🔒"}
+            </NavLink>
+          )}
+          {show("users") && (
+            <NavLink to="/users" icon={icons.users}>{t("nav.users")}</NavLink>
+          )}
           {import.meta.env.DEV && <NavLink to="/_dev">🔧 Dev probe</NavLink>}
         </nav>
 

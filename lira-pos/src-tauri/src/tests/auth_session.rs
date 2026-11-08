@@ -765,64 +765,97 @@ async fn a_user_switch_requires_a_deliberate_logout() {
     db.cleanup().await.expect("remove TempDb");
 }
 
-/// Stage A.1's release boundary: only the owner may sign in.
+/// STAFF MAY NOW SIGN IN, and they sign in AS THEMSELVES.
+///
+/// This test is the reversal of `a_manager_or_cashier_cannot_sign_in_in_this_stage`,
+/// which was correct for Stages A.1 through B.2 and is correct no longer. The
+/// restriction existed because a role that decides nothing is not a permission,
+/// so a staff login would have been an account with owner powers under somebody
+/// else's name — worse than no staff account, because it creates the belief
+/// that a cashier cannot refund.
+///
+/// Three things had to become true, and this asserts the consequence of all
+/// three: the roles decide something (`tests::authorization`), the attribution
+/// is trustworthy (`tests::actor_attribution`), and a staff account can be
+/// given a credential (`tests::user_admin`).
 #[tokio::test]
-async fn a_manager_or_cashier_cannot_sign_in_in_this_stage() {
+async fn staff_can_sign_in_and_their_session_carries_their_own_role() {
     let db = TempDb::new().await;
     let scratch = Scratch::new();
     let sessions = enrolled(&db, &scratch).await;
     let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
     logout_inner(&ctx, &sessions).await.expect("logout");
 
-    // Give a manager and a cashier real credentials, so the refusal is about
-    // the ROLE and not about a missing passphrase.
     let hash = testing::hash(GOOD_PASSPHRASE);
-    for (id, name, role) in [
-        ("mgr-1", "Mona", "manager"),
-        ("csh-1", "Sami", "cashier"),
+    for (id, name, stored_role, expected) in [
+        ("mgr-1", "Mona", "manager", Role::Manager),
+        ("csh-1", "Sami", "cashier", Role::Cashier),
     ] {
         db.exec(&format!(
             "INSERT INTO users (id, store_id, full_name, role, pin_hash,
                                 credential_algo, credential_version, credential_set_at)
-             VALUES ('{id}', '{STORE}', '{name}', '{role}', '{hash}',
+             VALUES ('{id}', '{STORE}', '{name}', '{stored_role}', '{hash}',
                      'argon2id', 1, '2026-11-08T00:00:00.000Z')"
         ))
         .await;
 
-        let refused = login_inner(&ctx, &sessions, id.to_string(), GOOD_PASSPHRASE.to_string())
+        let status = login_inner(&ctx, &sessions, id.to_string(), GOOD_PASSPHRASE.to_string())
             .await
-            .expect_err("only the owner may sign in at this stage");
-        assert!(
-            refused.contains("only be used by the owner"),
-            "the refusal must explain the stage boundary: {refused}"
+            .unwrap_or_else(|e| panic!("{name} should be able to sign in: {e}"));
+
+        let session = status.session.expect("a session");
+        assert_eq!(session.user_id, id);
+        assert_eq!(
+            session.role, expected,
+            "the session must carry {name}'s OWN role, not the owner's"
         );
+        assert!(!status.login_restricted_to_owner);
+
+        logout_inner(&ctx, &sessions).await.expect("logout");
     }
 
-    // The status says so, so the screen can explain it rather than looking
-    // broken.
+    // An account with NO credential still cannot sign in, and is marked as
+    // such — that is a different refusal from the role one and it has to stay.
+    db.exec(&format!(
+        "INSERT INTO users (id, store_id, full_name, role)
+         VALUES ('csh-2', '{STORE}', 'Rami', 'cashier')"
+    ))
+    .await;
     let status = status_inner(&ctx, &sessions).await.expect("status");
-    assert!(status.login_restricted_to_owner);
+    let unset = status
+        .accounts
+        .iter()
+        .find(|a| a.user_id == "csh-2")
+        .expect("the new cashier is listed");
+    assert!(!unset.has_credential);
+    assert!(
+        !unset.can_sign_in,
+        "an account with no passphrase cannot sign in, whatever its role"
+    );
+    let refused = login_inner(&ctx, &sessions, "csh-2".to_string(), GOOD_PASSPHRASE.to_string())
+        .await
+        .expect_err("no passphrase, no sign-in");
+    assert!(refused.contains("no passphrase yet"), "{refused}");
+
+    // And every account WITH a credential is now offered.
     for account in &status.accounts {
-        if account.role == Role::Owner {
-            assert!(account.can_sign_in, "the owner can sign in");
-        } else {
+        if account.has_credential {
             assert!(
-                !account.can_sign_in,
-                "{:?} must be marked unusable in this stage",
+                account.can_sign_in,
+                "{:?} has a passphrase and must be able to sign in",
                 account.role
             );
         }
     }
 
-    // The owner still can.
-    login_inner(
-        &ctx,
-        &sessions,
-        OWNER.to_string(),
-        GOOD_PASSPHRASE.to_string(),
-    )
-    .await
-    .expect("the owner signs in");
+    // A retired account cannot sign in either, whatever its role or
+    // credential — the one refusal that must survive lifting the restriction,
+    // because retiring somebody is how a shop stops them using the till.
+    db.exec("UPDATE users SET active = 0 WHERE id = 'csh-1'").await;
+    let refused = login_inner(&ctx, &sessions, "csh-1".to_string(), GOOD_PASSPHRASE.to_string())
+        .await
+        .expect_err("a retired account cannot sign in");
+    assert!(refused.contains("not right"), "{refused}");
 
     db.cleanup().await.expect("remove TempDb");
 }
@@ -2020,4 +2053,547 @@ async fn a_sql_null_text_column_decodes_as_an_empty_string_not_an_error() {
     );
 
     db.cleanup().await.expect("remove TempDb");
+}
+
+// ===========================================================================
+// The live session against its own row (Stage B.3, round 2)
+// ===========================================================================
+
+/// A ROLE CHANGED UNDERNEATH A SIGNED-IN SESSION IS ADOPTED, within one status
+/// call.
+///
+/// Found by an independent review of Stage B.3. The session caches the role as
+/// it was AT LOGIN. Writes were never at risk — `authz::stored_identity`
+/// re-reads the row inside every authorization, so a demoted manager is refused
+/// a refund on their next attempt — but the RAIL and the ROUTE GUARD read the
+/// cached role, and the read channel is not role-gated until Stage C. So a
+/// self-demoted owner kept the owner's screens indefinitely, and those screens
+/// still answered.
+///
+/// `lib/permissions.ts` claims the staleness is bounded by one poll interval.
+/// This is the assertion that makes the claim true.
+#[tokio::test]
+async fn a_role_changed_underneath_a_session_is_adopted_by_the_next_status() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    let before = status_inner(&ctx, &sessions).await.expect("status");
+    let session = before.session.expect("signed in");
+    assert_eq!(session.role, Role::Owner);
+    assert_eq!(session.full_name, "Owner");
+    let generation_before = before.session_generation;
+
+    // The owner's row changes underneath them. Done directly rather than
+    // through `users_save_as`, because what is under test is the session's
+    // reaction to the ROW, whatever wrote it.
+    db.exec(&format!(
+        "UPDATE users SET role = 'manager', full_name = 'Former Owner' WHERE id = '{OWNER}'"
+    ))
+    .await;
+
+    let after = status_inner(&ctx, &sessions).await.expect("status");
+    let session = after.session.expect("still signed in");
+    assert_eq!(
+        session.role,
+        Role::Manager,
+        "the status must report the role the DATABASE holds, not the one login cached"
+    );
+    assert_eq!(session.full_name, "Former Owner");
+    assert!(
+        after.session_generation > generation_before,
+        "the renderer keys a refresh off the generation, so a role that moved \
+         has to look like a new session"
+    );
+
+    // STILL SIGNED IN. A demotion is not a sign-out: the person is still at the
+    // till, with a cart and an open shift, and throwing those away over a role
+    // change would cost a sale to fix a screen.
+    assert!(!session.locked);
+
+    // And it is in the log, because a change of authority to a session already
+    // in progress is visible from nowhere else.
+    assert_eq!(
+        db.count(
+            "SELECT count(*) AS n FROM auth_audit
+              WHERE event = 'role_changed' AND detail LIKE '%live session adopted%'"
+        )
+        .await,
+        1
+    );
+
+    // IDEMPOTENT. A second status call with nothing changed writes no second
+    // row and does not bump the generation again, so the renderer is not told
+    // the session is new on every poll.
+    let generation_after = after.session_generation;
+    let again = status_inner(&ctx, &sessions).await.expect("status");
+    assert_eq!(again.session_generation, generation_after);
+    assert_eq!(
+        db.count(
+            "SELECT count(*) AS n FROM auth_audit
+              WHERE event = 'role_changed' AND detail LIKE '%live session adopted%'"
+        )
+        .await,
+        1
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A RETIRED ACCOUNT'S LIVE SESSION IS ENDED, not locked.
+///
+/// Locking invites the same person to unlock it and there is nothing left to
+/// unlock into: `stored_identity` refuses a retired account at every command,
+/// so a locked session would be a screen asking for a passphrase that cannot
+/// work. Ending it puts the till back at the login screen, which is the truthful
+/// state — somebody else can sign in and keep trading.
+#[tokio::test]
+async fn a_retired_accounts_session_is_ended_by_the_next_status() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    assert!(status_inner(&ctx, &sessions)
+        .await
+        .expect("status")
+        .session
+        .is_some());
+
+    db.exec(&format!("UPDATE users SET active = 0 WHERE id = '{OWNER}'"))
+        .await;
+
+    let after = status_inner(&ctx, &sessions).await.expect("status");
+    assert!(
+        after.session.is_none(),
+        "a retired account must not keep a live session"
+    );
+
+    // RECORDED AS A REVOCATION, NOT A LOGOUT. Nobody chose it, and calling it a
+    // logout would claim the person signed out when their access was withdrawn
+    // while they were working. Migration 024 added the event for exactly this.
+    assert_eq!(
+        db.count(&format!(
+            "SELECT count(*) AS n FROM auth_audit
+              WHERE event = 'session_revoked' AND user_id = '{OWNER}'
+                AND detail = 'the account was retired'"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM auth_audit WHERE event = 'logout'")
+            .await,
+        0,
+        "and it must not be recorded as a logout"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A MUST-CHANGE FLAG SET BY AN OWNER'S RESET REACHES THE LIVE SESSION.
+///
+/// The flag is a prompt rather than a gate — blocking the till over a password
+/// change at eight in the morning is how a shop ends up sharing one account —
+/// but a prompt that only appears at the NEXT sign-in is a prompt that does not
+/// appear, because the person whose passphrase was just reset is very often the
+/// one standing there.
+#[tokio::test]
+async fn a_reset_flag_reaches_a_session_already_open() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    assert!(
+        !status_inner(&ctx, &sessions)
+            .await
+            .expect("status")
+            .session
+            .expect("signed in")
+            .must_change_credential
+    );
+
+    db.exec(&format!(
+        "UPDATE users SET must_change_pin = 1 WHERE id = '{OWNER}'"
+    ))
+    .await;
+
+    assert!(
+        status_inner(&ctx, &sessions)
+            .await
+            .expect("status")
+            .session
+            .expect("still signed in")
+            .must_change_credential,
+        "the prompt must follow the column"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// RECONCILIATION DOES NOT DEFER THE IDLE LOCK.
+///
+/// The one thing that could have gone wrong in adding a database read to the
+/// status path. `auth_touch` is the only place that defers the limit, and
+/// `latch_expiry` is the only place that evaluates it; a reconcile that wrote
+/// `last_seen` would have made the renderer's own fifteen-second poll an
+/// infinite session, which is the `auth_touch` defect of Stage A.1 arriving by
+/// another door.
+#[tokio::test]
+async fn reconciling_does_not_keep_an_idle_session_alive() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    // A role change, so the reconcile does its most invasive work.
+    db.exec(&format!(
+        "UPDATE users SET role = 'manager' WHERE id = '{OWNER}'"
+    ))
+    .await;
+
+    // Age the session past the idle limit, then ask for the status.
+    sessions.force_idle_for_tests().await;
+
+    let after = status_inner(&ctx, &sessions).await.expect("status");
+    let session = after.session.expect("a locked session is still a session");
+    assert!(
+        session.locked,
+        "the status must report the lock the clock has already caused"
+    );
+    assert_eq!(session.idle_seconds_remaining, 0);
+    // The role still came through: locking and reconciling are independent.
+    assert_eq!(session.role, Role::Manager);
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+// ===========================================================================
+// A changed credential ends the session (Stage B.3, round 3)
+// ===========================================================================
+
+/// A CREDENTIAL THAT HAS BEEN REPLACED OR CLEARED ENDS THE LIVE SESSION, and
+/// the role is never adopted first.
+///
+/// Independent review, round 2, and the most consequential of the three rounds.
+/// A promotion out of the cashier tier CLEARS the stored credential, because a
+/// six-digit PIN set under the cashier rule cannot be re-tested against the
+/// manager rule. But the live session held its role in memory, and `reconcile`
+/// adopted the new one — so the session that the weak PIN had opened became a
+/// manager's, which is exactly the condition clearing the credential existed to
+/// prevent. Sessions are process-local and there is no single-instance guard,
+/// so an owner in one instance can promote a cashier signed into another and
+/// never see it.
+///
+/// The ordering is the fix: the fingerprint is compared BEFORE any role is
+/// adopted. Checking after would be the same defect in a different order.
+#[tokio::test]
+async fn clearing_a_credential_ends_its_session_instead_of_elevating_it() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    assert_eq!(
+        status_inner(&ctx, &sessions)
+            .await
+            .expect("status")
+            .session
+            .expect("signed in")
+            .role,
+        Role::Owner
+    );
+
+    // The credential is cleared and the role raised in ONE statement, which is
+    // what `users_save_as` does on a promotion out of the cashier tier.
+    db.exec(&format!(
+        "UPDATE users
+            SET role = 'owner', pin_hash = NULL, credential_algo = NULL,
+                credential_version = NULL, credential_set_at = NULL
+          WHERE id = '{OWNER}'"
+    ))
+    .await;
+
+    let after = status_inner(&ctx, &sessions).await.expect("status");
+    assert!(
+        after.session.is_none(),
+        "a session whose credential has been cleared must END, not continue"
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT count(*) AS n FROM auth_audit
+              WHERE event = 'session_revoked' AND user_id = '{OWNER}'
+                AND detail = 'the account''s passphrase was cleared'"
+        ))
+        .await,
+        1,
+        "and the reason must say which of the four it was"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A RESET BY SOMEBODY ELSE ALSO ENDS IT.
+///
+/// The ordinary case, and the right behaviour for the reason the owner resets a
+/// passphrase at all: somebody has left, or a secret is suspected. Leaving
+/// their open session running on the old one would make the reset cosmetic for
+/// as long as the till stayed on.
+#[tokio::test]
+async fn replacing_a_credential_ends_the_session_it_opened() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    // A DIFFERENT hash of a DIFFERENT secret — a fresh salt, which is what the
+    // fingerprint keys on.
+    let replacement = testing::hash(OTHER_PASSPHRASE);
+    db.exec(&format!(
+        "UPDATE users
+            SET pin_hash = '{replacement}', credential_algo = 'argon2id',
+                credential_version = 1, credential_set_at = '2026-01-01T00:00:00.000Z'
+          WHERE id = '{OWNER}'"
+    ))
+    .await;
+
+    let after = status_inner(&ctx, &sessions).await.expect("status");
+    assert!(after.session.is_none(), "the old session must not survive");
+    assert_eq!(
+        db.count(&format!(
+            "SELECT count(*) AS n FROM auth_audit
+              WHERE event = 'session_revoked' AND user_id = '{OWNER}'
+                AND detail = 'the account''s passphrase was changed'"
+        ))
+        .await,
+        1
+    );
+
+    // And the new secret works, which proves the revocation is about the
+    // SESSION and not about the account.
+    let back = login_inner(
+        &ctx,
+        &sessions,
+        OWNER.to_string(),
+        OTHER_PASSPHRASE.to_string(),
+    )
+    .await
+    .expect("the replacement credential signs in");
+    assert_eq!(back.session.expect("signed in").role, Role::Owner);
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// AN ORDINARY SELF-SERVICE CHANGE DOES NOT END THE SESSION IT IS MADE FROM.
+///
+/// The boundary of the rule above, and it has to hold or changing your own
+/// passphrase would sign you out of the till mid-shift — which for a cashier
+/// with a basket open is a lost sale to fix a screen. `change_credential_inner`
+/// re-stamps the live session, so the next poll agrees.
+#[tokio::test]
+async fn changing_your_own_passphrase_keeps_you_signed_in() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    change_credential_inner(
+        &ctx,
+        &sessions,
+        GOOD_PASSPHRASE.to_string(),
+        OTHER_PASSPHRASE.to_string(),
+    )
+    .await
+    .expect("an owner may change their own passphrase");
+
+    let after = status_inner(&ctx, &sessions).await.expect("status");
+    let session = after
+        .session
+        .expect("changing your own passphrase must not sign you out");
+    assert_eq!(session.user_id, OWNER);
+    assert_eq!(session.role, Role::Owner);
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM auth_audit WHERE event = 'session_revoked'")
+            .await,
+        0,
+        "and nothing is recorded as a revocation"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+// ===========================================================================
+// The reconciliation is latest-request-only (Stage B.3, round 3)
+// ===========================================================================
+
+/// A SUPERSEDED RECONCILIATION WRITES NOTHING.
+///
+/// Independent review, round 2. The database read cannot hold the session mutex
+/// — it is an `await` on a pool — so the state is captured before and
+/// re-checked after. The first version re-acquired the lock and mutated
+/// whatever session it found, which made two things reachable: an in-flight
+/// reconciliation could CLEAR a session that had been opened since, or copy the
+/// OLD user's role and name onto it; and two concurrent polls could apply their
+/// answers out of order or write the same `session_revoked` twice.
+///
+/// Driven deterministically rather than by racing threads: the account is
+/// retired (so the in-flight answer is "revoke"), and the session is replaced
+/// between the capture and the check by signing somebody else in. A superseded
+/// answer must not touch the new session.
+#[tokio::test]
+async fn a_superseded_reconciliation_does_not_touch_the_session_that_replaced_it() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    // A second account with its own credential, to stand in for "somebody else
+    // signed in while the first answer was in flight".
+    let other_hash = testing::hash(OTHER_PASSPHRASE);
+    db.exec(&format!(
+        "INSERT INTO users (id, store_id, full_name, role, pin_hash,
+                            credential_algo, credential_version, credential_set_at)
+         VALUES ('other-user', '{STORE}', 'Other', 'manager', '{other_hash}',
+                 'argon2id', 1, '2026-01-01T00:00:00.000Z')"
+    ))
+    .await;
+
+    // Retire the signed-in owner, so a reconciliation of THEIR session would
+    // revoke it...
+    db.exec(&format!("UPDATE users SET active = 0 WHERE id = '{OWNER}'"))
+        .await;
+
+    // ...and then replace the session before any reconciliation runs. This is
+    // the state an in-flight answer would land in. The sign-out is required by
+    // `login_inner` itself — one session per process, and it refuses to sign a
+    // second person in over the first — which is also why the scenario is
+    // driven this way rather than by racing two threads: there is no legal path
+    // that leaves two sessions overlapping, so what is under test is that a
+    // reconciliation CAPTURED against the first cannot write onto the second.
+    logout_inner(&ctx, &sessions).await.expect("the owner signs out");
+    login_inner(
+        &ctx,
+        &sessions,
+        "other-user".to_string(),
+        OTHER_PASSPHRASE.to_string(),
+    )
+    .await
+    .expect("the other account signs in");
+
+    let generation_before = sessions.generation();
+
+    // Every subsequent status call reconciles the CURRENT session, which is the
+    // other user's and is healthy. The retired owner's session is gone and must
+    // not be revoked a second time, nor must its name or role reach this one.
+    for _ in 0..3 {
+        let status = status_inner(&ctx, &sessions).await.expect("status");
+        let session = status.session.expect("the other user is still signed in");
+        assert_eq!(session.user_id, "other-user");
+        assert_eq!(session.full_name, "Other");
+        assert_eq!(session.role, Role::Manager);
+    }
+
+    assert_eq!(
+        sessions.generation(),
+        generation_before,
+        "a reconciliation that changes nothing must not bump the generation, \
+         or the renderer refreshes on every poll"
+    );
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM auth_audit WHERE event = 'session_revoked'")
+            .await,
+        0,
+        "and no revocation is recorded against a session that was replaced \
+         rather than revoked"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// CONCURRENT POLLS AGREE, and write one row at most.
+///
+/// Several status calls in flight at once is the ORDINARY state: `useSessionWatch`
+/// polls every fifteen seconds, a scheduled refresh fires near the idle limit,
+/// and every command that returns an `AuthStatus` produces one too. The
+/// assertion is about the shape of the outcome rather than about timing: however
+/// they interleave, the session ends exactly once and exactly one
+/// `session_revoked` row is written.
+#[tokio::test]
+async fn concurrent_status_calls_revoke_once_and_agree() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = std::sync::Arc::new(enrolled(&db, &scratch).await);
+
+    db.exec(&format!("UPDATE users SET active = 0 WHERE id = '{OWNER}'"))
+        .await;
+
+    let mut set = Vec::new();
+    for _ in 0..8 {
+        let sessions = std::sync::Arc::clone(&sessions);
+        let pool = db.pool().clone();
+        let code_file = scratch.code_file();
+        set.push(tokio::spawn(async move {
+            let ctx = AuthCtx::for_tests(&pool, code_file);
+            status_inner(&ctx, &sessions).await.map(|s| s.session.is_none())
+        }));
+    }
+
+    for handle in set {
+        let ended = handle
+            .await
+            .expect("the task must not panic")
+            .expect("status must not error");
+        assert!(ended, "every concurrent caller must see the session ended");
+    }
+
+    assert_eq!(
+        db.count("SELECT count(*) AS n FROM auth_audit WHERE event = 'session_revoked'")
+            .await,
+        1,
+        "exactly one revocation, however the polls interleaved"
+    );
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// The fingerprint is NOT the credential, and carries no part of what verifies
+/// a guess.
+///
+/// A structural assertion, because the alternative — holding the PHC string in
+/// session memory — would be easy, would work, and would keep the material an
+/// offline attack needs alive for as long as the till is on.
+#[test]
+fn the_session_fingerprint_drops_the_hash_output() {
+    let stored = testing::hash(GOOD_PASSPHRASE);
+    let print = testing::fingerprint(Some(&stored)).expect("a hash has a fingerprint");
+
+    // The parameters and the salt are kept; the final segment is not.
+    assert!(print.starts_with("$argon2id$"), "{print}");
+    assert!(stored.starts_with(&print), "{print}");
+    let output = stored
+        .rsplit_once('$')
+        .expect("a PHC string has segments")
+        .1;
+    assert!(!output.is_empty());
+    assert!(
+        !print.contains(output),
+        "the fingerprint must not contain the hash output"
+    );
+
+    // It changes whenever the credential is re-hashed, because Argon2id draws a
+    // fresh salt every time. That is the property the comparison relies on.
+    let again = testing::hash(GOOD_PASSPHRASE);
+    assert_ne!(
+        testing::fingerprint(Some(&again)),
+        Some(print),
+        "the same passphrase hashed twice must give two fingerprints"
+    );
+
+    // No credential at all has no fingerprint, and an empty column is the same
+    // as none — `sqlx` decodes a SQL NULL TEXT into `String` as `""`.
+    assert_eq!(testing::fingerprint(None), None);
+    assert_eq!(testing::fingerprint(Some("")), None);
+    assert_eq!(testing::fingerprint(Some("   ")), None);
 }

@@ -53,6 +53,8 @@ import {
 } from "../lib/menuCategories";
 import { gcd, makeFactor, type Factor } from "../lib/uom";
 import { useTranslation } from "../lib/i18n";
+import { canDo } from "../lib/permissions";
+import { useActiveUser } from "../state/session";
 import {
   defaultVatRateIdForNewProduct,
   isKnownVatRateId,
@@ -194,6 +196,9 @@ function getPrimaryBarcodeDisplay(p: ProductWithUoms): string {
 export default function Products() {
   const { storeId, hydrated } = useActiveContext();
   const { t } = useTranslation();
+  /** `SaveProductCost` is owner-only; a manager edits the menu but not what it
+   *  costs. See the note on the Costing section below. */
+  const mayChangeCost = canDo(useActiveUser()?.role, "productCost");
 
   const [products, setProducts] = useState<ProductWithUoms[]>([]);
   const [vatRates, setVatRates] = useState<VatRate[]>([]);
@@ -1113,18 +1118,39 @@ export default function Products() {
                 {t("products.costingSection")}
               </div>
 
+              {/* READ-ONLY FOR A MANAGER — Gate 2B, Stage B.3, round 2.
+                  `SaveProductCost` is the one thing a manager may not do to a
+                  product, and the backend refuses it by COMPARING the stored
+                  costing pair (`catalog.rs::cost_fields_would_change`), so a
+                  manager saving the menu with these fields untouched is fine
+                  and changing them is refused.
+
+                  The section is SHOWN and disabled rather than hidden, which
+                  is the matrix being followed rather than rounded off: a
+                  manager may SEE costs and margins (`ReadCostAndMargin` is
+                  theirs — they run the Sales History and the reports), they
+                  may not SET them. Hiding the figure would withhold something
+                  they are entitled to and make the refusal, when they
+                  eventually met it, unexplainable. */}
+              {!mayChangeCost && (
+                <div className="mb-2 rounded border border-info-line bg-info-bg p-2 text-xs text-info-fg">
+                  {t("products.costOwnerOnly")}
+                </div>
+              )}
+
               <div className="space-y-3">
                 <label className="block text-xs font-medium text-slate-700">
                   {t("products.costingMethodLabel")}
                   <select
                     value={form.costingMethod}
+                    disabled={!mayChangeCost}
                     onChange={(e) =>
                       setForm((f) => ({
                         ...f,
                         costingMethod: e.target.value as SelectableCostingMethod,
                       }))
                     }
-                    className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+                    className="mt-1 w-full rounded-md border border-slate-300 bg-surface px-3 py-2 text-sm shadow-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     {SELECTABLE_COSTING_METHODS.map((method) => (
                       <option key={method} value={method}>
@@ -1169,6 +1195,7 @@ export default function Products() {
                       prefix="$"
                       inputMode="decimal"
                       value={form.manualCostInput}
+                      disabled={!mayChangeCost}
                       onChange={(e) =>
                         setForm((f) => ({ ...f, manualCostInput: e.target.value }))
                       }

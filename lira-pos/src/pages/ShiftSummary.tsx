@@ -14,6 +14,8 @@ import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
 import { formatUsd, formatLbp, parseUsdInput, parseLbpInput } from "../lib/money";
 import { useTranslation } from "../lib/i18n";
+import { canDo } from "../lib/permissions";
+import { useActiveUser } from "../state/session";
 import { ShiftHistoryPanel } from "../components/ShiftHistoryPanel";
 import type { PaymentMethod } from "../db/types";
 import clsx from "clsx";
@@ -114,6 +116,7 @@ function DrawerRow({
 export default function ShiftSummary() {
   const { storeId, userId, hydrated } = useActiveContext();
   const { t } = useTranslation();
+  const activeUser = useActiveUser();
 
   // null = no open shift; undefined = still loading
   const [activeShift, setActiveShift] = useState<Shift | null | undefined>(undefined);
@@ -147,6 +150,50 @@ export default function ShiftSummary() {
    * route would have duplicated the store/hydration plumbing for no gain.
    */
   const [tab, setTab] = useState<"current" | "history">("current");
+
+  /**
+   * WHO MAY SEE THE HISTORY TAB — Gate 2B, Stage B.3, round 2.
+   *
+   * The history is every closed shift of the store: who closed it, what they
+   * counted, what was expected and the variance they were held to. `authz.rs`
+   * reserves that for a manager or the owner (`ReadAnotherShiftHistory`) — a
+   * cashier reading another cashier's drawer variance is neither their business
+   * nor safe, since the number is what a shortfall would be measured against.
+   *
+   * It is withheld here rather than merely refused, because the READ channel is
+   * not role-gated until Stage C: `ShiftHistoryPanel` composes ordinary
+   * repository queries, so nothing below this line would stop a cashier who
+   * reached the tab. Not rendering the tab is what currently enforces it, and
+   * that is stated plainly rather than implied.
+   *
+   * A cashier keeps the whole CURRENT tab: opening their shift, the running
+   * drawer figure and closing it are their job, and the screen is unchanged for
+   * them otherwise.
+   */
+  const mayReadHistory = canDo(activeUser?.role, "readShiftHistory");
+  const tabs: ("current" | "history")[] = mayReadHistory
+    ? ["current", "history"]
+    : ["current"];
+  // A role that loses the capability mid-session must not be left looking at
+  // it. `reconcile` adopts the new role within one status poll, and this
+  // follows it on the next render.
+  const shown = mayReadHistory ? tab : "current";
+
+  /**
+   * WHOSE SHIFT THIS IS, AND WHETHER THIS OPERATOR MAY CLOSE IT.
+   *
+   * `CloseOwnShift` is every role's; `CloseAnotherShift` is a manager's and the
+   * owner's. The shift scope is the STORE — `getOpenShift(storeId)` — so the
+   * open shift a cashier is looking at is frequently not theirs, and the close
+   * button used to be offered regardless.
+   *
+   * Nothing is assumed when the session has not resolved: no user means no
+   * close, which is also the locked state.
+   */
+  const mayCloseThisShift =
+    Boolean(activeUser) &&
+    (activeShift?.openedByUserId === activeUser?.userId ||
+      canDo(activeUser?.role, "closeAnotherShift"));
 
   /**
    * Is the Returns & Refunds detail expanded (WP-A6)?
@@ -400,7 +447,7 @@ export default function ShiftSummary() {
           <h2 className="text-2xl font-bold tracking-tight text-slate-900">{t("shift.title")}</h2>
           <p className="text-sm text-slate-600">{t("shift.subtitle")}</p>
         </div>
-        {activeShift && tab === "current" && (
+        {activeShift && shown === "current" && (
           <Button variant="ghost" onClick={refreshSummary} disabled={loading || submitting}>
             {t("shift.refresh")}
           </Button>
@@ -411,36 +458,38 @@ export default function ShiftSummary() {
           shift this store has opened, with the reconciliation each was closed
           on. Before this, a closed shift's counted cash, expected cash and
           variance were stored and unreachable. */}
-      <div role="tablist" aria-label={t("shift.title")} className="flex gap-1 border-b border-line">
-        {(["current", "history"] as const).map((id) => (
-          <button
-            key={id}
-            type="button"
-            role="tab"
-            aria-selected={tab === id}
-            onClick={() => setTab(id)}
-            className={clsx(
-              "-mb-px border-b-2 px-4 py-2 text-sm font-semibold transition-colors",
-              tab === id
-                ? "border-brand text-fg"
-                : "border-transparent text-fg-muted hover:text-fg",
-            )}
-          >
-            {t(id === "current" ? "shift.tabCurrent" : "shift.tabHistory")}
-          </button>
-        ))}
-      </div>
+      {tabs.length > 1 && (
+        <div role="tablist" aria-label={t("shift.title")} className="flex gap-1 border-b border-line">
+          {tabs.map((id) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={shown === id}
+              onClick={() => setTab(id)}
+              className={clsx(
+                "-mb-px border-b-2 px-4 py-2 text-sm font-semibold transition-colors",
+                shown === id
+                  ? "border-brand text-fg"
+                  : "border-transparent text-fg-muted hover:text-fg",
+              )}
+            >
+              {t(id === "current" ? "shift.tabCurrent" : "shift.tabHistory")}
+            </button>
+          ))}
+        </div>
+      )}
 
-      {tab === "history" && storeId && <ShiftHistoryPanel storeId={storeId} />}
+      {shown === "history" && storeId && <ShiftHistoryPanel storeId={storeId} />}
 
-      {error && tab === "current" && (
+      {error && shown === "current" && (
         <div className="rounded-md border border-danger-line bg-danger-bg px-4 py-3 text-sm text-danger-fg">
           {error}
         </div>
       )}
 
       {/* ── NO OPEN SHIFT ────────────────────────────────────────── */}
-      {tab === "current" && !activeShift && (
+      {shown === "current" && !activeShift && (
         <Card>
           <CardHeader
             title={t("shift.noOpenShiftTitle")}
@@ -477,7 +526,7 @@ export default function ShiftSummary() {
       )}
 
       {/* ── OPEN SHIFT ───────────────────────────────────────────── */}
-      {tab === "current" && activeShift && (
+      {shown === "current" && activeShift && (
         <>
           {/* Shift status banner */}
           <div className="flex flex-wrap items-center gap-4 rounded-lg border border-good-line bg-good-bg px-5 py-3">
@@ -933,17 +982,39 @@ export default function ShiftSummary() {
                 </div>
               </div>
 
+              {/* CLOSING SOMEBODY ELSE'S SHIFT IS A MANAGER'S (Stage B.3,
+                  round 3). `CloseAnotherShift` is denied to a cashier, and
+                  `close_shift` refuses it — but the button was offered on
+                  whichever shift the STORE had open, which is somebody else's
+                  whenever the cashier did not open it. Closing a shift computes
+                  `expected_cash_*` and both variances once, inside the
+                  transaction that closes it, and migration 009 makes them
+                  immutable: there is no second attempt, so the refusal has to
+                  arrive before the cash is counted rather than after.
+
+                  The form is replaced with a sentence naming who DID open it,
+                  rather than a disabled button, because a cashier looking at a
+                  colleague's open shift needs to know whose it is — that is the
+                  action they can take. */}
               <div className="mt-6 border-t border-slate-100 pt-5">
-                <Button
-                  variant="primary"
-                  onClick={handleCloseShift}
-                  disabled={submitting}
-                >
-                  {submitting ? t("shift.closing") : t("shift.closeShift")}
-                </Button>
-                <p className="mt-2 text-xs text-slate-500">
-                  {t("shift.closingFieldsOptional")}
-                </p>
+                {mayCloseThisShift ? (
+                  <>
+                    <Button
+                      variant="primary"
+                      onClick={handleCloseShift}
+                      disabled={submitting}
+                    >
+                      {submitting ? t("shift.closing") : t("shift.closeShift")}
+                    </Button>
+                    <p className="mt-2 text-xs text-slate-500">
+                      {t("shift.closingFieldsOptional")}
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-fg-muted">
+                    {t("shift.closeNotYours")}
+                  </p>
+                )}
               </div>
             </CardBody>
           </Card>

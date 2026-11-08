@@ -774,8 +774,11 @@ async fn an_unknown_audit_event_is_refused() {
         assert!(!refused.is_empty(), "`{bad}` must be refused");
     }
 
-    // Stage B's vocabulary is already admissible, so widening a CHECK on this
-    // table — which would mean a rebuild — is never needed.
+    // Stage B's vocabulary is admissible here. It turned out to be INCOMPLETE —
+    // 023 provided no event for restoring access or for a rename, and migration
+    // 024 had to widen the CHECK after all, by the rebuild this comment hoped
+    // to avoid. The three it adds are asserted in `tests::audit_vocabulary`
+    // rather than here, because this test is about the shape 023 shipped.
     for ok in [
         "login_ok",
         "login_failed",
@@ -812,13 +815,14 @@ async fn an_unknown_audit_event_is_refused() {
 // ===========================================================================
 
 /// 023 is registered, and the registered list is what the startup gate demands.
+///
+/// It is no longer the NEWEST — Stage B.3's round-2 corrections added 024 to
+/// widen the `auth_audit` event vocabulary, and that claim moved with it to
+/// `tests::audit_vocabulary`. The assertion here is the one that belongs to
+/// this file: 023 is registered under its own description, and a database
+/// carrying the whole registered list opens the startup gate.
 #[tokio::test]
-async fn migration_023_is_registered_and_is_the_newest() {
-    assert_eq!(
-        crate::test_support::latest_migration_version(),
-        23,
-        "023 must be the newest migration"
-    );
+async fn migration_023_is_registered() {
     assert!(crate::migrations().iter().any(|m| m.version == 23
         && m.description == "authentication"));
 
@@ -827,7 +831,7 @@ async fn migration_023_is_registered_and_is_the_newest() {
     let db = TempDb::new().await;
     crate::db_init::require_complete_migrations(db.pool())
         .await
-        .expect("a v23 database must satisfy the startup completeness check");
+        .expect("a fully migrated database must satisfy the startup completeness check");
     db.cleanup().await.expect("remove TempDb");
 }
 
