@@ -39,6 +39,7 @@ mod read_guard;
 mod auth_credentials;
 mod authorization;
 mod authorization_idempotency;
+mod actor_attribution;
 mod auth_schema;
 mod auth_session;
 mod startup_gate;

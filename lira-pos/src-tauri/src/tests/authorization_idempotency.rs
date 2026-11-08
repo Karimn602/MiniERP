@@ -347,14 +347,15 @@ async fn a_cashiers_stock_adjustment_is_refused_and_moves_no_stock() {
     );
 
     // A MANAGER may, so the refusal is about the role and not about the
-    // payload.
-    post_adjustment_tx(
-        db.pool(),
-        &actor(Role::Manager),
-        adjustment_payload("stock count correction", vec![adjustment_line(P_COFFEE, -10)]),
-    )
-    .await
-    .expect("a manager may adjust stock");
+    // payload. The declared actor is set to the manager, because the
+    // attribution cross-check refuses a request that names somebody else —
+    // which is itself asserted separately.
+    let mut as_manager =
+        adjustment_payload("stock count correction", vec![adjustment_line(P_COFFEE, -10)]);
+    as_manager.created_by_user_id = Some(MANAGER.to_string());
+    post_adjustment_tx(db.pool(), &actor(Role::Manager), as_manager)
+        .await
+        .expect("a manager may adjust stock");
     assert_eq!(quantity_on_hand(&db, P_COFFEE).await, before_qty - 10);
 
     db.cleanup().await.expect("remove TempDb");

@@ -479,6 +479,58 @@ pub(crate) async fn authorize_tx(
     }
 }
 
+/// THE ACTOR ON A NEW DOCUMENT COMES FROM THE SESSION, and a payload that
+/// disagrees is REFUSED.
+///
+/// WHAT THIS REPLACES. Every `*_user_id` column was bound straight from the
+/// request: `sales.cashier_user_id`, `shifts.opened_by_user_id`,
+/// `purchases.created_by_user_id`, `inventory_movements.created_by_user_id` and
+/// the rest. No command checked the value against `users`, checked `active`, or
+/// consulted `role` — the foreign key guaranteed only that it was SOME user id,
+/// and `NULL` was always available. So the attribution on every posted
+/// financial document in the shop's history is a claim by the caller, and
+/// because `activeContext.ts` picked whichever owner sorted first, that claim
+/// was the same hardcoded owner on every row.
+///
+/// THE CROSS-CHECK PATTERN IS THIS CODEBASE'S OWN, applied again. The database
+/// decides, the client's copy is a cross-check, and a disagreement is refused
+/// rather than silently normalised — exactly how `post_sale` already treats
+/// `quantity_base`, `factor_*_snapshot` and `product_uom_id_snapshot`, and how
+/// `post_purchase` treats a declared VAT counterpart. Keeping the field on the
+/// wire is what lets a frozen checkout attempt replay unchanged.
+///
+/// `None` is accepted and filled from the session: a caller that declines to
+/// name an actor is not asserting a false one. A caller that names SOMEBODY
+/// ELSE is refused, because accepting it silently would be the defect this
+/// function exists to remove, and refusing it is how a stale screen or a
+/// hand-built request gets found.
+pub(crate) fn attribute(actor: &Actor, declared: Option<&str>) -> Result<String, String> {
+    match declared {
+        None => Ok(actor.user_id.clone()),
+        Some(claimed) if claimed == actor.user_id => Ok(actor.user_id.clone()),
+        Some(_) => Err(
+            "This request names a different person than the one signed in. \
+             Nothing has been changed. Sign out and sign in again, then try once more."
+                .to_string(),
+        ),
+    }
+}
+
+/// The same, for a column that is `NOT NULL` and whose payload field is a plain
+/// `String` rather than an `Option` — `shifts.opened_by_user_id` and
+/// `closed_by_user_id`.
+///
+/// An EMPTY string counts as "not named", because that is what a form field
+/// nobody filled in sends, and treating it as a claim about a user whose id is
+/// `""` would refuse a shift nobody can otherwise open.
+pub(crate) fn attribute_required(actor: &Actor, declared: &str) -> Result<String, String> {
+    if declared.trim().is_empty() {
+        Ok(actor.user_id.clone())
+    } else {
+        attribute(actor, Some(declared))
+    }
+}
+
 /// Record a refused operation. Best-effort, like `auth::audit`.
 ///
 /// A failure to record a refusal must not become a second, different error on

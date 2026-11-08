@@ -146,13 +146,15 @@ pub async fn exchange_rate_save(
     }
     let notes = clean_opt(args.notes);
 
-    let (pool, _actor) = crate::authz::begin(
+    let (pool, actor) = crate::authz::begin(
         &app,
         &window,
         &state,
         crate::authz::Operation::ExchangeRateSave,
     )
     .await?;
+    let actor_user_id =
+        crate::authz::attribute(&actor, args.created_by_user_id.as_deref())?;
     let mut tx = pool
         .begin()
         .await
@@ -218,7 +220,11 @@ pub async fn exchange_rate_save(
             .bind(args.rate_lbp_per_usd)
             .bind(&source)
             .bind(&notes)
-            .bind(&args.created_by_user_id)
+            // The SESSION's actor, cross-checked against the declared one.
+            // An exchange rate is the one setting that reaches a posted
+            // figure - `post_sale` validates a lira tender against this
+            // row - so who wrote it is worth recording truthfully.
+            .bind(&actor_user_id)
             .execute(&mut *tx)
             .await
             .map_err(|e| format!("cannot insert the rate: {e}"))?;

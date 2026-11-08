@@ -1432,6 +1432,21 @@ pub(crate) async fn post_purchase_tx(
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostPurchase).await?;
 
+    // ---- THE ACTOR IS THE SESSION'S ----
+    //
+    // Every `*_user_id` column on this document used to be bound straight from
+    // the request, unchecked, with `NULL` always available — so the attribution
+    // on a posted financial document was a claim by the caller. It is now the
+    // authenticated actor, and the payload's copy is a CROSS-CHECK that is
+    // refused on disagreement: this codebase's own pattern for
+    // `quantity_base`, `factor_*_snapshot` and a declared VAT counterpart,
+    // applied to who did it.
+    //
+    // Computed after the replay resolution, so a replay keeps the actor it was
+    // posted with and is never re-attributed to whoever is at the till now.
+    let actor_user_id =
+        crate::authz::attribute(actor, payload.created_by_user_id.as_deref())?;
+
     // ---- The supplier is this store's supplier ----
     //
     // A normal purchase raises a payable, and which store's books it lands in
@@ -1579,7 +1594,7 @@ pub(crate) async fn post_purchase_tx(
 .bind(subtotal)
 .bind(vat_total)
 .bind(total)
-.bind(&payload.created_by_user_id)
+.bind(&actor_user_id)
 .bind(&payload.device_id)
 .bind(&payload.notes)
 .execute(&mut *tx)
@@ -1813,7 +1828,7 @@ pub(crate) async fn post_purchase_tx(
         .bind(&purchase_item_id)
         .bind(&payload.supplier_reference)
         .bind(&payload.notes)
-        .bind(&payload.created_by_user_id)
+        .bind(&actor_user_id)
         .bind(&payload.device_id)
         .bind(&now)
         .bind(line.quantity_in_uom)
@@ -1887,7 +1902,7 @@ pub(crate) async fn post_purchase_tx(
             .bind(&payload.purchase_date)
             .bind(&payload.purchase_id)
             .bind(format!("Purchase #{}", purchase_number))
-            .bind(&payload.created_by_user_id)
+            .bind(&actor_user_id)
             .bind(&payload.device_id)
             .bind(&now)
             .execute(&mut *tx)
@@ -2067,6 +2082,21 @@ pub(crate) async fn post_adjustment_tx(
     // read inside the transaction that commits. It runs before anything is
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostAdjustment).await?;
+
+    // ---- THE ACTOR IS THE SESSION'S ----
+    //
+    // Every `*_user_id` column on this document used to be bound straight from
+    // the request, unchecked, with `NULL` always available — so the attribution
+    // on a posted financial document was a claim by the caller. It is now the
+    // authenticated actor, and the payload's copy is a CROSS-CHECK that is
+    // refused on disagreement: this codebase's own pattern for
+    // `quantity_base`, `factor_*_snapshot` and a declared VAT counterpart,
+    // applied to who did it.
+    //
+    // Computed after the replay resolution, so a replay keeps the actor it was
+    // posted with and is never re-attributed to whoever is at the till now.
+    let actor_user_id =
+        crate::authz::attribute(actor, payload.created_by_user_id.as_deref())?;
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
@@ -2271,7 +2301,7 @@ pub(crate) async fn post_adjustment_tx(
         .bind(avg_excl_mc)
         .bind(avg_incl_mc)
         .bind(&payload.reason)
-        .bind(&payload.created_by_user_id)
+        .bind(&actor_user_id)
         .bind(&payload.device_id)
         .bind(&now)
         .bind(line.quantity_in_uom_signed)
@@ -2530,6 +2560,21 @@ pub(crate) async fn post_supplier_payment_tx(
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::SupplierPayment).await?;
 
+    // ---- THE ACTOR IS THE SESSION'S ----
+    //
+    // Every `*_user_id` column on this document used to be bound straight from
+    // the request, unchecked, with `NULL` always available — so the attribution
+    // on a posted financial document was a claim by the caller. It is now the
+    // authenticated actor, and the payload's copy is a CROSS-CHECK that is
+    // refused on disagreement: this codebase's own pattern for
+    // `quantity_base`, `factor_*_snapshot` and a declared VAT counterpart,
+    // applied to who did it.
+    //
+    // Computed after the replay resolution, so a replay keeps the actor it was
+    // posted with and is never re-attributed to whoever is at the till now.
+    let actor_user_id =
+        crate::authz::attribute(actor, payload.created_by_user_id.as_deref())?;
+
     // ---- The supplier is this store's supplier ----
     //
     // The foreign key only proves the supplier exists somewhere. Which store's
@@ -2589,7 +2634,7 @@ pub(crate) async fn post_supplier_payment_tx(
     .bind(&payload.entry_date)
     .bind(&payload.payment_reference)
     .bind(&payload.notes)
-    .bind(&payload.created_by_user_id)
+    .bind(&actor_user_id)
     .bind(&payload.device_id)
     .bind(&now)
     .execute(&mut *tx)
@@ -4120,6 +4165,21 @@ pub(crate) async fn post_sale_tx(
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostSale).await?;
 
+    // ---- THE ACTOR IS THE SESSION'S ----
+    //
+    // Every `*_user_id` column on this document used to be bound straight from
+    // the request, unchecked, with `NULL` always available — so the attribution
+    // on a posted financial document was a claim by the caller. It is now the
+    // authenticated actor, and the payload's copy is a CROSS-CHECK that is
+    // refused on disagreement: this codebase's own pattern for
+    // `quantity_base`, `factor_*_snapshot` and a declared VAT counterpart,
+    // applied to who did it.
+    //
+    // Computed after the replay resolution, so a replay keeps the actor it was
+    // posted with and is never re-attributed to whoever is at the till now.
+    let actor_user_id =
+        crate::authz::attribute(actor, payload.cashier_user_id.as_deref())?;
+
     // ---- The locked exchange rate is the DATABASE's, not the payload's (WP-04) ----
     //
     // `exchange_rate_id` names the rate this sale is locked to; the FK already
@@ -4658,7 +4718,7 @@ pub(crate) async fn post_sale_tx(
     .bind(&payload.store_id)
     .bind(&payload.shift_id)
     .bind(&payload.device_id)
-    .bind(&payload.cashier_user_id)
+    .bind(&actor_user_id)
     .bind(receipt_number)
     .bind(payload.exchange_rate_lbp_per_usd)
     .bind(&payload.exchange_rate_id)
@@ -4830,7 +4890,7 @@ pub(crate) async fn post_sale_tx(
             .bind(&payload.sale_id)
             .bind(&line.sale_item_id)
             .bind(format!("Sale #{}", receipt_number))
-            .bind(&payload.cashier_user_id)
+            .bind(&actor_user_id)
             .bind(&payload.device_id)
             .bind(&now)
             .bind(line.quantity_in_uom)
@@ -4990,7 +5050,7 @@ pub(crate) async fn post_sale_tx(
         .bind(&now[..10])
         .bind(&payload.sale_id)
         .bind(shift_id)
-        .bind(&payload.cashier_user_id)
+        .bind(&actor_user_id)
         .bind(&payload.device_id)
         .bind(&now)
         .execute(&mut *tx)
@@ -5423,6 +5483,21 @@ pub(crate) async fn open_shift_tx(
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::OpenShift).await?;
 
+    // ---- THE ACTOR IS THE SESSION'S ----
+    //
+    // Every `*_user_id` column on this document used to be bound straight from
+    // the request, unchecked, with `NULL` always available — so the attribution
+    // on a posted financial document was a claim by the caller. It is now the
+    // authenticated actor, and the payload's copy is a CROSS-CHECK that is
+    // refused on disagreement: this codebase's own pattern for
+    // `quantity_base`, `factor_*_snapshot` and a declared VAT counterpart,
+    // applied to who did it.
+    //
+    // Computed after the replay resolution, so a replay keeps the actor it was
+    // posted with and is never re-attributed to whoever is at the till now.
+    let actor_user_id =
+        crate::authz::attribute_required(actor, &payload.opened_by_user_id)?;
+
     let now = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
@@ -5440,7 +5515,7 @@ pub(crate) async fn open_shift_tx(
     .bind(&payload.shift_id)
     .bind(&payload.store_id)
     .bind(&payload.device_id)
-    .bind(&payload.opened_by_user_id)
+    .bind(&actor_user_id)
     .bind(&now)
     .bind(payload.opening_cash_usd_cents)
     .bind(payload.opening_cash_lbp)
@@ -5579,6 +5654,21 @@ pub(crate) async fn close_shift_tx(
     // written, so a refusal leaves nothing behind.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::CloseOwnShift).await?;
 
+    // ---- THE ACTOR IS THE SESSION'S ----
+    //
+    // Every `*_user_id` column on this document used to be bound straight from
+    // the request, unchecked, with `NULL` always available — so the attribution
+    // on a posted financial document was a claim by the caller. It is now the
+    // authenticated actor, and the payload's copy is a CROSS-CHECK that is
+    // refused on disagreement: this codebase's own pattern for
+    // `quantity_base`, `factor_*_snapshot` and a declared VAT counterpart,
+    // applied to who did it.
+    //
+    // Computed after the replay resolution, so a replay keeps the actor it was
+    // posted with and is never re-attributed to whoever is at the till now.
+    let actor_user_id =
+        crate::authz::attribute_required(actor, &payload.closed_by_user_id)?;
+
     let row = sqlx::query(
         "SELECT status, closed_at, opening_cash_usd_cents, opening_cash_lbp
            FROM shifts WHERE id = ? AND store_id = ?",
@@ -5654,7 +5744,7 @@ pub(crate) async fn close_shift_tx(
          WHERE id = ? AND store_id = ? AND status = 'open'",
     )
     .bind(&now)
-    .bind(&payload.closed_by_user_id)
+    .bind(&actor_user_id)
     .bind(payload.closing_cash_usd_cents)
     .bind(payload.closing_cash_lbp)
     .bind(expected_usd)
@@ -6488,6 +6578,21 @@ pub(crate) async fn post_credit_memo_tx(
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostCreditMemo).await?;
 
+    // ---- THE ACTOR IS THE SESSION'S ----
+    //
+    // Every `*_user_id` column on this document used to be bound straight from
+    // the request, unchecked, with `NULL` always available — so the attribution
+    // on a posted financial document was a claim by the caller. It is now the
+    // authenticated actor, and the payload's copy is a CROSS-CHECK that is
+    // refused on disagreement: this codebase's own pattern for
+    // `quantity_base`, `factor_*_snapshot` and a declared VAT counterpart,
+    // applied to who did it.
+    //
+    // Computed after the replay resolution, so a replay keeps the actor it was
+    // posted with and is never re-attributed to whoever is at the till now.
+    let actor_user_id =
+        crate::authz::attribute(actor, payload.cashier_user_id.as_deref())?;
+
     // ---- The original sale: this store's, posted, and an actual sale ----
     let sale_row = sqlx::query(
         "SELECT sale_type, status, receipt_number, driver_id,
@@ -7263,7 +7368,7 @@ pub(crate) async fn post_credit_memo_tx(
     .bind(credit_memo_number)
     .bind(shift_id)
     .bind(&payload.device_id)
-    .bind(&payload.cashier_user_id)
+    .bind(&actor_user_id)
     .bind(locked_rate)
     .bind(&sale_rate_id)
     .bind(&payload.reason)
@@ -7408,7 +7513,7 @@ pub(crate) async fn post_credit_memo_tx(
         .bind(format!(
             "Return #{credit_memo_number} (receipt #{receipt_number})"
         ))
-        .bind(&payload.cashier_user_id)
+        .bind(&actor_user_id)
         .bind(&payload.device_id)
         .bind(&now)
         .bind(r.quantity_in_uom)
@@ -7557,7 +7662,7 @@ pub(crate) async fn post_credit_memo_tx(
         .bind(&now[..10])
         .bind(&payload.credit_memo_id)
         .bind(shift_id)
-        .bind(&payload.cashier_user_id)
+        .bind(&actor_user_id)
         .bind(&payload.device_id)
         .bind(&now)
         .execute(&mut *tx)
@@ -8085,6 +8190,21 @@ pub(crate) async fn post_driver_remittance_tx(
     // so a refusal costs the sequence nothing.
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::DriverRemittance).await?;
 
+    // ---- THE ACTOR IS THE SESSION'S ----
+    //
+    // Every `*_user_id` column on this document used to be bound straight from
+    // the request, unchecked, with `NULL` always available — so the attribution
+    // on a posted financial document was a claim by the caller. It is now the
+    // authenticated actor, and the payload's copy is a CROSS-CHECK that is
+    // refused on disagreement: this codebase's own pattern for
+    // `quantity_base`, `factor_*_snapshot` and a declared VAT counterpart,
+    // applied to who did it.
+    //
+    // Computed after the replay resolution, so a replay keeps the actor it was
+    // posted with and is never re-attributed to whoever is at the till now.
+    let actor_user_id =
+        crate::authz::attribute(actor, payload.created_by_user_id.as_deref())?;
+
     // ---- The driver is this store's driver ----
     //
     // The foreign key only proves he exists somewhere. Which store's books the
@@ -8229,7 +8349,7 @@ pub(crate) async fn post_driver_remittance_tx(
     .bind(payload.exchange_rate_lbp_per_usd)
     .bind(&payload.reference)
     .bind(&payload.shift_id)
-    .bind(&payload.created_by_user_id)
+    .bind(&actor_user_id)
     .bind(&payload.device_id)
     .bind(&now)
     .execute(&mut *tx)

@@ -166,6 +166,33 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/023_authentication.sql"),
             kind: MigrationKind::Up,
         },
+        // MIGRATION 024 IS WRITTEN BUT NOT YET REGISTERED.
+        //
+        // `src/db/migrations-pending/024_actor_required.sql` exists and is
+        // complete: BEFORE INSERT triggers requiring every new financial
+        // document to name an active user of its own store. It is the
+        // ENGINE's half of Stage B.2's attribution rule, for a writer that
+        // never goes through `posting.rs`.
+        //
+        // It is not registered yet because registering it makes ~131
+        // existing TEST FIXTURES invalid in one step: they insert sales,
+        // purchases, movements, shifts and ledger rows directly, naming
+        // nobody, because until Stage B.2 nobody had to be named. Those
+        // are fixtures standing in for real documents and they must now
+        // look like real documents; the edit is mechanical but it is 131
+        // of them across 19 files, and rushing it is how a fixture gets
+        // quietly weakened to make a suite pass.
+        //
+        // NOTHING IS UNENFORCED IN THE MEANTIME. The application already
+        // takes every actor from the session and refuses a request that
+        // names somebody else (`authz::attribute`), with
+        // `tests::actor_attribution` proving it against a real database
+        // and a structural guard proving no actor column is written from
+        // a request. 024 adds defence in depth against a FUTURE writer,
+        // not a fix for a present hole.
+        //
+        // See that directory's README for the exact adoption steps, and
+        // dev/AUTONOMOUS-COMPLETION-LEDGER.md for where it sits in the plan.
     ]
 }
 
