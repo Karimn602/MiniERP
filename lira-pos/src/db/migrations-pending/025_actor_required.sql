@@ -1,13 +1,23 @@
 -- ============================================================================
--- Migration v24 — A NEW FINANCIAL DOCUMENT MUST NAME A REAL ACTOR
+-- Migration v25 — A NEW FINANCIAL DOCUMENT MUST NAME A REAL ACTOR
 --                 (Gate 2B, Stage B.2b)
 -- ----------------------------------------------------------------------------
--- NUMBERED 024, NOT 025. The Gate 2B plan proposed 023 authentication, 024
--- audit, 025 actor triggers. The audit table was folded into 023 because the
--- login path has to audit from its very first line — shipping it one release
--- later would have meant the first release of authentication kept no record of
--- attacks on itself — so 024 was free and the numbering stays contiguous. The
--- planning documents' "025" and this file are the same migration.
+-- RENUMBERED 024 -> 025, and this file has never been applied to any database,
+-- so the renumbering costs nothing: a migration's version is only fixed once a
+-- database records its checksum, and no database has recorded this one. 024 was
+-- taken by the auth_audit vocabulary correction, which had to ship with the
+-- Stage B.3 round that found it. sqlx refuses a migration that arrives BELOW
+-- the highest version a database has already applied, so a gap could not have
+-- been left here and filled later.
+--
+-- The Gate 2B plan proposed 023 authentication, 024 audit, 025 actor triggers.
+-- The audit TABLE was folded into 023 because the login path has to audit from
+-- its very first line — shipping it one release later would have meant the
+-- first release of authentication kept no record of attacks on itself. 024 then
+-- held the one thing that fold got wrong: an event vocabulary missing two of
+-- the administrative events Stage B.3 needed to write. So the planning
+-- documents' "025 actor triggers" and this file are the same migration, and the
+-- number is the one the plan gave it after all.
 -- ----------------------------------------------------------------------------
 -- WHAT THIS ADDS, AND WHY IT COMES LAST
 --
