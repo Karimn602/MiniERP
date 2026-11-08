@@ -187,10 +187,7 @@ fn close_db_pool_on_exit(app: &tauri::AppHandle) {
 
     let state = app.state::<DbState>();
     tauri::async_runtime::block_on(async move {
-        let mut guard = state.pool.lock().await;
-        if let Some(pool) = guard.take() {
-            pool.close().await;
-        }
+        state.close_pool().await;
     });
 }
 
@@ -227,7 +224,7 @@ fn close_read_pool_on_exit(app: &tauri::AppHandle) {
 pub fn run() {
     let migrations = migrations();
 
-    tauri::Builder::default()
+    match tauri::Builder::default()
         .manage(DbState::new())
         .manage(ReadPool::new())
         .plugin(
@@ -262,39 +259,79 @@ pub fn run() {
             admin::supplier_set_active,
         ])
         .setup(|app| {
-            // The journal mode the Gate 1 backup procedure depends on. Was a
-            // frontend PRAGMA until Gate 2A removed `sql:allow-execute`; see
-            // `db_init` for why it is not optional.
+            // MANDATORY DATABASE VALIDATION, AND IT FAILS CLOSED.
+            //
+            // Until this work package both bad outcomes here — an error, or a
+            // journal mode that is not `wal` — were printed to `stderr` and
+            // followed by an ordinary launch. That let Greaz trade onto a
+            // database whose documented backup procedure no longer described
+            // it, with nothing on screen to say so. See the `db_init` module
+            // header for why that is the worse of the two failures.
+            //
+            // The hook still returns `Ok(())` on failure, deliberately.
+            // Returning `Err` aborts `build()`, and a GUI application that
+            // vanishes tells the person at the till nothing at all. Instead the
+            // startup gate is shut and the pools are released, so the window
+            // opens, every command and every read is refused, and `App.tsx`'s
+            // existing "Startup failed" screen shows the operator exactly what
+            // is wrong and what to do about it.
             let handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
                 use tauri::Manager;
                 let state = handle.state::<DbState>();
-                match db_init::ensure_production_pragmas(&handle, &state).await {
-                    Ok(mode) if mode == "wal" => {
+                match db_init::initialize_database(&handle, &state).await {
+                    Ok(mode) => {
+                        // The ONLY path that opens the gate.
+                        state.mark_startup_ready().await;
                         println!("[db] ready, journal_mode = {mode}");
                     }
-                    Ok(mode) => {
-                        // Not fatal — the till must still open — but the
-                        // documented backup procedure no longer describes this
-                        // application, so it is said loudly.
-                        eprintln!(
-                            "[db] journal_mode is {mode}, expected wal: the documented backup procedure assumes WAL"
-                        );
+                    Err(reason) => {
+                        let message = db_init::fatal_startup_message(&reason);
+                        eprintln!("[db] STARTUP FAILED — refusing to trade.\n{message}");
+                        // Order matters: shut the gate BEFORE letting go of the
+                        // pools, so nothing can lazily re-open the file in
+                        // between.
+                        state.mark_startup_failed(&message).await;
+                        db_init::release_pools_after_failed_startup(&handle, &state).await;
                     }
-                    Err(e) => eprintln!("[db] startup PRAGMA failed: {e}"),
                 }
             });
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
-                // Read-only FIRST: it cannot checkpoint, so it must not be the
-                // last connection holding the file. See the note on
-                // `close_read_pool_on_exit`.
-                close_read_pool_on_exit(app_handle);
-                close_db_pool_on_exit(app_handle);
-            }
-        });
+    {
+        Ok(app) => app,
+        Err(e) => {
+            // tauri-plugin-sql runs the `preload` connection AND the migrations
+            // inside its own setup, so a database that cannot be opened, a
+            // migration that errors, and a migration whose checksum no longer
+            // matches all surface HERE rather than in the hook above — before
+            // any window exists.
+            //
+            // That was already fail-closed: the process cannot reach trading
+            // mode. What it was not was legible. `.expect()` turned the one
+            // startup failure that most needs explaining into a Rust panic, so
+            // this prints the operator text and exits non-zero instead. There
+            // is no window to show it in yet, and building a fallback window to
+            // carry it would be a new startup framework; that limitation is
+            // recorded in the handoff rather than papered over.
+            eprintln!(
+                "{}",
+                db_init::fatal_startup_message(&format!(
+                    "The database could not be opened or brought up to date: {e}"
+                ))
+            );
+            std::process::exit(1);
+        }
+    }
+    .run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            // Read-only FIRST: it cannot checkpoint, so it must not be the
+            // last connection holding the file. See the note on
+            // `close_read_pool_on_exit`. Both are no-ops after a failed
+            // startup, which has already released them.
+            close_read_pool_on_exit(app_handle);
+            close_db_pool_on_exit(app_handle);
+        }
+    });
 }

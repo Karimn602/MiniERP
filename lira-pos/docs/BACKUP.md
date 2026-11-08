@@ -57,8 +57,13 @@ most recently modified `greaz-pos.db` under `%APPDATA%`.
 
 ## Companion files
 
-The application runs SQLite in **WAL** mode (`db/migrate.ts::ensureDbReady`
-issues `PRAGMA journal_mode = WAL`, which is persisted in the database header).
+The application runs SQLite in **WAL** mode. It is set during Rust startup by
+`src-tauri/src/db_init.rs` and persisted in the database header, and since the
+startup-hardening correction Greaz **refuses to trade** if it cannot confirm it
+— see *What the database guarantees on its own*. Until Gate 2A the statement
+came from the frontend (`db/migrate.ts::ensureDbReady`); it does not any more,
+and that module no longer issues PRAGMAs at all.
+
 While the app is running you will therefore also see:
 
 * `greaz-pos.db-wal` — committed transactions not yet folded into the main file
@@ -386,18 +391,34 @@ Worth knowing when judging how much backup paranoia is warranted:
 * **WAL plus the default `synchronous = FULL`** means a committed transaction
   survives a power cut. What is lost in a crash is at most the transaction in
   flight, which was never committed and never shown as complete.
-* **Closing the app closes the database.** Greaz holds two connection pools
-  against the one file — tauri-plugin-sql's, and the posting pool in
-  `posting.rs` that every financial command uses. The plugin always closed its
-  own on exit; nothing closed the second, so the WAL was never merged and the
-  step-3 check above could not be trusted. `lib.rs::close_db_pool_on_exit` now
-  closes it on `RunEvent::Exit`, which is what makes a clean close leave one
-  self-contained file. It changes no durability setting: WAL, `synchronous`,
-  foreign keys and every posting guard are exactly as they were.
+* **Closing the app closes the database.** Greaz holds three connection pools
+  against the one file — tauri-plugin-sql's, the posting pool in `posting.rs`
+  that every financial command uses, and (since Gate 2A) the read-only pool
+  behind the renderer's `db_select`. The plugin always closed its own on exit;
+  nothing closed the posting pool, so the WAL was never merged and the step-3
+  check above could not be trusted. `lib.rs` now closes both of the others on
+  `RunEvent::Exit`, and in a specific ORDER: the read-only pool first, because
+  only a connection that may WRITE can perform SQLite's final checkpoint, so a
+  read-only handle closing last would leave the companions on disk exactly as
+  if nothing had been closed at all. It changes no durability setting: WAL,
+  `synchronous`, foreign keys and every posting guard are exactly as they were.
 
-  Note that WAL itself is switched on from the FRONTEND, by
-  `src/db/migrate.ts::ensureDbReady`, and persists in the database header
-  thereafter. The Rust side never sets it — see
-  `lifecycle.rs::sqlx_does_not_open_in_wal_the_frontend_pragma_does` — so any
-  future entry point that opens this database without running that startup path
-  would quietly not be in WAL.
+* **Greaz will not trade on a database it has not validated.** On startup it
+  proves two things before anything can be read or written: that every
+  migration this build needs is applied and recorded as successful, and that
+  the journal mode really is `wal` — read back on a second connection that did
+  not set it, so the answer comes from the file rather than from one session.
+  If either check fails, the window still opens but every sale, refund, shift,
+  catalog change and administrative write is refused, the screen says what is
+  wrong and what to do, and nothing is recorded. There is deliberately no
+  fallback to another journal mode: a database that trades perfectly and
+  silently cannot be backed up by the procedure above is the worse outcome, not
+  the safer one.
+
+  This matters for step 3 specifically. The absence of `-wal` and `-shm` only
+  means "the main file is complete" if the database was in WAL in the first
+  place; in SQLite's default `delete` mode those files never appear at all, so
+  the check would pass every time while proving nothing. Before the hardening
+  correction a build that failed to establish WAL logged a line and opened the
+  till anyway. It now refuses, which is what makes step 3 trustworthy rather
+  than merely usual.

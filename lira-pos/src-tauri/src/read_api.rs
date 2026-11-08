@@ -108,7 +108,10 @@ use tokio::sync::Mutex;
 /// read-write pool the posting commands share, and the whole point here is
 /// that the frontend never touches it.
 pub struct ReadPool {
-    pool: Mutex<Option<SqlitePool>>,
+    /// Crate-visible so `tests::startup_gate` can assert that a refused
+    /// startup leaves NO read pool behind, which is a property of this field
+    /// rather than of anything observable through the command.
+    pub(crate) pool: Mutex<Option<SqlitePool>>,
 }
 
 impl ReadPool {
@@ -141,6 +144,25 @@ async fn read_pool(
     db_state: &State<'_, crate::posting::DbState>,
     read_state: &State<'_, ReadPool>,
 ) -> Result<SqlitePool, String> {
+    let path = crate::posting::resolve_db_path(app)?;
+    read_pool_for_state(db_state, read_state, &path).await
+}
+
+/// [`read_pool`] without the `AppHandle`, so `tests::startup_gate` can drive
+/// the real read path against a real database.
+///
+/// GATED, and gated BEFORE the cache is consulted. A read is not harmless after
+/// a failed startup: `ensureDbReady` is a read, every repo is a read, and a
+/// renderer that could still read would show a till full of figures from a
+/// database the application has refused to trade on. The refusal it returns is
+/// the operator-facing message itself, which is how it reaches the screen.
+pub(crate) async fn read_pool_for_state(
+    db_state: &crate::posting::DbState,
+    read_state: &ReadPool,
+    path: &std::path::Path,
+) -> Result<SqlitePool, String> {
+    db_state.ensure_trading_allowed().await?;
+
     {
         let guard = read_state.pool.lock().await;
         if let Some(p) = &*guard {
@@ -149,10 +171,9 @@ async fn read_pool(
     }
 
     // Make sure the WAL companions exist before asking for a read-only handle.
-    crate::posting::pool(app, db_state).await?;
+    crate::posting::pool_for_state(db_state, path).await?;
 
-    let path = crate::posting::resolve_db_path(app)?;
-    let p = open_read_only_pool(&path).await?;
+    let p = open_read_only_pool(path).await?;
 
     let mut guard = read_state.pool.lock().await;
     if let Some(existing) = &*guard {

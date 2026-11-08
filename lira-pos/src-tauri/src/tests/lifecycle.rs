@@ -1062,3 +1062,101 @@ async fn closing_the_read_only_pool_first_checkpoints_the_wal() {
 
     db.cleanup().await.expect("remove TempDb");
 }
+
+// ============================================================================
+// GZ-WAL-01 — the backup premise survives a REFUSED startup
+// ============================================================================
+
+/// A startup that fails validation still leaves one self-contained file behind
+/// after the operator closes the application.
+///
+/// This is the new failure path's half of the Gate 1 guarantee. `docs/BACKUP.md`
+/// step 3 has the operator read the absence of `-wal` / `-shm` as proof that the
+/// main file holds everything, and that signal has to survive a bad launch as
+/// well as a good one — arguably more so, because a refused startup is exactly
+/// when somebody will be told to take a copy before getting help.
+///
+/// The sequence is the one `lib.rs` performs, in that order:
+///
+///   1. tauri-plugin-sql's preload pool is open (it ran the migrations) —
+///      `db.pool()` stands in for it, as in the tests above;
+///   2. `posting::pool_for_startup_validation` opens the writable pool, which is
+///      what validation runs on;
+///   3. validation fails, so the gate is shut and
+///      `db_init::release_pools_after_failed_startup` lets go of the read-only
+///      pool and then the writable one;
+///   4. the operator closes the window, and the plugin releases its own pool on
+///      `RunEvent::Exit`.
+///
+/// Step 4 is where the checkpoint happens, and it happens because the plugin's
+/// connection is both LAST and WRITABLE. The read-only pool is opened here even
+/// though a refused startup never opens one in practice: the release path
+/// closes it unconditionally, and that order is what is being proved.
+///
+/// The validation failure itself is not re-litigated here — `tests::startup_gate`
+/// covers every way it can fail — so this test shuts the gate directly with a
+/// real fault message and tests the cleanup that follows it.
+#[tokio::test]
+async fn a_refused_startup_still_leaves_one_self_contained_file() {
+    let db = store_with_coffee().await;
+    let path = db.path().to_path_buf();
+    enable_wal(&db).await;
+
+    // An evening's trade already on the file, sitting in the WAL.
+    let sale_id = post_one_sale(db.pool()).await;
+    assert!(
+        wal_of(&path).exists(),
+        "precondition: the sale must still be in the WAL"
+    );
+
+    // (2) The launch opens the writable pool to validate on.
+    let state = crate::posting::DbState::new();
+    let app_pool = crate::posting::pool_for_startup_validation(&state, &path)
+        .await
+        .expect("startup validation opens the writable pool");
+    assert_eq!(sales_count(&app_pool).await, 1);
+
+    let read_pool = crate::read_api::open_read_only_pool(&path)
+        .await
+        .expect("open the read-only pool");
+
+    // (3) Validation failed: shut the gate, then release — in that order.
+    state
+        .mark_startup_failed(crate::db_init::fatal_startup_message(
+            "TEST FAULT: the database schema is incomplete",
+        ))
+        .await;
+    read_pool.close().await;
+    state.close_pool().await;
+
+    // Nothing can trade, and nothing can re-open the file.
+    let refused = crate::posting::pool_for_state(&state, &path)
+        .await
+        .expect_err("a refused startup must not hand out a pool");
+    assert!(refused.contains("GREAZ CANNOT TRADE"), "{refused}");
+
+    // The companions are still there, because the plugin still holds the file.
+    assert!(
+        wal_of(&path).exists(),
+        "the plugin's pool is still open, so the WAL has not been checkpointed yet"
+    );
+
+    // (4) The operator closes the window.
+    close_sqlite_pool_checked(db.pool(), "plugin pool")
+        .await
+        .expect("close plugin pool");
+
+    assert_self_contained_after_shutdown(
+        &path,
+        ExpectedCommittedSale {
+            id: &sale_id,
+            payment_count: 1,
+            movement_count: 1,
+        },
+        "a startup refused for a database fault must still leave a single \
+         self-contained file once the application is closed",
+    )
+    .await;
+
+    db.cleanup().await.expect("remove TempDb");
+}

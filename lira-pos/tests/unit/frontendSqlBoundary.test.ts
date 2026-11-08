@@ -107,6 +107,29 @@ describe("the startup path", () => {
     expect(migrate).not.toContain("db.execute");
   });
 
+  /**
+   * GZ-WAL-01. A startup fault is refused by `db_select` itself — the Rust
+   * side shuts a gate before any pool is opened — and the refusal IS the
+   * operator-facing message. This asserts the renderer passes it through
+   * untouched, because `App.tsx`'s "Startup failed" screen is the only place
+   * it is ever shown. Wrapping it in "something went wrong" would leave the
+   * person at the till with a dead application and no instruction.
+   */
+  it("shows a startup fault to the operator instead of replacing it", async () => {
+    const fault = [
+      "GREAZ CANNOT TRADE — the database did not start up correctly.",
+      "",
+      "The database is not in WAL journal mode: a second, independent connection reports `delete`.",
+      "",
+      "WHAT TO DO NOW",
+      "1. Do not take payments on this machine while this message is showing.",
+    ].join("\n");
+    invokeMock.mockRejectedValue(fault);
+
+    const { ensureDbReady } = await import("../../src/db/migrate");
+    await expect(ensureDbReady()).rejects.toBe(fault);
+  });
+
   it("still probes the applied schema version, and refuses an unmigrated database", async () => {
     invokeMock.mockResolvedValue([{ version: 22 }]);
     const { ensureDbReady } = await import("../../src/db/migrate");

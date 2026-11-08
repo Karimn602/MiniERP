@@ -39,14 +39,94 @@ use tokio::sync::Mutex;
 // State
 // ============================================================================
 
+/// Whether this process has PROVEN its database fit to trade on.
+///
+/// Greaz must never reach trading mode on a database it has not validated. The
+/// three states are deliberately not a boolean, because "not yet checked" and
+/// "checked and good" must not be the same value — a boolean would default to
+/// one of them, and the safe default is the one that refuses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupStatus {
+    /// Startup validation has not completed. Nothing may read or write.
+    Pending,
+    /// Validation passed: every registered migration is applied and the
+    /// journal mode has been independently verified as `wal`.
+    Ready,
+    /// Validation failed, with the operator-facing reason. Nothing may read or
+    /// write, and the reason is what the screen shows.
+    Failed(String),
+}
+
 pub struct DbState {
     pub pool: Mutex<Option<SqlitePool>>,
+    /// THE STARTUP GATE. Lives here rather than in its own managed state
+    /// because this is the struct every writable command already holds, and
+    /// `read_api` already receives it too — so one gate covers both.
+    startup: Mutex<StartupStatus>,
 }
 
 impl DbState {
     pub fn new() -> Self {
         Self {
             pool: Mutex::new(None),
+            // Closed until proven open. See `StartupStatus`.
+            startup: Mutex::new(StartupStatus::Pending),
+        }
+    }
+
+    /// Validation passed. Called from exactly one place: `lib.rs`'s setup hook,
+    /// after `db_init::initialize_database` has returned `Ok`.
+    pub(crate) async fn mark_startup_ready(&self) {
+        *self.startup.lock().await = StartupStatus::Ready;
+    }
+
+    /// Validation failed. `reason` is shown to the operator verbatim, so it is
+    /// the full `db_init::fatal_startup_message`, not a code.
+    pub(crate) async fn mark_startup_failed(&self, reason: impl Into<String>) {
+        *self.startup.lock().await = StartupStatus::Failed(reason.into());
+    }
+
+    /// Read the gate. Used by `tests::startup_gate` to assert the three
+    /// states directly; the application itself only ever asks the question
+    /// through [`DbState::ensure_trading_allowed`].
+    #[allow(dead_code)]
+    pub(crate) async fn startup_status(&self) -> StartupStatus {
+        self.startup.lock().await.clone()
+    }
+
+    /// THE GATE ITSELF, and it is checked before a pool is opened rather than
+    /// before a statement is run.
+    ///
+    /// Every writable command in this application begins by acquiring the
+    /// shared pool through [`pool`], and the renderer's only read channel
+    /// acquires its own through `read_api::read_pool`. Both go through
+    /// [`pool_for_state`], which calls this first. So a failed startup is not
+    /// a flag that each of the twenty-one commands has to remember to check:
+    /// there is no pool to run a statement on, and a lazily-opened pool cannot
+    /// be conjured either, because this refusal happens BEFORE the open.
+    ///
+    /// `Pending` refuses as firmly as `Failed`. In the running application no
+    /// command can arrive while pending — the setup hook blocks before the run
+    /// loop starts and before the webview loads — but "we have not checked" is
+    /// not a licence to trade, and a future entry point that reached a command
+    /// earlier must fail closed rather than discover this.
+    pub(crate) async fn ensure_trading_allowed(&self) -> Result<(), String> {
+        match &*self.startup.lock().await {
+            StartupStatus::Ready => Ok(()),
+            StartupStatus::Failed(reason) => Err(reason.clone()),
+            StartupStatus::Pending => Err(crate::db_init::STARTUP_NOT_COMPLETE.to_string()),
+        }
+    }
+
+    /// Let go of the database file.
+    ///
+    /// Used by the ordinary exit path and by the failed-startup path. Taking
+    /// the pool out of the state is what makes it a release rather than a
+    /// close-and-forget: nothing can clone a handle to it afterwards.
+    pub(crate) async fn close_pool(&self) {
+        let mut guard = self.pool.lock().await;
+        if let Some(pool) = guard.take() {
+            pool.close().await;
         }
     }
 }
@@ -144,16 +224,47 @@ pub(crate) async fn open_write_pool(path: &std::path::Path) -> Result<SqlitePool
 
 /// The one lazily-opened pool every transactional command shares — the posting
 /// commands here and the catalog commands in `crate::catalog`.
+///
+/// GATED. A database that failed startup validation has no pool and cannot get
+/// one: see [`DbState::ensure_trading_allowed`].
 pub(crate) async fn pool(
     app: &tauri::AppHandle,
     state: &State<'_, DbState>,
+) -> Result<SqlitePool, String> {
+    let path = resolve_db_path(app)?;
+    pool_for_state(state, &path).await
+}
+
+/// [`pool`] without the `AppHandle`, so the startup gate can be driven by a
+/// test against a real database rather than only reasoned about.
+///
+/// The gate is consulted BEFORE the lazy open, which is the whole point: after
+/// a failed startup the pool has been released, and a check that ran after the
+/// open would quietly re-create a handle to the file it was supposed to let go
+/// of.
+pub(crate) async fn pool_for_state(
+    state: &DbState,
+    path: &std::path::Path,
+) -> Result<SqlitePool, String> {
+    state.ensure_trading_allowed().await?;
+    pool_for_startup_validation(state, path).await
+}
+
+/// The same lazy open with NO gate — for startup validation only.
+///
+/// This is the one function that may open the database before the gate has
+/// been decided, because it is what `db_init::initialize_database` uses to
+/// decide it. `tests::startup_gate` asserts that `db_init` is its only
+/// non-test caller; anything else must go through [`pool_for_state`].
+pub(crate) async fn pool_for_startup_validation(
+    state: &DbState,
+    path: &std::path::Path,
 ) -> Result<SqlitePool, String> {
     let mut guard = state.pool.lock().await;
     if let Some(p) = &*guard {
         return Ok(p.clone());
     }
-    let path = resolve_db_path(app)?;
-    let p = open_write_pool(&path).await?;
+    let p = open_write_pool(path).await?;
     *guard = Some(p.clone());
     Ok(p)
 }

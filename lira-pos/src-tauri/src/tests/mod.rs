@@ -35,3 +35,4 @@ mod tenders;
 mod admin_commands;
 mod fk_enforcement;
 mod sql_boundary;
+mod startup_gate;
