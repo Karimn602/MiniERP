@@ -936,8 +936,8 @@ fn the_two_cost_comparisons_agree() {
     }
 }
 
-/// And the recorded residual is recorded: the discount control's limit is named
-/// in the policy, and the gap has a measured test rather than a sentence.
+/// The discount control's reach is named in the policy, and GZ-B-P1 (the gap it
+/// used to have) is held by a test that now RUNS rather than one that is ignored.
 #[test]
 fn the_discount_controls_limit_is_written_down_and_measured() {
     let authz_src = include_str!("../authz.rs");
@@ -956,8 +956,13 @@ fn the_discount_controls_limit_is_written_down_and_measured() {
         "the gap must have a test in the known-defect register, not just prose"
     );
     assert!(
-        defects.contains("#[ignore = \"GZ-B-P1"),
-        "and it must be registered as a defect the implementation still has"
+        !defects.contains("#[ignore = \"GZ-B-P1"),
+        "GZ-B-P1 is closed: its regression must run normally, not be ignored"
+    );
+    let posting = include_str!("../posting.rs");
+    assert!(
+        posting.contains("sale_price_shortfall_cents(&mut tx, &payload)"),
+        "post_sale_tx must authorize on the economic discount"
     );
 }
 

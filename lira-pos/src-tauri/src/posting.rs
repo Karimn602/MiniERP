@@ -4037,7 +4037,165 @@ pub async fn post_sale(
         .map_err(PostSaleFailure::refused)?;
     }
 
+    // AND THE DISCOUNT HIDDEN IN THE PRICES, so its refusal is AUDITED
+    // (independent review, V1). `post_sale_tx` decides the economic discount
+    // inside the transaction that commits, and that remains the authority —
+    // but a refusal there is rolled back with everything else, so a cashier
+    // repeatedly ringing a $10.00 item at $0.01 left no `permission_denied`
+    // row. This preflight runs the same calculation in a throwaway read and,
+    // when it is over the threshold, asks the AUDITABLE `authorize`.
+    //
+    // Only for a NEW sale identity: a replay must reach the replay resolution
+    // in `post_sale_tx` untouched, so a lost answer still returns its receipt.
+    let economic = economic_discount_preflight(&pool, &payload)
+        .await
+        .map_err(PostSaleFailure::refused)?;
+    if economic > crate::authz::DISCOUNT_WITHOUT_APPROVAL_CENTS {
+        // The SAME sentence the in-transaction refusal gives, so a stale cart
+        // still hears "re-add the item" rather than only "ask a manager".
+        let hidden = economic - payload.discount_cents;
+        crate::authz::authorize(
+            &pool,
+            &actor,
+            crate::authz::Operation::PostSaleLargeDiscount,
+        )
+        .await
+        .map_err(|refusal| PostSaleFailure::refused(hidden_price_refusal(refusal, hidden)))?;
+    }
+
     post_sale_tx(&pool, &actor, payload, prepared).await.map_err(PostSaleFailure::refused)
+}
+
+/// The economic discount of a sale, computed in a read-only transaction that
+/// is rolled back (it writes nothing). For an identity that already EXISTS the
+/// price reductions are not computed and only the DECLARED discount is
+/// returned — the figure the older declared-discount boundary check above
+/// already judges — so this adds no refusal to any replay. Advisory: the
+/// decision is made again inside `post_sale_tx`.
+pub(crate) async fn economic_discount_preflight(
+    pool: &SqlitePool,
+    payload: &PostSalePayload,
+) -> Result<i64, String> {
+    let mut tx = pool.begin().await.map_err(|e| format!("begin preflight: {e}"))?;
+    let exists = sqlx::query("SELECT 1 FROM sales WHERE id = ?")
+        .bind(&payload.sale_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("read sale identity: {e}"))?
+        .is_some();
+    let reductions = if exists {
+        0
+    } else {
+        sale_price_shortfall_cents(&mut tx, payload).await?
+    };
+    tx.rollback().await.map_err(|e| format!("end preflight: {e}"))?;
+    Ok(payload.discount_cents.max(reductions))
+}
+
+/// THE PART OF A SALE'S DISCOUNT THAT HIDES IN ITS PRICES (GZ-B-P1).
+///
+/// For every line, the price the CATALOGUE gives that product in that unit —
+/// `product_uoms.sale_price_*` when the unit carries its own price, otherwise
+/// the product's base price scaled by the unit's factor and rounded half away
+/// from zero, which is `lib/uom.ts::resolvePriceForUom` exactly — is compared
+/// with the unit price the line declares, on BOTH the inclusive and the
+/// exclusive side, and with the line's posted (post-discount) inclusive TOTAL;
+/// the largest reduction is counted. Lines priced at or above the catalogue
+/// contribute nothing: a surcharge on one line never offsets a reduction on
+/// another. The result INCLUDES the declared discount's allocations, so the
+/// caller takes the larger of it and the declared discount, never the sum.
+///
+/// WHY A SHORTFALL IS AUTHORIZED, NOT REFUSED. The register holds a product
+/// snapshot per cart line, so a cart opened before a manager reprices an item
+/// legitimately carries yesterday's figure, and a parked cart restores it.
+/// Refusing every difference would strand those carts — and a frozen checkout
+/// attempt with them. Treating the shortfall as discount instead means the
+/// difference is decided by the same role rule as any other reduction: within
+/// the threshold for anybody, above it only for a manager or the owner.
+///
+/// A line whose product or unit cannot be resolved contributes nothing here;
+/// the line resolution that follows refuses it by name.
+pub(crate) async fn sale_price_shortfall_cents(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    payload: &PostSalePayload,
+) -> Result<i64, String> {
+    let mut shortfall: i128 = 0;
+    for line in &payload.lines {
+        let row = sqlx::query(
+            "SELECT p.price_excl_vat_cents, p.price_incl_vat_cents,
+                    u.factor_num, u.factor_den,
+                    u.sale_price_excl_vat_cents, u.sale_price_incl_vat_cents
+               FROM products p
+               JOIN product_uoms u
+                 ON u.product_id = p.id AND u.store_id = p.store_id
+                AND u.uom_code = ? AND u.is_active = 1
+              WHERE p.id = ? AND p.store_id = ?",
+        )
+        .bind(&line.uom_code_snapshot)
+        .bind(&line.product_id)
+        .bind(&payload.store_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("read catalogue price for {}: {e}", line.product_id))?;
+        let Some(row) = row else { continue };
+
+        let get = |col: &str| -> Result<i64, String> {
+            row.try_get::<i64, _>(col).map_err(|e| format!("decode {col}: {e}"))
+        };
+        let get_opt = |col: &str| -> Result<Option<i64>, String> {
+            row.try_get::<Option<i64>, _>(col).map_err(|e| format!("decode {col}: {e}"))
+        };
+        let (num, den) = (get("factor_num")? as i128, get("factor_den")? as i128);
+        if num <= 0 || den <= 0 {
+            continue; // refused by name in the line resolution
+        }
+        let scale = |base: i64| -> i128 { (2 * base as i128 * num + den) / (2 * den) };
+        let (cat_excl, cat_incl) = match (
+            get_opt("sale_price_excl_vat_cents")?,
+            get_opt("sale_price_incl_vat_cents")?,
+        ) {
+            (Some(e), Some(i)) => (e as i128, i as i128),
+            _ => (
+                scale(get("price_excl_vat_cents")?),
+                scale(get("price_incl_vat_cents")?),
+            ),
+        };
+
+        let qty = line.quantity_in_uom as i128;
+        let short_excl = (cat_excl - line.unit_price_excl_vat_cents as i128) * qty;
+        let short_incl = (cat_incl - line.unit_price_incl_vat_cents as i128) * qty;
+        // AND THE LINE TOTAL (independent review, V1). `validate_line_financials`
+        // proves only that a line's subtotal + VAT = total; nothing ties the
+        // TOTAL to the unit price. So honest unit prices over a line total of
+        // one cent were a $0.01 sale with zero shortfall. The register posts
+        // line totals AFTER the discount allocation, so this term is the line's
+        // whole economic reduction — the declared allocation included — and a
+        // legitimately discounted line counts its discount exactly once.
+        //
+        // Inclusive side only, deliberately: the catalogue's excl/incl pair is
+        // not held coherent by `save_product`, and the register derives a
+        // post-discount EXCLUSIVE subtotal from the inclusive figure, so an
+        // exclusive comparison would refuse honest sales on catalogue rounding.
+        // The exclusive unit price is still compared above.
+        let short_total = cat_incl * qty - line.line_total_incl_vat_cents as i128;
+        shortfall += short_excl.max(short_incl).max(short_total).max(0);
+    }
+    i64::try_from(shortfall).map_err(|_| "The sale's prices are out of range.".to_string())
+}
+
+/// A large-discount refusal, with the remedy when part of the discount is
+/// hidden in the PRICES (GZ-B-P1). One function for both the boundary preflight
+/// and the in-transaction check, so the cashier hears the same sentence.
+pub(crate) fn hidden_price_refusal(refusal: String, hidden_cents: i64) -> String {
+    if hidden_cents > 0 {
+        format!(
+            "{refusal} This sale prices its lines {hidden_cents} cents below the \
+             catalogue, which counts as a discount. If a price was changed while this \
+             cart was open, remove the item and add it again so it carries today's price."
+        )
+    } else {
+        refusal
+    }
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).
@@ -4225,16 +4383,32 @@ pub(crate) async fn post_sale_tx(
     crate::authz::authorize_tx(&mut tx, actor, crate::authz::Operation::PostSale).await?;
 
     // AND THE LARGE-DISCOUNT DECISION, re-checked here for the same reason the
-    // base one is: the boundary check ran before this transaction opened. Note
-    // what this does and does not reach — see `authz::DISCOUNT_CONTROL_LIMIT`
-    // and the recorded residual GZ-B-P1.
-    if payload.discount_cents > crate::authz::DISCOUNT_WITHOUT_APPROVAL_CENTS {
+    // base one is: the boundary check ran before this transaction opened.
+    //
+    // GZ-B-P1 (closed). It is decided on the ECONOMIC discount, not the
+    // declared one: the declared header discount PLUS every line's shortfall
+    // against the price the CATALOGUE gives that product in that unit, read
+    // here, inside the transaction that commits. A request that sells a $10.00
+    // item at $0.01 with `discount_cents = 0` therefore meets this permission
+    // exactly as a declared $9.99 discount does. See
+    // `sale_price_shortfall_cents` for why a difference is authorized rather
+    // than refused outright.
+    //
+    // The line reductions already INCLUDE each line's share of the declared
+    // discount (line totals are posted after allocation), so the two are not
+    // added; the larger is taken, which can never be less than either. What the
+    // prices hide beyond the declared figure is reported in the refusal.
+    let line_reductions = sale_price_shortfall_cents(&mut tx, &payload).await?;
+    let economic_discount = payload.discount_cents.max(line_reductions);
+    let price_shortfall = economic_discount - payload.discount_cents;
+    if economic_discount > crate::authz::DISCOUNT_WITHOUT_APPROVAL_CENTS {
         crate::authz::authorize_tx(
             &mut tx,
             actor,
             crate::authz::Operation::PostSaleLargeDiscount,
         )
-        .await?;
+        .await
+        .map_err(|refusal| hidden_price_refusal(refusal, price_shortfall))?;
     }
     // And the DOCUMENT must belong to the actor's own shop. Every check
     // above confirms the actor is who they say and may do this; this is

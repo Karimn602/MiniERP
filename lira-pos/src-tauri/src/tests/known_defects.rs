@@ -391,11 +391,15 @@ async fn gp_a07_line_discounts_must_sum_to_the_header_discount() {
 // product decision first: may a till sell at an overridden price at all, and if
 // so is that override a discount for reporting?
 //
-// The test is `#[ignore]`d, which in this file means "a defect the current
-// implementation still has". Remove the attribute when the fix lands; do not
-// weaken the assertion.
+// CLOSED (V1 release blockers). `post_sale_tx` now authorizes on the economic
+// discount: the declared discount plus each line's shortfall against the
+// catalogue price, read inside the posting transaction. The product decision
+// was taken the conservative way: an overridden price is not refused outright
+// (a cart rung before a reprice legitimately carries the old figure); it is
+// treated as discount and meets the large-discount permission. The test runs
+// normally and its assertion was not weakened. The companions below pin what
+// must keep working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "GZ-B-P1: sale prices are not authoritative; owned by a later work package"]
 async fn gz_b_p1_a_sale_price_cannot_be_used_to_give_an_unapproved_discount() {
     use crate::auth::{Actor, Role};
     use crate::posting::{post_sale_tx, prepare_sale};
@@ -458,5 +462,329 @@ async fn gz_b_p1_a_sale_price_cannot_be_used_to_give_an_unapproved_discount() {
          authorized."
     );
 
+    db.cleanup().await.expect("remove TempDb");
+}
+
+// ---- GZ-B-P1 companions ----------------------------------------------------
+
+const GZ_B_P1_USER: &str = "00000000-0000-0000-0000-0000000000a3";
+const GZ_B_P1_STORE: &str = "00000000-0000-0000-0000-000000000001";
+
+/// The GZ-B-P1 scenario ($10.00 / $9.01 coffee, ten in stock, an open shift)
+/// with one member of staff of the given role.
+async fn gz_b_p1_store(role: crate::auth::Role) -> (TempDb, String) {
+    let db = TempDb::new().await;
+    let role_text = match role {
+        crate::auth::Role::Owner => "owner",
+        crate::auth::Role::Manager => "manager",
+        crate::auth::Role::Cashier => "cashier",
+    };
+    db.exec(&format!(
+        "INSERT INTO users (id, store_id, full_name, role)
+         VALUES ('{GZ_B_P1_USER}', '{GZ_B_P1_STORE}', 'Staff', '{role_text}')"
+    ))
+    .await;
+    seed_exchange_rate(&db).await;
+    seed_product(
+        &db,
+        &ProductSpec {
+            quantity_on_hand: 10,
+            ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee")
+        },
+    )
+    .await;
+    db.exec(&format!(
+        "UPDATE products SET price_incl_vat_cents = 1000, price_excl_vat_cents = 901
+          WHERE id = '{P_COFFEE}'"
+    ))
+    .await;
+    let shift = uuid();
+    db.exec(&format!(
+        "INSERT INTO shifts (id, store_id, opened_by_user_id, opened_at, status,
+                             opening_cash_usd_cents, opening_cash_lbp)
+         VALUES ('{shift}', '{GZ_B_P1_STORE}', '{GZ_B_P1_USER}', '2026-11-08T08:00:00.000Z', 'open', 0, 0)"
+    ))
+    .await;
+    (db, shift)
+}
+
+async fn gz_b_p1_post(
+    db: &TempDb,
+    role: crate::auth::Role,
+    shift: &str,
+    unit_excl: i64,
+    unit_incl: i64,
+    qty: i64,
+) -> Result<(), String> {
+    use crate::auth::Actor;
+    use crate::posting::{post_sale_tx, prepare_sale};
+    let line = SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .qty(qty)
+        .unit_prices(unit_excl, unit_incl)
+        .build();
+    let total = line.line_total_incl_vat_cents;
+    let mut payload = sale_payload(vec![line], vec![cash_usd(total)]);
+    payload.shift_id = Some(shift.to_string());
+    payload.cashier_user_id = Some(GZ_B_P1_USER.to_string());
+    payload.discount_cents = 0;
+    let prepared = prepare_sale(&payload)?;
+    post_sale_tx(
+        db.pool(),
+        &Actor::for_tests(GZ_B_P1_USER, GZ_B_P1_STORE, role),
+        payload,
+        prepared,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// A cashier selling at the catalogue price is untouched by the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_cashier_at_the_catalogue_price_still_posts() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    gz_b_p1_post(&db, Role::Cashier, &shift, 901, 1000, 2)
+        .await
+        .expect("a catalogue-priced sale must post for a cashier");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A price below the catalogue but within the threshold (a cart rung before a
+/// small reprice) still posts for a cashier: it is discount, and small.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_small_price_shortfall_is_within_a_cashiers_authority() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    // 2 x 50 cents short = 100 cents of economic discount, under 500.
+    gz_b_p1_post(&db, Role::Cashier, &shift, 856, 950, 2)
+        .await
+        .expect("a 100-cent shortfall is within a cashier's discount authority");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// Quantity multiplies the shortfall: 6 x 90 cents = 540 > 500.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_shortfall_is_counted_per_unit_sold() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    let err = gz_b_p1_post(&db, Role::Cashier, &shift, 820, 910, 6)
+        .await
+        .expect_err("540 cents below catalogue across six units exceeds the threshold");
+    assert!(err.contains("below the"), "the refusal must say why: {err}");
+    let sales = db.scalar_i64("SELECT COUNT(*) FROM sales").await;
+    assert_eq!(sales, 0, "a refused sale leaves nothing behind");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// Understating only the EXCLUSIVE price (revenue moved into VAT) is a
+/// shortfall too, even though the customer pays the catalogue's inclusive one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_an_understated_exclusive_price_is_a_shortfall() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    let err = gz_b_p1_post(&db, Role::Cashier, &shift, 1, 1000, 1)
+        .await
+        .expect_err("900 cents of revenue moved into VAT must be authorized");
+    assert!(err.contains("below the"), "refused by the shortfall rule: {err}");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A manager may give the reduction: the permission is a role rule, not a ban.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_manager_may_sell_below_the_catalogue() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Manager).await;
+    gz_b_p1_post(&db, Role::Manager, &shift, 1, 1, 1)
+        .await
+        .expect("a manager holds the large-discount permission");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A price ABOVE the catalogue is not a discount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_price_above_the_catalogue_is_not_a_discount() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    gz_b_p1_post(&db, Role::Cashier, &shift, 1081, 1200, 1)
+        .await
+        .expect("a higher price is not a discount");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A unit with its OWN sale price is priced from that row, not from the base
+/// price scaled by the factor: a 6-pack sold at its own $50.00 is not a
+/// $10.00 shortfall against 6 x $10.00.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_unit_with_its_own_price_is_priced_from_that_row() {
+    use crate::auth::{Actor, Role};
+    use crate::posting::{post_sale_tx, prepare_sale};
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    db.exec(&format!(
+        "INSERT INTO product_uoms (id, product_id, store_id, uom_code, factor_num, factor_den,
+                                   is_base, is_default_sale_uom, is_default_purchase_uom, is_active,
+                                   sale_price_excl_vat_cents, sale_price_incl_vat_cents)
+         VALUES ('{}', '{P_COFFEE}', '{GZ_B_P1_STORE}', 'box', 6, 1, 0, 0, 0, 1, 4505, 5000)",
+        uuid()
+    ))
+    .await;
+    let line = SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .uom("box", 6, 1)
+        .qty(1)
+        .unit_prices(4505, 5000)
+        .build();
+    let total = line.line_total_incl_vat_cents;
+    let mut payload = sale_payload(vec![line], vec![cash_usd(total)]);
+    payload.shift_id = Some(shift);
+    payload.cashier_user_id = Some(GZ_B_P1_USER.to_string());
+    let prepared = prepare_sale(&payload).expect("coherent");
+    post_sale_tx(
+        db.pool(),
+        &Actor::for_tests(GZ_B_P1_USER, GZ_B_P1_STORE, Role::Cashier),
+        payload,
+        prepared,
+    )
+    .await
+    .expect("the unit's own price is the catalogue price");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// Post a one-line sale as the GZ-B-P1 user with the line's TOTALS (and the
+/// declared discount) set by hand, the unit prices left at the catalogue's.
+async fn gz_b_p1_post_totals(
+    db: &TempDb,
+    role: crate::auth::Role,
+    shift: &str,
+    qty: i64,
+    line_total_incl: i64,
+    line_subtotal_excl: i64,
+    discount: i64,
+) -> Result<(), String> {
+    use crate::auth::Actor;
+    use crate::posting::{post_sale_tx, prepare_sale};
+    let mut line = SaleLineBuilder::new(P_COFFEE, "Coffee")
+        .qty(qty)
+        .unit_prices(901, 1000)
+        .build();
+    line.line_total_incl_vat_cents = line_total_incl;
+    line.line_subtotal_excl_vat_cents = line_subtotal_excl;
+    line.line_vat_cents = line_total_incl - line_subtotal_excl;
+    line.line_discount_cents = discount;
+    let mut payload = sale_payload(vec![line], vec![cash_usd(line_total_incl)]);
+    payload.shift_id = Some(shift.to_string());
+    payload.cashier_user_id = Some(GZ_B_P1_USER.to_string());
+    payload.discount_cents = discount;
+    let prepared = prepare_sale(&payload)?;
+    post_sale_tx(
+        db.pool(),
+        &Actor::for_tests(GZ_B_P1_USER, GZ_B_P1_STORE, role),
+        payload,
+        prepared,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// INDEPENDENT REVIEW (V1): honest unit prices over a ONE-CENT line total.
+/// `validate_line_financials` proves subtotal + VAT = total and nothing ties
+/// the total to the unit price, so this was a $10.00 item sold for $0.01 with
+/// zero unit-price shortfall. The line total is now compared too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_honest_unit_prices_over_a_one_cent_total_are_refused() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    let err = gz_b_p1_post_totals(&db, Role::Cashier, &shift, 1, 1, 1, 0)
+        .await
+        .expect_err("a $0.01 line total under a $10.00 unit price is a $9.99 discount");
+    assert!(err.contains("below the"), "refused by the economic-discount rule: {err}");
+    assert_eq!(db.scalar_i64("SELECT COUNT(*) FROM sales").await, 0);
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// A legitimate DECLARED discount within the threshold — line totals posted
+/// after allocation, exactly as the register sends them — still posts for a
+/// cashier, and is counted ONCE (declared $4.00 is not doubled to $8.00).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_declared_discount_is_counted_once() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    // Two coffees, $20.00, $4.00 off: $16.00 posted, $14.41 net.
+    gz_b_p1_post_totals(&db, Role::Cashier, &shift, 2, 1600, 1441, 400)
+        .await
+        .expect("a $4.00 declared discount is within a cashier's authority");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// And a declared discount over the threshold is still refused for a cashier
+/// and still allowed for a manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_large_declared_discount_still_needs_a_manager() {
+    use crate::auth::Role;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+    assert!(gz_b_p1_post_totals(&db, Role::Cashier, &shift, 2, 1400, 1261, 600)
+        .await
+        .is_err());
+    db.cleanup().await.expect("remove TempDb");
+    let (db, shift) = gz_b_p1_store(Role::Manager).await;
+    gz_b_p1_post_totals(&db, Role::Manager, &shift, 2, 1400, 1261, 600)
+        .await
+        .expect("a manager may give $6.00 off");
+    db.cleanup().await.expect("remove TempDb");
+}
+
+/// INDEPENDENT REVIEW ROUND 2 (V1): a hidden-price discount refusal must be
+/// AUDITED. The in-transaction refusal rolls back, so the command boundary runs
+/// `economic_discount_preflight` and, over the threshold, the auditable
+/// `authz::authorize`. This drives exactly those two calls, in that order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gz_b_p1_a_hidden_price_discount_refusal_is_audited() {
+    use crate::auth::{Actor, Role};
+    use crate::posting::economic_discount_preflight;
+    let (db, shift) = gz_b_p1_store(Role::Cashier).await;
+
+    let line = SaleLineBuilder::new(P_COFFEE, "Coffee").qty(1).unit_prices(1, 1).build();
+    let mut payload = sale_payload(vec![line], vec![cash_usd(1)]);
+    payload.shift_id = Some(shift);
+    payload.cashier_user_id = Some(GZ_B_P1_USER.to_string());
+
+    let economic = economic_discount_preflight(db.pool(), &payload)
+        .await
+        .expect("preflight reads");
+    assert_eq!(economic, 999, "$10.00 sold at $0.01 is $9.99 of discount");
+    assert!(economic > crate::authz::DISCOUNT_WITHOUT_APPROVAL_CENTS);
+
+    let before = db
+        .scalar_i64("SELECT count(*) FROM auth_audit WHERE event = 'permission_denied'")
+        .await;
+    let refused = crate::authz::authorize(
+        db.pool(),
+        &Actor::for_tests(GZ_B_P1_USER, GZ_B_P1_STORE, Role::Cashier),
+        crate::authz::Operation::PostSaleLargeDiscount,
+    )
+    .await;
+    // And the boundary returns the SAME actionable sentence as the
+    // in-transaction check (round 3): a stale cart must hear "re-add the item".
+    let message = crate::posting::hidden_price_refusal(
+        refused.clone().expect_err("a cashier is refused"),
+        economic - payload.discount_cents,
+    );
+    assert!(
+        message.contains("999 cents below the catalogue") && message.contains("add it again"),
+        "{message}"
+    );
+    let after = db
+        .scalar_i64("SELECT count(*) FROM auth_audit WHERE event = 'permission_denied'")
+        .await;
+    assert_eq!(after, before + 1, "the refusal leaves a durable audit row");
+
+    // And a REPLAY identity is never refused by the preflight: an existing
+    // sale reports only its declared discount.
+    db.exec(&format!(
+        "INSERT INTO sales (id, store_id, receipt_number, exchange_rate_lbp_per_usd,
+                            subtotal_excl_vat_cents, vat_total_cents, total_incl_vat_cents)
+         VALUES ('{}', '{GZ_B_P1_STORE}', 9001, 89000, 1, 0, 1)",
+        payload.sale_id
+    ))
+    .await;
+    assert_eq!(economic_discount_preflight(db.pool(), &payload).await.unwrap(), 0);
     db.cleanup().await.expect("remove TempDb");
 }

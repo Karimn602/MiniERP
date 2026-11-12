@@ -8,6 +8,16 @@ import type {
   PaymentCurrency,
   RefundMethod,
 } from "../types";
+import {
+  SHIFT_CONFIDENTIAL_COLUMNS,
+  SHIFT_PUBLIC_COLUMNS,
+  costsVisible,
+  projection,
+} from "../projection";
+
+/** Shift columns this session may read (Stage C). Never `*`. */
+const shiftCols = (alias: string | null = null) =>
+  projection(alias, SHIFT_PUBLIC_COLUMNS, SHIFT_CONFIDENTIAL_COLUMNS);
 
 // ---------- DB row shape ----------
 
@@ -42,12 +52,14 @@ function toShift(r: ShiftRow): Shift {
     closedAt: r.closed_at,
     openingCashUsdCents: r.opening_cash_usd_cents,
     openingCashLbp: r.opening_cash_lbp,
-    closingCashUsdCents: r.closing_cash_usd_cents,
-    closingCashLbp: r.closing_cash_lbp,
-    expectedCashUsdCents: r.expected_cash_usd_cents,
-    expectedCashLbp: r.expected_cash_lbp,
-    varianceUsdCents: r.variance_usd_cents,
-    varianceLbp: r.variance_lbp,
+    closingCashUsdCents: r.closing_cash_usd_cents ?? null,
+    closingCashLbp: r.closing_cash_lbp ?? null,
+    // `?? null`: absent on a cashier's read (Stage C), and an open shift has
+    // none stored anyway.
+    expectedCashUsdCents: r.expected_cash_usd_cents ?? null,
+    expectedCashLbp: r.expected_cash_lbp ?? null,
+    varianceUsdCents: r.variance_usd_cents ?? null,
+    varianceLbp: r.variance_lbp ?? null,
     status: r.status,
     notes: r.notes,
   };
@@ -204,7 +216,7 @@ export interface ShiftHistoryDetail {
 export const shiftsRepo = {
   async getOpenShift(storeId: string): Promise<Shift | null> {
     const rows = await query<ShiftRow>(
-      `SELECT * FROM shifts
+      `SELECT ${shiftCols()} FROM shifts
        WHERE store_id = ? AND status = 'open'
        ORDER BY opened_at DESC
        LIMIT 1`,
@@ -307,7 +319,7 @@ export const shiftsRepo = {
     params.push(args.limit ?? 100);
 
     const rows = await query<Row>(
-      `SELECT s.*,
+      `SELECT ${shiftCols("s")},
               uo.full_name AS opened_by_name,
               uc.full_name AS closed_by_name
          FROM shifts s
@@ -336,7 +348,7 @@ export const shiftsRepo = {
       closed_by_name: string | null;
     }
     const rows = await query<Row>(
-      `SELECT s.*,
+      `SELECT ${shiftCols("s")},
               uo.full_name AS opened_by_name,
               uc.full_name AS closed_by_name
          FROM shifts s
@@ -594,7 +606,7 @@ export const shiftsRepo = {
          COALESCE(SUM(subtotal_excl_vat_cents), 0) AS subtotal_excl_vat_cents,
          COALESCE(SUM(vat_total_cents), 0)         AS vat_total_cents,
          COALESCE(SUM(total_incl_vat_cents), 0)    AS total_incl_vat_cents,
-         COALESCE(SUM(cogs_reversed_cents), 0)     AS cogs_reversed_cents
+         ${costsVisible() ? "COALESCE(SUM(cogs_reversed_cents), 0)" : "0"} AS cogs_reversed_cents
        FROM sales_credit_memos
        WHERE store_id = ? AND shift_id = ? AND status = 'posted'`,
       [storeId, shiftId],

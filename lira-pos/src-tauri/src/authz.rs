@@ -71,9 +71,10 @@ use crate::auth::{Actor, Role};
 pub(crate) enum Operation {
     // --- front of house -------------------------------------------------
     PostSale,
-    /// A DECLARED discount above [`DISCOUNT_WITHOUT_APPROVAL_CENTS`]. See the
+    /// An ECONOMIC discount above [`DISCOUNT_WITHOUT_APPROVAL_CENTS`] — the
+    /// declared discount plus any line priced below the catalogue. See the
     /// constant for why this is an amount and not a role, and
-    /// [`DISCOUNT_CONTROL_LIMIT`] for what it does NOT reach.
+    /// [`DISCOUNT_CONTROL_LIMIT`] for what it reaches.
     PostSaleLargeDiscount,
     OpenShift,
     CloseOwnShift,
@@ -219,44 +220,34 @@ impl Operation {
 /// those two things; leaving it hard-coded now does not have to be undone.
 pub(crate) const DISCOUNT_WITHOUT_APPROVAL_CENTS: i64 = 500;
 
-/// WHAT THE DISCOUNT CONTROL DOES NOT REACH, stated here rather than left to be
-/// discovered.
+/// WHAT THE DISCOUNT CONTROL REACHES.
 ///
-/// GZ-B-P1 (independent review). The permission is checked against
-/// `payload.discount_cents`, which is the discount the request DECLARES. It is
-/// not checked against the economic discount, because `post_sale` does not
-/// prove a sale's unit prices against the catalogue: `PostSaleLine` carries
-/// `unit_price_excl_vat_cents` / `unit_price_incl_vat_cents` and the posting
-/// command persists them. So a caller that can shape a request may sell a
-/// $10.00 item for $0.01 with `discount_cents = 0`, and the sale reconciles
-/// internally — every line total, VAT figure and header sum agrees — while
-/// never meeting this permission.
+/// GZ-B-P1 (independent review, now CLOSED). The permission used to be checked
+/// against `payload.discount_cents` only — the discount the request DECLARES —
+/// while `post_sale` persisted whatever unit prices the request carried. So a
+/// caller that could shape a request could sell a $10.00 item for $0.01 with
+/// `discount_cents = 0`, the sale reconciled internally, and this permission was
+/// never consulted.
 ///
-/// THE CONTROL IS THEREFORE HONEST ABOUT ITS REACH: it binds the DECLARED
-/// discount, which is the only discount the register can produce, and it does
-/// not bind a hand-built request. That is a smaller claim than "a cashier
-/// cannot give a large discount", and the smaller claim is the true one. This
-/// codebase has a name for the alternative — see
-/// `posting::UNVERIFIED_APPROVAL_PREFIX`, which exists because a control that
-/// looks stronger than it is, is worse than no control.
+/// `post_sale_tx` now decides it on the ECONOMIC discount: the declared
+/// discount plus every line's shortfall against the price the catalogue gives
+/// that product in that unit, read inside the posting transaction
+/// (`posting::sale_price_shortfall_cents`). A price below the catalogue is not
+/// refused outright, because a cart line holds the product as it was when it
+/// was rung and a manager may reprice mid-shift; it is treated as discount and
+/// meets the same role rule as any other reduction.
 ///
-/// WHY IT IS NOT FIXED HERE. The sound correction is to make sale prices
-/// AUTHORITATIVE — resolve each line's price from the product and its resolved
-/// `product_uoms` row inside the posting transaction, derive the economic
-/// discount, and authorize on that. That is the same treatment `post_purchase`
-/// already gives a supplier's unit cost and `post_sale` already gives the UoM
-/// conversion and the COGS rate. It is a change to what `post_sale` ACCEPTS,
-/// not an addition to what it checks, and it needs a product decision first:
-/// whether a till may sell at an overridden price at all, and if so whether
-/// that override is a discount for reporting. Inventing price arithmetic for a
-/// permission check, in a codebase this careful about money, is not a thing to
-/// do at the end of a work package.
+/// What it still does not do, stated: the boundary pre-check in the `post_sale`
+/// command reads only the declared figure (it runs before the transaction and
+/// is an early answer, not the decision), and a manager or the owner may still
+/// post a line below the catalogue without it being recorded in
+/// `discount_cents` — the permission says they may give that reduction, not
+/// that the receipt files it under "discount".
 ///
-/// The gap is recorded as a measured, failing-by-design test in
-/// `tests::known_defects` rather than as prose, so it cannot be forgotten and
-/// cannot be claimed closed without the test changing.
+/// The regression is `tests::known_defects::gz_b_p1_*`, which now runs
+/// normally and passes.
 pub(crate) const DISCOUNT_CONTROL_LIMIT: &str =
-    "binds the declared discount only; sale prices are not authoritative (GZ-B-P1)";
+    "binds the economic discount: declared discount plus any price below the catalogue (GZ-B-P1 closed)";
 
 /// THE MATRIX.
 ///
@@ -405,6 +396,28 @@ pub(crate) async fn begin(
 
     authorize(&pool, &actor, operation).await?;
     Ok((pool, actor))
+}
+
+/// WHICH READ CHANNEL THIS ACTOR GETS (Stage C, GZ-B3-R1).
+///
+/// The staff tier only if BOTH the session's role and the role on the user's own
+/// row permit `ReadCostAndMargin`; otherwise the cashier tier. Reading the row
+/// is what makes a demotion take effect on the next read rather than at the
+/// next sign-in, and taking the stricter of the two means neither a stale
+/// session nor a stale row can widen what is visible. Any failure to confirm
+/// the identity is an `Err` — there is no "default" tier to fall back to.
+pub(crate) async fn read_tier(
+    pool: &sqlx::SqlitePool,
+    actor: &Actor,
+) -> Result<crate::read_guard::ReadTier, String> {
+    let stored = stored_identity(pool, actor).await?;
+    if permits(actor.role, Operation::ReadCostAndMargin)
+        && permits(stored, Operation::ReadCostAndMargin)
+    {
+        Ok(crate::read_guard::ReadTier::Staff)
+    } else {
+        Ok(crate::read_guard::ReadTier::Cashier)
+    }
 }
 
 /// The role and store as the DATABASE has them, not as the actor claims.

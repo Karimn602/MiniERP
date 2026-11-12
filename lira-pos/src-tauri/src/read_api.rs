@@ -112,12 +112,20 @@ pub struct ReadPool {
     /// startup leaves NO read pool behind, which is a property of this field
     /// rather than of anything observable through the command.
     pub(crate) pool: Mutex<Option<SqlitePool>>,
+    /// The CASHIER pool (Stage C, GZ-B3-R1): the same read-only file handle and
+    /// credential policy, plus `read_guard`'s cashier tier, which refuses cost,
+    /// COGS, purchasing, stock-ledger and recipe data. A separate pool rather
+    /// than a per-query switch because the authorizer is a property of the
+    /// CONNECTION, fixed when it is configured, and SQLite gives a statement no
+    /// way to change it.
+    pub(crate) cashier_pool: Mutex<Option<SqlitePool>>,
 }
 
 impl ReadPool {
     pub fn new() -> Self {
         Self {
             pool: Mutex::new(None),
+            cashier_pool: Mutex::new(None),
         }
     }
 }
@@ -173,19 +181,28 @@ pub(crate) async fn read_pool_for_state(
     // longer issues a single `db_select`.
     sessions.ensure_signed_in().await?;
 
+    // AND A TIER (Stage C). Decided on EVERY read, from the session AND the
+    // user's own row, so a demotion takes effect on the next query. The write
+    // pool is acquired first anyway (it creates the WAL companions a read-only
+    // handle cannot), so this costs one indexed lookup.
+    let write_pool = crate::posting::pool_for_state(db_state, sessions, path).await?;
+    let actor = sessions.current_actor().await?;
+    let tier = crate::authz::read_tier(&write_pool, &actor).await?;
+    let slot = match tier {
+        crate::read_guard::ReadTier::Staff => &read_state.pool,
+        crate::read_guard::ReadTier::Cashier => &read_state.cashier_pool,
+    };
+
     {
-        let guard = read_state.pool.lock().await;
+        let guard = slot.lock().await;
         if let Some(p) = &*guard {
             return Ok(p.clone());
         }
     }
 
-    // Make sure the WAL companions exist before asking for a read-only handle.
-    crate::posting::pool_for_state(db_state, sessions, path).await?;
+    let p = open_read_only_pool_tier(path, tier).await?;
 
-    let p = open_read_only_pool(path).await?;
-
-    let mut guard = read_state.pool.lock().await;
+    let mut guard = slot.lock().await;
     if let Some(existing) = &*guard {
         // Another task won the race; keep theirs and drop ours.
         let ours = p.clone();
@@ -205,6 +222,15 @@ pub(crate) async fn read_pool_for_state(
 /// ever relaxed, `tests::sql_boundary` fails — which is the point.
 pub(crate) async fn open_read_only_pool(
     path: &std::path::Path,
+) -> Result<SqlitePool, String> {
+    open_read_only_pool_tier(path, crate::read_guard::ReadTier::Staff).await
+}
+
+/// [`open_read_only_pool`] with the authorizer tier chosen. Every connection of
+/// the returned pool carries that tier's policy and has proved it on itself.
+pub(crate) async fn open_read_only_pool_tier(
+    path: &std::path::Path,
+    tier: crate::read_guard::ReadTier,
 ) -> Result<SqlitePool, String> {
     let opts = SqliteConnectOptions::new()
         .filename(path)
@@ -229,8 +255,8 @@ pub(crate) async fn open_read_only_pool(
         // query is spelled. On this hook returning `Err`, sqlx discards the
         // connection and pool creation fails — so there is no renderer read
         // channel that is not covered. See `read_guard`'s module header.
-        .after_connect(|conn, _meta| {
-            Box::pin(async move { crate::read_guard::install(conn).await })
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move { crate::read_guard::install_tier(conn, tier).await })
         })
         .connect_with(opts)
         .await
@@ -301,9 +327,13 @@ pub(crate) async fn run_select(
 /// written to fix for the posting pool. Adding a third pool without closing it
 /// would have reintroduced it.
 pub(crate) async fn close_read_pool(read_state: &ReadPool) {
-    let mut guard = read_state.pool.lock().await;
-    if let Some(p) = guard.take() {
-        p.close().await;
+    // BOTH pools. A cashier pool left open would hold the WAL companions open
+    // exactly as an unclosed staff pool would — see above.
+    for slot in [&read_state.pool, &read_state.cashier_pool] {
+        let mut guard = slot.lock().await;
+        if let Some(p) = guard.take() {
+            p.close().await;
+        }
     }
 }
 
@@ -432,11 +462,13 @@ pub async fn db_select(
     // window, and a second webview must not inherit the right to read the
     // shop's takings any more than the right to write them.
     //
-    // WHAT THIS COMMAND STILL DOES NOT DO is check a ROLE. It accepts arbitrary
-    // SELECT text, so a cashier can read every cost and margin in the business
-    // through it. That is Stage C, and it is the largest remaining
-    // confidentiality gap — `read_guard` protects the credentials and nothing
-    // else.
+    // AND THE ROLE (Stage C, GZ-B3-R1). The text is still arbitrary SELECT,
+    // but a cashier's statement is compiled on a connection whose authorizer
+    // refuses cost, COGS, purchasing, stock-ledger and recipe data, chosen in
+    // `read_pool_for_state` from the session and the user's own row. The
+    // authorizer sees resolved (table, column) pairs, so no spelling of the
+    // query avoids it. What remains readable to a cashier is listed in
+    // `read_guard`'s Stage C notes; the database FILE is the T9 limit, as ever.
     crate::auth::require_primary_window_label(window.label())?;
 
     // The shape guard runs first so a mistaken write gets a useful sentence

@@ -1,6 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
 import { query } from "../client";
 import { normalizeCogsSource } from "../../lib/standardCost";
+import {
+  SALE_CONFIDENTIAL_COLUMNS,
+  SALE_ITEM_CONFIDENTIAL_COLUMNS,
+  SALE_ITEM_PUBLIC_COLUMNS,
+  SALE_PUBLIC_COLUMNS,
+  projection,
+} from "../projection";
+
+/** Sale and sale-line columns this session may read (Stage C). Never `*`. */
+const saleCols = () => projection(null, SALE_PUBLIC_COLUMNS, SALE_CONFIDENTIAL_COLUMNS);
+const saleItemCols = () =>
+  projection(null, SALE_ITEM_PUBLIC_COLUMNS, SALE_ITEM_CONFIDENTIAL_COLUMNS);
 import { newId } from "../../lib/ids";
 import type { SalesChannel } from "../../lib/salesChannel";
 import type {
@@ -120,8 +132,7 @@ function toSale(r: SaleRow): Sale {
     voidReason: r.void_reason,
     notes: r.notes,
     // The delivery attribution, carried onto the domain object so a receipt, a
-    // kitchen ticket and Sales History can all state it (WP-A4). `SELECT *`
-    // already returned these three columns; nothing read them.
+    // kitchen ticket and Sales History can all state it (WP-A4).
     channel: r.channel,
     driverId: r.driver_id,
     deliveryFeeCents: r.delivery_fee_cents,
@@ -303,7 +314,7 @@ export interface PostSaleResult {
 
 export const salesRepo = {
   async findById(id: string): Promise<Sale | null> {
-    const rows = await query<SaleRow>(`SELECT * FROM sales WHERE id = ?`, [id]);
+    const rows = await query<SaleRow>(`SELECT ${saleCols()} FROM sales WHERE id = ?`, [id]);
     return rows[0] ? toSale(rows[0]) : null;
   },
 
@@ -314,7 +325,7 @@ export const salesRepo = {
 
     const [lineRows, paymentRows] = await Promise.all([
       query<SaleItemRow>(
-        `SELECT * FROM sale_items WHERE sale_id = ? ORDER BY created_at ASC`,
+        `SELECT ${saleItemCols()} FROM sale_items WHERE sale_id = ? ORDER BY created_at ASC`,
         [id],
       ),
       query<SalePaymentRow>(
@@ -354,7 +365,7 @@ export const salesRepo = {
     limit?: number;
   }): Promise<Sale[]> {
     const rows = await query<SaleRow>(
-      `SELECT * FROM sales
+      `SELECT ${saleCols()} FROM sales
        WHERE store_id = ? AND status = 'posted'
        ORDER BY COALESCE(posted_at, created_at) DESC
        LIMIT ?`,
@@ -378,7 +389,7 @@ export const salesRepo = {
 
     if (args.status) {
       const rows = await query<SaleRow>(
-        `SELECT * FROM sales
+        `SELECT ${saleCols()} FROM sales
          WHERE store_id = ? AND status = ?
          ORDER BY COALESCE(posted_at, created_at) DESC
          LIMIT ?`,
@@ -389,7 +400,7 @@ export const salesRepo = {
     }
 
     const rows = await query<SaleRow>(
-      `SELECT * FROM sales
+      `SELECT ${saleCols()} FROM sales
        WHERE store_id = ?
        ORDER BY COALESCE(posted_at, created_at) DESC
        LIMIT ?`,

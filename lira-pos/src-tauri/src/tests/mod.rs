@@ -36,6 +36,7 @@ mod admin_commands;
 mod fk_enforcement;
 mod sql_boundary;
 mod read_guard;
+mod confidential_reads;
 mod auth_credentials;
 mod authorization;
 mod authorization_idempotency;

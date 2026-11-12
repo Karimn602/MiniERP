@@ -1,5 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { query } from "../client";
+import {
+  PRODUCT_CONFIDENTIAL_COLUMNS,
+  PRODUCT_PUBLIC_COLUMNS,
+  projection,
+} from "../projection";
+
+/** The product columns this session may read (Stage C). Never `*`. */
+const productCols = (alias: string | null = null) =>
+  projection(alias, PRODUCT_PUBLIC_COLUMNS, PRODUCT_CONFIDENTIAL_COLUMNS);
 import { newId } from "../../lib/ids";
 import { normalizeCategoryId } from "../../lib/menuCategories";
 import { assertVatRateChosen } from "../../lib/catalogDefaults";
@@ -198,10 +207,12 @@ function rowToProduct(r: ProductRow): Product {
     vatPricingMode: r.vat_pricing_mode,
     priceExclVatCents: r.price_excl_vat_cents,
     priceInclVatCents: r.price_incl_vat_cents,
-    avgCostExclVatMicrocents: r.avg_cost_excl_vat_microcents,
-    avgCostInclVatMicrocents: r.avg_cost_incl_vat_microcents,
-    avgCostExclVatCents: r.avg_cost_excl_vat_cents,
-    avgCostInclVatCents: r.avg_cost_incl_vat_cents,
+    // Absent on a cashier's read (Stage C): the backend refuses these columns
+    // to that role and no cashier screen shows a cost.
+    avgCostExclVatMicrocents: r.avg_cost_excl_vat_microcents ?? 0,
+    avgCostInclVatMicrocents: r.avg_cost_incl_vat_microcents ?? 0,
+    avgCostExclVatCents: r.avg_cost_excl_vat_cents ?? 0,
+    avgCostInclVatCents: r.avg_cost_incl_vat_cents ?? 0,
     quantityOnHand: r.quantity_on_hand,
     reorderPoint: r.reorder_point,
     isActive: r.is_active === 1,
@@ -314,7 +325,7 @@ export interface InventoryValuationRow {
 export const productsRepo = {
   async findById(id: string): Promise<Product | null> {
     const rows = await query<ProductRow>(
-      `SELECT * FROM products WHERE id = ?`,
+      `SELECT ${productCols()} FROM products WHERE id = ?`,
       [id],
     );
 
@@ -332,7 +343,7 @@ export const productsRepo = {
 
     if (!args.search || args.search.trim() === "") {
       const rows = await query<ProductRow>(
-        `SELECT * FROM products
+        `SELECT ${productCols()} FROM products
          WHERE store_id = ?
          ${includeInactive ? "" : "AND is_active = 1"}
          ORDER BY name
@@ -348,14 +359,14 @@ export const productsRepo = {
     const likePattern = `%${term}%`;
 
     const rows = await query<ProductRow & { match_priority: number }>(
-      `SELECT p.*, 1 AS match_priority FROM products p
+      `SELECT ${productCols("p")}, 1 AS match_priority FROM products p
          JOIN product_barcodes pb ON pb.product_id = p.id
         WHERE p.store_id = ?
           AND pb.lookup_value = ?
           AND pb.is_active = 1
           ${includeInactive ? "" : "AND p.is_active = 1"}
        UNION
-       SELECT p.*, 2 AS match_priority FROM products p
+       SELECT ${productCols("p")}, 2 AS match_priority FROM products p
         WHERE p.store_id = ?
           AND (p.name LIKE ? OR p.sku LIKE ?)
           ${includeInactive ? "" : "AND p.is_active = 1"}

@@ -247,6 +247,125 @@ const MUST_NEVER_BE_READABLE: &[(&str, &str)] = &[
 /// rather than trusting the default.
 const PROTECTED_FUNCTIONS: &[&str] = &["load_extension"];
 
+/// STAGE C — WHAT A CASHIER'S READ CONNECTION MAY NOT SEE (GZ-B3-R1).
+///
+/// Everything above applies to every renderer connection. What follows applies
+/// ONLY to connections of the CASHIER pool, which `read_api` hands out when the
+/// signed-in user's STORED role does not permit `Operation::ReadCostAndMargin`.
+/// The authorizer is the right mechanism for the same reason as above: it is
+/// asked about resolved `(table, column)` pairs, so `SELECT *`, aliases, views,
+/// CTEs and subqueries cannot route around it.
+///
+/// Whole tables: the purchasing side of the business (what the shop paid, and
+/// to whom), the stock ledger (every movement carries the unit cost it left
+/// at), the recipe tables and the posted recipe-cost evidence, the dormant
+/// accounting tables, and the sync queue (whose payloads would copy any of
+/// them). `supplier_balances` is a view over `supplier_ledger` and is denied
+/// through it.
+const CASHIER_PROTECTED_TABLES: &[&str] = &[
+    "purchases",
+    "purchase_items",
+    "suppliers",
+    "supplier_ledger",
+    "inventory_movements",
+    "recipes",
+    "recipe_components",
+    "sale_item_recipe_costs",
+    "accounts",
+    "journal_entries",
+    "journal_lines",
+    "sync_queue",
+    // Independent review (V1): `next_purchase_number` and its `updated_at`
+    // disclose purchasing activity the purchase tables above hide. No renderer
+    // code reads this table — the active store comes from `auth_status`.
+    "app_settings",
+];
+
+/// Any column, on ANY table, whose name contains one of these (ASCII,
+/// case-insensitive). A name rule rather than a list on purpose: every cost and
+/// COGS figure in this schema is named that way (`avg_cost_*`,
+/// `standard_cost_*`, `unit_cogs_*`, `line_cogs_*`, `cogs_total_cents`,
+/// `cogs_reversed_cents`, ...), so a cost column a future migration adds is
+/// denied to a cashier before anybody has thought about it — the default the
+/// credential allowlist above chose for the same reason. It also catches
+/// `costing_method`, `cogs_method` and `cogs_source`, which carry no figure;
+/// no cashier screen needs them, and an over-broad deny on a configuration
+/// label is the cheap direction to be wrong in.
+///
+/// `variance` covers the closed-shift reconciliation (`variance_usd_cents`,
+/// `variance_lbp`): what another operator's drawer was short.
+const CASHIER_PROTECTED_COLUMN_FRAGMENTS: &[&str] = &["cost", "cogs", "variance"];
+
+/// And these exact columns: the stored reconciliation of a CLOSED shift — what
+/// was expected and what was COUNTED. The counted figure is here because of an
+/// independent-review finding: the expected figure is a sum of tender, refund
+/// and remittance rows a cashier may legitimately read, so with the count
+/// readable the variance is one subtraction away. Without the count it is not.
+/// A cashier's own open shift has none of these stored; its running figure is
+/// composed from the tender rows, and its close returns its own reconciliation
+/// through the `close_shift` command.
+const CASHIER_PROTECTED_COLUMNS: &[(&str, &str)] = &[
+    ("shifts", "expected_cash_usd_cents"),
+    ("shifts", "expected_cash_lbp"),
+    ("shifts", "closing_cash_usd_cents"),
+    ("shifts", "closing_cash_lbp"),
+];
+
+/// The cashier pool's own install-time proof: a cost column must be REFUSED
+/// and an ordinary catalogue read ALLOWED, on the connection itself. Both
+/// columns exist from migration 001.
+const CASHIER_PROOF_MUST_FAIL: &str = "SELECT avg_cost_excl_vat_cents FROM products LIMIT 0";
+const CASHIER_PROOF_MUST_PASS: &str =
+    "SELECT id, name, price_incl_vat_cents FROM products LIMIT 0";
+
+/// Which policy a read connection carries. Chosen once, at connection time,
+/// and fixed for the connection's life. The callback is SELECTED, not
+/// parameterised, so there is still no captured state for SQLite to outlive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadTier {
+    /// Owner and manager: the credential policy only.
+    Staff,
+    /// Cashier: the credential policy AND Stage C.
+    Cashier,
+}
+
+/// Does `haystack` contain `needle`, ASCII case-insensitively? Allocates
+/// nothing and cannot panic (`windows` over a byte slice, no indexing).
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(n.len())
+        .any(|w| w.eq_ignore_ascii_case(n))
+}
+
+/// The cashier-only decision for one read. `true` means DENY.
+fn cashier_denies(table: &str, column: Option<&str>) -> bool {
+    for t in CASHIER_PROTECTED_TABLES {
+        if matches(table, t) {
+            return true;
+        }
+    }
+    let Some(column) = column else {
+        // A column name SQLite could not give as UTF-8: fail closed.
+        return true;
+    };
+    for fragment in CASHIER_PROTECTED_COLUMN_FRAGMENTS {
+        if contains_ignore_ascii_case(column, fragment) {
+            return true;
+        }
+    }
+    for (t, c) in CASHIER_PROTECTED_COLUMNS {
+        if matches(table, t) && matches(column, c) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The read the install-time proof must be REFUSED.
 ///
 /// `users.pin_hash` exists from migration 001, so this probe is valid against
@@ -292,6 +411,37 @@ unsafe extern "C" fn authorizer(
     _db_name: *const c_char,
     _trigger_or_view: *const c_char,
 ) -> c_int {
+    decide(ReadTier::Staff, action, arg1, arg2)
+}
+
+/// The CASHIER pool's callback: the same base policy, then Stage C.
+///
+/// # Safety
+///
+/// As [`authorizer`].
+unsafe extern "C" fn cashier_authorizer(
+    _user_data: *mut c_void,
+    action: c_int,
+    arg1: *const c_char,
+    arg2: *const c_char,
+    _db_name: *const c_char,
+    _trigger_or_view: *const c_char,
+) -> c_int {
+    decide(ReadTier::Cashier, action, arg1, arg2)
+}
+
+/// The decision both callbacks share.
+///
+/// # Safety
+///
+/// `arg1` / `arg2` are SQLite's callback arguments, valid for the call only;
+/// they are dereferenced after a null check and only through `CStr`.
+unsafe fn decide(
+    tier: ReadTier,
+    action: c_int,
+    arg1: *const c_char,
+    arg2: *const c_char,
+) -> c_int {
     // Reading a cstr argument, or `None` if SQLite passed NULL (it does, for
     // the arguments an action does not use) or if the bytes are not UTF-8.
     //
@@ -325,6 +475,13 @@ unsafe extern "C" fn authorizer(
                 if matches(table, protected) {
                     return ffi::SQLITE_DENY;
                 }
+            }
+
+            // Stage C, on the cashier pool only. Placed before the allowlist
+            // below, which RETURNS for `users`; nothing on `users` matches a
+            // cashier rule today, but the order must not depend on that.
+            if tier == ReadTier::Cashier && cashier_denies(table, as_str(arg2)) {
+                return ffi::SQLITE_DENY;
             }
 
             // An allowlisted table: only the named columns, and DENY BY DEFAULT
@@ -430,7 +587,26 @@ unsafe extern "C" fn authorizer(
 /// this point — sqlx applies those during `establish`, before `after_connect` —
 /// which is why the authorizer can be installed without having to permit the
 /// statements that configure the connection.
-pub(crate) async fn install(conn: &mut sqlx::sqlite::SqliteConnection) -> Result<(), sqlx::Error> {
+///
+/// The TIER selects the callback. The cashier tier additionally proves, on the
+/// connection itself, that a cost column is refused and a catalogue read is
+/// not: the same two-probe discipline as the credential proof.
+pub(crate) async fn install_tier(
+    conn: &mut sqlx::sqlite::SqliteConnection,
+    tier: ReadTier,
+) -> Result<(), sqlx::Error> {
+    type Callback = unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+    ) -> c_int;
+    let callback: Callback = match tier {
+        ReadTier::Staff => authorizer,
+        ReadTier::Cashier => cashier_authorizer,
+    };
     {
         let mut handle = conn.lock_handle().await?;
         let db = handle.as_raw_handle().as_ptr();
@@ -440,7 +616,7 @@ pub(crate) async fn install(conn: &mut sqlx::sqlite::SqliteConnection) -> Result
         // The callback is a static `extern "C" fn` with no captured state, so
         // there is nothing for SQLite to outlive; `pUserData` is null because
         // the callback needs none. See the module header.
-        let rc = unsafe { ffi::sqlite3_set_authorizer(db, Some(authorizer), std::ptr::null_mut()) };
+        let rc = unsafe { ffi::sqlite3_set_authorizer(db, Some(callback), std::ptr::null_mut()) };
 
         if rc != ffi::SQLITE_OK {
             return Err(sqlx::Error::Configuration(
@@ -480,6 +656,26 @@ pub(crate) async fn install(conn: &mut sqlx::sqlite::SqliteConnection) -> Result
         ));
     }
 
+    if tier == ReadTier::Cashier {
+        if sqlx::query(CASHIER_PROOF_MUST_FAIL).fetch_optional(&mut *conn).await.is_ok() {
+            return Err(sqlx::Error::Configuration(
+                "the cashier read-pool policy did not take effect: a cost column was \
+                 still readable on a freshly configured connection. Refusing to open \
+                 the cashier read channel."
+                    .into(),
+            ));
+        }
+        if let Err(e) = sqlx::query(CASHIER_PROOF_MUST_PASS).fetch_optional(&mut *conn).await {
+            return Err(sqlx::Error::Configuration(
+                format!(
+                    "the cashier read-pool policy is over-broad: an ordinary catalogue \
+                     read was refused on a freshly configured connection ({e})."
+                )
+                .into(),
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -491,6 +687,9 @@ pub(crate) struct Policy {
     pub allowlist: &'static [(&'static str, &'static [&'static str])],
     pub must_never_be_readable: &'static [(&'static str, &'static str)],
     pub functions: &'static [&'static str],
+    pub cashier_tables: &'static [&'static str],
+    pub cashier_fragments: &'static [&'static str],
+    pub cashier_columns: &'static [(&'static str, &'static str)],
 }
 
 #[cfg(test)]
@@ -500,5 +699,8 @@ pub(crate) fn policy_for_tests() -> Policy {
         allowlist: COLUMN_ALLOWLIST,
         must_never_be_readable: MUST_NEVER_BE_READABLE,
         functions: PROTECTED_FUNCTIONS,
+        cashier_tables: CASHIER_PROTECTED_TABLES,
+        cashier_fragments: CASHIER_PROTECTED_COLUMN_FRAGMENTS,
+        cashier_columns: CASHIER_PROTECTED_COLUMNS,
     }
 }

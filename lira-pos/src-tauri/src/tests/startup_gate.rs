@@ -647,12 +647,21 @@ fn the_startup_gate_cannot_be_bypassed() {
     let read_check = read_fn
         .find("ensure_trading_allowed")
         .expect("the read path must consult the gate");
+    // Stage C: the cache is a per-TIER slot, chosen before it is consulted.
     let read_cache = read_fn
-        .find("read_state.pool.lock()")
+        .find("slot.lock()")
         .expect("the read path has a cache");
     assert!(
         read_check < read_cache,
         "the gate must be checked before the cached read pool is handed back"
+    );
+    let read_tier = read_fn
+        .find("authz::read_tier(")
+        .expect("the read path must resolve the caller's tier");
+    assert!(
+        read_tier < read_cache,
+        "the tier must be decided before a cached pool is handed back, or a \
+         cashier could be handed the staff pool another read opened"
     );
 
     // 4. `lib.rs` shuts the gate and releases the pools on failure, and no

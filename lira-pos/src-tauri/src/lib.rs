@@ -13,6 +13,7 @@ mod read_guard;
 mod recipe_cost;
 mod recipe_sale_cost;
 mod recipes;
+mod single_instance;
 mod users;
 use posting::DbState;
 use read_api::ReadPool;
@@ -250,6 +251,13 @@ pub(crate) fn migrations() -> Vec<Migration> {
 /// terminal the application was launched from is the right place for the text.
 #[cfg(windows)]
 fn show_fatal_startup_dialog(message: &str) {
+    show_notice_dialog(message, true);
+}
+
+/// The native box itself. `fatal` selects the caption and the error icon; the
+/// already-running notice is information, not a failure.
+#[cfg(windows)]
+fn show_notice_dialog(message: &str, fatal: bool) {
     use std::ffi::OsStr;
     use std::iter::once;
     use std::os::windows::ffi::OsStrExt;
@@ -266,6 +274,7 @@ fn show_fatal_startup_dialog(message: &str) {
 
     const MB_OK: u32 = 0x0000_0000;
     const MB_ICONERROR: u32 = 0x0000_0010;
+    const MB_ICONINFORMATION: u32 = 0x0000_0040;
     const MB_SETFOREGROUND: u32 = 0x0001_0000;
     const MB_TOPMOST: u32 = 0x0004_0000;
 
@@ -288,7 +297,12 @@ fn show_fatal_startup_dialog(message: &str) {
     };
 
     let body = wide(&body);
-    let caption = wide("Greaz POS - cannot start");
+    let caption = wide(if fatal {
+        "Greaz POS - cannot start"
+    } else {
+        "Greaz POS is already open"
+    });
+    let icon = if fatal { MB_ICONERROR } else { MB_ICONINFORMATION };
 
     // SAFETY: both pointers are to NUL-terminated UTF-16 buffers that outlive
     // the call, and a null owner window is documented as valid (the box is
@@ -298,13 +312,16 @@ fn show_fatal_startup_dialog(message: &str) {
             std::ptr::null_mut(),
             body.as_ptr(),
             caption.as_ptr(),
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+            MB_OK | icon | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }
 
 #[cfg(not(windows))]
 fn show_fatal_startup_dialog(_message: &str) {}
+
+#[cfg(not(windows))]
+fn show_notice_dialog(_message: &str, _fatal: bool) {}
 
 /// Close Greaz's own SQLite pool, in order, as the application exits.
 ///
@@ -368,6 +385,36 @@ fn close_read_pool_on_exit(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ONE INSTANCE PER IDENTITY PER WINDOWS USER (GZ-A1-R2), decided BEFORE the
+    // builder: `tauri-plugin-sql` opens and migrates the database inside
+    // `build()`, so a second copy must be turned away before it gets there.
+    // The guard lives until `run` returns, i.e. for the life of the process,
+    // and the OS releases it however the process ends.
+    let context = tauri::generate_context!();
+    let instance = single_instance::current_user()
+        .map(|user| single_instance::mutex_name(&context.config().identifier, &user))
+        .map_err(single_instance::InstanceError::Unavailable)
+        .and_then(|name| single_instance::acquire(&name));
+    let _instance_guard = match instance {
+        Ok(guard) => guard,
+        Err(single_instance::InstanceError::AlreadyRunning) => {
+            eprintln!("{}", single_instance::ALREADY_RUNNING_MESSAGE);
+            show_notice_dialog(single_instance::ALREADY_RUNNING_MESSAGE, false);
+            std::process::exit(0);
+        }
+        Err(single_instance::InstanceError::Unavailable(code)) => {
+            let message = format!(
+                "Greaz POS could not confirm that it is the only copy running \
+                 (Windows error {code}), so it will not open the till data.\n\n\
+                 Restart the computer and open Greaz again. Do NOT delete or move \
+                 any Greaz files."
+            );
+            eprintln!("{message}");
+            show_notice_dialog(&message, true);
+            std::process::exit(1);
+        }
+    };
+
     let migrations = migrations();
 
     match tauri::Builder::default()
@@ -465,7 +512,7 @@ pub fn run() {
             });
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
     {
         Ok(app) => app,
         Err(e) => {
