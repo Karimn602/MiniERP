@@ -93,8 +93,9 @@ async fn a_posted_sale_reconciles_header_lines_payments_and_stock() {
     let header_total = db
         .scalar_i64(&format!("SELECT total_incl_vat_cents FROM sales WHERE id='{sale_id}'"))
         .await;
-    assert_eq!(subtotal, 1350);
-    assert_eq!(vat, 150);
+    // round(1500 / 1.11) = 1351: VAT is stripped from the line total.
+    assert_eq!(subtotal, 1351);
+    assert_eq!(vat, 149);
     assert_eq!(header_total, 1500);
     assert_eq!(subtotal + vat, header_total, "subtotal + VAT = total");
 
@@ -1886,7 +1887,13 @@ async fn a_replay_that_changes_the_vat_code_is_a_conflict() {
     seed_open_shift(&db).await;
     seed_product(
         &db,
-        &ProductSpec { quantity_on_hand: 100, ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee") },
+        &ProductSpec {
+            quantity_on_hand: 100,
+            // Configured exempt, so the first post is a faithful one (GZ-VAT-1
+            // proves the line's rate against the product's own).
+            vat_rate_id: VAT_EXEMPT_ID,
+            ..ProductSpec::stocked(P_COFFEE, "SKU-C1", "Coffee")
+        },
     )
     .await;
 
@@ -2455,8 +2462,8 @@ async fn an_online_order_moves_stock_and_is_vat_rated_exactly_like_a_counter_one
             online.sale_id
         ))
         .await,
-        100,
-        "VAT charged the same way (50c per unit, twice)"
+        99,
+        "VAT charged the same way: stripped from the $10.00 line, 901 + 99"
     );
     assert_eq!(
         db.count(&format!(

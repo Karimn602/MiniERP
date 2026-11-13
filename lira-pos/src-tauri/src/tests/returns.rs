@@ -206,7 +206,10 @@ async fn sale_fingerprint(db: &TempDb, sale: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_full_single_line_return_credits_the_whole_line() {
     let db = shop().await;
-    let sale = sell_coffee_for_cash(&db, 2).await; // 900 + 100 VAT = 1000
+    // The register's split of a 1000-cent line at 11%: strip_vat(1000) = 901,
+    // so 901 + 99 VAT (GZ-VAT-1). Not 2 x (450 + 50): VAT is taken off the
+    // line total, never multiplied up from a rounded unit figure.
+    let sale = sell_coffee_for_cash(&db, 2).await;
     let item = sale_item_id(&db, &sale, P_COFFEE).await;
 
     let payload = cash_return(&db, &sale, &item, 2, 1_000).await;
@@ -216,16 +219,16 @@ async fn a_full_single_line_return_credits_the_whole_line() {
         .expect("a full return of a cash sale must post");
 
     assert_eq!(result.credit_memo_number, 1, "the first return is #1");
-    assert_eq!(result.subtotal_excl_vat_cents, 900);
-    assert_eq!(result.vat_total_cents, 100);
+    assert_eq!(result.subtotal_excl_vat_cents, 901);
+    assert_eq!(result.vat_total_cents, 99);
     assert_eq!(result.total_incl_vat_cents, 1_000);
     assert_eq!(result.refund_total_usd_cents, 1_000);
     assert_eq!(result.cogs_reversed_cents, 400, "2 units at the $2.00 sale cost");
     assert_eq!(result.movement_ids.len(), 1);
 
     // The persisted header is what the command reported.
-    assert_eq!(memo_i64(&db, &memo_id, "subtotal_excl_vat_cents").await, 900);
-    assert_eq!(memo_i64(&db, &memo_id, "vat_total_cents").await, 100);
+    assert_eq!(memo_i64(&db, &memo_id, "subtotal_excl_vat_cents").await, 901);
+    assert_eq!(memo_i64(&db, &memo_id, "vat_total_cents").await, 99);
     assert_eq!(memo_i64(&db, &memo_id, "total_incl_vat_cents").await, 1_000);
     assert_eq!(memo_i64(&db, &memo_id, "cogs_reversed_cents").await, 400);
     assert_eq!(
@@ -266,12 +269,14 @@ async fn a_partial_return_credits_only_the_returned_units() {
     let sale = sell_coffee_for_cash(&db, 2).await;
     let item = sale_item_id(&db, &sale, P_COFFEE).await;
 
-    let result = post_credit_memo_with_pool(db.pool(), cash_return(&db, &sale, &item, 1, 500).await)
+    // The line persisted 901 + 99. Half of each, rounded half away from zero,
+    // is 451 + 50 = 501; the second unit takes the remaining 450 + 49 = 499.
+    let result = post_credit_memo_with_pool(db.pool(), cash_return(&db, &sale, &item, 1, 501).await)
         .await
         .expect("a partial return must post");
 
-    assert_eq!(result.total_incl_vat_cents, 500, "half the line");
-    assert_eq!(result.subtotal_excl_vat_cents, 450);
+    assert_eq!(result.total_incl_vat_cents, 501, "half of each persisted component");
+    assert_eq!(result.subtotal_excl_vat_cents, 451);
     assert_eq!(result.vat_total_cents, 50);
     assert_eq!(result.cogs_reversed_cents, 200, "one unit at the $2.00 sale cost");
     assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 99, "one unit back, one still sold");
@@ -515,11 +520,12 @@ async fn the_returned_base_quantity_comes_from_the_original_lines_conversion() {
     let item = sale_item_id(&db, &sale, P_COFFEE).await;
     assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 76, "100 - 24");
 
-    // One box back: 12 base units, $60.00.
+    // One box back: 12 base units. The line persisted 10,811 + 1,189 (the
+    // register's split of $120.00); half of each is 5,406 + 595 = $60.01.
     let payload = credit_memo_payload(
         &sale,
         vec![return_line(&item).qty(1).uom(12, 1).build()],
-        vec![refund_cash_usd(6_000)],
+        vec![refund_cash_usd(6_001)],
     );
     let memo_id = payload.credit_memo_id.clone();
     post_credit_memo_with_pool(db.pool(), payload)
@@ -833,7 +839,7 @@ async fn the_reversed_vat_comes_from_the_sale_snapshot_not_todays_rate() {
     let memo_id = payload.credit_memo_id.clone();
     let result = post_credit_memo_with_pool(db.pool(), payload).await.expect("post");
 
-    assert_eq!(result.vat_total_cents, 100, "11% of the sale, not 20% of today");
+    assert_eq!(result.vat_total_cents, 99, "the sale's own 11% split, not 20% of today");
     assert_eq!(
         db.scalar_i64(&format!(
             "SELECT vat_rate_bps_snapshot FROM sales_credit_memo_lines
@@ -1015,24 +1021,25 @@ async fn a_cash_only_sale_cannot_be_refunded_to_a_card() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_split_sale_may_be_refunded_through_either_of_its_own_methods_only() {
     let db = shop().await;
-    let lines = vec![coffee(2)]; // 1000
+    let lines = vec![coffee(2)]; // 1000, persisted 901 + 99
     let sale = post_sale_ok(&db, sale_payload(lines, vec![cash_usd(300), card_usd(700)])).await;
     let item = sale_item_id(&db, &sale, P_COFFEE).await;
+    // The first unit back is 451 + 50 = 501 (half of each persisted component).
 
     // A refund that leans harder on cash than the sale took is refused — and
     // so is one through a method that never appeared on the receipt. The split
     // need not be proportional, only within each method's own cap.
     for (refunds, needle) in [
-        (vec![refund_cash_usd(500)], "Refund through cash_usd"),
-        (vec![refund_cash_usd(400), refund_card_usd(100)], "Refund through cash_usd"),
+        (vec![refund_cash_usd(501)], "Refund through cash_usd"),
+        (vec![refund_cash_usd(400), refund_card_usd(101)], "Refund through cash_usd"),
         (
             vec![PostCreditMemoRefund {
                 refund_id: uuid(),
                 method: "bank_transfer".to_string(),
                 currency: "USD".to_string(),
-                amount_native_usd_cents: 500,
+                amount_native_usd_cents: 501,
                 amount_native_lbp: 0,
-                amount_usd_cents_equivalent: 500,
+                amount_usd_cents_equivalent: 501,
                 reference: None,
             }],
             "took no bank_transfer",
@@ -1055,7 +1062,7 @@ async fn a_split_sale_may_be_refunded_through_either_of_its_own_methods_only() {
         credit_memo_payload(
             &sale,
             vec![return_line(&item).qty(1).build()],
-            vec![refund_cash_usd(200), refund_card_usd(300)],
+            vec![refund_cash_usd(200), refund_card_usd(301)],
         ),
     )
     .await
@@ -1069,13 +1076,14 @@ async fn the_per_method_refund_cap_is_cumulative_across_every_return_of_a_sale()
         .await;
     let item = sale_item_id(&db, &sale, P_COFFEE).await;
 
-    // The first return uses up the whole $3.00 of cash the sale took.
+    // The first return (451 + 50 = 501 of the persisted 901 + 99) uses up the
+    // whole $3.00 of cash the sale took.
     post_credit_memo_with_pool(
         db.pool(),
         credit_memo_payload(
             &sale,
             vec![return_line(&item).qty(1).build()],
-            vec![refund_cash_usd(300), refund_card_usd(200)],
+            vec![refund_cash_usd(300), refund_card_usd(201)],
         ),
     )
     .await
@@ -1087,20 +1095,20 @@ async fn the_per_method_refund_cap_is_cumulative_across_every_return_of_a_sale()
         credit_memo_payload(
             &sale,
             vec![return_line(&item).qty(1).build()],
-            vec![refund_cash_usd(1), refund_card_usd(499)],
+            vec![refund_cash_usd(1), refund_card_usd(498)],
         ),
     )
     .await
     .expect_err("cash is exhausted for this sale");
     assert!(err.contains("301 against the 300"), "got: {err}");
 
-    // Back to the card, which still has $5.00 of room, it posts.
+    // Back to the card, which still has room for the remaining 499, it posts.
     post_credit_memo_with_pool(
         db.pool(),
         credit_memo_payload(
             &sale,
             vec![return_line(&item).qty(1).build()],
-            vec![refund_card_usd(500)],
+            vec![refund_card_usd(499)],
         ),
     )
     .await
@@ -1338,8 +1346,9 @@ async fn an_lbp_cash_refund_reduces_the_expected_lira_drawer() {
         db.pool(),
         credit_memo_payload(
             &sale,
+            // 501 cents (451 + 50 of the persisted 901 + 99) at 89,500.
             vec![return_line(&item).qty(1).build()],
-            vec![refund_cash_lbp(447_500)],
+            vec![refund_cash_lbp(448_395)],
         ),
     )
     .await
@@ -1352,7 +1361,7 @@ async fn an_lbp_cash_refund_reduces_the_expected_lira_drawer() {
             store_id: STORE_ID.to_string(),
             closed_by_user_id: USER_ID.to_string(),
             closing_cash_usd_cents: 0,
-            closing_cash_lbp: 1_447_500,
+            closing_cash_lbp: 1_446_605,
         },
     )
     .await
@@ -1360,8 +1369,8 @@ async fn an_lbp_cash_refund_reduces_the_expected_lira_drawer() {
 
     assert_eq!(
         shift.expected_cash_lbp,
-        Some(1_447_500),
-        "1,000,000 float + 895,000 in - 447,500 refunded"
+        Some(1_446_605),
+        "1,000,000 float + 895,000 in - 448,395 refunded"
     );
     assert_eq!(shift.variance_lbp, Some(0));
 }
@@ -1413,8 +1422,9 @@ async fn a_usd_cash_refund_cannot_drive_the_usd_drawer_negative() {
     assert_eq!(credit_memo_count(&db).await, 0);
     assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 90, "nothing restocked");
 
-    // One coffee — $5.00 — fits.
-    let mut small = cash_return(&db, &sale, &item, 1, 500).await;
+    // One coffee fits. The ten-coffee line persisted 4,505 + 495, so one tenth
+    // of each is 451 + 50 = $5.01.
+    let mut small = cash_return(&db, &sale, &item, 1, 501).await;
     small.shift_id = Some(SHIFT_B.to_string());
     post_credit_memo_with_pool(db.pool(), small)
         .await
@@ -1426,13 +1436,13 @@ async fn a_usd_cash_refund_cannot_drive_the_usd_drawer_negative() {
             shift_id: SHIFT_B.to_string(),
             store_id: STORE_ID.to_string(),
             closed_by_user_id: USER_ID.to_string(),
-            closing_cash_usd_cents: 100,
+            closing_cash_usd_cents: 99,
             closing_cash_lbp: 0,
         },
     )
     .await
     .expect("shift B closes");
-    assert_eq!(shift.expected_cash_usd_cents, Some(100), "$6.00 float less the $5.00 refund");
+    assert_eq!(shift.expected_cash_usd_cents, Some(99), "$6.00 float less the $5.01 refund");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1481,16 +1491,17 @@ async fn an_lbp_cash_refund_cannot_drive_the_lbp_drawer_negative() {
     assert!(err.contains("expected to hold 500000"), "got: {err}");
     assert_eq!(credit_memo_count(&db).await, 0);
 
-    // Half of it fits.
+    // Half of it fits: 451 + 50 = 501 cents of the persisted 901 + 99, which is
+    // 448,395 LBP at the sale's locked 89,500.
     let mut half = credit_memo_payload(
         &sale,
         vec![return_line(&item).qty(1).build()],
-        vec![refund_cash_lbp(447_500)],
+        vec![refund_cash_lbp(448_395)],
     );
     half.shift_id = Some(SHIFT_B.to_string());
     post_credit_memo_with_pool(db.pool(), half)
         .await
-        .expect("447,500 LBP fits in a 500,000 LBP till");
+        .expect("448,395 LBP fits in a 500,000 LBP till");
 }
 
 // ============================================================================
@@ -1721,7 +1732,8 @@ async fn the_same_return_identity_with_different_content_is_a_conflict() {
     let sale = sell_coffee_for_cash(&db, 4).await;
     let item = sale_item_id(&db, &sale, P_COFFEE).await;
 
-    let payload = cash_return(&db, &sale, &item, 1, 500).await;
+    // Four coffees persisted 1,802 + 198; one quarter of each is 451 + 50.
+    let payload = cash_return(&db, &sale, &item, 1, 501).await;
     let identity = payload.credit_memo_id.clone();
     post_credit_memo_with_pool(db.pool(), payload).await.expect("post");
 
@@ -1737,7 +1749,7 @@ async fn the_same_return_identity_with_different_content_is_a_conflict() {
     let mut different_restock = credit_memo_payload(
         &sale,
         vec![return_line(&item).qty(1).restock(false).build()],
-        vec![refund_cash_usd(500)],
+        vec![refund_cash_usd(501)],
     );
     different_restock.credit_memo_id = identity.clone();
     let err = post_credit_memo_with_pool(db.pool(), different_restock)
@@ -1749,7 +1761,7 @@ async fn the_same_return_identity_with_different_content_is_a_conflict() {
     let mut different_tender = credit_memo_payload(
         &sale,
         vec![return_line(&item).qty(1).build()],
-        vec![refund_cash_usd(250), refund_cash_usd(250)],
+        vec![refund_cash_usd(250), refund_cash_usd(251)],
     );
     different_tender.credit_memo_id = identity.clone();
     let err = post_credit_memo_with_pool(db.pool(), different_tender)
@@ -1767,12 +1779,14 @@ async fn a_second_partial_return_under_its_own_identity_posts() {
     let sale = sell_coffee_for_cash(&db, 4).await;
     let item = sale_item_id(&db, &sale, P_COFFEE).await;
 
-    // Two separate visits, two identities, the same amount each time. Content
-    // deduplication would swallow the second; identity keying must not.
-    let first = post_credit_memo_with_pool(db.pool(), cash_return(&db, &sale, &item, 1, 500).await)
+    // Two separate visits, two identities, one coffee each time. Content
+    // deduplication would swallow the second; identity keying must not. (The
+    // four-coffee line persisted 1,802 + 198, so the cumulative slices are
+    // 451 + 50 = 501 and then 450 + 49 = 499.)
+    let first = post_credit_memo_with_pool(db.pool(), cash_return(&db, &sale, &item, 1, 501).await)
         .await
         .expect("the first visit");
-    let second = post_credit_memo_with_pool(db.pool(), cash_return(&db, &sale, &item, 1, 500).await)
+    let second = post_credit_memo_with_pool(db.pool(), cash_return(&db, &sale, &item, 1, 499).await)
         .await
         .expect("the second visit is a second return, not a retry of the first");
 
@@ -2175,9 +2189,13 @@ async fn a_lira_card_refund_reblends_both_averages_and_leaves_the_drawer_alone()
 // is non-negative; and because each lands exactly on its own original at full
 // return, so does their sum.
 
-/// Sell `qty` units as ONE line carrying the given persisted subtotal / VAT /
-/// total, paid in cash. The figures are stated raw because the point here is
-/// awkward arithmetic, not plausible pricing.
+/// A sale of `qty` units as ONE line carrying the given persisted subtotal /
+/// VAT / total, paid in cash. The figures are stated raw because the point
+/// here is awkward arithmetic, not plausible pricing — and since GZ-VAT-1
+/// `post_sale` refuses a split that is not the product's rate applied to the
+/// line total, so these lines are seeded as HISTORY (a sale posted before
+/// that rule), in the open shift, which is exactly what a credit memo must
+/// still reverse to the cent.
 async fn sell_awkward_line(db: &TempDb, qty: i64, subtotal: i64, vat: i64) -> (String, String) {
     let total = subtotal + vat;
     let line = SaleLineBuilder::new(P_COFFEE, "Coffee 250g")
@@ -2185,7 +2203,9 @@ async fn sell_awkward_line(db: &TempDb, qty: i64, subtotal: i64, vat: i64) -> (S
         .unit_incl(1)
         .raw_line_totals(subtotal, vat, total)
         .build();
-    let sale = post_sale_ok(db, sale_payload(vec![line], vec![cash_usd(total)])).await;
+    let payload = sale_payload(vec![line], vec![cash_usd(total)]);
+    seed_posted_sale_in_its_shift(db, &payload).await;
+    let sale = payload.sale_id.clone();
     let item = sale_item_id(db, &sale, P_COFFEE).await;
     (sale, item)
 }
@@ -2678,7 +2698,7 @@ async fn a_posted_credit_memo_header_cannot_be_mutated_at_all() {
     }
 
     assert_eq!(memo_i64(&db, &memo_id, "total_incl_vat_cents").await, 1_000);
-    assert_eq!(memo_i64(&db, &memo_id, "vat_total_cents").await, 100);
+    assert_eq!(memo_i64(&db, &memo_id, "vat_total_cents").await, 99, "the line's 901 + 99");
     assert_eq!(memo_i64(&db, &memo_id, "cogs_reversed_cents").await, 400);
     assert_eq!(memo_i64(&db, &memo_id, "credit_memo_number").await, 1);
     assert_eq!(

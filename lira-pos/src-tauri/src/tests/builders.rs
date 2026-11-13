@@ -138,8 +138,12 @@ impl SaleLineBuilder {
 
     fn finish_totals(&self) -> PostSaleLine {
         let qty = self.line.quantity_in_uom;
-        let subtotal = self.line.unit_price_excl_vat_cents * qty;
         let total = self.line.unit_price_incl_vat_cents * qty;
+        // The register's posting rule (`lib/discount.ts::postDiscountLineTotals`),
+        // which `post_sale` enforces for a new sale (GZ-VAT-1): the exclusive
+        // subtotal is stripped from the line TOTAL, never the unit price times
+        // the quantity.
+        let subtotal = strip_vat(total, self.line.vat_rate_bps_snapshot);
         PostSaleLine {
             sale_item_id: self.line.sale_item_id.clone(),
             product_id: self.line.product_id.clone(),
@@ -408,6 +412,18 @@ pub fn clone_sale_payment(p: &PostSalePayment) -> PostSalePayment {
 /// either. The committed row state is identical; only the order differs, which
 /// is exactly the order `post_sale` itself uses since WP-07.
 pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePayload) {
+    seed_historical_sale(db, payload, None).await
+}
+
+/// The same historical row, IN the payload's shift — for a sale whose line
+/// split only a writer from before GZ-VAT-1 could have posted, and which a
+/// credit memo must still reverse exactly. `post_sale` now refuses such a
+/// split for a NEW sale, so the only honest way to produce one is as history.
+pub async fn seed_posted_sale_in_its_shift(db: &TempDb, payload: &PostSalePayload) {
+    seed_historical_sale(db, payload, payload.shift_id.as_deref()).await
+}
+
+async fn seed_historical_sale(db: &TempDb, payload: &PostSalePayload, shift_id: Option<&str>) {
     let subtotal: i64 = payload.lines.iter().map(|l| l.line_subtotal_excl_vat_cents).sum();
     let vat_total: i64 = payload.lines.iter().map(|l| l.line_vat_cents).sum();
     let total: i64 = payload.lines.iter().map(|l| l.line_total_incl_vat_cents).sum();
@@ -421,11 +437,12 @@ pub async fn seed_posted_sale_without_shift(db: &TempDb, payload: &PostSalePaylo
            discount_cents, cogs_total_cents, cogs_method,
            sale_type, status, posted_at, notes,
            channel, driver_id, delivery_fee_cents
-         ) VALUES (?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 'normal', 'draft', NULL, ?,
+         ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 'normal', 'draft', NULL, ?,
                    ?, ?, ?)",
     )
     .bind(&payload.sale_id)
     .bind(&payload.store_id)
+    .bind(shift_id)
     .bind(&payload.device_id)
     .bind(&payload.cashier_user_id)
     .bind(payload.exchange_rate_lbp_per_usd)

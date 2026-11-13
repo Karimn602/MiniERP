@@ -3476,10 +3476,12 @@ fn validate_kitchen_note(index: usize, raw: &Option<String>) -> Result<(), Strin
 /// internally inconsistent line: the header it sums into would be wrong, and
 /// posted rows are immutable, so it has to be refused up front.
 ///
-/// This deliberately does NOT re-derive the VAT split from the rate. Both
-/// legitimate decompositions in the codebase (per-unit-then-multiply in
-/// `lib/saleMath.ts`, total-then-strip in `lib/discount.ts`) can differ by a
-/// cent while both reconciling, and WP-02 does not redesign VAT policy.
+/// This pure check does not re-derive the VAT split; for a NEW sale that is
+/// `validate_sale_vat_authority`, inside the transaction and after the replay
+/// resolution, against the product's configured rate (GZ-VAT-1). The posted
+/// split is the register's total-then-strip rule (`lib/discount.ts`); the
+/// per-unit-then-multiply figures in `lib/saleMath.ts` are pre-discount
+/// display only and never reach a posted line.
 pub(crate) fn validate_line_financials(index: usize, line: &PostSaleLine) -> Result<(), String> {
     let n = index + 1;
     if line.line_subtotal_excl_vat_cents < 0
@@ -4183,6 +4185,79 @@ pub(crate) async fn sale_price_shortfall_cents(
     i64::try_from(shortfall).map_err(|_| "The sale's prices are out of range.".to_string())
 }
 
+/// THE REVENUE/VAT SPLIT OF EVERY NEW SALE LINE IS THE DATABASE'S (GZ-VAT-1).
+///
+/// `validate_line_financials` proves only that a line's parts add up. Two
+/// figures that sum to the same total could therefore move revenue into VAT
+/// (or VAT into revenue) at will, and the rate itself was the caller's: the
+/// `vat_rate_id_snapshot` / `vat_rate_bps_snapshot` pair was stored as sent,
+/// so a taxable product could be posted as exempt. Both are now proved here,
+/// inside the posting transaction, AFTER the replay resolution (a sale that
+/// already posted replays to its receipt on the terms it posted under, and no
+/// historical row is re-judged) and BEFORE any number is consumed:
+///
+/// 1. THE RATE. The line must name the product's own `vat_rate_id`, and carry
+///    that `vat_rates` row's `rate_bps`. Zero-rated and exempt rows are both
+///    0 bps and are honoured exactly as configured; no rate is assumed.
+/// 2. THE SPLIT. Given the posted (post-discount) VAT-inclusive line total —
+///    whose own size is governed by the economic-discount permission
+///    (GZ-B-P1) — the exclusive subtotal must be `strip_vat(total, bps)` and
+///    the VAT `total − subtotal`. That is the register's one posting rule,
+///    `lib/discount.ts::postDiscountLineTotals`, which every line it sends goes
+///    through (discounted or not), and `strip_vat` is its integer mirror
+///    pinned by `pure.rs`. No second VAT formula is introduced.
+///
+/// A difference is REFUSED, never rewritten: the caller priced the sale on the
+/// figures it sent, and a posted line is immutable. A product whose rate was
+/// changed while the cart was open is refused with the same remedy as a
+/// repriced one. A line whose product cannot be resolved is skipped here; the
+/// line resolution that follows refuses it by name.
+pub(crate) async fn validate_sale_vat_authority(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    payload: &PostSalePayload,
+) -> Result<(), String> {
+    for (i, line) in payload.lines.iter().enumerate() {
+        let n = i + 1;
+        let row = sqlx::query(
+            "SELECT p.name, p.vat_rate_id, v.rate_bps
+               FROM products p
+               JOIN vat_rates v ON v.id = p.vat_rate_id
+              WHERE p.id = ? AND p.store_id = ?",
+        )
+        .bind(&line.product_id)
+        .bind(&payload.store_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| format!("read VAT configuration for {}: {e}", line.product_id))?;
+        let Some(row) = row else { continue };
+        let name: String = row.try_get("name").map_err(|e| format!("decode name: {e}"))?;
+        let rate_id: String =
+            row.try_get("vat_rate_id").map_err(|e| format!("decode vat_rate_id: {e}"))?;
+        let bps: i64 = row.try_get("rate_bps").map_err(|e| format!("decode rate_bps: {e}"))?;
+
+        if line.vat_rate_id_snapshot != rate_id || line.vat_rate_bps_snapshot != bps {
+            return Err(format!(
+                "Line {n} ({name}) is taxed at {} bps, but the product is configured at {bps} \
+                 bps. Nothing has been changed. If the product's VAT was changed while this \
+                 cart was open, remove the item and add it again.",
+                line.vat_rate_bps_snapshot
+            ));
+        }
+
+        let total = line.line_total_incl_vat_cents;
+        let subtotal = strip_vat(total, bps).map_err(|e| format!("Line {n}: {e}."))?;
+        let vat = total - subtotal;
+        if line.line_subtotal_excl_vat_cents != subtotal || line.line_vat_cents != vat {
+            return Err(format!(
+                "Line {n} ({name}) splits its total of {total} cents into {} revenue + {} VAT; \
+                 at {bps} bps it is {subtotal} revenue + {vat} VAT. Nothing has been changed.",
+                line.line_subtotal_excl_vat_cents, line.line_vat_cents
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A large-discount refusal, with the remedy when part of the discount is
 /// hidden in the PRICES (GZ-B-P1). One function for both the boundary preflight
 /// and the in-transaction check, so the cashier hears the same sentence.
@@ -4361,6 +4436,11 @@ pub(crate) async fn post_sale_tx(
         tx.rollback().await.map_err(|e| format!("close replay tx: {e}"))?;
         return Ok(result);
     }
+
+    // ---- The rate and the revenue/VAT split are the database's (GZ-VAT-1) ----
+    // After the replay (history is not re-judged), before any number is
+    // consumed. See `validate_sale_vat_authority`.
+    validate_sale_vat_authority(&mut tx, &payload).await?;
 
     // ---- Authorization, INSIDE the transaction, AFTER the replay ----
     //

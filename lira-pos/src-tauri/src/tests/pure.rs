@@ -83,10 +83,11 @@ fn prepare_sale_totals_reconcile_and_are_summed_from_lines() {
 
     let prep = prepare_sale(&payload).expect("valid sale");
 
-    // 2 × $5.00 incl VAT, 11% → excl 450/unit, so 900 + 100 = 1000.
+    // 2 × $5.00 incl VAT at 11%: the register strips VAT from the LINE total,
+    // round(1000 / 1.11) = 901, so 901 + 99 = 1000 (GZ-VAT-1).
     assert_eq!(prep.total, 1000);
-    assert_eq!(prep.subtotal, 900);
-    assert_eq!(prep.vat_total, 100);
+    assert_eq!(prep.subtotal, 901);
+    assert_eq!(prep.vat_total, 99);
     assert_eq!(
         prep.subtotal + prep.vat_total,
         prep.total,

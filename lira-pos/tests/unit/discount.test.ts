@@ -361,3 +361,45 @@ describe("the totals strip adds up (GZ-WP0-04)", () => {
     expect(f.netExclVat + f.vat).toBe(300);
   });
 });
+
+// GZ-VAT-1: `post_sale` now REFUSES a new sale line whose split is not the
+// product's rate applied to the line total, by `posting.rs::strip_vat`. That
+// is only safe if the register's own rule is the same rule. The Rust suite
+// holds `strip_vat` to this exact specification
+// (`vat_authority::the_backend_split_is_the_exactly_rounded_quotient_for_every_small_total`);
+// this holds the register's to it, over the same range.
+describe("postDiscountLineTotals is the rule post_sale enforces (GZ-VAT-1)", () => {
+  /**
+   * net = nearest integer to total × 10000 / (10000 + bps), a half going up —
+   * in exact integer arithmetic (total × 10000 stays far below 2^53 here).
+   */
+  function exactNet(total: number, bps: number): number {
+    const num = total * 10000;
+    const d = 10000 + bps;
+    const lo = Math.floor(num / d);
+    return 2 * (num - lo * d) >= d ? lo + 1 : lo;
+  }
+
+  it("splits every small total exactly as the backend does, at every rate step", () => {
+    const rates = [...Array.from({ length: 101 }, (_, i) => i * 100), 1, 25, 550, 9999];
+    const mismatches: string[] = [];
+    for (const bps of rates) {
+      for (let total = 1; total <= 20000; total++) {
+        const pd = postDiscountLineTotals(total, 0, bps);
+        if (pd.subtotalExclVat !== exactNet(total, bps) || pd.vat !== total - pd.subtotalExclVat) {
+          mismatches.push(`${total}@${bps}: ${pd.subtotalExclVat}+${pd.vat}`);
+        }
+      }
+    }
+    expect(mismatches).toEqual([]);
+  });
+
+  it("splits the post-DISCOUNT total, not the undiscounted one", () => {
+    // Two $10.00 coffees, $4.00 off: $16.00 at 11% is 1441 + 159.
+    expect(postDiscountLineTotals(2000, 400, STANDARD)).toEqual({
+      subtotalExclVat: 1441,
+      vat: 159,
+      totalInclVat: 1600,
+    });
+  });
+});
