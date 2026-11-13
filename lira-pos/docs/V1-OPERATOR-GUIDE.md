@@ -20,7 +20,9 @@ anyone who can run programs on that account can copy or change the file. So:
 
 Run the installer you were given (`Greaz POS_<version>_x64_en-US.msi`, or the
 `-setup.exe`) **while signed in as the till's Windows account**. Check its
-SHA-256 against the value in the release notes before running it.
+SHA-256 against the value in the release notes before running it. Only the
+installers listed in the CURRENT release notes are approved; any other copy,
+including an earlier release candidate with the same file name, is not.
 
 The installer is **not code-signed**. Windows SmartScreen may warn about an
 unknown publisher; that is expected for this release.
@@ -62,6 +64,14 @@ manager. Anything larger — whether typed as a discount or produced by a price
 lower than the menu price — needs a manager or the owner signed in. If a cashier
 sees "This sale prices its lines … below the catalogue", a price was changed
 while the cart was open: remove the item and add it again.
+
+**VAT.** Each item's VAT rate comes from its product record (standard 11%,
+zero-rated or exempt), and the till works out the revenue and VAT of every line
+from that rate. If a cashier sees "Line … is taxed at … bps, but the product is
+configured at …", the item's VAT setting was changed while the cart was open:
+remove the item and add it again. Setting each product's VAT rate correctly is
+the owner's responsibility; confirm the shop's VAT classification of its menu
+with the accountant before trading.
 
 ## 5. A trading day
 
