@@ -20,14 +20,17 @@ use crate::test_support::{self, TempDb};
 const STORE: &str = "00000000-0000-0000-0000-000000000001";
 const USER: &str = "00000000-0000-0000-0000-000000000002";
 
-/// 024 is registered and is the newest migration.
+/// 024 is registered, and is followed only by V1.1's 025.
 #[tokio::test]
 async fn migration_024_is_registered_and_is_the_newest() {
     assert_eq!(
         test_support::latest_migration_version(),
-        24,
-        "024 must be the newest registered migration"
+        25,
+        "025 (operator_controls, V1.1) must be the only migration after 024"
     );
+    assert!(crate::migrations()
+        .iter()
+        .any(|m| m.version == 25 && m.description == "operator_controls"));
     assert!(crate::migrations()
         .iter()
         .any(|m| m.version == 24 && m.description == "audit_vocabulary"));

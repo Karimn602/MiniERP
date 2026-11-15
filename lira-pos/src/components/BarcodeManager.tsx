@@ -11,7 +11,7 @@ import clsx from "clsx";
  * - Lists all barcodes for a product, with the primary one starred.
  * - Add a new barcode (validates EAN-13 if scanner-style format detected).
  * - Click ★ to make a barcode primary (demotes the previous primary).
- * - ✕ to remove. Cannot remove the last barcode.
+ * - ✕ to remove. A barcode is optional (V1.1), so the last one may go too.
  *
  * Self-contained — owns its own loading state and reloads after each mutation.
  */
@@ -118,8 +118,7 @@ export function BarcodeManager({
               <Button
                 variant="ghost"
                 size="sm"
-                disabled={rows.length <= 1}
-                title={rows.length <= 1 ? "At least one barcode is required" : "Remove"}
+                title="Remove"
                 onClick={() => handleRemove(b.id)}
               >
                 ✕

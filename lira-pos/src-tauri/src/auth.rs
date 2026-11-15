@@ -141,7 +141,12 @@ const PRIMARY_WINDOW: &str = "main";
 
 /// How long the till may sit untouched before it LOCKS. Not logs out — see
 /// [`SessionState::lock`] for why those are different.
-const IDLE_LOCK_AFTER: Duration = Duration::from_secs(5 * 60);
+///
+/// 45 minutes for every role (V1.1 founder decision). Only REAL input resets it:
+/// pointer, key, wheel and touch events reach `auth_touch`; an ordinary
+/// command — including every background poll and read — is checked against the
+/// limit but does not defer it (see [`SessionState::ensure_signed_in`]).
+const IDLE_LOCK_AFTER: Duration = Duration::from_secs(45 * 60);
 
 /// Credential policy version. Bumped when the Argon2id parameters below change,
 /// so a successful login against an older hash can re-hash it rather than
@@ -156,7 +161,11 @@ const CREDENTIAL_VERSION: i64 = 1;
 /// whatever rate their hardware allows. The owner credential is the one that
 /// can reach every figure in the business, so it is held to a length that makes
 /// offline guessing impractical rather than slow.
-const MIN_PASSPHRASE_LEN: usize = 10;
+/// V1.1 (founder decision): 8, so a plain alphabetic passphrase works. No
+/// composition rule (digits, symbols, case) is imposed, and none ever was beyond
+/// "not only digits". Argon2id, the lockout ladder and the session controls are
+/// what carry the weight; the guidance on screen still recommends a few words.
+const MIN_PASSPHRASE_LEN: usize = 8;
 
 /// A cashier PIN floor. Six digits, and the documentation says plainly what
 /// that is and is not worth.
@@ -482,7 +491,13 @@ impl SessionState {
             return Err(SESSION_LOCKED.to_string());
         }
 
-        session.last_seen = Instant::now();
+        // V1.1: a COMMAND does not defer the idle lock. Background polling (the
+        // session watch, the low-stock badge, a screen's periodic refresh) goes
+        // through this gate too, and a till must lock after 45 minutes of
+        // nobody touching it however many timers are still asking questions.
+        // Real activity defers the lock through `touch`, which the renderer
+        // calls on pointer, key, wheel and touch events — a scanner's keystrokes
+        // included.
         Ok(())
     }
 
@@ -854,6 +869,23 @@ impl SessionState {
         }
     }
 
+    /// Set how long ago the session last saw real activity (V1.1 tests).
+    #[cfg(test)]
+    pub(crate) async fn set_idle_for_tests(&self, elapsed: Duration) {
+        let mut guard = self.inner.lock().await;
+        if let Some(session) = guard.as_mut() {
+            session.last_seen = Instant::now()
+                .checked_sub(elapsed)
+                .expect("the test clock can be moved back");
+        }
+    }
+
+    /// The idle limit, for the V1.1 tests.
+    #[cfg(test)]
+    pub(crate) fn idle_limit_for_tests() -> Duration {
+        IDLE_LOCK_AFTER
+    }
+
     /// Test-only views of the private lifecycle operations, so
     /// `tests::auth_session` can drive the gate directly rather than only
     /// through a command.
@@ -1129,6 +1161,19 @@ fn still_in_future(stored: &str) -> bool {
 // Credential rules
 // ===========================================================================
 
+/// True when a secret contains at least one LETTER, in any script (Codex V1.1
+/// P1, second round). The first fix asked "is it only numerals and a list of
+/// separators?", and a denylist of separators is never finished: Arabic-Indic
+/// digits grouped with U+066C or U+060C, or split by a zero-width joiner, still
+/// passed. So the rule is stated positively instead: an owner or manager
+/// passphrase must contain one Unicode alphabetic character that is not itself
+/// a numeral (`is_alphabetic` counts letter-numbers such as Roman numerals,
+/// category Nl, which are digits for this purpose). Nothing else is required —
+/// no case, digit or symbol rule.
+pub(crate) fn has_a_letter(secret: &str) -> bool {
+    secret.chars().any(|c| c.is_alphabetic() && !c.is_numeric())
+}
+
 /// What a secret must look like for a given role.
 ///
 /// The refusal names the requirement, because "invalid passphrase" at an
@@ -1157,9 +1202,9 @@ fn check_secret_strength(role: Role, secret: &str) -> Result<(), String> {
                      every figure in the business."
                 ));
             }
-            if secret.chars().all(|c| c.is_ascii_digit()) {
+            if !has_a_letter(secret) {
                 return Err(
-                    "An owner or manager passphrase cannot be only digits. Use words."
+                    "An owner or manager passphrase must contain at least one letter.                      Use words, not only digits or symbols."
                         .to_string(),
                 );
             }
@@ -1631,6 +1676,47 @@ async fn load_accounts(pool: &SqlitePool, store_id: &str) -> Result<Vec<AccountV
         });
     }
     Ok(out)
+}
+
+/// Open THIS installation's enrollment-code file in Notepad (V1.1, founder
+/// report B6).
+///
+/// The ceremony is unchanged: the code is still minted per installation (160
+/// bits), still written only to this Windows account's own app-data folder,
+/// still single-use and expiring, and whoever can read that file is still the
+/// trusted installer. What changes is only that the installer no longer has to
+/// find the folder by hand. It opens the FIXED path `auth_status` reports, with
+/// a FIXED program, takes no argument, and refuses once the shop is enrolled.
+/// Nothing here is a code, a default password, or a way round the ceremony.
+async fn open_enrollment_code_inner(
+    ctx: &AuthCtx<'_>,
+    _sessions: &SessionState,
+) -> Result<(), String> {
+    let state: Option<String> = sqlx::query_scalar("SELECT state FROM auth_enrollment LIMIT 1")
+        .fetch_optional(ctx.pool)
+        .await
+        .map_err(|e| format!("enrollment state: {e}"))?;
+    if state.as_deref() == Some("initialized") {
+        return Err("This shop is already enrolled. There is no enrollment code to open.".into());
+    }
+    if !ctx.code_file.is_file() {
+        return Err(
+            "The enrollment code has not been written yet. Close this message and try again in a moment."
+                .into(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("notepad.exe")
+            .arg(&ctx.code_file)
+            .spawn()
+            .map_err(|e| format!("could not open Notepad: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Opening the code file is supported on Windows only.".into())
+    }
 }
 
 fn enrollment_code_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -2674,6 +2760,7 @@ macro_rules! auth_command {
 }
 
 auth_command!(auth_status -> status_inner, AuthStatus);
+auth_command!(auth_open_enrollment_code -> open_enrollment_code_inner, ());
 auth_command!(auth_logout -> logout_inner, AuthStatus);
 auth_command!(auth_lock -> lock_inner, AuthStatus);
 auth_command!(auth_login -> login_inner, AuthStatus, user_id: String, secret: String);

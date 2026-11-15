@@ -223,6 +223,67 @@ pub fn new_weighted_avg(
     to_i64(average, "weighted-average unit cost in microcents")
 }
 
+/// A VAT-exclusive cost RATE grossed up to its VAT-inclusive twin, in
+/// microcents (V1.1, owner revaluation).
+///
+/// `rate × (10000 + bps) / 10000`, accumulated in i128 and rounded ONCE, half
+/// away from zero — the same rule every other rate here uses. Only an owner
+/// revaluation needs it: every other inclusive rate comes from a document that
+/// states it.
+pub fn rate_with_vat_microcents(rate_excl_microcents: i64, vat_bps: i64) -> Result<i64, String> {
+    if rate_excl_microcents < 0 {
+        return Err("a cost rate cannot be negative".into());
+    }
+    if vat_bps < 0 {
+        return Err("a VAT rate cannot be negative".into());
+    }
+    let gross = (rate_excl_microcents as i128)
+        .checked_mul(10_000 + vat_bps as i128)
+        .ok_or_else(|| "VAT-inclusive cost rate overflows".to_string())?;
+    to_i64(div_round_half_away(gross, 10_000)?, "VAT-inclusive cost rate")
+}
+
+/// The average a PURCHASE leaves behind (V1.1).
+///
+/// A positive pool blends exactly as [`new_weighted_avg`] does. A pool that is
+/// EMPTY or NEGATIVE — reachable only for an item whose owner allows selling
+/// below zero (`products.allow_negative_stock`) — takes the incoming rate
+/// outright, and the receipt is never refused:
+///
+/// * Blending against a deficit is not a valuation. `-1000 @ 0.30` plus
+///   `3000 @ 0.40` "averages" to 0.45, a rate nobody paid, because the
+///   deficit's value is SUBTRACTED. The oversold units were already costed out,
+///   at the average of the day they were sold, on their own sale movements.
+/// * Refusing a receipt that does not clear the deficit (the old behaviour)
+///   made a shop that oversold unable to book the very delivery that would
+///   restore it.
+///
+/// So the units on hand after the receipt are valued at what the receipt
+/// says they cost. What this does NOT do, stated plainly: the difference
+/// between the average the oversold units were costed at and the price the
+/// replacement units actually cost is not recognised anywhere — Greaz has no
+/// cost-variance account — and nothing posted is restated.
+pub fn purchase_weighted_avg(
+    old_qty: i64,
+    old_avg_microcents: i64,
+    new_qty: i64,
+    new_cost_microcents: i64,
+) -> Result<i64, String> {
+    if new_qty <= 0 {
+        return Err("a purchase must receive a positive quantity".into());
+    }
+    if new_cost_microcents < 0 {
+        return Err("a purchase cost rate cannot be negative".into());
+    }
+    if old_qty <= 0 {
+        // Through the same representability check a blend into an empty pool
+        // gets: the received VALUE must fit, or the receipt is refused rather
+        // than the rate accepted unexamined.
+        return new_weighted_avg(0, 0, new_qty, new_cost_microcents);
+    }
+    new_weighted_avg(old_qty, old_avg_microcents, new_qty, new_cost_microcents)
+}
+
 /// Weighted-average unit cost after RETURNED stock comes back, in microcents,
 /// or `None` when no average can honestly be formed.
 ///

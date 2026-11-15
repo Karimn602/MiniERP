@@ -182,6 +182,8 @@ fn burger_update() -> SaveProductPayload {
         sale_price_incl_vat_cents: None,
         barcode: None,
         barcode_type: None,
+        show_on_register: None,
+        allow_negative_stock: None,
     }
 }
 

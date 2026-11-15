@@ -2,9 +2,12 @@
 //
 // Posted credit memos, newest first, with a drawer showing one in full.
 //
-// Read-only. A return is CREATED from the receipt it reverses (Sales History →
-// Create return), because every figure on it is derived from that receipt and
-// choosing a sale is the first decision a cashier makes.
+// A return is CREATED from the receipt it reverses, because every figure on it
+// is derived from that receipt and choosing a sale is the first decision a
+// cashier makes. V1.1: that choice can now be made HERE — type the receipt
+// number, pick the items, confirm — as well as from a Sales History receipt.
+// Every role may post a sale-linked return (founder decision); the backend's
+// quantity, tender and drawer caps are unchanged.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useActiveContext } from "../state/activeContext";
@@ -26,18 +29,96 @@ import { Badge } from "../components/ui/Badge";
 import { formatLbp, formatUsd } from "../lib/money";
 import { formatPrettyDate, isoToLocalDate, relativeFromToday } from "../lib/dates";
 import { CreditMemoPrint } from "../components/CreditMemoPrint";
+import { CreateReturnModal } from "../components/CreateReturnModal";
+import { Input } from "../components/ui/Input";
+import { costsVisible } from "../db/projection";
+import { browserRefundStorage, loadPendingRefunds, type RefundAttempt } from "../lib/refundAttempt";
 import { useTranslation } from "../lib/i18n";
 import clsx from "clsx";
 
 type CreditMemoRow = CreditMemo & { originalReceiptNumber: number | null };
+
+/** A cost the session may not read is NULL: shown as a dash, never "$0.00".
+ *  (The columns are hidden for such a session anyway; this is the backstop.) */
+function costCell(cents: number | null): string {
+  return cents === null ? "—" : formatUsd(cents);
+}
 
 function isoToTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 export default function Returns() {
-  const { storeId, hydrated } = useActiveContext();
+  const { storeId, userId, hydrated } = useActiveContext();
   const { t } = useTranslation();
+  const showCost = costsVisible();
+
+  // V1.1: start a return from a receipt number.
+  const [receiptInput, setReceiptInput] = useState("");
+  const [lookupError, setLookupError] = useState<string | null>(null);
+  const [returning, setReturning] = useState<
+    { saleId: string; receiptNumber: number; postedAt: string } | null
+  >(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  // Codex V1.1 P0: refunds whose outcome never confirmed, from storage — so
+  // after a restart or a lock they are on screen without anyone having to
+  // remember the receipt. Each one is resolved inside the return screen.
+  const readPending = useCallback(
+    () => loadPendingRefunds(browserRefundStorage()).filter((a) => a.storeId === storeId),
+    [storeId],
+  );
+  const [pendingRefunds, setPendingRefunds] = useState<RefundAttempt[]>(readPending);
+  useEffect(() => setPendingRefunds(readPending()), [readPending]);
+
+  async function openPending(a: RefundAttempt) {
+    setNotice(null);
+    setLookupError(null);
+    try {
+      const rows = await query<{ posted_at: string | null; created_at: string }>(
+        "SELECT posted_at, created_at FROM sales WHERE id = ? AND store_id = ? LIMIT 1",
+        [a.saleId, a.storeId],
+      );
+      const row = rows[0];
+      setReturning({
+        saleId: a.saleId,
+        receiptNumber: a.receiptNumber,
+        postedAt: row ? (row.posted_at ?? row.created_at) : a.startedAt,
+      });
+    } catch (e) {
+      setLookupError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function findReceipt() {
+    if (!storeId) return;
+    setLookupError(null);
+    setNotice(null);
+    const n = receiptInput.trim();
+    if (!/^\d{1,9}$/.test(n)) {
+      setLookupError(t("returns.lookupInvalid"));
+      return;
+    }
+    try {
+      const rows = await query<{ id: string; receipt_number: number; posted_at: string | null; created_at: string }>(
+        `SELECT id, receipt_number, posted_at, created_at FROM sales
+          WHERE store_id = ? AND receipt_number = ? AND status = 'posted' LIMIT 1`,
+        [storeId, Number(n)],
+      );
+      const row = rows[0];
+      if (!row) {
+        setLookupError(t("returns.lookupNotFound", { number: n }));
+        return;
+      }
+      setReturning({
+        saleId: row.id,
+        receiptNumber: row.receipt_number,
+        postedAt: row.posted_at ?? row.created_at,
+      });
+    } catch (e) {
+      setLookupError(e instanceof Error ? e.message : String(e));
+    }
+  }
 
   const [storeName, setStoreName] = useState("Store");
   const [memos, setMemos] = useState<CreditMemoRow[]>([]);
@@ -104,7 +185,9 @@ export default function Returns() {
           (acc, m) => {
             acc.refunded += m.totalInclVatCents;
             acc.vat += m.vatTotalCents;
-            acc.cost += m.cogsReversedCents;
+            // NULL is withheld (a cashier); it is only ever summed where
+            // costs are visible, and then every memo carries its figure.
+            acc.cost += m.cogsReversedCents ?? 0;
             return acc;
           },
           { refunded: 0, vat: 0, cost: 0 },
@@ -126,14 +209,62 @@ export default function Returns() {
     <div className="space-y-6">
       <PageHeader title={t("returns.title")} subtitle={t("returns.subtitle")} />
 
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+      <Card>
+        <CardHeader title={t("returns.startTitle")} subtitle={t("returns.startSubtitle")} />
+        <CardBody>
+          <form
+            className="flex flex-wrap items-end gap-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void findReceipt();
+            }}
+          >
+            <div className="w-48">
+              <Input
+                label={t("returns.receiptNumberLabel")}
+                inputMode="numeric"
+                value={receiptInput}
+                onChange={(e) => setReceiptInput(e.target.value)}
+                error={lookupError}
+                autoFocus
+              />
+            </div>
+            <Button type="submit" variant="primary">
+              {t("returns.startButton")}
+            </Button>
+          </form>
+          {notice && <p className="mt-3 text-sm font-semibold text-good-fg">{notice}</p>}
+          {pendingRefunds.map((a) => (
+            <div
+              key={a.memoId}
+              role="alert"
+              data-testid="pending-refund-banner"
+              className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-warn-line bg-warn-bg px-4 py-2 text-sm text-warn-fg"
+            >
+              <span>
+                {t("returns.pendingBanner", {
+                  number: String(a.receiptNumber),
+                  total: formatUsd(a.totalUsdCents),
+                })}
+              </span>
+              <Button size="sm" variant="primary" onClick={() => void openPending(a)}>
+                {t("returns.pendingResolve")}
+              </Button>
+            </div>
+          ))}
+        </CardBody>
+      </Card>
+
+      <div className={clsx("grid grid-cols-1 gap-3", showCost ? "md:grid-cols-3" : "md:grid-cols-2")}>
         <StatCard
           label={t("returns.statRefund")}
           value={formatUsd(summary.refunded)}
           tone={summary.refunded > 0 ? "warn" : undefined}
         />
         <StatCard label={t("returns.statVatReversed")} value={formatUsd(summary.vat)} />
-        <StatCard label={t("returns.statCostReversed")} value={formatUsd(summary.cost)} />
+        {showCost && (
+          <StatCard label={t("returns.statCostReversed")} value={formatUsd(summary.cost)} />
+        )}
       </div>
 
       <div>
@@ -159,7 +290,9 @@ export default function Returns() {
                     <th className="px-5 py-2">{t("returns.colTime")}</th>
                     <th className="px-5 py-2 text-end">{t("returns.colRefunded")}</th>
                     <th className="px-5 py-2 text-end">{t("returns.colVatReversed")}</th>
-                    <th className="px-5 py-2 text-end">{t("returns.colCostReversed")}</th>
+                    {showCost && (
+                      <th className="px-5 py-2 text-end">{t("returns.colCostReversed")}</th>
+                    )}
                     <th className="px-5 py-2">{t("returns.colStatus")}</th>
                   </tr>
                 </thead>
@@ -197,9 +330,11 @@ export default function Returns() {
                         <td className="px-5 py-2 text-end tabular-nums text-slate-700">
                           {formatUsd(m.vatTotalCents)}
                         </td>
-                        <td className="px-5 py-2 text-end tabular-nums text-slate-700">
-                          {formatUsd(m.cogsReversedCents)}
-                        </td>
+                        {showCost && (
+                          <td className="px-5 py-2 text-end tabular-nums text-slate-700">
+                            {costCell(m.cogsReversedCents)}
+                          </td>
+                        )}
                         <td className="px-5 py-2">
                           <Badge
                             tone={
@@ -256,6 +391,27 @@ export default function Returns() {
           <CreditMemoPrint memo={details} storeName={storeName} />
         </div>
       )}
+
+      {returning && storeId && (
+        <CreateReturnModal
+          storeId={storeId}
+          userId={userId}
+          saleId={returning.saleId}
+          receiptNumber={returning.receiptNumber}
+          saleDateLabel={formatPrettyDate(isoToLocalDate(returning.postedAt))}
+          onClose={() => {
+            setReturning(null);
+            setPendingRefunds(readPending());
+          }}
+          onPosted={async (creditMemoNumber) => {
+            setReturning(null);
+            setPendingRefunds(readPending());
+            setReceiptInput("");
+            setNotice(t("returns.postedNotice", { number: String(creditMemoNumber) }));
+            await reload();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -274,6 +430,7 @@ function CreditMemoDetail({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  const showCost = costsVisible();
 
   const title = memo
     ? t("returns.detailTitle", { number: String(memo.creditMemoNumber) })
@@ -320,10 +477,12 @@ function CreditMemoDetail({
                 label={t("returns.statVatReversed")}
                 value={formatUsd(memo.vatTotalCents)}
               />
-              <StatCard
-                label={t("returns.statCostReversed")}
-                value={formatUsd(memo.cogsReversedCents)}
-              />
+              {showCost && (
+                <StatCard
+                  label={t("returns.statCostReversed")}
+                  value={costCell(memo.cogsReversedCents)}
+                />
+              )}
               <StatCard
                 label={t("returns.statDiscountReversed")}
                 value={formatUsd(memo.discountCents)}
@@ -360,14 +519,16 @@ function CreditMemoDetail({
                   label={t("returns.totalsTotal")}
                   value={formatUsd(memo.totalInclVatCents)}
                 />
-                <DetailRow
-                  label={t("returns.totalsCost")}
-                  value={formatUsd(memo.cogsReversedCents)}
-                />
+                {showCost && (
+                  <DetailRow
+                    label={t("returns.totalsCost")}
+                    value={costCell(memo.cogsReversedCents)}
+                  />
+                )}
               </div>
             </div>
 
-            <ReturnedLinesTable lines={memo.lines} />
+            <ReturnedLinesTable lines={memo.lines} showCost={showCost} />
             <RefundsTable refunds={memo.refunds} />
           </>
         ) : null}
@@ -385,7 +546,13 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ReturnedLinesTable({ lines }: { lines: CreditMemoLine[] }) {
+function ReturnedLinesTable({
+  lines,
+  showCost,
+}: {
+  lines: CreditMemoLine[];
+  showCost: boolean;
+}) {
   const { t } = useTranslation();
   return (
     <div className="overflow-x-auto rounded-md border border-slate-200">
@@ -398,7 +565,7 @@ function ReturnedLinesTable({ lines }: { lines: CreditMemoLine[] }) {
             <th className="px-4 py-2 text-end">{t("returns.linesColVat")}</th>
             <th className="px-4 py-2 text-end">{t("returns.linesColLineTotal")}</th>
             <th className="px-4 py-2">{t("returns.linesColRestock")}</th>
-            <th className="px-4 py-2 text-end">{t("returns.linesColCost")}</th>
+            {showCost && <th className="px-4 py-2 text-end">{t("returns.linesColCost")}</th>}
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
@@ -444,9 +611,11 @@ function ReturnedLinesTable({ lines }: { lines: CreditMemoLine[] }) {
                       : t("returns.restockNo")}
                 </Badge>
               </td>
-              <td className="px-4 py-2 text-end tabular-nums text-slate-700">
-                {formatUsd(line.lineCogsExclVatCents)}
-              </td>
+              {showCost && (
+                <td className="px-4 py-2 text-end tabular-nums text-slate-700">
+                  {costCell(line.lineCogsExclVatCents)}
+                </td>
+              )}
             </tr>
           ))}
         </tbody>

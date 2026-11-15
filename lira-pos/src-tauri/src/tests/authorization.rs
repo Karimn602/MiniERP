@@ -182,7 +182,9 @@ fn a_cashier_cannot_refund_reprice_adjust_or_set_the_rate() {
     // covered up, and the whole point of hiring a cashier under Greaz is that
     // the owner can rely on this list.
     for op in [
-        PostCreditMemo,          // cannot refund
+        // (V1.1: a cashier MAY post a sale-linked refund — founder decision.
+        // `post_credit_memo`'s quantity, tender and drawer caps are what keep
+        // that honest, and they are tested in `returns.rs`.)
         PostAdjustment,          // cannot write stock off to cover theft
         SaveProduct,             // cannot reprice
         SaveProductCost,         // cannot restate a margin
@@ -314,17 +316,17 @@ async fn a_role_change_takes_effect_on_the_next_operation() {
 
     // An actor that CLAIMS to be an owner, backed by a cashier row.
     let liar = Actor::for_tests(CASHIER, STORE, Role::Owner);
-    let refused = authz::authorize(db.pool(), &liar, Operation::PostCreditMemo)
+    let refused = authz::authorize(db.pool(), &liar, Operation::PostAdjustment)
         .await
         .expect_err("the stored role decides, not the actor's copy");
-    assert!(refused.contains("cannot give a refund"), "{refused}");
+    assert!(refused.contains("cannot change the stock count"), "{refused}");
 
     // Promote the row; the same actor is now allowed, with no new session.
     db.exec(&format!(
         "UPDATE users SET role = 'manager' WHERE id = '{CASHIER}'"
     ))
     .await;
-    authz::authorize(db.pool(), &liar, Operation::PostCreditMemo)
+    authz::authorize(db.pool(), &liar, Operation::PostAdjustment)
         .await
         .expect("a promotion takes effect at once");
 
@@ -334,7 +336,7 @@ async fn a_role_change_takes_effect_on_the_next_operation() {
     ))
     .await;
     assert!(
-        authz::authorize(db.pool(), &liar, Operation::PostCreditMemo)
+        authz::authorize(db.pool(), &liar, Operation::PostAdjustment)
             .await
             .is_err(),
         "a demotion takes effect at once too"
@@ -450,10 +452,10 @@ fn an_owner_only_refusal_does_not_send_the_cashier_to_a_manager() {
         );
     }
 
-    let message = Operation::PostCreditMemo.refusal(Role::Cashier);
+    let message = Operation::PostAdjustment.refusal(Role::Cashier);
     assert!(
         message.contains("Ask a manager or the owner"),
-        "a refund can be done by a manager: {message}"
+        "a stock correction can be done by a manager: {message}"
     );
 }
 
@@ -554,8 +556,11 @@ fn every_writable_command_authorizes_before_it_opens_a_pool() {
     }
 
     assert_eq!(
-        commands, 20,
-        "expected 20 writable commands across the four modules, found {commands}"
+        // 21 since V1.1: `sale_lines_with_stock_movement` is a READ, but it is
+        // a command in `posting.rs` and is held to the same rule — it takes the
+        // window and authorizes before it touches a pool.
+        commands, 21,
+        "expected 21 writable commands across the four modules, found {commands}"
     );
 }
 
@@ -731,10 +736,10 @@ async fn an_unauthenticated_caller_never_reaches_the_permission_check() {
         .await
         .expect("a cashier may post a sale");
     assert!(
-        authz::authorize(db.pool(), &actor, Operation::PostCreditMemo)
+        authz::authorize(db.pool(), &actor, Operation::PostAdjustment)
             .await
             .is_err(),
-        "a cashier may not refund"
+        "a cashier may not adjust stock"
     );
 
     // A LOCKED session yields no actor either, so locking the screen removes

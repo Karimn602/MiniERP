@@ -18,11 +18,16 @@
 // refusal rather than a wrong refund, and this component's job is only to make
 // the refusal unlikely.
 //
-// DOUBLE SUBMIT. The credit-memo identity is minted ONCE per modal and held in
-// a ref, so a second click, a retry after a failure, or a resend after an
-// answer that never arrived all carry the same identity — which
-// `post_credit_memo` is idempotent on. The button is also disabled while a
-// post is in flight, but the identity is what makes the guarantee.
+// DOUBLE SUBMIT AND LOST ANSWERS (Codex V1.1 P0). The identity used to live in
+// a `useRef`, i.e. only as long as this modal — so a refund that committed and
+// lost its answer could be re-submitted after a restart under a NEW identity
+// and pay the customer twice on a partly returned sale. Now every return is a
+// FROZEN ATTEMPT (`lib/refundAttempt.ts`): the complete request, persisted and
+// read back before `post_credit_memo` is invoked. Any failure is an UNKNOWN
+// outcome, resolved by reading `sales_credit_memos` by that identity; while an
+// attempt for this receipt is unresolved, no new return can be started, and a
+// retry re-sends the frozen request exactly. A new identity is minted only for
+// a deliberate NEW return.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { creditMemosRepo } from "../db/repos/creditMemos";
@@ -46,6 +51,17 @@ import {
   usdCentsToLbp,
 } from "../lib/money";
 import { returnedLineAmounts } from "../lib/creditMemoMath";
+import {
+  beginRefundAttempt,
+  browserRefundStorage,
+  loadPendingRefunds,
+  pendingRefundForSale,
+  clearRefundAttempt,
+  refundFailureMessage,
+  refundInFlight,
+  sendRefundAttempt,
+  type RefundAttempt,
+} from "../lib/refundAttempt";
 import { useTranslation } from "../lib/i18n";
 import { newId } from "../lib/ids";
 import clsx from "clsx";
@@ -97,12 +113,25 @@ export function CreateReturnModal({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  // ONE identity for this return, for the lifetime of the modal. Every attempt
-  // — first click, retry after an error, resend after a lost answer — carries
-  // it, and `post_credit_memo` reconciles a replay to the memo it may already
-  // have written instead of refunding the customer twice.
-  const returnIdentity = useRef<string | null>(null);
-  if (returnIdentity.current === null) returnIdentity.current = newId();
+  // A synchronous gate: two clicks in one frame both see `submitting` false.
+  const submitGate = useRef(false);
+
+  /** The unresolved attempt for THIS receipt, from storage — survives restart. */
+  const [pending, setPending] = useState<RefundAttempt | null>(() =>
+    pendingRefundForSale(loadPendingRefunds(browserRefundStorage()), storeId, saleId),
+  );
+  const [recovery, setRecovery] = useState<
+    | { kind: "checking" }
+    | { kind: "inFlight" }
+    | { kind: "notPosted"; message: string | null }
+    | { kind: "indeterminate"; message: string }
+    /** It POSTED, but this till could not remove its record (Codex V1.1 P3). */
+    | { kind: "cleanupFailed"; creditMemoNumber: number; message: string }
+    | null
+  >(null);
+  /** A discard whose record removal did not stick. */
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const [recoveredNumber, setRecoveredNumber] = useState<number | null>(null);
 
   // ---------- Load ----------
 
@@ -137,6 +166,109 @@ export function CreateReturnModal({
   useEffect(() => {
     void load();
   }, [load]);
+
+  // ---------- Resolving an earlier, uncertain attempt ----------
+
+  /** Read the database for the attempt's identity. Never a guess. */
+  const resolvePending = useCallback(
+    async (attempt: RefundAttempt) => {
+      if (refundInFlight.has(attempt.memoId)) {
+        setRecovery({ kind: "inFlight" });
+        return;
+      }
+      setRecovery({ kind: "checking" });
+      try {
+        const found = await creditMemosRepo.probeIdentity(storeId, attempt.memoId);
+        if (found && found.status === "posted") {
+          const cleared = clearRefundAttempt(browserRefundStorage(), attempt.memoId);
+          if (!cleared.ok) {
+            // The record is still there, so the screen keeps showing it —
+            // blocking a new return on this receipt is the safe failure.
+            setRecovery({
+              kind: "cleanupFailed",
+              creditMemoNumber: found.creditMemoNumber,
+              message: cleared.message,
+            });
+            await load();
+            return;
+          }
+          setStorageError(null);
+          setPending(null);
+          setRecovery(null);
+          setRecoveredNumber(found.creditMemoNumber);
+          await load();
+        } else if (found) {
+          setRecovery({ kind: "indeterminate", message: `status "${found.status}"` });
+        } else {
+          setRecovery({ kind: "notPosted", message: attempt.message ?? null });
+        }
+      } catch (e) {
+        setRecovery({ kind: "indeterminate", message: refundFailureMessage(e) });
+      }
+    },
+    [storeId, load],
+  );
+
+  // On mount only: an attempt left on record (a restart, a lock, a remount)
+  // is reconciled before anything else can be submitted for this receipt.
+  const resolvedOnMount = useRef(false);
+  useEffect(() => {
+    if (resolvedOnMount.current) return;
+    resolvedOnMount.current = true;
+    if (pending) void resolvePending(pending);
+  }, [pending, resolvePending]);
+
+  /** Re-send the SAME frozen request — same identity, same content. */
+  async function resendPending() {
+    if (!pending || submitGate.current) return;
+    submitGate.current = true;
+    setSubmitting(true);
+    setRecovery({ kind: "inFlight" });
+    try {
+      const outcome = await sendRefundAttempt(
+        browserRefundStorage(),
+        pending,
+        creditMemosRepo.postFrozen,
+        { fresh: false },
+      );
+      if (outcome.kind === "posted") {
+        if (outcome.cleanupError !== undefined) {
+          setRecovery({
+            kind: "cleanupFailed",
+            creditMemoNumber: outcome.creditMemoNumber,
+            message: outcome.cleanupError,
+          });
+          await load();
+          return;
+        }
+        setPending(null);
+        setRecovery(null);
+        onPosted(outcome.creditMemoNumber);
+        return;
+      }
+      const again: RefundAttempt = { ...pending, state: "unknown", message: outcome.message };
+      setPending(again);
+      await resolvePending(again);
+    } finally {
+      submitGate.current = false;
+      setSubmitting(false);
+    }
+  }
+
+  /** Only after a READ proved the identity never posted. */
+  function discardPending() {
+    if (!pending || recovery?.kind !== "notPosted") return;
+    const cleared = clearRefundAttempt(browserRefundStorage(), pending.memoId);
+    if (!cleared.ok) {
+      // Not discarded: say so, keep it on screen, and keep the receipt blocked.
+      setStorageError(cleared.message);
+      return;
+    }
+    setStorageError(null);
+    setPending(null);
+    setRecovery(null);
+    void load();
+  }
 
   // ---------- Derived: the returned lines and the memo total ----------
 
@@ -222,6 +354,7 @@ export function CreateReturnModal({
 
   const canSubmit =
     !submitting &&
+    pending === null &&
     !loading &&
     shift !== null &&
     lockedRate !== null &&
@@ -260,12 +393,26 @@ export function CreateReturnModal({
   }
 
   async function handleSubmit() {
-    if (!canSubmit || !shift) return;
+    if (!canSubmit || !shift || submitGate.current) return;
+    // Storage, not this component, is the record of what is unresolved.
+    const onRecord = pendingRefundForSale(
+      loadPendingRefunds(browserRefundStorage()),
+      storeId,
+      saleId,
+    );
+    if (onRecord) {
+      setPending(onRecord);
+      void resolvePending(onRecord);
+      return;
+    }
+    submitGate.current = true;
     setSubmitError(null);
+    setRecoveredNumber(null);
     setSubmitting(true);
     try {
-      const result = await creditMemosRepo.post({
-        creditMemoId: returnIdentity.current!,
+      // A NEW physical return: the only place a return identity is minted.
+      const request = creditMemosRepo.freeze({
+        creditMemoId: newId(),
         storeId,
         originalSaleId: saleId,
         shiftId: shift.id,
@@ -289,15 +436,40 @@ export function CreateReturnModal({
           reference: null,
         })),
       });
-      onPosted(result.creditMemoNumber);
-    } catch (e) {
-      // The backend owns every one of these decisions, so its refusal is the
-      // truth and this screen may be stale. Re-read the authoritative state
-      // and then state the refusal.
-      const message = e instanceof Error ? e.message : String(e);
-      await load();
-      setSubmitError(message);
+      const attempt = beginRefundAttempt(
+        request,
+        { receiptNumber, totalUsdCents: memoTotalCents },
+        new Date().toISOString(),
+      );
+      const outcome = await sendRefundAttempt(
+        browserRefundStorage(),
+        attempt,
+        creditMemosRepo.postFrozen,
+        { fresh: true },
+      );
+      if (outcome.kind === "posted" && outcome.cleanupError !== undefined) {
+        // Posted, but its record is stuck in storage: keep it on screen.
+        setPending(attempt);
+        setRecovery({
+          kind: "cleanupFailed",
+          creditMemoNumber: outcome.creditMemoNumber,
+          message: outcome.cleanupError,
+        });
+        await load();
+      } else if (outcome.kind === "posted") {
+        onPosted(outcome.creditMemoNumber);
+      } else if (outcome.kind === "notSent") {
+        // Proven: nothing was sent, so this is an ordinary failure.
+        setSubmitError(t("createReturn.notSent", { error: outcome.message }));
+      } else {
+        // UNKNOWN: it may have posted. Never shown as a plain failure that
+        // invites a second submission; resolved by identity instead.
+        const unknown: RefundAttempt = { ...attempt, state: "unknown", message: outcome.message };
+        setPending(unknown);
+        await resolvePending(unknown);
+      }
     } finally {
+      submitGate.current = false;
       setSubmitting(false);
     }
   }
@@ -313,7 +485,12 @@ export function CreateReturnModal({
         className="fixed inset-0 z-40 bg-scrim/30 backdrop-blur-sm"
         onClick={submitting ? undefined : onClose}
       />
-      <div className="fixed inset-y-0 end-0 z-50 w-[880px] max-w-[92vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-surface shadow-2xl">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("createReturn.title")}
+        className="fixed inset-y-0 end-0 z-50 w-[880px] max-w-[92vw] animate-fade-in overflow-y-auto border-s border-slate-200 bg-surface shadow-2xl"
+      >
         <Card className="border-0 shadow-none">
           <CardHeader
             title={t("createReturn.title")}
@@ -340,6 +517,83 @@ export function CreateReturnModal({
                 {!shift && (
                   <div className="rounded-md border border-warn-line bg-warn-bg px-4 py-3 text-sm text-warn-fg">
                     {t("createReturn.noOpenShift")}
+                  </div>
+                )}
+
+                {recoveredNumber !== null && (
+                  <div
+                    role="status"
+                    className="rounded-md border border-good-line bg-good-bg px-4 py-3 text-sm text-good-fg"
+                  >
+                    {t("createReturn.recoveredPosted", { number: String(recoveredNumber) })}
+                  </div>
+                )}
+
+                {pending && (
+                  <div
+                    role="alert"
+                    data-testid="refund-recovery"
+                    className="space-y-2 rounded-md border border-warn-line bg-warn-bg px-4 py-3 text-sm text-warn-fg"
+                  >
+                    <div className="font-semibold">
+                      {t("createReturn.pendingTitle", { total: formatUsd(pending.totalUsdCents) })}
+                    </div>
+                    <div>
+                      {recovery?.kind === "checking" && t("createReturn.pendingChecking")}
+                      {recovery?.kind === "inFlight" && t("createReturn.pendingInFlight")}
+                      {recovery?.kind === "notPosted" && (
+                        <>
+                          {t("createReturn.pendingNotPosted")}
+                          {recovery.message && (
+                            <div className="mt-1 text-xs">
+                              {t("createReturn.pendingLastError", { error: recovery.message })}
+                            </div>
+                          )}
+                        </>
+                      )}
+                      {recovery?.kind === "indeterminate" &&
+                        t("createReturn.pendingIndeterminate", { error: recovery.message })}
+                      {recovery?.kind === "cleanupFailed" &&
+                        t("createReturn.pendingCleanupFailed", {
+                          number: String(recovery.creditMemoNumber),
+                          error: recovery.message,
+                        })}
+                      {storageError && (
+                        <div className="mt-1 font-medium">
+                          {t("createReturn.pendingDiscardFailed", { error: storageError })}
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={submitting || recovery?.kind === "checking"}
+                        onClick={() => void resolvePending(pending)}
+                      >
+                        {t("createReturn.pendingCheck")}
+                      </Button>
+                      {(recovery?.kind === "notPosted" || recovery?.kind === "indeterminate") && (
+                        <Button
+                          size="sm"
+                          variant="primary"
+                          disabled={submitting}
+                          onClick={() => void resendPending()}
+                        >
+                          {t("createReturn.pendingResend")}
+                        </Button>
+                      )}
+                      {recovery?.kind === "notPosted" && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={submitting}
+                          onClick={discardPending}
+                        >
+                          {t("createReturn.pendingDiscard")}
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 )}
 

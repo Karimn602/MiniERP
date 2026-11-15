@@ -3696,8 +3696,10 @@ async fn a_reactivated_demo_product_still_sells_through_the_real_command() {
         .uom("pcs", 1, 1)
         .build()];
     let total = lines_total(&lines);
-    let mut payload = sale_payload(lines, vec![cash_usd(total)]);
-    payload.allow_negative_inventory = true;
+    // V1.1: the demo product holds no stock, and overselling is the item's
+    // own owner policy now, not a request flag.
+    db.exec(&format!("UPDATE products SET allow_negative_stock = 1 WHERE id = '{DEMO_D1}'")).await;
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
     let sale_id = payload.sale_id.clone();
 
     post_sale_with_pool(db.pool(), payload)
@@ -4419,7 +4421,9 @@ async fn migration_022_upgrades_a_populated_v21_database_without_restating_it() 
     let recipes_before = snapshot(&db, "recipes").await;
     let components_before = snapshot(&db, "recipe_components").await;
 
-    db.migrate_again().await.expect("migration 022 must apply");
+    // Pinned to 22: a later migration (025 adds two `products` columns) is
+    // not what this test is about, and "latest" would silently measure it.
+    db.migrate_through(22).await.expect("migration 022 must apply");
 
     // `sale_items` gains exactly two columns, both NULL on every existing row.
     assert_only_null_columns_appended(
@@ -4470,10 +4474,8 @@ async fn migration_022_upgrades_a_populated_v21_database_without_restating_it() 
     // The new table exists and is EMPTY. A migration is not a fixture.
     assert_eq!(db.count("SELECT COUNT(*) FROM sale_item_recipe_costs").await, 0);
 
-    assert_eq!(
-        db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await,
-        latest_migration_version()
-    );
+    // Pinned: this test migrates to exactly 22 (see above).
+    assert_eq!(db.scalar_i64("SELECT MAX(version) FROM _sqlx_migrations").await, 22);
 }
 
 /// 022 REPLACES 020's trigger pair rather than leaving it in place — the 017
@@ -4712,7 +4714,7 @@ async fn a_v21_upgrade_converges_on_the_same_schema_as_a_fresh_install() {
 /// 022 touches no table but `sale_items`, and adds only the two columns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn migration_022_adds_only_two_columns_and_only_to_sale_items() {
-    let v22 = TempDb::new().await;
+    let v22 = TempDb::at_schema_version(22).await;
     let v21 = TempDb::at_schema_version(21).await;
 
     for table in [

@@ -26,7 +26,7 @@
 //     divides or rounds a cost by hand.
 
 use crate::cost::{
-    extended_cost_cents, microcents_to_cents, new_weighted_avg,
+    extended_cost_cents, microcents_to_cents, purchase_weighted_avg,
     unit_cost_in_uom_to_base_microcents,
 };
 use serde::{Deserialize, Serialize};
@@ -1753,9 +1753,9 @@ pub(crate) async fn post_purchase_tx(
         // quantity, so the pool's value and its quantity come from one resolved
         // conversion.
         let new_avg_excl =
-            new_weighted_avg(old_qty, old_avg_excl, quantity_base, unit_cost_excl_base_mc)?;
+            purchase_weighted_avg(old_qty, old_avg_excl, quantity_base, unit_cost_excl_base_mc)?;
         let new_avg_incl =
-            new_weighted_avg(old_qty, old_avg_incl, quantity_base, unit_cost_incl_base_mc)?;
+            purchase_weighted_avg(old_qty, old_avg_incl, quantity_base, unit_cost_incl_base_mc)?;
 
         let movement_id = uuid::Uuid::new_v4().to_string();
         movement_ids.push(movement_id.clone());
@@ -2273,11 +2273,28 @@ pub(crate) async fn post_adjustment_tx(
         let resulting = opening_qoh
             .checked_add(*net_delta)
             .ok_or_else(|| format!("Resulting stock is out of range for product {product_id}."))?;
+        // V1.1: the OWNER's per-item policy (`products.allow_negative_stock`,
+        // migration 025) may permit it. Read from the row inside this
+        // transaction, never from the request. A count correction below zero
+        // is still a documented movement valued at the current average — the
+        // policy permits the QUANTITY, it moves no cost.
         if resulting < 0 {
-            return Err(format!(
-                "Adjustment would drive stock negative for product {product_id} \
-                 (current {opening_qoh}, net change {net_delta} across this document)."
-            ));
+            let allowed: i64 = sqlx::query_scalar(
+                "SELECT allow_negative_stock FROM products WHERE id = ? AND store_id = ?",
+            )
+            .bind(product_id)
+            .bind(&payload.store_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("read negative-stock policy: {e}"))?
+            .unwrap_or(0);
+            if allowed != 1 {
+                return Err(format!(
+                    "Adjustment would drive stock negative for product {product_id} \
+                     (current {opening_qoh}, net change {net_delta} across this document). \
+                     The owner can allow negative stock for this item in Products."
+                ));
+            }
         }
     }
 
@@ -4709,13 +4726,21 @@ pub(crate) async fn post_sale_tx(
     //      for non-service lines, and snapshot COGS.
     let mut resolved: Vec<ResolvedLine> = Vec::with_capacity(payload.lines.len());
     let mut cogs_total: i64 = 0;
+    // V1.1 (Codex P1): the negative-stock policy is judged against the SALE's
+    // aggregate demand per product, not per line. Nothing is decremented until
+    // every line is resolved, so each line reads the same opening quantity —
+    // two lines of 6 against 10 each saw 10 and each passed, committing -2.
+    // The same fix `post_adjustment` got for its net delta (WP-07).
+    let mut demand_by_product: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
 
     for (i, line) in payload.lines.iter().enumerate() {
         let row = sqlx::query(
             "SELECT quantity_on_hand,
                     avg_cost_excl_vat_microcents, avg_cost_incl_vat_microcents,
                     is_active, is_service,
-                    costing_method, standard_cost_excl_vat_microcents
+                    costing_method, standard_cost_excl_vat_microcents,
+                    show_on_register, allow_negative_stock
              FROM products WHERE id = ? AND store_id = ?",
         )
         .bind(&line.product_id)
@@ -4747,6 +4772,12 @@ pub(crate) async fn post_sale_tx(
         let is_service_db: i64 = row
             .try_get("is_service")
             .map_err(|e| format!("decode is_service: {e}"))?;
+        let show_on_register: i64 = row
+            .try_get("show_on_register")
+            .map_err(|e| format!("decode show_on_register: {e}"))?;
+        let allow_negative_stock: i64 = row
+            .try_get("allow_negative_stock")
+            .map_err(|e| format!("decode allow_negative_stock: {e}"))?;
         // WP-B1: the product's own costing configuration. Read here, inside the
         // posting transaction, from the row itself — a COGS basis is never
         // taken from cashier-controlled request data, and there is no field for
@@ -4761,6 +4792,18 @@ pub(crate) async fn post_sale_tx(
         if is_active == 0 {
             return Err(format!(
                 "Line {}: product \"{}\" is inactive.",
+                i + 1,
+                line.product_name_snapshot
+            ));
+        }
+        // V1.1 (migration 025): an item the owner keeps OFF the Register — an
+        // ingredient, a stock-only good — is not for sale. Checked after the
+        // replay resolution like every other new-sale rule, so a sale that
+        // already posted still replays to its receipt.
+        if show_on_register == 0 {
+            return Err(format!(
+                "Line {}: \"{}\" is an inventory item that is not sold at the Register. \
+                 The owner can enable \"Sell on Register\" for it in Products.",
                 i + 1,
                 line.product_name_snapshot
             ));
@@ -4815,16 +4858,44 @@ pub(crate) async fn post_sale_tx(
         // The guard runs on the AUTHORITATIVE quantity, and before the payload
         // consistency check below: when there genuinely isn't enough stock, the
         // cashier needs to hear that, not a payload diagnostic.
-        if !is_service && !payload.allow_negative_inventory && quantity_base > qoh {
-            return Err(format!(
-                "Line {}: insufficient stock for \"{}\" (have {}, need {} — {} {}).",
-                i + 1,
-                line.product_name_snapshot,
-                qoh,
-                quantity_base,
-                line.quantity_in_uom,
-                line.uom_code_snapshot
-            ));
+        // V1.1: whether this item may go below zero is the OWNER's per-item
+        // policy, read from the row above — not the request's
+        // `allow_negative_inventory`, which used to be a per-device setting
+        // any cashier could switch on. The field stays on the wire for
+        // compatibility and is ignored.
+        let demand_so_far = if is_service {
+            0
+        } else {
+            let entry = demand_by_product.entry(line.product_id.clone()).or_insert(0);
+            *entry = entry.checked_add(quantity_base).ok_or_else(|| {
+                format!(
+                    "Line {}: the total quantity of \"{}\" on this sale is too large.",
+                    i + 1,
+                    line.product_name_snapshot
+                )
+            })?;
+            *entry
+        };
+        if !is_service && allow_negative_stock == 0 && demand_so_far > qoh {
+            return Err(if demand_so_far == quantity_base {
+                format!(
+                    "Line {}: insufficient stock for \"{}\" (have {}, need {} — {} {}).",
+                    i + 1,
+                    line.product_name_snapshot,
+                    qoh,
+                    quantity_base,
+                    line.quantity_in_uom,
+                    line.uom_code_snapshot
+                )
+            } else {
+                format!(
+                    "Line {}: insufficient stock for \"{}\" (have {}, this sale needs {}                      across its lines).",
+                    i + 1,
+                    line.product_name_snapshot,
+                    qoh,
+                    demand_so_far
+                )
+            });
         }
 
         // A payload whose declared base quantity disagrees with the product's
@@ -4908,22 +4979,16 @@ pub(crate) async fn post_sale_tx(
             // movement is the only place `unit_cogs_incl_mc` is persisted.
             (rate, rate, "recipe")
         } else if costing_method == "standard" {
-            // A MANUAL STANDARD COST (WP-B1).
+            // A MANUAL STANDARD COST (WP-B1), and since V1.1 the OWNER'S
+            // OVERRIDE on a stocked item too (founder decision, migration 025).
             //
-            // Restricted to non-stock items, and refused here as well as by
-            // migration 020's trigger: a manual rate on a stocked line would be
-            // stamped onto the sale's `inventory_movements` row while the cost
-            // pool those goods left says something else, and an append-only
-            // movement table can never unwind that disagreement.
-            if !is_service {
-                return Err(format!(
-                    "Line {}: \"{}\" is set to Manual Cost but is a stocked product. \
-                     Manual Cost applies to non-stock menu items only; a stocked \
-                     product is valued from its purchases.",
-                    i + 1,
-                    line.product_name_snapshot
-                ));
-            }
+            // On a stocked line the sale's `inventory_movements` row records
+            // this rate, so the movement states exactly what the P&L was
+            // charged; the pool's `avg_cost_*` is not touched by a sale (it
+            // never was) and goes on describing what the shelf cost to buy.
+            // The two figures may differ, and that difference is recognised
+            // nowhere — see migration 025's header.
+            //
             // NULL is "not configured" and is NOT zero. Posting at zero here is
             // precisely how a restaurant ends up with a year of 100% margins
             // and no way to find out when it started, so a product whose owner
@@ -4940,10 +5005,19 @@ pub(crate) async fn post_sale_tx(
             // The typed cost is stated EXCLUSIVE of VAT and has no inclusive
             // sibling: the excl figure is the only one any report reads, and
             // deriving an incl one would mean choosing a VAT rate for a cost
-            // with no document behind it. The incl slot is carried at the same
-            // value and reaches no row — a service line writes no movement, and
-            // the movement is the only place `unit_cogs_incl_mc` is persisted.
-            (rate, rate, "standard")
+            // with no document behind it. For a SERVICE line the incl slot is
+            // carried at the same value and reaches no row — a service writes
+            // no movement. A STOCKED line writes one, so its incl rate is the
+            // typed rate grossed up at the line's VAT rate — which
+            // `validate_sale_vat_authority` has already proved is the
+            // product's own.
+            let rate_incl = if is_service {
+                rate
+            } else {
+                crate::cost::rate_with_vat_microcents(rate, line.vat_rate_bps_snapshot)
+                    .map_err(|e| format!("Line {}: {e}", i + 1))?
+            };
+            (rate, rate_incl, "standard")
         } else if is_service {
             // A service with purchase valuation has no basis at all: the only
             // writer of `avg_cost_*` is a purchase, and a service is not
@@ -6853,7 +6927,7 @@ pub async fn post_credit_memo(
     window: tauri::Window,
     state: State<'_, DbState>,
     payload: PostCreditMemoPayload,
-) -> Result<PostCreditMemoResult, String> {
+) -> Result<serde_json::Value, String> {
     validate_credit_memo_payload(&payload)?;
     let (pool, actor) = crate::authz::begin(
         &app,
@@ -6862,7 +6936,73 @@ pub async fn post_credit_memo(
         crate::authz::Operation::PostCreditMemo,
     )
     .await?;
-    post_credit_memo_tx(&pool, &actor, payload).await
+    let result = post_credit_memo_tx(&pool, &actor, payload).await?;
+    let tier = crate::authz::read_tier(&pool, &actor).await?;
+    Ok(credit_memo_result_for_tier(&result, tier))
+}
+
+/// The posted memo as the CALLER may see it (Codex V1.1 P2). Every role may
+/// post a refund, but only a tier that may read cost gets the reversed COGS:
+/// for a cashier the field is `null` — withheld, which is not zero — exactly as
+/// the cashier's read connection withholds it from `sales_credit_memos`.
+pub(crate) fn credit_memo_result_for_tier(
+    result: &PostCreditMemoResult,
+    tier: crate::read_guard::ReadTier,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(result).unwrap_or(serde_json::Value::Null);
+    if !matches!(tier, crate::read_guard::ReadTier::Staff) {
+        if let Some(o) = v.as_object_mut() {
+            o.insert("cogsReversedCents".into(), serde_json::Value::Null);
+        }
+    }
+    v
+}
+
+/// Which lines of a sale moved STOCK when it posted (V1.1).
+///
+/// The return screen needs exactly one fact it used to read straight out of
+/// `inventory_movements`: whether a line can go back on the shelf, which is
+/// decided by whether the SALE produced a movement for it, never by today's
+/// `is_service`. A cashier's read connection refuses that table whole (Stage
+/// C: every movement carries a unit cost), and V1.1 lets a cashier post a
+/// sale-linked refund. So the fact is served here, by a fixed statement that
+/// returns line ids and nothing else, to whoever may post a return — and
+/// scoped to the caller's own store.
+#[tauri::command]
+pub async fn sale_lines_with_stock_movement(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    state: State<'_, DbState>,
+    sale_id: String,
+) -> Result<Vec<String>, String> {
+    let (pool, actor) = crate::authz::begin(
+        &app,
+        &window,
+        &state,
+        crate::authz::Operation::PostCreditMemo,
+    )
+    .await?;
+    sale_lines_with_stock_movement_for(&pool, &actor.store_id, &sale_id).await
+}
+
+pub(crate) async fn sale_lines_with_stock_movement_for(
+    pool: &SqlitePool,
+    store_id: &str,
+    sale_id: &str,
+) -> Result<Vec<String>, String> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT si.id
+           FROM sale_items si
+           JOIN sales s ON s.id = si.sale_id
+           JOIN inventory_movements im
+             ON im.related_sale_item_id = si.id AND im.movement_type = 'sale'
+          WHERE si.sale_id = ? AND s.store_id = ?",
+    )
+    .bind(sale_id)
+    .bind(store_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("read the sale's stock movements: {e}"))
 }
 
 /// Validate-then-post against an already-resolved pool (test seam).

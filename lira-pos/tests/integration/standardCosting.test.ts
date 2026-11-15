@@ -133,11 +133,11 @@ describe("migration 020 coherence guards", () => {
     ).toThrow(/needs a cost/i);
   });
 
-  it("refuses Manual Cost on a stocked product", () => {
-    // A stocked line's COGS rate is also stamped onto the sale's inventory
-    // movement, so a typed rate there would make the stock ledger and the
-    // P&L disagree with no document between them — permanently, because
-    // `inventory_movements` is append-only.
+  // V1.1 (founder decision, migration 025): a STOCKED product may carry the
+  // owner's Manual Cost override. Its sales are costed at the stated figure
+  // and the sale movement records it; the shelf stays valued at the purchase
+  // average. Still refused without a figure.
+  it("admits Manual Cost on a stocked product, but not without a figure", () => {
     expect(() =>
       db
         .prepare(
@@ -146,7 +146,16 @@ describe("migration 020 coherence guards", () => {
             WHERE id=?`,
         )
         .run(COFFEE),
-    ).toThrow(/non-stock/i);
+    ).not.toThrow();
+    expect(() =>
+      db
+        .prepare(
+          `UPDATE products
+              SET costing_method='standard', standard_cost_excl_vat_microcents=NULL
+            WHERE id=?`,
+        )
+        .run(COFFEE),
+    ).toThrow(/needs a cost/i);
   });
 
   it("refuses recipe costing for an item with no published recipe", () => {

@@ -72,6 +72,8 @@ function product(over: Partial<ProductWithUoms> & { name: string }): ProductWith
     costingMethod: "purchase_average" as const,
     standardCostExclVatMicrocents: null,
     standardCostSetAt: null,
+    showOnRegister: true,
+    allowNegativeStock: false,
     createdAt: "2026-01-01",
     updatedAt: "2026-01-01",
     uoms: [base],

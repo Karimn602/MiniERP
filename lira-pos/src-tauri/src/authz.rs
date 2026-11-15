@@ -290,8 +290,13 @@ pub(crate) fn permits(role: Role, operation: Operation) -> bool {
         (Cashier, PostSaleLargeDiscount) => false,
 
         // --- money out and corrections ----------------------------------
-        (Manager, PostCreditMemo) => true,
-        (Cashier, PostCreditMemo) => false,
+        // V1.1 founder decision: every role may post a SALE-LINKED refund
+        // without further approval. What keeps that safe is not the role but
+        // the document: `post_credit_memo` refunds only lines of a posted sale,
+        // within their remaining quantities, only through tender the sale
+        // actually took, never more than once per identity, and a cash refund
+        // only out of a drawer that can fund it. None of those checks moved.
+        (Manager | Cashier, PostCreditMemo) => true,
 
         (Manager, PostAdjustment) => true,
         (Cashier, PostAdjustment) => false,

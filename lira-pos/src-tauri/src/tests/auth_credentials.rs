@@ -138,7 +138,10 @@ fn the_hash_costs_something_but_not_too_much() {
 fn an_owner_passphrase_must_be_long_and_not_only_digits() {
     let min = testing::min_passphrase_len();
 
-    for bad in ["", "   ", "short", "abcdefghi", "123456789012345"] {
+    // V1.1: the floor is 8 (founder decision), so "abcdefg" (7) is the
+    // longest letters-only refusal. Digits-only is still refused at any length.
+    assert_eq!(min, 8);
+    for bad in ["", "   ", "short", "abcdefg", "12345678", "123456789012345"] {
         assert!(
             testing::strength(Role::Owner, bad).is_err(),
             "`{bad}` must be refused as an owner passphrase"
@@ -163,10 +166,68 @@ fn an_owner_passphrase_must_be_long_and_not_only_digits() {
         "copper-kettle-olive-tree",
         "three unrelated words",
         "Beirut-Hamra-2026!",
+        // V1.1: a plain alphabetic passphrase of eight letters is enough. No
+        // digit, symbol or capital is demanded.
+        "posgreaz",
+        "cedarhill",
     ] {
         testing::strength(Role::Owner, good)
             .unwrap_or_else(|e| panic!("`{good}` should be accepted: {e}"));
     }
+}
+
+/// Codex V1.1 P1 (both rounds): an owner or manager passphrase must contain
+/// at least one LETTER, in any script. The first fix refused "numerals plus a
+/// list of separators" and was bypassed by separators off that list (U+066C,
+/// U+060C, zero-width characters); the rule is now stated positively.
+#[test]
+fn an_owner_passphrase_needs_a_letter_in_any_script() {
+    for bad in [
+        "12345678",                                                         // ASCII
+        "\u{0661}\u{0662}\u{0663}\u{0664}\u{0665}\u{0666}\u{0667}\u{0668}", // Arabic-Indic
+        "\u{06F1}\u{06F2}\u{06F3}\u{06F4}\u{06F5}\u{06F6}\u{06F7}\u{06F8}", // Eastern Arabic-Indic
+        "\u{FF11}\u{FF12}\u{FF13}\u{FF14}\u{FF15}\u{FF16}\u{FF17}\u{FF18}", // fullwidth
+        "\u{0967}\u{0968}\u{0969}\u{096A}\u{096B}\u{096C}\u{096D}\u{096E}", // Devanagari
+        "\u{2160}\u{2161}\u{2162}\u{2163}\u{2164}\u{2165}\u{2166}\u{2167}", // Roman numerals (Nl, "alphabetic")
+        "\u{00B9}\u{00B2}\u{00B3}\u{2074}\u{2075}\u{2076}\u{2077}\u{2078}", // superscripts (No)
+        "1\u{0662}3\u{06F4}5\u{FF16}78",                                    // mixed scripts
+        "\u{0661}\u{0662}\u{066C}\u{0663}\u{0664}\u{0665}\u{066C}\u{0666}\u{0667}\u{0668}", // U+066C thousands separator
+        "\u{0661}\u{0662}\u{060C}\u{0663}\u{0664}\u{060C}\u{0665}\u{0666}\u{0667}", // U+060C Arabic comma
+        "\u{0661}\u{200B}\u{0662}\u{200C}\u{0663}\u{200D}\u{0664}\u{2060}\u{0665}\u{FEFF}\u{0666}\u{0667}\u{0668}", // zero-width / format chars
+        "\u{0661}\u{0662}\u{0663}\u{0664}\u{066B}\u{0665}\u{0666}\u{0667}", // U+066B decimal separator
+        "1234 5678",                                                        // space grouping
+        "1234\u{00A0}5678",                                                 // no-break space
+        "1234-5678-90",
+        "12.345.678",
+        "1234/5678",
+        "!!!!????",                                                         // symbols only
+        "\u{2014}\u{2014}\u{2014}\u{2014}\u{2014}\u{2014}\u{2014}\u{2014}", // em dashes
+    ] {
+        for role in [Role::Owner, Role::Manager] {
+            let refusal = testing::strength(role, bad)
+                .expect_err(&format!("`{bad:?}` has no letter and must be refused for {role:?}"));
+            assert!(refusal.contains("letter"), "the refusal must say a letter is needed: {refusal}");
+        }
+    }
+    for good in [
+        "posgreaz",
+        "POSGREAZ",
+        "cedarhill",
+        "\u{0645}\u{0637}\u{0639}\u{0645}\u{063A}\u{0631}\u{064A}\u{0632}", // Arabic letters only
+        "greaz2026",
+        "1234567a",                                                         // one letter suffices
+        "\u{0661}\u{0662}\u{0663}\u{0664}\u{0661}\u{0662}\u{0663}\u{0628}", // Arabic-Indic digits + one Arabic letter
+        "copper kettle",
+    ] {
+        for role in [Role::Owner, Role::Manager] {
+            testing::strength(role, good)
+                .unwrap_or_else(|e| panic!("`{good}` should be accepted for {role:?}: {e}"));
+        }
+    }
+    // The cashier PIN rule is unchanged: digits, in any script.
+    testing::strength(Role::Cashier, "\u{0661}\u{0662}\u{0663}\u{0664}\u{0665}\u{0666}")
+        .expect("an Arabic-Indic six-digit cashier PIN is still a PIN");
+    testing::strength(Role::Cashier, "123456").expect("a six-digit cashier PIN");
 }
 
 /// The cashier floor, and the honest note about what it is worth.

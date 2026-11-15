@@ -94,6 +94,8 @@ fn create_payload(product_id: &str, sku: &str, name: &str) -> SaveProductPayload
         standard_cost_excl_vat_microcents: None,
         barcode: None,
         barcode_type: None,
+        show_on_register: None,
+        allow_negative_stock: None,
     }
 }
 
@@ -131,6 +133,8 @@ fn update_payload(name: &str) -> SaveProductPayload {
         standard_cost_excl_vat_microcents: None,
         barcode: None,
         barcode_type: None,
+        show_on_register: None,
+        allow_negative_stock: None,
     }
 }
 
@@ -487,13 +491,14 @@ async fn removing_a_primary_promotes_a_survivor_in_the_same_transaction() {
         "the survivor was promoted, not left unflagged"
     );
 
-    // And the last one cannot go: a product with no barcode cannot be scanned.
+    // V1.1 (founder report A1): a barcode is OPTIONAL, so the last one may go
+    // too. The product stays, found by name or SKU.
     let last = db
         .scalar_string(&format!(
             "SELECT id FROM product_barcodes WHERE product_id = '{P_EXISTING}' AND is_active = 1"
         ))
         .await;
-    let err = remove_product_barcode_with_pool(
+    remove_product_barcode_with_pool(
         db.pool(),
         BarcodeRefPayload {
             product_id: P_EXISTING.to_string(),
@@ -501,10 +506,13 @@ async fn removing_a_primary_promotes_a_survivor_in_the_same_transaction() {
         },
     )
     .await
-    .expect_err("the last barcode cannot be removed");
-    assert!(err.contains("last barcode"), "got: {err}");
-    assert_eq!(barcode_count(&db, P_EXISTING).await, 1, "still there");
-    assert_eq!(primary_barcode(&db, P_EXISTING).await, "5555555555555");
+    .expect("the last barcode may be removed");
+    assert_eq!(barcode_count(&db, P_EXISTING).await, 0, "no barcode left");
+    assert_eq!(
+        db.count(&format!("SELECT COUNT(*) FROM products WHERE id = '{P_EXISTING}' AND is_active = 1")).await,
+        1,
+        "the product itself is untouched"
+    );
 }
 
 // ============================================================================

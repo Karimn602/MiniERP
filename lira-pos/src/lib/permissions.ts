@@ -97,7 +97,8 @@ export const SCREENS: Record<AppScreen, ScreenPolicy> = {
   purchases: { path: "purchases", roles: SUPERVISORY, operation: "PostPurchase" },
   suppliers: { path: "suppliers", roles: SUPERVISORY, operation: "SupplierSave" },
   sales: { path: "sales", roles: SUPERVISORY, operation: "ReadCostAndMargin" },
-  returns: { path: "returns", roles: SUPERVISORY, operation: "PostCreditMemo" },
+  // V1.1: every role may post a sale-linked refund (founder decision).
+  returns: { path: "returns", roles: ALL, operation: "PostCreditMemo" },
   reports: { path: "reports", roles: SUPERVISORY, operation: "ReadProfitReports" },
   exchangeRate: {
     path: "exchange-rate",

@@ -41,6 +41,7 @@ export default function Enroll() {
   const onlyOne = candidates.length === 1 ? candidates[0] : undefined;
 
   const [userId, setUserId] = useState(onlyOne?.userId ?? "");
+  const [openError, setOpenError] = useState<string | null>(null);
   const [code, setCode] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -148,6 +149,20 @@ export default function Enroll() {
               <div className="mt-2 font-semibold text-fg">
                 {t("auth.codeFileLabel")}
               </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenError(null);
+                  auth.openEnrollmentCode().catch((e) =>
+                    setOpenError(e instanceof Error ? e.message : String(e)),
+                  );
+                }}
+                className="mt-2 rounded-chip border border-brand bg-brand px-3 py-1.5 text-xs font-extrabold text-brand-fg hover:bg-brand-hover"
+              >
+                {t("auth.openCodeButton")}
+              </button>
+              {openError && <p className="mt-1 text-danger-fg">{openError}</p>}
+              <div className="mt-2 text-[11px]">{t("auth.openCodeHint")}</div>
               <code className="select-all break-all font-mono text-[11px]">
                 {status.enrollmentCodeFile}
               </code>

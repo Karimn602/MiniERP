@@ -563,9 +563,7 @@ export async function validateImportRows(
 
     // barcode
     const barcode = rawBarcode.trim() || null;
-    if (!isService && !barcode) {
-      errors.push("Barcode is required for stock products.");
-    }
+    // V1.1: a barcode is optional for every item, stocked or not.
     if (barcode) {
       const normalized = normalizeBarcode(barcode);
       if (duplicateBarcodesInFile.has(normalized)) {

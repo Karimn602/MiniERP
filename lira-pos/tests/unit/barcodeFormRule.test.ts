@@ -51,9 +51,10 @@ describe("the EAN-13 checksum applies only where it means something", () => {
 });
 
 describe("productFormBarcodeError on CREATE", () => {
-  it("requires a barcode for stocked goods", () => {
-    expect(productFormBarcodeError("new", "", false)).toBe("required");
-    expect(productFormBarcodeError("new", "   ", false)).toBe("required");
+  // V1.1 (founder report A1): a barcode is optional for every item.
+  it("does not require a barcode for stocked goods either", () => {
+    expect(productFormBarcodeError("new", "", false)).toBeNull();
+    expect(productFormBarcodeError("new", "   ", false)).toBeNull();
   });
 
   it("does not require one for a service", () => {

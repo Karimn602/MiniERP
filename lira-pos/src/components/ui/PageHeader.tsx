@@ -44,21 +44,21 @@ export function PageHeader({
           // The prototype's asymmetric banner radius: generous at the top,
           // tight where the menu meets it.
           "relative flex min-h-[78px] flex-wrap items-center justify-between gap-4 overflow-hidden rounded-t-[17px] rounded-b-panel border border-line bg-banner px-[19px] py-[15px] text-banner-fg",
-          "squat:min-h-[56px] squat:px-[15px] squat:py-2 tiny:min-h-0 tiny:py-1.5",
+          "squat:min-h-0 squat:px-[15px] squat:py-1.5 tiny:py-1",
           className,
         )}
       >
         <div className="min-w-0">
           {eyebrow && (
-            <p className="text-[10px] font-black uppercase tracking-[0.2em] text-banner-kicker">
+            <p className="text-[10px] font-black uppercase tracking-[0.2em] text-banner-kicker squat:hidden">
               {eyebrow}
             </p>
           )}
-          <h2 className="greaz-poster mt-1 text-[29px] leading-none squat:text-[25px] tiny:mt-0.5 tiny:text-[21px]">
+          <h2 className="greaz-poster mt-1 text-[29px] leading-none squat:mt-0 squat:text-[22px] tiny:text-[21px]">
             {title}
           </h2>
           {subtitle && (
-            <p className="mt-0.5 text-[11px] text-banner-sub">{subtitle}</p>
+            <p className="mt-0.5 text-[11px] text-banner-sub squat:hidden">{subtitle}</p>
           )}
         </div>
         {actions && (

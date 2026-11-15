@@ -20,7 +20,7 @@
 //      exactly why it is restricted to non-stock items in this milestone.
 
 use crate::catalog::{
-    save_product_with_pool, SaveProductPayload, MANUAL_COST_NEEDS_SERVICE, MANUAL_COST_REQUIRED,
+    save_product_with_pool, SaveProductPayload, MANUAL_COST_REQUIRED,
     RECIPE_COSTING_NEEDS_ACTIVE_RECIPE, RECIPE_COSTING_NEEDS_SERVICE,
 };
 use crate::cost::cents_to_microcents;
@@ -894,31 +894,23 @@ async fn a_product_that_acquires_a_basis_costs_its_next_sale_from_it() {
 }
 
 // ============================================================================
-// 8. Manual cost is restricted to non-stock items
+// 8. V1.1 (founder decision, migration 025): the OWNER'S OVERRIDE on a
+//    stocked item
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_engine_refuses_a_manual_cost_on_a_stocked_product() {
-    // Migration 020's trigger, against a direct writer. A manual rate on a
-    // stocked line would be stamped onto the sale's inventory movement while
-    // the pool those goods left says something else, and an append-only
-    // movement table can never unwind that.
+async fn the_engine_admits_a_manual_cost_on_a_stocked_product() {
     let db = shop().await;
-    let err = db
-        .try_exec(&format!(
-            "UPDATE products
-                SET costing_method='standard', standard_cost_excl_vat_microcents=185000000
-              WHERE id='{P_COFFEE}'"
-        ))
-        .await
-        .expect_err("a stocked product may not be manual-costed");
-    assert!(
-        err.to_string().contains("non-stock"),
-        "the refusal should say why: {err}"
-    );
+    db.try_exec(&format!(
+        "UPDATE products
+            SET costing_method='standard', standard_cost_excl_vat_microcents=185000000
+          WHERE id='{P_COFFEE}'"
+    ))
+    .await
+    .expect("a stocked product may carry the owner's override");
     let (method, cost) = costing_config(&db, P_COFFEE).await;
-    assert_eq!(method, "purchase_average");
-    assert_eq!(cost, None);
+    assert_eq!(method, "standard");
+    assert_eq!(cost, Some(185_000_000));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -952,14 +944,18 @@ async fn the_engine_refuses_recipe_costing_with_no_published_recipe() {
     assert!(err.to_string().contains("published recipe"), "{err}");
 }
 
+/// A stocked line under the owner's override: the SALE is costed at the stated
+/// figure and its movement records that figure; the purchase average — what
+/// the shelf cost to buy — is not touched; stock still moves. Nothing posted
+/// before the override is restated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn posting_refuses_a_manual_cost_stocked_line_even_if_the_row_existed() {
-    // Belt and braces. The trigger makes this row unreachable, so the row is
-    // forged by disabling the trigger — which is exactly the shape a future
-    // migration bug, an import or a hand-edited database would take. The
-    // posting command must not depend on the schema having held.
+async fn a_stocked_override_costs_the_sale_and_leaves_the_purchase_average_alone() {
     let db = shop().await;
-    db.exec("DROP TRIGGER trg_products_costing_coherence_upd").await;
+    let avg_before = db
+        .scalar_i64(&format!(
+            "SELECT avg_cost_excl_vat_microcents FROM products WHERE id='{P_COFFEE}'"
+        ))
+        .await;
     db.exec(&format!(
         "UPDATE products
             SET costing_method='standard', standard_cost_excl_vat_microcents=185000000
@@ -969,18 +965,43 @@ async fn posting_refuses_a_manual_cost_stocked_line_even_if_the_row_existed() {
 
     let payload = sale_payload(
         vec![SaleLineBuilder::new(P_COFFEE, "Coffee 250g")
-            .qty(1)
+            .qty(2)
             .unit_incl(500)
             .build()],
-        vec![cash_usd(500)],
+        vec![cash_usd(1_000)],
     );
-    let err = post_sale_with_pool(db.pool(), payload).await.unwrap_err();
-    assert!(
-        err.contains("stocked product") && err.contains("Manual Cost"),
-        "{err}"
+    let sale_id = payload.sale_id.clone();
+    post_sale_with_pool(db.pool(), payload).await.expect("the override posts");
+
+    // The line is costed at the override, and says so.
+    let (rate, line_cents, source): (i64, i64, String) = sqlx::query_as(
+        "SELECT unit_cogs_excl_vat_microcents, line_cogs_excl_vat_cents, cogs_source
+           FROM sale_items WHERE sale_id = ?",
+    )
+    .bind(&sale_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!((rate, line_cents, source.as_str()), (185_000_000, 370, "standard"));
+
+    // The movement records exactly what the P&L was charged.
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT unit_cost_excl_vat_microcents FROM inventory_movements
+              WHERE related_sale_id='{sale_id}' AND movement_type='sale'"
+        ))
+        .await,
+        185_000_000
     );
-    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 0);
-    assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 100, "no stock moved");
+    // The shelf is still valued at what it cost to buy, and stock moved.
+    assert_eq!(
+        db.scalar_i64(&format!(
+            "SELECT avg_cost_excl_vat_microcents FROM products WHERE id='{P_COFFEE}'"
+        ))
+        .await,
+        avg_before
+    );
+    assert_eq!(quantity_on_hand(&db, P_COFFEE).await, 98);
 }
 
 // ============================================================================
@@ -1015,6 +1036,8 @@ fn service_create(product_id: &str, sku: &str, name: &str) -> SaveProductPayload
         sale_price_incl_vat_cents: None,
         barcode: None,
         barcode_type: None,
+        show_on_register: None,
+        allow_negative_stock: None,
     }
 }
 
@@ -1141,19 +1164,30 @@ async fn save_product_refuses_manual_cost_with_no_figure() {
     );
 }
 
+/// V1.1 (founder decision, migration 025): a STOCKED item may carry the
+/// owner's Manual Cost override, and setting it is audited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn save_product_refuses_manual_cost_on_a_stocked_item() {
+async fn save_product_accepts_and_audits_manual_cost_on_a_stocked_item() {
     let db = TempDb::new().await;
     let mut payload = service_create(P_BURGER, "SKU-B1", "Greaz Burger");
     payload.is_service = false;
     payload.costing_method = Some("standard".to_string());
     payload.standard_cost_excl_vat_microcents = Some(185_000_000);
 
-    let err = save_product_with_pool(db.pool(), payload).await.unwrap_err();
-    assert_eq!(err, MANUAL_COST_NEEDS_SERVICE);
+    save_product_with_pool(db.pool(), payload).await.expect("a stocked override is accepted");
     assert_eq!(
-        db.count(&format!("SELECT COUNT(*) FROM products WHERE id='{P_BURGER}'")).await,
-        0
+        db.count(&format!(
+            "SELECT COUNT(*) FROM products WHERE id='{P_BURGER}' AND is_service = 0                AND costing_method = 'standard' AND standard_cost_excl_vat_microcents = 185000000"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        db.count(&format!(
+            "SELECT COUNT(*) FROM product_valuation_audit WHERE product_id='{P_BURGER}'                AND event = 'manual_cost_set' AND new_standard_cost_excl_microcents = 185000000"
+        ))
+        .await,
+        1
     );
 }
 

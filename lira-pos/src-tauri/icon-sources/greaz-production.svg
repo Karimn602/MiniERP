@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Greaz POS — Production. Deep red capital G on a warm cream tile, with
+       melted cheese dripping from the G's upper edge. -->
+  <rect x="32" y="32" width="960" height="960" rx="200" fill="#FFF4E6"/>
+  <rect x="32" y="32" width="960" height="960" rx="200" fill="none" stroke="#E9D8C4" stroke-width="12"/>
+  <!-- The G: a thick open ring plus its crossbar and spur. -->
+  <path d="M 760 330 A 300 300 0 1 0 812 560" fill="none" stroke="#A50E24" stroke-width="170" stroke-linecap="butt"/>
+  <rect x="540" y="482" width="357" height="150" fill="#A50E24"/>
+  <rect x="727" y="482" width="170" height="280" fill="#A50E24"/>
+  <!-- Melted cheese over the top of the G, with three drips. -->
+  <path d="M 268 300
+           C 330 205, 470 160, 560 172
+           C 650 182, 720 215, 770 262
+           C 790 282, 778 300, 752 296
+           C 735 293, 728 312, 726 336
+           C 724 372, 690 376, 686 340
+           C 683 312, 668 300, 640 300
+           C 606 300, 600 330, 598 380
+           C 596 440, 548 444, 544 382
+           C 541 330, 520 292, 480 292
+           C 440 292, 420 318, 418 350
+           C 416 386, 378 388, 376 350
+           C 374 318, 350 314, 324 322
+           C 290 332, 252 326, 268 300 Z"
+        fill="#FFC21A" stroke="#E0A000" stroke-width="10" stroke-linejoin="round"/>
+</svg>

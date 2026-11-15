@@ -66,7 +66,6 @@ import { MenuPane, MenuChip } from "../components/pos/MenuPane";
 import {
   AmountLine,
   CartLineRow,
-  RailHeading,
   ShiftChip,
   TinyButton,
   TotalBlock,
@@ -289,7 +288,6 @@ function createEmptyCart(seq: number): CartState {
 // ============================================================================
 
 const COST_METHOD_KEY = "lira_pos_cost_method";
-const ALLOW_NEG_KEY = "lira_pos_allow_negative_inventory";
 const OPEN_CARTS_KEY = "lira_pos_open_carts";
 
 function loadCostMethod(): CogsMethod {
@@ -302,13 +300,6 @@ function loadCostMethod(): CogsMethod {
   }
 }
 
-function loadAllowNegative(): boolean {
-  try {
-    return localStorage.getItem(ALLOW_NEG_KEY) === "true"; // default false
-  } catch {
-    return false;
-  }
-}
 
 /**
  * The carts as they come back from storage, with their attempts normalised.
@@ -525,7 +516,12 @@ export default function PosRegister() {
 
   // ----- POS setup -----
   const [costMethod, setCostMethod] = useState<CogsMethod>(loadCostMethod);
-  const [allowNegativeInventory, setAllowNegativeInventory] = useState<boolean>(loadAllowNegative);
+  // V1.1: selling below zero is the OWNER's per-item policy
+  // (`products.allow_negative_stock`), read by `post_sale` from the database.
+  // The old per-device switch is gone; this constant is the device-wide part
+  // that remains, and it is always off. Each item's own flag is consulted
+  // wherever the register checks stock.
+  const allowNegativeInventory = false;
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
@@ -536,13 +532,6 @@ export default function PosRegister() {
     }
   }, [costMethod]);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(ALLOW_NEG_KEY, String(allowNegativeInventory));
-    } catch {
-      /* ignore */
-    }
-  }, [allowNegativeInventory]);
 
   // Switching carts needs no effect any more: the delivery edit session is
   // KEYED BY CART ID (`deliveryEditCartId`), so a session opened on the cart
@@ -1128,6 +1117,12 @@ export default function PosRegister() {
       setScanError(t("pos.errInactiveProduct", { name: product.name }));
       return;
     }
+    // V1.1: an inventory-only item (an ingredient) is refused at the till as
+    // well as by `post_sale`, so a scan or a search pick says why at once.
+    if (product.showOnRegister === false) {
+      setScanError(t("pos.errNotOnRegister", { name: product.name }));
+      return;
+    }
     // NOTE — a stocked product used to be refused here unless it carried a
     // primary barcode ("barcode-first" catalog policy). That rule made a
     // restaurant menu unsellable: a Double has no barcode, so every burger was
@@ -1156,7 +1151,7 @@ export default function PosRegister() {
         const next = prev.slice();
         const newQty = next[existingIdx].quantityInUom + 1;
         const probedBase = (newQty * uom.factor.num) / uom.factor.den;
-        if (!allowNegativeInventory && !product.isService && probedBase > product.quantityOnHand) {
+        if (!allowNegativeInventory && !product.allowNegativeStock && !product.isService && probedBase > product.quantityOnHand) {
           setScanError(
             t("pos.errStockExceeded", {
               qty: String(product.quantityOnHand),
@@ -1176,7 +1171,7 @@ export default function PosRegister() {
 
       // New line. Default qty = 1.
       const math = lineMathFor(product, uom, 1);
-      if (!allowNegativeInventory && !product.isService && math.quantityBase > product.quantityOnHand) {
+      if (!allowNegativeInventory && !product.allowNegativeStock && !product.isService && math.quantityBase > product.quantityOnHand) {
         setScanError(
           t("pos.errStockExceeded", {
             qty: String(product.quantityOnHand),
@@ -1206,7 +1201,7 @@ export default function PosRegister() {
         if (l.draftId !== draftId) return l;
         if (!Number.isInteger(newQty) || newQty <= 0) return l;
         const probedBase = (newQty * l.uom.factor.num) / l.uom.factor.den;
-        if (!allowNegativeInventory && !l.product.isService && probedBase > l.product.quantityOnHand) {
+        if (!allowNegativeInventory && !l.product.allowNegativeStock && !l.product.isService && probedBase > l.product.quantityOnHand) {
           setScanError(
             t("pos.errStockExceeded", {
               qty: String(l.product.quantityOnHand),
@@ -2176,14 +2171,102 @@ export default function PosRegister() {
   const handlePostRef = useRef<() => Promise<void>>(() => Promise.resolve());
   handlePostRef.current = handlePost;
 
+  // ----- F5 / F6: EXACT-CASH CHECKOUT (V1.1 founder decision) -----
+  //
+  // F5 settles the order in exact USD cash, F6 in exact LBP cash, and posts it
+  // — one keypress, no amount typed. Both go through the SAME `handlePost`
+  // (submission gate, frozen attempt, idempotent identity, backend VAT and
+  // discount authority); the only thing the shortcut adds is filling the cash
+  // box the cashier would otherwise have typed into, visibly.
+  //
+  // In order:
+  //   * a frozen attempt or a driver-collected order posts as it stands —
+  //     neither has a cash tender to fill;
+  //   * a tender that already covers the order posts as typed (the cashier
+  //     took $20 for $17 and wants the change shown);
+  //   * otherwise the REMAINDER is added to the chosen cash box — so a part
+  //     typed in the other currency is kept — and the post is deferred to the
+  //     next render, where it runs ONLY if the same cart still has the same
+  //     total the keypress saw. A total that moved in between is refused with
+  //     a message rather than paid with a stale figure.
+  //
+  // A key held down (`e.repeat`) and a second press while a post is in flight
+  // are both dropped; the gate in `handlePost` drops a same-frame double anyway.
+  const pendingShortcutRef = useRef<{ cartId: string; total: number } | null>(null);
+  const [shortcutNonce, setShortcutNonce] = useState(0);
+
+  /** Why posting is blocked right now, as the cashier should hear it. */
+  function postBlockReason(): string {
+    const probe = buildFrozenRequest("shortcut-probe");
+    return typeof probe === "string" ? probe : t("pos.errShortcutBlocked");
+  }
+
+  function exactCashShortcut(currency: "USD" | "LBP") {
+    if (receiptOpenRef.current || submitting || pendingShortcutRef.current) return;
+    setSubmitError(null);
+    if (canReplayFrozenAttempt || driverCollect) {
+      if (canPost) void handlePost();
+      else setSubmitError(postBlockReason());
+      return;
+    }
+    if (lines.length === 0) return;
+    if (payments.errors.length > 0) {
+      setSubmitError(payments.errors[0]);
+      return;
+    }
+    const total = totals.postDiscountTotal;
+    const remaining = isAutoPayMode ? total : remainingCents;
+    if (remaining <= 0) {
+      if (canPost) void handlePost();
+      else setSubmitError(postBlockReason());
+      return;
+    }
+    if (currency === "USD") {
+      setCashUsdInput(((payments.cashUsdCents + remaining) / 100).toFixed(2));
+    } else {
+      if (!rate) {
+        setSubmitError(t("pos.noExchangeRate"));
+        return;
+      }
+      // The smallest whole-lira amount whose USD equivalent at the locked rate
+      // covers the remainder — the backend derives the equivalent the same way,
+      // so the tender can never come out a cent short.
+      let lbp = usdCentsToLbp(remaining, rate.rateLbpPerUsd);
+      for (let i = 0; i < 1000 && lbpToUsdCents(lbp, rate.rateLbpPerUsd) < remaining; i++) lbp++;
+      setCashLbpInput(String(payments.cashLbp + lbp));
+    }
+    pendingShortcutRef.current = { cartId: activeCartId, total };
+    setShortcutNonce((n) => n + 1);
+  }
+
+  // Runs after the filled cash box has rendered, against fresh state.
+  useEffect(() => {
+    const pending = pendingShortcutRef.current;
+    if (!pending) return;
+    pendingShortcutRef.current = null;
+    if (pending.cartId !== activeCartId || pending.total !== totals.postDiscountTotal) {
+      setSubmitError(t("pos.errShortcutStale"));
+      return;
+    }
+    if (!canPost) {
+      setSubmitError(postBlockReason());
+      return;
+    }
+    void handlePost();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shortcutNonce]);
+
+  const shortcutRef = useRef(exactCashShortcut);
+  shortcutRef.current = exactCashShortcut;
+
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key !== "F5") return;
-      if (e.repeat) return;
+      if (e.key !== "F5" && e.key !== "F6") return;
+      // Never let WebView2 reload the till (F5) or move focus to the address
+      // bar it does not have (F6), whatever else happens.
       e.preventDefault();
-      if (receiptOpenRef.current) return;
-      if (!canPostRef.current) return;
-      void handlePostRef.current();
+      if (e.repeat) return;
+      shortcutRef.current(e.key === "F5" ? "USD" : "LBP");
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -2579,25 +2662,10 @@ export default function PosRegister() {
                 </label>
               </div>
 
-              {/* Allow negative inventory */}
-              <div className="border-t border-line pt-4">
-                <label className="flex cursor-pointer items-start gap-3 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={allowNegativeInventory}
-                    onChange={(e) => setAllowNegativeInventory(e.target.checked)}
-                    className="mt-1 h-4 w-4 accent-brand"
-                  />
-                  <span>
-                    <span className="block font-semibold text-fg">
-                      {t("pos.allowNegativeInventory")}
-                    </span>
-                    <span className="text-xs text-fg-muted">
-                      {t("pos.allowNegativeInventoryHelp")}
-                    </span>
-                  </span>
-                </label>
-              </div>
+              {/* V1.1: negative stock is no longer a device setting. */}
+              <p className="border-t border-line pt-4 text-xs text-fg-muted">
+                {t("pos.negativeStockMoved")}
+              </p>
             </div>
           </div>
         </div>
@@ -2616,7 +2684,7 @@ export default function PosRegister() {
           off the bottom of a 768px-tall screen. Nothing the table showed was
           dropped to fit the 325px rail — the UoM and the unit price moved onto
           a muted sub-line under each item name. */}
-      <div className="grid grid-cols-1 gap-3.5 lg:min-h-0 lg:flex-1 lg:grid-cols-[minmax(0,1fr)_300px] xl:grid-cols-[minmax(0,1fr)_325px]">
+      <div className="grid grid-cols-1 gap-3.5 lg:min-h-0 lg:flex-1 lg:grid-cols-[minmax(0,1fr)_minmax(380px,42%)] xl:grid-cols-[minmax(0,1fr)_minmax(430px,45%)]">
         {/* ─── LEFT: the menu. Tap an item, it goes in the cart. ────────── */}
         <MenuPane
           title={t("pos.menuTitle")}
@@ -2817,7 +2885,7 @@ export default function PosRegister() {
                     type="button"
                     onClick={() => switchCart(c.id)}
                     className={clsx(
-                      "px-2.5 py-1.5 text-[11px] font-extrabold",
+                      "px-2.5 py-1.5 text-[11px] font-extrabold squat:py-1",
                       isActive ? "text-brand-700" : "text-fg-muted",
                     )}
                   >
@@ -2861,8 +2929,40 @@ export default function PosRegister() {
               asked to pay, and the button that takes it, can never be scrolled
               off, however long the order or however the discount is open. */}
           <section className="flex flex-col overflow-hidden rounded-panel border border-line bg-surface p-[15px] shadow-panel squat:p-2.5 tiny:p-2 lg:min-h-[6.75rem] lg:flex-1">
-            <RailHeading
-              actions={
+            {/* V1.1: ONE header row — the channel switch and the order's own
+                actions. The cart's name is already on its tab above, and a
+                second heading row was ~40px the order lines could not spare
+                at 1366x768. */}
+            <h3 className="sr-only">{t("pos.cartLabel", { n: String(activeCart.seq) })}</h3>
+            <div className="flex shrink-0 items-center gap-2">
+            <div
+              role="group"
+              aria-label={t("channel.groupLabel")}
+              className="flex min-w-0 flex-1 items-center gap-1.5"
+            >
+              {SALES_CHANNEL_OPTIONS.map((opt) => {
+                const selected = activeChannel === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    aria-pressed={selected}
+                    disabled={isActiveCartLocked}
+                    onClick={() => setChannel(opt.id)}
+                    className={clsx(
+                      "flex-1 rounded-chip border px-2 py-1.5 text-[11px] font-extrabold uppercase tracking-wide transition-colors",
+                      selected
+                        ? "border-brand bg-brand text-brand-fg"
+                        : "border-line bg-paper text-fg-muted hover:text-fg",
+                      isActiveCartLocked && "cursor-not-allowed opacity-50",
+                    )}
+                  >
+                    {t(opt.shortLabelKey)}
+                  </button>
+                );
+              })}
+            </div>
+              <div className="flex shrink-0 items-center gap-1.5">
                 <>
                   {/* The discount TRIGGER rides in the heading rather than
                       taking a full row of its own. At 1366x768 that row was
@@ -2895,10 +2995,10 @@ export default function PosRegister() {
                     </TinyButton>
                   )}
                 </>
-              }
-            >
-              {t("pos.cartLabel", { n: String(activeCart.seq) })}
-            </RailHeading>
+              </div>
+            </div>
+
+
 
             {/* WHERE THIS ORDER CAME FROM (WP-4).
                 Two segments rather than a dropdown: the cashier has to be able
@@ -2913,40 +3013,11 @@ export default function PosRegister() {
                 It is NOT a payment control and says nothing about settlement —
                 an online order still has to be paid for before it will post.
                 See lib/salesChannel.ts. */}
-            <div
-              role="group"
-              aria-label={t("channel.groupLabel")}
-              className="mt-2 flex items-center gap-1.5 squat:mt-1.5"
-            >
-              {SALES_CHANNEL_OPTIONS.map((opt) => {
-                const selected = activeChannel === opt.id;
-                return (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    aria-pressed={selected}
-                    disabled={isActiveCartLocked}
-                    onClick={() => setChannel(opt.id)}
-                    className={clsx(
-                      "flex-1 rounded-chip border px-2 py-1.5 text-[11px] font-extrabold uppercase tracking-wide transition-colors",
-                      selected
-                        ? "border-brand bg-brand text-brand-fg"
-                        : "border-line bg-paper text-fg-muted hover:text-fg",
-                      isActiveCartLocked && "cursor-not-allowed opacity-50",
-                    )}
-                  >
-                    {t(opt.shortLabelKey)}
-                  </button>
-                );
-              })}
-            </div>
-
-
             {/* The order lines are the primary independently scrollable
                 region: a long order scrolls HERE first, so the discount, the
                 totals and the amount due stay where the cashier last saw them
                 instead of sliding about. */}
-            <div className="-mx-1 mt-3 min-h-[2.75rem] flex-1 scroll-p-2 overflow-y-auto tiny:min-h-0 px-1 squat:mt-1.5">
+            <div className="-mx-1 mt-2 min-h-[2.75rem] flex-1 scroll-p-2 overflow-y-auto tiny:min-h-0 px-1 squat:mt-1">
               {/* THE DELIVERY ARRANGEMENT lives INSIDE the scrollable region
                   (WP-A3). It is order content, not a pinned control: at
                   1366x768 under 125% Windows scaling the CSS viewport is
@@ -3408,12 +3479,12 @@ export default function PosRegister() {
               content inside it, so it can never be scrolled away and never
               overlaps a figure. */}
           <section className="shrink-0 rounded-panel border border-line bg-surface p-[15px] shadow-panel squat:p-2.5">
-            <h3 className="greaz-display text-[19px] uppercase leading-none text-fg squat:text-[18px] tiny:sr-only">
+            <h3 className="greaz-display text-[19px] uppercase leading-none text-fg squat:sr-only">
               {t("pos.paymentTitle")}
             </h3>
 
 
-            <div className="mt-3 space-y-2.5 squat:mt-1.5 squat:space-y-1.5 tiny:grid tiny:grid-cols-2 tiny:gap-2 tiny:space-y-0">
+            <div className="mt-3 grid grid-cols-2 gap-2 squat:mt-0">
               {/* The two cash boxes are REMOVED, not merely disabled, on a
                   driver-collected order (WP-A3).
 
@@ -3469,7 +3540,7 @@ export default function PosRegister() {
                   with no field on screen to explain the number. So a non-empty
                   card value surfaces itself, with a way to clear it. */}
               {cardUsdInput.trim() !== "" && (
-                <div className="flex items-start justify-between gap-2 rounded-chip border border-warn-line bg-warn-bg px-2.5 py-2">
+                <div className="col-span-2 flex items-start justify-between gap-2 rounded-chip border border-warn-line bg-warn-bg px-2.5 py-2">
                   <div className="min-w-0">
                     <p className="text-[11px] font-extrabold text-warn-fg">
                       {t("pos.cardUsdReceived")}:{" "}
@@ -3497,7 +3568,13 @@ export default function PosRegister() {
                 and the till is taking nothing. So the two rows state the two
                 facts the cashier needs: nothing is collected here, and the
                 driver owes the shop the food total. */}
-            <div className="mt-3 space-y-1 rounded-chip border border-line bg-paper p-2.5 squat:mt-1.5 squat:p-2">
+            {/* V1.1: with NOTHING typed, "paid $0.00 / remaining = the total"
+                only repeats the figure in the red block above, so the box is
+                left out until a tender is typed (or the order is driver-
+                collected, where it states something the block does not). F5
+                and F6 fill the tender themselves. */}
+            {(driverCollect || !allPaymentsEmpty) && (
+            <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-0.5 rounded-chip border border-line bg-paper px-2.5 py-1.5 squat:mt-1.5">
               {driverCollect ? (
                 <>
                   <AmountLine
@@ -3559,6 +3636,7 @@ export default function PosRegister() {
                 </>
               )}
             </div>
+            )}
 
             {payments.errors.length > 0 && (
               <p className="mt-2 text-[11px] text-danger-fg">{payments.errors[0]}</p>
@@ -3591,6 +3669,11 @@ export default function PosRegister() {
                 </kbd>
               )}
             </button>
+            {!driverCollect && (
+              <p className="mt-1.5 text-center text-[10px] font-semibold text-fg-muted">
+                {t("pos.shortcutHint")}
+              </p>
+            )}
           </section>
         </div>
       </div>

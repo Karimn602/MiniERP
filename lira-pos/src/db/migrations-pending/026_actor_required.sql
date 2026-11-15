@@ -1,7 +1,11 @@
 -- ============================================================================
--- Migration v25 — A NEW FINANCIAL DOCUMENT MUST NAME A REAL ACTOR
+-- Migration v26 — A NEW FINANCIAL DOCUMENT MUST NAME A REAL ACTOR
 --                 (Gate 2B, Stage B.2b)
 -- ----------------------------------------------------------------------------
+-- RENUMBERED 025 -> 026 (V1.1): 025 was taken by `025_operator_controls.sql`,
+-- and this file has still never been applied to any database, so the move is
+-- free for the same reason the earlier one was.
+--
 -- RENUMBERED 024 -> 025, and this file has never been applied to any database,
 -- so the renumbering costs nothing: a migration's version is only fixed once a
 -- database records its checksum, and no database has recorded this one. 024 was

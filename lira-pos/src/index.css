@@ -287,6 +287,59 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* ===========================================================================
+   FORM FIELDS IN BOTH APPEARANCES (V1.1, founder report A3).
+
+   A bare `<input>` with no background class — the New Purchase quantity and
+   unit-cost boxes, among others — used to get the BROWSER's white fill while
+   inheriting the theme's text colour, which on Midnight is near-white: light
+   digits on a white box. The rule is now made once, here, in the base layer:
+   every field is filled with the inset `paper` tone and written in `fg`, so a
+   field that names its own `bg-*`/`text-*` utilities still wins (utilities
+   come after base) and a field that names none is legible in both themes.
+
+   `color-scheme` tells WebView2 to draw its OWN parts of a control — the
+   select drop-down, the date picker, scrollbars, autofill — for the active
+   theme, which no CSS colour can reach.
+   =========================================================================== */
+:root,
+:root[data-theme="classic"] {
+  color-scheme: light;
+}
+:root[data-theme="midnight"] {
+  color-scheme: dark;
+}
+
+@layer base {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]),
+  select,
+  textarea {
+    background-color: rgb(var(--greaz-paper));
+    color: rgb(var(--greaz-fg));
+    caret-color: rgb(var(--greaz-fg));
+  }
+  input::placeholder,
+  textarea::placeholder {
+    color: rgb(var(--greaz-fg-subtle));
+    opacity: 1;
+  }
+  input:disabled,
+  select:disabled,
+  textarea:disabled {
+    color: rgb(var(--greaz-fg-muted));
+    -webkit-text-fill-color: rgb(var(--greaz-fg-muted));
+    cursor: not-allowed;
+    opacity: 0.75;
+  }
+  select option {
+    background-color: rgb(var(--greaz-surface));
+    color: rgb(var(--greaz-fg));
+  }
+  input[aria-invalid="true"] {
+    border-color: rgb(var(--greaz-danger));
+  }
+}
+
 /* Money / quantity columns read cleaner with lining tabular figures. */
 .tabular-nums {
   font-variant-numeric: tabular-nums;

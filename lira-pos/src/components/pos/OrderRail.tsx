@@ -203,31 +203,32 @@ export function CartLineRow({
   }
 
   return (
-    <div className="group/row grid grid-cols-[minmax(0,1fr)_91px_57px] items-center gap-1.5 border-b border-dashed border-line py-2.5 squat:py-1.5">
+    <div className="group/row grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 border-b border-dashed border-line py-1 squat:py-0.5">
       <div className="min-w-0">
-        <div className="truncate text-[11px] font-extrabold text-fg" title={name}>
-          {name}
+        {/* V1.1: ONE line per item at 1366x768 — the name, then the unit
+            price, unit and stock in muted type on the SAME baseline, then the
+            note control. A two-line row held a 14-item order to three visible
+            lines. The detail truncates first; the name keeps priority. */}
+        <div className="flex min-w-0 items-baseline gap-2">
+          <span className="min-w-0 shrink truncate text-[13px] font-extrabold text-fg" title={name}>
+            {name}
+          </span>
+          {detail && (
+            <span className="min-w-0 flex-1 truncate text-[11px] leading-tight text-fg-muted">
+              {detail}
+            </span>
+          )}
+          {onNoteChange && !editing && !note && (
+            <button
+              type="button"
+              disabled={noteDisabled}
+              onClick={openEditor}
+              className="shrink-0 rounded-chip border border-dashed border-line px-1 text-[11px] font-bold text-fg-muted transition-colors hover:border-brand hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {noteAddLabel}
+            </button>
+          )}
         </div>
-        {/* Detail and the ADD affordance share ONE row, so a line with no
-            instruction is exactly as tall as it was before this feature
-            existed. The detail truncates and the button does not: the unit
-            and the unit price can lose their tail, but a control that
-            disappeared at a narrow width would be unreachable. */}
-        {(detail || (onNoteChange && !editing && !note)) && (
-          <div className="flex items-center gap-1 text-[10px] leading-tight text-fg-muted">
-            {detail && <span className="min-w-0 truncate">{detail}</span>}
-            {onNoteChange && !editing && !note && (
-              <button
-                type="button"
-                disabled={noteDisabled}
-                onClick={openEditor}
-                className="shrink-0 rounded-chip border border-dashed border-line px-1 font-bold text-fg-muted transition-colors hover:border-brand hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {noteAddLabel}
-              </button>
-            )}
-          </div>
-        )}
 
         {onNoteChange && (editing ? (
           <input
@@ -288,31 +289,31 @@ export function CartLineRow({
           type="button"
           onClick={onDecrease}
           aria-label={decreaseLabel}
-          className="flex h-[25px] w-6 items-center justify-center rounded-chip border border-line bg-paper text-fg transition-colors hover:border-brand hover:text-brand-ink"
+          className="flex h-7 w-7 items-center justify-center rounded-chip border border-line bg-paper text-base font-bold text-fg transition-colors hover:border-brand hover:text-brand-ink"
         >
           −
         </button>
-        <span className="min-w-[14px] text-center text-[11px] font-extrabold tabular-nums text-fg">
+        <span className="min-w-[22px] text-center text-[13px] font-extrabold tabular-nums text-fg">
           {quantity}
         </span>
         <button
           type="button"
           onClick={onIncrease}
           aria-label={increaseLabel}
-          className="flex h-[25px] w-6 items-center justify-center rounded-chip border border-line bg-paper text-fg transition-colors hover:border-brand hover:text-brand-ink"
+          className="flex h-7 w-7 items-center justify-center rounded-chip border border-line bg-paper text-base font-bold text-fg transition-colors hover:border-brand hover:text-brand-ink"
         >
           +
         </button>
       </div>
 
-      <div className="flex items-center justify-end gap-1">
-        <span className="text-[12px] font-black tabular-nums text-fg">{amount}</span>
+      <div className="flex min-w-[96px] items-center justify-end gap-1.5">
+        <span className="text-[13px] font-black tabular-nums text-fg">{amount}</span>
         <button
           type="button"
           onClick={onRemove}
           aria-label={removeLabel}
           title={removeLabel}
-          className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-fg-subtle transition-colors hover:bg-danger-bg hover:text-danger-fg"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-base text-fg-subtle transition-colors hover:bg-danger-bg hover:text-danger-fg"
         >
           ×
         </button>
@@ -391,12 +392,19 @@ export function TotalBlock({
   secondaryValue?: string;
 }) {
   return (
-    <div className="mt-3 shrink-0 rounded-chip bg-brand px-[15px] py-[15px] text-brand-fg squat:mt-1.5 squat:py-2.5 tiny:py-1.5">
+    <div className="mt-3 shrink-0 rounded-chip bg-brand px-[15px] py-[15px] text-brand-fg squat:mt-1.5 squat:py-1.5 tiny:py-1">
       <div className="flex items-center justify-between gap-3">
         <span className="text-[11px] font-black uppercase tracking-wide">
           {label}
         </span>
-        <span className="greaz-display text-[29px] leading-none squat:text-[24px] tiny:text-[21px]">
+        {/* V1.1: on a short screen the lira equivalent rides on THIS line,
+            beside the amount, rather than a line of its own. */}
+        {secondaryValue && (
+          <span className="ms-auto hidden text-[11px] tabular-nums squat:inline">
+            = {secondaryValue}
+          </span>
+        )}
+        <span className="greaz-display text-[29px] leading-none squat:text-[22px] tiny:text-[20px]">
           {value}
         </span>
       </div>
@@ -408,7 +416,7 @@ export function TotalBlock({
         // 11px. Full `brand-fg` is the same colour the panel already uses for
         // its label, so the row still reads as secondary through size and
         // weight rather than through transparency.
-        <div className="mt-1 flex items-center justify-between gap-3 text-[11px]">
+        <div className="mt-1 flex items-center justify-between gap-3 text-[11px] squat:hidden">
           <span>{secondaryLabel}</span>
           <span className="tabular-nums">{secondaryValue}</span>
         </div>

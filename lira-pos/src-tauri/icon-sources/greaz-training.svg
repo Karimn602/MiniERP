@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Greaz POS — TRAINING. High-contrast yellow and black, so it can never be
+       mistaken for the cream-and-red Production icon on a taskbar. -->
+  <defs>
+    <clipPath id="tile"><rect x="32" y="32" width="960" height="960" rx="200"/></clipPath>
+    <pattern id="hazard" width="120" height="120" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="120" height="120" fill="#FFD400"/>
+      <rect width="60" height="120" fill="#111111"/>
+    </pattern>
+  </defs>
+  <g clip-path="url(#tile)">
+    <rect x="32" y="32" width="960" height="960" fill="#FFD400"/>
+    <rect x="32" y="800" width="960" height="192" fill="url(#hazard)"/>
+  </g>
+  <rect x="32" y="32" width="960" height="960" rx="200" fill="none" stroke="#111111" stroke-width="24"/>
+  <path d="M 740 300 A 270 270 0 1 0 786 500" fill="none" stroke="#111111" stroke-width="160" stroke-linecap="butt"/>
+  <rect x="540" y="430" width="330" height="140" fill="#111111"/>
+  <rect x="716" y="430" width="154" height="250" fill="#111111"/>
+</svg>

@@ -188,6 +188,21 @@ pub struct SaveProductPayload {
     #[serde(default)]
     pub standard_cost_excl_vat_microcents: Option<i64>,
 
+    // ---- Operator controls (V1.1, migration 025). ----
+    /// Whether the item is offered for SALE at the Register. `None` keeps the
+    /// stored value on an update and means "yes" on a create, so every
+    /// existing caller (the importer among them) is unchanged. An ingredient
+    /// kept off the Register stays active, purchasable, countable and usable in
+    /// a recipe; `post_sale` refuses a new sale of it.
+    #[serde(default)]
+    pub show_on_register: Option<bool>,
+    /// The owner's negative-stock policy for this item. `None` keeps the stored
+    /// value (or `false` on a create). Changing it is a valuation decision, so
+    /// it needs `SaveProductCost` (owner only) and is written to
+    /// `product_valuation_audit`.
+    #[serde(default)]
+    pub allow_negative_stock: Option<bool>,
+
     // ---- The UoM configuration the Products page edits as one unit. ----
     /// The stocking unit. On an update it is informational: a product's base
     /// UoM is not something this command changes (see `save_product_tx`).
@@ -297,13 +312,11 @@ pub(crate) fn validate_save_product(payload: &SaveProductPayload) -> Result<(), 
             if payload.standard_cost_excl_vat_microcents.is_none() {
                 return Err(MANUAL_COST_REQUIRED.into());
             }
-            // See migration 020's header for the financial argument. Short
-            // version: a stocked line's COGS rate is also written onto its
-            // `inventory_movements` row, so a manual rate there would make the
-            // stock ledger and the P&L disagree with no document between them.
-            if !payload.is_service {
-                return Err(MANUAL_COST_NEEDS_SERVICE.into());
-            }
+            // V1.1 (founder decision, migration 025): a STOCKED item may carry
+            // an owner override too. Its sales are costed at the stated
+            // figure; the shelf stays valued at the purchase average. See
+            // migration 025's header for exactly what that does and does not
+            // mean.
         }
         Some("recipe") => {
             // WP-B2-B. Only the SHAPE half is decidable here: whether the item
@@ -357,12 +370,6 @@ pub(crate) fn created_costing_method(payload: &SaveProductPayload) -> &str {
 /// Manual Cost was chosen and no figure was stated.
 pub const MANUAL_COST_REQUIRED: &str =
     "Manual Cost needs a cost. Enter a cost excluding VAT, or choose purchase valuation.";
-
-/// Manual Cost was chosen for a stocked product.
-pub const MANUAL_COST_NEEDS_SERVICE: &str =
-    "Manual Cost applies to non-stock menu items only. A stocked product is valued from its \
-     purchases, so a typed cost would contradict the inventory movements its sales write. \
-     Mark the item as a service (no stock tracking), or leave it on purchase valuation.";
 
 /// Recipe costing was chosen for a stocked product (WP-B2-B).
 pub const RECIPE_COSTING_NEEDS_SERVICE: &str =
@@ -435,8 +442,8 @@ async fn cost_fields_would_change_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     payload: &SaveProductPayload,
 ) -> Result<bool, String> {
-    let stored: Option<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT costing_method, standard_cost_excl_vat_microcents
+    let stored: Option<(String, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT costing_method, standard_cost_excl_vat_microcents, allow_negative_stock
            FROM products WHERE id = ? AND store_id = ?",
     )
     .bind(&payload.product_id)
@@ -445,8 +452,8 @@ async fn cost_fields_would_change_tx(
     .await
     .map_err(|e| format!("cannot read the product's costing: {e}"))?;
 
-    let (stored_method, stored_cost) =
-        stored.unwrap_or_else(|| ("purchase_average".to_string(), None));
+    let (stored_method, stored_cost, stored_negative) =
+        stored.unwrap_or_else(|| ("purchase_average".to_string(), None, 0));
 
     let method_moves = payload
         .costing_method
@@ -456,7 +463,13 @@ async fn cost_fields_would_change_tx(
         .standard_cost_excl_vat_microcents
         .is_some_and(|c| Some(c) != stored_cost);
 
-    Ok(method_moves || cost_moves)
+    // V1.1: the negative-stock policy decides how far a pool may be drawn, so
+    // it is a valuation decision and owner-only like the cost itself.
+    let policy_moves = payload
+        .allow_negative_stock
+        .is_some_and(|v| i64::from(v) != stored_negative);
+
+    Ok(method_moves || cost_moves || policy_moves)
 }
 
 /// Would this save move the product's cost or its costing method?
@@ -470,8 +483,8 @@ async fn cost_fields_would_change(
     pool: &SqlitePool,
     payload: &SaveProductPayload,
 ) -> Result<bool, String> {
-    let stored: Option<(String, Option<i64>)> = sqlx::query_as(
-        "SELECT costing_method, standard_cost_excl_vat_microcents
+    let stored: Option<(String, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT costing_method, standard_cost_excl_vat_microcents, allow_negative_stock
            FROM products WHERE id = ? AND store_id = ?",
     )
     .bind(&payload.product_id)
@@ -480,7 +493,7 @@ async fn cost_fields_would_change(
     .await
     .map_err(|e| format!("cannot read the product's costing: {e}"))?;
 
-    let (stored_method, stored_cost) = stored.unwrap_or_else(|| ("purchase_average".to_string(), None));
+    let (stored_method, stored_cost, stored_negative) = stored.unwrap_or_else(|| ("purchase_average".to_string(), None, 0));
 
     // An omitted field means "leave it alone" — `save_product_tx` preserves the
     // stored value — so an omission can never be a change.
@@ -492,7 +505,13 @@ async fn cost_fields_would_change(
         .standard_cost_excl_vat_microcents
         .is_some_and(|c| Some(c) != stored_cost);
 
-    Ok(method_moves || cost_moves)
+    // V1.1: the negative-stock policy decides how far a pool may be drawn, so
+    // it is a valuation decision and owner-only like the cost itself.
+    let policy_moves = payload
+        .allow_negative_stock
+        .is_some_and(|v| i64::from(v) != stored_negative);
+
+    Ok(method_moves || cost_moves || policy_moves)
 }
 
 /// Validate-then-save against an already-resolved pool (test seam).
@@ -558,6 +577,12 @@ pub(crate) async fn save_product_tx(
     // the one that confirms they may do it HERE. See
     // `authz::require_same_store`.
     crate::authz::require_same_store(actor, &payload.store_id)?;
+    // V1.1: the valuation configuration as it stood before this save, so a
+    // change can be recorded in `product_valuation_audit` below. A new product
+    // has none: purchase valuation, no override, no negative stock.
+    let valuation_before = read_valuation_state(&mut tx, &payload.product_id, &payload.store_id)
+        .await?
+        .unwrap_or_default();
     let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
     // Only `standard_cost_set_at` uses this: every other timestamp on a
     // product row is written by the schema's own DEFAULT or by
@@ -597,8 +622,9 @@ pub(crate) async fn save_product_tx(
                  is_active, is_service,
                  category, icon,
                  costing_method, standard_cost_excl_vat_microcents,
-                 standard_cost_set_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 standard_cost_set_at,
+                 show_on_register, allow_negative_stock
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&payload.product_id)
         .bind(&payload.store_id)
@@ -623,6 +649,8 @@ pub(crate) async fn save_product_tx(
                 .standard_cost_excl_vat_microcents
                 .map(|_| now.clone()),
         )
+        .bind(i64::from(payload.show_on_register.unwrap_or(true)))
+        .bind(i64::from(payload.allow_negative_stock.unwrap_or(false)))
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -850,7 +878,9 @@ pub(crate) async fn save_product_tx(
                       icon = ?,
                       costing_method = ?,
                       standard_cost_excl_vat_microcents = ?,
-                      standard_cost_set_at = ?
+                      standard_cost_set_at = ?,
+                      show_on_register = COALESCE(?, show_on_register),
+                      allow_negative_stock = COALESCE(?, allow_negative_stock)
                 WHERE id = ? AND store_id = ?"#,
         )
         .bind(&payload.sku)
@@ -868,6 +898,8 @@ pub(crate) async fn save_product_tx(
         .bind(&costing_method)
         .bind(new_cost)
         .bind(standard_cost_set_at)
+        .bind(payload.show_on_register.map(i64::from))
+        .bind(payload.allow_negative_stock.map(i64::from))
         .bind(&payload.product_id)
         .bind(&payload.store_id)
         .execute(&mut *tx)
@@ -954,6 +986,17 @@ pub(crate) async fn save_product_tx(
             }
         }
     }
+
+    // ---- V1.1: an owner's cost or stock-policy change is AUDITED ----
+    //
+    // Only the owner reaches here with such a change (see
+    // `cost_fields_would_change_tx`). The rows name who, when and what changed,
+    // in the same transaction as the change, with the purchase average and the
+    // stock on hand it was made against.
+    let valuation_after = read_valuation_state(&mut tx, &payload.product_id, &payload.store_id)
+        .await?
+        .ok_or_else(|| "the saved product could not be re-read".to_string())?;
+    record_valuation_changes(&mut tx, actor, &payload, &valuation_before, &valuation_after).await?;
 
     tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
     Ok(SaveProductResult {
@@ -1247,8 +1290,8 @@ pub(crate) async fn remove_product_barcode_with_pool(
 
 /// Deactivate a barcode and, if it was the primary, promote the oldest
 /// survivor — as one step, so a product never ends up with barcodes and no
-/// primary. The last barcode cannot be removed, which is the rule
-/// `barcodesRepo.remove` already had.
+/// primary. Since V1.1 the last barcode may be removed too: a barcode is
+/// optional.
 pub(crate) async fn remove_product_barcode_tx(
     pool: &SqlitePool,
     actor: &crate::auth::Actor,
@@ -1290,18 +1333,11 @@ pub(crate) async fn remove_product_barcode_tx(
     .ok_or_else(|| "Barcode not found or already inactive.".to_string())?;
     let was_primary: bool = row.try_get::<i64, _>("is_primary").map_err(|e| format!("decode: {e}"))? == 1;
 
-    let active: i64 = sqlx::query(
-        "SELECT COUNT(*) AS n FROM product_barcodes WHERE product_id = ? AND is_active = 1",
-    )
-    .bind(&payload.product_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| format!("count barcodes: {e}"))?
-    .try_get("n")
-    .map_err(|e| format!("decode count: {e}"))?;
-    if active <= 1 {
-        return Err("Cannot remove the last barcode.".into());
-    }
+    // V1.1: a barcode is OPTIONAL. Removing the last one leaves an item that
+    // is found by name or SKU instead of by scan, which is how every product
+    // created without one already works. Nothing else depends on a barcode:
+    // posting resolves the product by id, and the unique index still holds for
+    // every barcode that exists.
 
     sqlx::query("UPDATE product_barcodes SET is_active = 0, is_primary = 0 WHERE id = ?")
         .bind(&payload.barcode_id)
@@ -1332,5 +1368,108 @@ pub(crate) async fn remove_product_barcode_tx(
     }
 
     tx.commit().await.map_err(|e| format!("commit tx: {e}"))?;
+    Ok(())
+}
+
+/// A product's valuation configuration, as `product_valuation_audit` records
+/// it (V1.1, migration 025).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ValuationState {
+    costing_method: Option<String>,
+    standard_cost: Option<i64>,
+    allow_negative_stock: i64,
+    avg_cost_excl: i64,
+    quantity_on_hand: i64,
+}
+
+async fn read_valuation_state(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    product_id: &str,
+    store_id: &str,
+) -> Result<Option<ValuationState>, String> {
+    let row = sqlx::query(
+        "SELECT costing_method, standard_cost_excl_vat_microcents, allow_negative_stock,
+                avg_cost_excl_vat_microcents, quantity_on_hand
+           FROM products WHERE id = ? AND store_id = ?",
+    )
+    .bind(product_id)
+    .bind(store_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| format!("read valuation configuration: {e}"))?;
+    let Some(row) = row else { return Ok(None) };
+    let d = |what: &'static str| move |e: sqlx::Error| format!("decode {what}: {e}");
+    Ok(Some(ValuationState {
+        costing_method: Some(row.try_get("costing_method").map_err(d("costing_method"))?),
+        standard_cost: row
+            .try_get("standard_cost_excl_vat_microcents")
+            .map_err(d("standard_cost"))?,
+        allow_negative_stock: row.try_get("allow_negative_stock").map_err(d("allow_negative_stock"))?,
+        avg_cost_excl: row.try_get("avg_cost_excl_vat_microcents").map_err(d("avg_cost"))?,
+        quantity_on_hand: row.try_get("quantity_on_hand").map_err(d("quantity_on_hand"))?,
+    }))
+}
+
+/// Write one audit row per valuation change a save made.
+///
+/// "The override" is what a SALE would be costed at: a Manual Cost figure
+/// while the method is `standard`, nothing otherwise. So switching a typed
+/// cost on, changing its figure, and switching it off are the three changes;
+/// a figure edited while the method is something else changes no sale and
+/// writes nothing.
+async fn record_valuation_changes(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    actor: &crate::auth::Actor,
+    payload: &SaveProductPayload,
+    before: &ValuationState,
+    after: &ValuationState,
+) -> Result<(), String> {
+    let override_of = |v: &ValuationState| {
+        if v.costing_method.as_deref() == Some("standard") {
+            v.standard_cost
+        } else {
+            None
+        }
+    };
+    let (was, now) = (override_of(before), override_of(after));
+    let cost_event = match (was, now) {
+        (a, Some(b)) if a != Some(b) => Some("manual_cost_set"),
+        (Some(_), None) => Some("manual_cost_removed"),
+        _ => None,
+    };
+    let policy_event = if before.allow_negative_stock != after.allow_negative_stock {
+        Some(if after.allow_negative_stock == 1 {
+            "negative_stock_enabled"
+        } else {
+            "negative_stock_disabled"
+        })
+    } else {
+        None
+    };
+    for event in [cost_event, policy_event].into_iter().flatten() {
+        sqlx::query(
+            "INSERT INTO product_valuation_audit
+               (id, store_id, product_id, event,
+                previous_costing_method, previous_standard_cost_excl_microcents,
+                new_costing_method, new_standard_cost_excl_microcents,
+                avg_cost_excl_microcents_at_change, quantity_on_hand_at_change,
+                created_by_user_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&payload.store_id)
+        .bind(&payload.product_id)
+        .bind(event)
+        .bind(&before.costing_method)
+        .bind(before.standard_cost)
+        .bind(&after.costing_method)
+        .bind(after.standard_cost)
+        .bind(after.avg_cost_excl)
+        .bind(after.quantity_on_hand)
+        .bind(&actor.user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("record the valuation change: {e}"))?;
+    }
     Ok(())
 }

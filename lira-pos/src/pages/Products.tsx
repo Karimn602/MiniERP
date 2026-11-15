@@ -91,6 +91,10 @@ interface ProductFormState {
 
   isService: boolean;
   isActive: boolean;
+  /** V1.1: offered for sale at the Register (false = inventory only). */
+  showOnRegister: boolean;
+  /** V1.1: the owner's negative-stock policy for this item. */
+  allowNegativeStock: boolean;
 
   /**
    * How sales of this product are costed (WP-B1, extended by WP-B2-B).
@@ -137,6 +141,8 @@ const EMPTY_FORM: ProductFormState = {
 
   isService: false,
   isActive: true,
+  showOnRegister: true,
+  allowNegativeStock: false,
 
   costingMethod: "purchase_average",
   manualCostInput: "",
@@ -376,6 +382,8 @@ export default function Products() {
 
       isService: product.isService,
       isActive: product.isActive,
+      showOnRegister: product.showOnRegister,
+      allowNegativeStock: product.allowNegativeStock,
 
       // Round-tripped through the selectable set rather than collapsed to a
       // pair: before WP-B2-B this read `=== "standard" ? "standard" :
@@ -433,9 +441,14 @@ export default function Products() {
       if (!form.baseUomCode.trim() || !form.saleUomCode.trim()) {
         throw new Error(t("products.errUomRequired"));
       }
-      if (!form.priceInput.trim()) throw new Error(t("products.errPriceRequired"));
+      // V1.1: an inventory-only item (an ingredient) is never sold, so it
+      // needs no selling price; a blank box means $0.00. A menu item still
+      // must state one.
+      if (!form.priceInput.trim() && form.showOnRegister) {
+        throw new Error(t("products.errPriceRequired"));
+      }
 
-      const typedPriceCents = parseUsdInput(form.priceInput);
+      const typedPriceCents = form.priceInput.trim() ? parseUsdInput(form.priceInput) : 0;
 
       const price =
         form.vatPricingMode === "inclusive"
@@ -476,12 +489,6 @@ export default function Products() {
         // shop acquires a year of 100% margins it cannot date.
         if (standardCostExclVatMicrocents === null) {
           throw new Error(t("products.errManualCostRequired"));
-        }
-        // A stocked line's COGS rate is also stamped onto the sale's
-        // inventory movement, so a typed rate there would make the stock
-        // ledger and the P&L disagree with no document between them.
-        if (!form.isService) {
-          throw new Error(t("products.errManualCostNeedsService"));
         }
       }
       // WP-B2-B. The same two conditions the backend holds, said here first so
@@ -546,6 +553,8 @@ export default function Products() {
           priceInclVatCents: price.inclVatCents,
           reorderPoint,
           isService: form.isService,
+          showOnRegister: form.showOnRegister,
+          allowNegativeStock: form.isService ? undefined : form.allowNegativeStock,
           costingMethod: form.costingMethod,
           standardCostExclVatMicrocents,
           category: form.category || null,
@@ -577,6 +586,13 @@ export default function Products() {
           reorderPoint,
           isService: form.isService,
           isActive: form.isActive,
+          showOnRegister: form.showOnRegister,
+          // Sent only when it differs from what is stored, so a manager's
+          // ordinary edit never asks for the owner-only permission.
+          allowNegativeStock:
+            !form.isService && form.allowNegativeStock !== selectedProduct?.allowNegativeStock
+              ? form.allowNegativeStock
+              : undefined,
           costingMethod: form.costingMethod,
           standardCostExclVatMicrocents,
           category: form.category || null,
@@ -902,6 +918,41 @@ export default function Products() {
                 placeholder={t("products.optionalPlaceholder")}
               />
 
+              {/* V1.1: is this sold at the till, or only stocked and used?
+                  An ingredient stays purchasable, countable and usable in a
+                  recipe either way; this decides only whether the Register
+                  offers it and whether a sale of it may post. */}
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="text-xs font-medium text-slate-700">{t("products.itemUseLabel")}</span>
+                <select
+                  value={form.showOnRegister ? "menu" : "inventory"}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, showOnRegister: e.target.value === "menu" }))
+                  }
+                  className="rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                >
+                  <option value="menu">{t("products.itemUseMenu")}</option>
+                  <option value="inventory">{t("products.itemUseInventory")}</option>
+                </select>
+              </label>
+
+              {!form.isService && (
+                <label
+                  className="flex items-center gap-2 text-sm"
+                  title={mayChangeCost ? undefined : t("products.allowNegativeOwnerOnly")}
+                >
+                  <input
+                    type="checkbox"
+                    checked={form.allowNegativeStock}
+                    disabled={!mayChangeCost}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, allowNegativeStock: e.target.checked }))
+                    }
+                  />
+                  <span>{t("products.allowNegativeLabel")}</span>
+                </label>
+              )}
+
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
@@ -984,7 +1035,7 @@ export default function Products() {
 
               {form.mode === "new" ? (
                 <Input
-                  label={form.isService ? t("products.barcodeLabelOptional") : t("products.barcodeLabel")}
+                  label={t("products.barcodeLabelOptional")}
                   value={form.barcode}
                   onChange={(e) =>
                     setForm((f) => ({ ...f, barcode: e.target.value }))
@@ -1203,11 +1254,11 @@ export default function Products() {
                       hint={t("products.manualCostHint")}
                     />
 
-                    {/* The restriction, stated where it is reachable rather
-                        than only in the error the save would return. */}
+                    {/* V1.1: on a STOCKED item this is the owner's override.
+                        Say exactly what it does, where it is chosen. */}
                     {!form.isService && (
-                      <div className="rounded border border-warn-line bg-warn-bg p-2 text-xs text-warn-fg">
-                        {t("products.errManualCostNeedsService")}
+                      <div className="rounded border border-info-line bg-info-bg p-2 text-xs text-info-fg">
+                        {t("products.manualCostStockedNote")}
                       </div>
                     )}
 

@@ -480,13 +480,127 @@ async fn allow_negative_inventory_bypasses_the_guard_but_still_moves_stock() {
     )
     .await;
 
-    let lines = vec![SaleLineBuilder::new(P_WATER, "Water").qty(5).unit_incl(100).build()];
-    let mut payload = sale_payload(lines, vec![cash_usd(500)]);
+    // V1.1: the REQUEST's flag no longer decides. Sent alone, it is ignored
+    // and the guard holds — a cashier's device setting cannot oversell.
+    let water = || vec![SaleLineBuilder::new(P_WATER, "Water").qty(5).unit_incl(100).build()];
+    let mut payload = sale_payload(water(), vec![cash_usd(500)]);
     payload.allow_negative_inventory = true;
-    post_sale_with_pool(db.pool(), payload).await.expect("override permits the sale");
+    let err = post_sale_with_pool(db.pool(), payload)
+        .await
+        .expect_err("the request flag alone must not permit overselling");
+    assert!(err.contains("insufficient stock"), "{err}");
+    assert_eq!(quantity_on_hand(&db, P_WATER).await, 1);
+
+    // The OWNER's per-item policy does.
+    db.exec(&format!("UPDATE products SET allow_negative_stock = 1 WHERE id = '{P_WATER}'")).await;
+    let payload = sale_payload(water(), vec![cash_usd(500)]);
+    post_sale_with_pool(db.pool(), payload).await.expect("the item policy permits the sale");
 
     assert_eq!(quantity_on_hand(&db, P_WATER).await, -4);
     assert_eq!(movement_sum(&db, P_WATER).await, -5);
+}
+
+// ---- Codex V1.1 P1: the stock guard judges the SALE's aggregate demand ----
+
+async fn water_and_bread(qoh: i64) -> TempDb {
+    let db = TempDb::new().await;
+    seed_exchange_rate(&db).await;
+    seed_open_shift(&db).await;
+    for (id, sku, name) in [(P_WATER, "SKU-W1", "Water"), (P_BREAD, "SKU-B1", "Bread")] {
+        seed_product(&db, &ProductSpec { quantity_on_hand: qoh, ..ProductSpec::stocked(id, sku, name) })
+            .await;
+    }
+    db
+}
+
+fn water_lines(qtys: &[i64]) -> (Vec<crate::posting::PostSaleLine>, i64) {
+    let lines = qtys
+        .iter()
+        .map(|q| SaleLineBuilder::new(P_WATER, "Water").qty(*q).unit_incl(100).build())
+        .collect();
+    (lines, qtys.iter().sum::<i64>() * 100)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_lines_of_one_product_cannot_together_oversell() {
+    let db = water_and_bread(10).await;
+    let (lines, total) = water_lines(&[6, 6]);
+    let err = post_sale_with_pool(db.pool(), sale_payload(lines, vec![cash_usd(total)]))
+        .await
+        .expect_err("6 + 6 against 10 must be refused");
+    assert!(err.contains("insufficient stock") && err.contains("12"), "{err}");
+    // Complete rollback.
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 0);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sale_items").await, 0);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sale_payments").await, 0);
+    assert_eq!(db.count("SELECT COUNT(*) FROM inventory_movements").await, 0);
+    assert_eq!(quantity_on_hand(&db, P_WATER).await, 10);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_lines_are_summed_and_the_exact_boundary_posts() {
+    let db = water_and_bread(10).await;
+    let (lines, total) = water_lines(&[4, 4, 3]);
+    let err = post_sale_with_pool(db.pool(), sale_payload(lines, vec![cash_usd(total)]))
+        .await
+        .expect_err("4 + 4 + 3 against 10 must be refused");
+    assert!(err.contains("insufficient stock"), "{err}");
+    assert_eq!(quantity_on_hand(&db, P_WATER).await, 10);
+
+    let (lines, total) = water_lines(&[4, 3, 3]);
+    post_sale_with_pool(db.pool(), sale_payload(lines, vec![cash_usd(total)]))
+        .await
+        .expect("4 + 3 + 3 = 10 sells down to exactly zero");
+    assert_eq!(quantity_on_hand(&db, P_WATER).await, 0);
+    assert_eq!(movement_sum(&db, P_WATER).await, -10);
+    assert_eq!(
+        db.count(&format!("SELECT COUNT(*) FROM inventory_movements WHERE product_id = '{P_WATER}'"))
+            .await,
+        3,
+        "each line still writes its own movement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn different_products_are_judged_separately() {
+    let db = water_and_bread(10).await;
+    let lines = vec![
+        SaleLineBuilder::new(P_WATER, "Water").qty(6).unit_incl(100).build(),
+        SaleLineBuilder::new(P_BREAD, "Bread").qty(6).unit_incl(100).build(),
+    ];
+    post_sale_with_pool(db.pool(), sale_payload(lines, vec![cash_usd(1200)]))
+        .await
+        .expect("6 water and 6 bread against 10 of each");
+    assert_eq!(quantity_on_hand(&db, P_WATER).await, 4);
+    assert_eq!(quantity_on_hand(&db, P_BREAD).await, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_owners_policy_still_permits_duplicate_lines_below_zero() {
+    let db = water_and_bread(10).await;
+    db.exec(&format!("UPDATE products SET allow_negative_stock = 1 WHERE id = '{P_WATER}'")).await;
+    let (lines, total) = water_lines(&[6, 6]);
+    post_sale_with_pool(db.pool(), sale_payload(lines, vec![cash_usd(total)]))
+        .await
+        .expect("the owner allows this item below zero");
+    assert_eq!(quantity_on_hand(&db, P_WATER).await, -2);
+    assert_eq!(movement_sum(&db, P_WATER).await, -12);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_sales_cannot_together_oversell() {
+    let db = water_and_bread(10).await;
+    let post = || {
+        let pool = db.pool().clone();
+        let (lines, total) = water_lines(&[6]);
+        tokio::spawn(async move { post_sale_with_pool(&pool, sale_payload(lines, vec![cash_usd(total)])).await })
+    };
+    let (a, b) = (post(), post());
+    let results = [a.await.unwrap(), b.await.unwrap()];
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(ok, 1, "exactly one of two concurrent 6-unit sales against 10 may post: {results:?}");
+    assert_eq!(quantity_on_hand(&db, P_WATER).await, 4);
+    assert_eq!(db.count("SELECT COUNT(*) FROM sales").await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

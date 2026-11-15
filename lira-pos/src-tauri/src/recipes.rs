@@ -997,12 +997,12 @@ pub(crate) async fn activate_recipe_as(
     if !uncosted.is_empty() {
         return Err(format!(
             "This recipe cannot be published yet: {} {} no cost. Receive {} on a purchase or an \
-             opening stock valuation first, or set a Manual Cost if {} not stocked. Greaz will not \
-             publish a recipe whose cost it would have to guess.",
+             opening stock valuation first, or have the owner set a Manual Cost on {}. Greaz \
+             will not publish a recipe whose cost it would have to guess.",
             uncosted.join(", "),
             if uncosted.len() == 1 { "has" } else { "have" },
             if uncosted.len() == 1 { "it" } else { "them" },
-            if uncosted.len() == 1 { "it is" } else { "they are" },
+            if uncosted.len() == 1 { "it" } else { "them" },
         ));
     }
 

@@ -85,6 +85,11 @@ export interface EnrollmentResult {
  * what lets the read channel be gated with no allowlist of "harmless"
  * pre-login queries.
  */
+/** V1.1: open this installation's enrollment-code file in Notepad. */
+export function openEnrollmentCode(): Promise<void> {
+  return invoke<void>("auth_open_enrollment_code");
+}
+
 export function status(): Promise<AuthStatus> {
   return invoke<AuthStatus>("auth_status");
 }

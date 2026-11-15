@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { query } from "../client";
+import { costsVisible, projection } from "../projection";
 import { newId } from "../../lib/ids";
 import type {
   CreditMemo,
@@ -48,7 +49,7 @@ interface CreditMemoRow {
   vat_total_cents: number;
   discount_cents: number;
   total_incl_vat_cents: number;
-  cogs_reversed_cents: number;
+  cogs_reversed_cents?: number;
   refund_total_usd_cents: number;
   status: CreditMemoStatus;
   created_at: string;
@@ -77,9 +78,9 @@ interface CreditMemoLineRow {
   line_vat_cents: number;
   line_total_incl_vat_cents: number;
   line_discount_cents: number;
-  unit_cogs_excl_vat_microcents: number;
-  unit_cogs_excl_vat_cents: number;
-  line_cogs_excl_vat_cents: number;
+  unit_cogs_excl_vat_microcents?: number;
+  unit_cogs_excl_vat_cents?: number;
+  line_cogs_excl_vat_cents?: number;
   is_service: number;
   return_to_stock: number;
   related_movement_id: string | null;
@@ -97,6 +98,35 @@ interface CreditMemoRefundRow {
   reference: string | null;
   created_at: string;
 }
+
+// ---------- Column lists (V1.1: a cashier may post a return) ----------
+//
+// A cashier's read connection refuses every cost column (Stage C). A memo
+// carries one on its header and three on each line, so the cashier's reads
+// name the public columns only; the cost figures map to NULL (withheld, not
+// zero — Codex V1.1 P2) and no cashier screen prints them.
+
+const MEMO_PUBLIC = [
+  "id", "store_id", "original_sale_id", "credit_memo_number", "shift_id",
+  "device_id", "cashier_user_id", "exchange_rate_lbp_per_usd", "exchange_rate_id",
+  "reason", "subtotal_excl_vat_cents", "vat_total_cents", "discount_cents",
+  "total_incl_vat_cents", "refund_total_usd_cents", "status", "created_at",
+  "posted_at", "notes",
+] as const;
+const MEMO_CONFIDENTIAL = ["cogs_reversed_cents"] as const;
+
+const MEMO_LINE_PUBLIC = [
+  "id", "credit_memo_id", "store_id", "original_sale_item_id", "product_id",
+  "product_name_snapshot", "product_sku_snapshot", "vat_rate_id_snapshot",
+  "vat_rate_bps_snapshot", "quantity_base", "quantity_in_uom", "uom_code_snapshot",
+  "factor_num_snapshot", "factor_den_snapshot", "unit_price_excl_vat_cents",
+  "unit_price_incl_vat_cents", "line_subtotal_excl_vat_cents", "line_vat_cents",
+  "line_total_incl_vat_cents", "line_discount_cents", "is_service",
+  "return_to_stock", "related_movement_id", "created_at",
+] as const;
+const MEMO_LINE_CONFIDENTIAL = [
+  "unit_cogs_excl_vat_microcents", "unit_cogs_excl_vat_cents", "line_cogs_excl_vat_cents",
+] as const;
 
 // ---------- Mappers ----------
 
@@ -116,7 +146,7 @@ function toCreditMemo(r: CreditMemoRow): CreditMemo {
     vatTotalCents: r.vat_total_cents,
     discountCents: r.discount_cents,
     totalInclVatCents: r.total_incl_vat_cents,
-    cogsReversedCents: r.cogs_reversed_cents,
+    cogsReversedCents: r.cogs_reversed_cents ?? null,
     refundTotalUsdCents: r.refund_total_usd_cents,
     status: r.status,
     createdAt: r.created_at,
@@ -147,9 +177,11 @@ function toCreditMemoLine(r: CreditMemoLineRow): CreditMemoLine {
     lineVatCents: r.line_vat_cents,
     lineTotalInclVatCents: r.line_total_incl_vat_cents,
     lineDiscountCents: r.line_discount_cents,
-    unitCogsExclVatMicrocents: r.unit_cogs_excl_vat_microcents,
-    unitCogsExclVatCents: r.unit_cogs_excl_vat_cents,
-    lineCogsExclVatCents: r.line_cogs_excl_vat_cents,
+    // Withheld (column not projected for this session) is NULL, never 0: a
+    // legitimate zero cost and "you may not see this" are different facts.
+    unitCogsExclVatMicrocents: r.unit_cogs_excl_vat_microcents ?? null,
+    unitCogsExclVatCents: r.unit_cogs_excl_vat_cents ?? null,
+    lineCogsExclVatCents: r.line_cogs_excl_vat_cents ?? null,
     isService: r.is_service === 1,
     returnToStock: r.return_to_stock === 1,
     relatedMovementId: r.related_movement_id,
@@ -222,7 +254,7 @@ export interface PostCreditMemoResult {
   vatTotalCents: number;
   discountCents: number;
   totalInclVatCents: number;
-  cogsReversedCents: number;
+  cogsReversedCents: number | null;
   refundTotalUsdCents: number;
 }
 
@@ -234,7 +266,8 @@ export const creditMemosRepo = {
     (CreditMemo & { originalReceiptNumber: number | null })[]
   > {
     const rows = await query<CreditMemoRow & { original_receipt_number: number | null }>(
-      `SELECT m.*, s.receipt_number AS original_receipt_number
+      `SELECT ${projection("m", MEMO_PUBLIC, MEMO_CONFIDENTIAL)},
+              s.receipt_number AS original_receipt_number
          FROM sales_credit_memos m
          LEFT JOIN sales s ON s.id = m.original_sale_id
         WHERE m.store_id = ?
@@ -250,7 +283,8 @@ export const creditMemosRepo = {
 
   async findByIdWithDetails(id: string): Promise<CreditMemoWithDetails | null> {
     const headers = await query<CreditMemoRow & { original_receipt_number: number | null }>(
-      `SELECT m.*, s.receipt_number AS original_receipt_number
+      `SELECT ${projection("m", MEMO_PUBLIC, MEMO_CONFIDENTIAL)},
+              s.receipt_number AS original_receipt_number
          FROM sales_credit_memos m
          LEFT JOIN sales s ON s.id = m.original_sale_id
         WHERE m.id = ?`,
@@ -261,7 +295,8 @@ export const creditMemosRepo = {
 
     const [lineRows, refundRows] = await Promise.all([
       query<CreditMemoLineRow>(
-        `SELECT * FROM sales_credit_memo_lines WHERE credit_memo_id = ? ORDER BY created_at ASC`,
+        `SELECT ${projection(null, MEMO_LINE_PUBLIC, MEMO_LINE_CONFIDENTIAL)}
+           FROM sales_credit_memo_lines WHERE credit_memo_id = ? ORDER BY created_at ASC`,
         [id],
       ),
       query<CreditMemoRefundRow>(
@@ -281,7 +316,7 @@ export const creditMemosRepo = {
   /** Every posted memo of one sale, for the receipt's own history. */
   async listForSale(saleId: string): Promise<CreditMemo[]> {
     const rows = await query<CreditMemoRow>(
-      `SELECT * FROM sales_credit_memos
+      `SELECT ${projection(null, MEMO_PUBLIC, MEMO_CONFIDENTIAL)} FROM sales_credit_memos
         WHERE original_sale_id = ? AND status = 'posted'
         ORDER BY credit_memo_number ASC`,
       [saleId],
@@ -345,6 +380,7 @@ export const creditMemosRepo = {
     storeId: string;
     saleId: string;
   }): Promise<ReturnableLine[]> {
+    const supervisor = costsVisible();
     const rows = await query<{
       sale_item_id: string;
       product_id: string;
@@ -392,16 +428,30 @@ export const creditMemosRepo = {
               si.line_discount_cents,
               si.vat_rate_bps_snapshot,
               si.kitchen_note,
-              CASE WHEN EXISTS (
+              ${
+                // A cashier's connection refuses `inventory_movements`; the
+                // same fact comes from a trusted command below instead.
+                supervisor
+                  ? `CASE WHEN EXISTS (
                 SELECT 1 FROM inventory_movements im
                  WHERE im.related_sale_item_id = si.id AND im.movement_type = 'sale'
-              ) THEN 1 ELSE 0 END                     AS moved_stock
+              ) THEN 1 ELSE 0 END`
+                  : "0"
+              }                                       AS moved_stock
          FROM sale_items si
          JOIN sales s ON s.id = si.sale_id
         WHERE si.sale_id = ? AND s.store_id = ?
         ORDER BY si.created_at ASC`,
       [args.saleId, args.storeId],
     );
+    // V1.1: a cashier learns which lines left the shelf from
+    // `sale_lines_with_stock_movement`, which returns line ids and nothing else.
+    if (!supervisor) {
+      const moved = new Set(
+        await invoke<string[]>("sale_lines_with_stock_movement", { saleId: args.saleId }),
+      );
+      for (const r of rows) r.moved_stock = moved.has(r.sale_item_id) ? 1 : 0;
+    }
 
     return rows.map((r) => ({
       saleItemId: r.sale_item_id,
@@ -492,17 +542,54 @@ export const creditMemosRepo = {
    * Line and refund identifiers are minted here because a replay never reaches
    * the insert path: the return identity alone decides what is the same return.
    */
+  /**
+   * Mint the child identities ONCE, producing the complete request a return
+   * attempt freezes (`lib/refundAttempt.ts`). A retry sends this object again;
+   * nothing in it is re-minted.
+   */
+  freeze(
+    input: Omit<PostCreditMemoInput, "lines" | "refunds"> & {
+      lines: Omit<PostCreditMemoLineInput, "creditMemoLineId">[];
+      refunds: Omit<PostCreditMemoRefundInput, "refundId">[];
+    },
+  ): PostCreditMemoInput {
+    return {
+      ...input,
+      lines: input.lines.map((l) => ({ ...l, creditMemoLineId: newId() })),
+      refunds: input.refunds.map((r) => ({ ...r, refundId: newId() })),
+    };
+  },
+
+  /** Send a frozen request exactly as it was frozen. */
+  async postFrozen(payload: PostCreditMemoInput): Promise<PostCreditMemoResult> {
+    return invoke<PostCreditMemoResult>("post_credit_memo", { payload });
+  },
+
   async post(
     input: Omit<PostCreditMemoInput, "lines" | "refunds"> & {
       lines: Omit<PostCreditMemoLineInput, "creditMemoLineId">[];
       refunds: Omit<PostCreditMemoRefundInput, "refundId">[];
     },
   ): Promise<PostCreditMemoResult> {
-    const payload: PostCreditMemoInput = {
-      ...input,
-      lines: input.lines.map((l) => ({ ...l, creditMemoLineId: newId() })),
-      refunds: input.refunds.map((r) => ({ ...r, refundId: newId() })),
-    };
-    return invoke<PostCreditMemoResult>("post_credit_memo", { payload });
+    return creditMemosRepo.postFrozen(creditMemosRepo.freeze(input));
+  },
+
+  /**
+   * Did a return identity post? A READ, public columns only, scoped to the
+   * store. `post_credit_memo` writes the memo and promotes it in one
+   * transaction, so a row that is not `posted` is not something it left
+   * behind; it is reported as found-but-not-posted and never treated as done.
+   */
+  async probeIdentity(
+    storeId: string,
+    creditMemoId: string,
+  ): Promise<{ creditMemoNumber: number; status: string } | null> {
+    const rows = await query<{ credit_memo_number: number; status: string }>(
+      `SELECT credit_memo_number, status FROM sales_credit_memos
+        WHERE id = ? AND store_id = ?`,
+      [creditMemoId, storeId],
+    );
+    const r = rows[0];
+    return r ? { creditMemoNumber: r.credit_memo_number, status: r.status } : null;
   },
 };

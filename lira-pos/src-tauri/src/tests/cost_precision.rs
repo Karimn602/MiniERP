@@ -661,11 +661,12 @@ async fn an_oversold_line_is_still_costed_at_the_fractional_rate() {
     let db = store_with_flour().await;
     buy_flour(&db, 1, 250).await; // only 1,000 g on hand
 
-    // Sell 1,600 g with negative inventory allowed.
+    // Sell 1,600 g with negative inventory allowed — by the item's owner
+    // policy (V1.1), not by the request.
+    db.exec(&format!("UPDATE products SET allow_negative_stock = 1 WHERE id = '{P_FLOUR}'")).await;
     let line = SaleLineBuilder::new(P_FLOUR, "Flour").uom("g", 1, 1).qty(1_600).unit_incl(1).build();
     let total = lines_total(std::slice::from_ref(&line));
-    let mut payload = sale_payload(vec![line], vec![cash_usd(total)]);
-    payload.allow_negative_inventory = true;
+    let payload = sale_payload(vec![line], vec![cash_usd(total)]);
     let sale_id = payload.sale_id.clone();
     post_sale_with_pool(db.pool(), payload).await.unwrap();
 

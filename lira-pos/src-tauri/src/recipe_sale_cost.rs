@@ -274,12 +274,12 @@ pub async fn cost_sale_line_from_active_recipe(
         return Err(format!(
             "\"{product_name}\" cannot be sold right now: {} {} no cost on file, so its recipe \
              cost cannot be worked out. Receive {} on a purchase or an opening stock valuation, \
-             or set a Manual Cost if {} not stocked. Greaz will not post a sale at a cost it \
-             would have to guess.",
+             or have the owner set a Manual Cost on {}. Greaz will not post a sale at a cost \
+             it would have to guess.",
             uncosted.join(", "),
             if uncosted.len() == 1 { "has" } else { "have" },
             if uncosted.len() == 1 { "it" } else { "them" },
-            if uncosted.len() == 1 { "it is" } else { "they are" },
+            if uncosted.len() == 1 { "it" } else { "them" },
         ));
     }
 

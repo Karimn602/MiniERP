@@ -115,6 +115,14 @@ export interface Product {
    * when the figure moves — an ordinary edit does not restamp it.
    */
   standardCostSetAt: string | null;
+  /**
+   * V1.1 (migration 025): offered for sale at the Register. An ingredient the
+   * owner keeps off the till is still active, purchasable and usable in a
+   * recipe; `post_sale` refuses a new sale of it.
+   */
+  showOnRegister: boolean;
+  /** V1.1: the owner's per-item policy for selling/adjusting below zero. */
+  allowNegativeStock: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -611,8 +619,9 @@ export interface CreditMemo {
   vatTotalCents: UsdCents;
   discountCents: UsdCents;
   totalInclVatCents: UsdCents;
-  /** COGS put back into inventory — restocked lines only. */
-  cogsReversedCents: UsdCents;
+  /** COGS put back into inventory — restocked lines only. NULL when the
+   *  session may not read cost (a cashier): withheld, which is not zero. */
+  cogsReversedCents: UsdCents | null;
   /** Equal to `totalInclVatCents` exactly; there is no unpaid-credit model. */
   refundTotalUsdCents: UsdCents;
   status: CreditMemoStatus;
@@ -644,12 +653,13 @@ export interface CreditMemoLine {
   lineVatCents: UsdCents;
   lineTotalInclVatCents: UsdCents;
   lineDiscountCents: UsdCents;
-  /** The ORIGINAL sale's COGS rate for this line. */
-  unitCogsExclVatMicrocents: Microcents;
+  /** The ORIGINAL sale's COGS rate for this line. The three cost fields are
+   *  NULL when the session may not read cost — withheld, not zero. */
+  unitCogsExclVatMicrocents: Microcents | null;
   /** Rounded mirror of the rate above. Display only. */
-  unitCogsExclVatCents: UsdCents;
+  unitCogsExclVatCents: UsdCents | null;
   /** The COGS actually reversed — zero when the line did not restock. */
-  lineCogsExclVatCents: UsdCents;
+  lineCogsExclVatCents: UsdCents | null;
   /** True when the original sale line moved no stock. */
   isService: boolean;
   returnToStock: boolean;

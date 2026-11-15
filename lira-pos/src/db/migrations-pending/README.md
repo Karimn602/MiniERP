@@ -11,7 +11,10 @@ that folder.
 Moving a file out of here is therefore the deliberate act of adopting it, and it
 means doing the work its adoption requires in the same change.
 
-## 025_actor_required.sql
+## 026_actor_required.sql
+
+(Numbered 025 until V1.1 took 025 for `operator_controls`. Never applied, so
+the move cost nothing.)
 
 **What it is.** `BEFORE INSERT` triggers requiring every new financial document
 — sale, credit memo, purchase, supplier ledger entry, driver ledger entry,
@@ -39,8 +42,8 @@ is defence in depth against a future writer, not a fix for a present hole.
 
 **To adopt it:**
 
-1. Move it to `../migrations/025_actor_required.sql`.
-2. Register it in `src-tauri/src/lib.rs::migrations()` as version 24,
+1. Move it to `../migrations/026_actor_required.sql`.
+2. Register it in `src-tauri/src/lib.rs::migrations()` as version 26,
    description `actor_required` — the commented-out block is already there.
 3. Give every fixture that inserts into one of the seven tables an actor. Start
    with the shared helpers, which account for most of the failures:

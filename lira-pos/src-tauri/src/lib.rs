@@ -174,9 +174,17 @@ pub(crate) fn migrations() -> Vec<Migration> {
             sql: include_str!("../../src/db/migrations/024_audit_vocabulary.sql"),
             kind: MigrationKind::Up,
         },
-        // MIGRATION 025 IS WRITTEN BUT NOT YET REGISTERED.
+        Migration {
+            version: 25,
+            description: "operator_controls",
+            sql: include_str!("../../src/db/migrations/025_operator_controls.sql"),
+            kind: MigrationKind::Up,
+        },
+        // THE ACTOR-TRIGGER MIGRATION IS WRITTEN BUT NOT YET REGISTERED. It
+        // is `migrations-pending/026_actor_required.sql` (numbered 025 until
+        // V1.1 took 025 for the operator controls above).
         //
-        // `src/db/migrations-pending/025_actor_required.sql` exists and is
+        // `src/db/migrations-pending/026_actor_required.sql` exists and is
         // complete: BEFORE INSERT triggers requiring every new financial
         // document to name an active user of its own store. It is the
         // ENGINE's half of Stage B.2's attribution rule, for a writer that
@@ -433,6 +441,7 @@ pub fn run() {
             posting::post_driver_remittance,
             posting::post_sale,
             posting::post_credit_memo,
+            posting::sale_lines_with_stock_movement,
             posting::open_shift,
             posting::close_shift,
             catalog::save_product,
@@ -456,6 +465,7 @@ pub fn run() {
             // boot runs on, so the read channel can be session-gated without
             // an allowlist of "harmless" pre-login queries.
             auth::auth_status,
+            auth::auth_open_enrollment_code,
             auth::auth_enroll_owner,
             auth::auth_login,
             auth::auth_logout,

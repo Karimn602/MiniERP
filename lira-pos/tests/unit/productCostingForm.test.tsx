@@ -120,6 +120,8 @@ function burger(over: Partial<ProductWithUoms> = {}): ProductWithUoms {
     costingMethod: "standard",
     standardCostExclVatMicrocents: 185_000_000,
     standardCostSetAt: "2026-10-25T00:00:00.000Z",
+    showOnRegister: true,
+    allowNegativeStock: false,
     createdAt: "2026-10-01T00:00:00.000Z",
     updatedAt: "2026-10-01T00:00:00.000Z",
     vatRate: VAT,
@@ -249,16 +251,16 @@ describe("the costing section", () => {
     expect(screen.getByText(/Manual cost set to zero \(deliberate\)/i)).toBeTruthy();
   });
 
-  it("warns on a stocked item BEFORE the save is attempted", async () => {
-    // The restriction stated where it is reachable, rather than only in the
-    // error a round trip would return.
+  // V1.1 (founder decision): a stocked item may carry the owner's override.
+  // The form says exactly what that means where it is chosen.
+  it("explains the override on a stocked item BEFORE the save", async () => {
     await renderProducts([
       burger({ isService: false, costingMethod: "purchase_average", standardCostExclVatMicrocents: null }),
     ]);
     await openEdit();
 
     fireEvent.change(costingSelect(), { target: { value: "standard" } });
-    expect(screen.getByText(/non-stock items only/i)).toBeTruthy();
+    expect(screen.getByText(/still valued at what you paid/i)).toBeTruthy();
   });
 });
 
@@ -312,7 +314,7 @@ describe("what the form saves", () => {
     expect(save).not.toHaveBeenCalled();
   });
 
-  it("refuses manual cost on a stocked product", async () => {
+  it("saves the owner's override on a stocked product (V1.1)", async () => {
     await renderProducts([
       burger({ isService: false, costingMethod: "purchase_average", standardCostExclVatMicrocents: null }),
     ]);
@@ -322,10 +324,12 @@ describe("what the form saves", () => {
     fireEvent.change(manualCostField(), { target: { value: "1.85" } });
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
 
-    await waitFor(() =>
-      expect(screen.getAllByText(/non-stock items only/i).length).toBeGreaterThan(0),
-    );
-    expect(save).not.toHaveBeenCalled();
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    expect(save.mock.calls[0]?.[0]).toMatchObject({
+      costingMethod: "standard",
+      standardCostExclVatMicrocents: 185_000_000,
+      isService: false,
+    });
   });
 
   it("sends purchase valuation explicitly when the owner switches back", async () => {

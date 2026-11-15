@@ -37,7 +37,10 @@ import {
  * sale line, it simply moves no stock.
  */
 export function isMenuSellable(product: ProductWithUoms): boolean {
-  return product.isActive;
+  // V1.1: an item the owner keeps OFF the Register (an ingredient) is not a
+  // tile, whatever its stock or price. `?? true` for a fixture or a row from
+  // before migration 025.
+  return product.isActive && (product.showOnRegister ?? true);
 }
 
 /**
@@ -75,6 +78,9 @@ export function isMenuOutOfStock(
   allowNegativeInventory: boolean,
 ): boolean {
   if (allowNegativeInventory) return false;
+  // V1.1: the owner's per-item policy. `?? false` for a fixture or a row from
+  // before migration 025.
+  if (product.allowNegativeStock ?? false) return false;
   if (product.isService) return false;
   const { num, den } = product.defaultSaleUom.factor;
   const oneUnitBase = (1 * num) / den;

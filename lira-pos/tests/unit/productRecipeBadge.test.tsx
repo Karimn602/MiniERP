@@ -120,6 +120,8 @@ function item(id: string, name: string): ProductWithUoms {
     costingMethod: "purchase_average",
     standardCostExclVatMicrocents: null,
     standardCostSetAt: null,
+    showOnRegister: true,
+    allowNegativeStock: false,
     createdAt: "2026-10-01T00:00:00.000Z",
     updatedAt: "2026-10-01T00:00:00.000Z",
     vatRate: VAT,

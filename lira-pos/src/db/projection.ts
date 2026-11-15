@@ -55,6 +55,11 @@ export const PRODUCT_PUBLIC_COLUMNS = [
   "is_service",
   "category",
   "icon",
+  // V1.1 (migration 025). Neither carries a figure: whether an item is sold at
+  // the Register, and whether the owner lets it go below zero. A cashier's
+  // menu needs both.
+  "show_on_register",
+  "allow_negative_stock",
   "created_at",
   "updated_at",
 ] as const;

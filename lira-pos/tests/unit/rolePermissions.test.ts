@@ -43,7 +43,9 @@ describe("the screens a role is offered", () => {
     // their own shift, and takes the driver's hand-over. Everything else is
     // either money out, a correction, the menu's prices or a report built on
     // costs — and the matrix says none of those is theirs.
-    expect(screensFor("cashier").sort()).toEqual(["drivers", "register", "shift"]);
+    // V1.1 (founder decision): plus Returns — a cashier may post a
+    // sale-linked refund, and the screen reads no cost for that role.
+    expect(screensFor("cashier").sort()).toEqual(["drivers", "register", "returns", "shift"]);
   });
 
   it("gives a manager everything except staff administration", () => {
@@ -131,7 +133,8 @@ describe("the frontend policy against the Rust matrix", () => {
     // every assertion below would pass vacuously by throwing in a way nobody
     // reads — so the two ends of the matrix are asserted first.
     expect(permits("manager", "PostCreditMemo")).toBe(true);
-    expect(permits("cashier", "PostCreditMemo")).toBe(false);
+    expect(permits("cashier", "PostCreditMemo")).toBe(true); // V1.1
+    expect(permits("cashier", "PostAdjustment")).toBe(false);
     expect(permits("cashier", "PostSale")).toBe(true);
     expect(permits("manager", "UserAdmin")).toBe(false);
   });

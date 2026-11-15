@@ -71,6 +71,20 @@ export default function App() {
     if (IS_SANDBOX) document.title = SANDBOX_WINDOW_TITLE;
   }, []);
 
+  // V1.1: the till is never reloaded by a key. F5 and F6 are checkout
+  // shortcuts on the Register; anywhere else, and Ctrl+R everywhere, WebView2
+  // would reload the page — dropping whatever screen the operator was on. The
+  // Register installs its own handler for what the keys DO there.
+  useEffect(() => {
+    function blockReload(e: KeyboardEvent) {
+      if (e.key === "F5" || e.key === "F6" || ((e.ctrlKey || e.metaKey) && (e.key === "r" || e.key === "R"))) {
+        e.preventDefault();
+      }
+    }
+    window.addEventListener("keydown", blockReload);
+    return () => window.removeEventListener("keydown", blockReload);
+  }, []);
+
   useEffect(() => {
     void refresh();
   }, [refresh]);
@@ -205,11 +219,8 @@ export default function App() {
                   />
                   <Route
                     path="returns"
-                    element={
-                      <RequireRole screen="returns">
-                        <Returns />
-                      </RequireRole>
-                    }
+                    // V1.1: every role may post a sale-linked return.
+                    element={<Returns />}
                   />
                   <Route
                     path="reports"

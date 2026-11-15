@@ -900,6 +900,46 @@ async fn a_reload_rediscovers_the_session_and_a_locked_one_stays_locked() {
     db.cleanup().await.expect("remove TempDb");
 }
 
+/// V1.1 (founder decision): the idle limit is 45 minutes for every role, and
+/// only REAL activity defers it. A command — a background poll, a read — is
+/// checked against the limit but leaves the clock alone; `touch`, which the
+/// renderer sends on pointer, key, wheel and touch events, resets it.
+#[tokio::test]
+async fn only_real_activity_defers_the_45_minute_idle_lock() {
+    let db = TempDb::new().await;
+    let scratch = Scratch::new();
+    let sessions = enrolled(&db, &scratch).await;
+    let ctx = AuthCtx::for_tests(db.pool(), scratch.code_file());
+
+    let limit = SessionState::idle_limit_for_tests();
+    assert_eq!(limit, std::time::Duration::from_secs(45 * 60));
+
+    // Forty-four minutes without anybody touching the till.
+    sessions.set_idle_for_tests(limit - std::time::Duration::from_secs(60)).await;
+    for _ in 0..20 {
+        sessions.ensure_signed_in().await.expect("still inside the limit");
+    }
+    let remaining = status_inner(&ctx, &sessions)
+        .await
+        .unwrap()
+        .session
+        .unwrap()
+        .idle_seconds_remaining;
+    assert!(remaining <= 60, "polling must not defer the lock: {remaining}s left");
+
+    // A real keypress does.
+    sessions.touch_for_tests().await.expect("touch");
+    let remaining = status_inner(&ctx, &sessions)
+        .await
+        .unwrap()
+        .session
+        .unwrap()
+        .idle_seconds_remaining;
+    assert!(remaining > 44 * 60, "a touch resets the clock: {remaining}s left");
+
+    db.cleanup().await.expect("remove TempDb");
+}
+
 /// IDLE LOCKING IS ENFORCED IN RUST, on a monotonic clock.
 #[tokio::test]
 async fn an_idle_session_locks_itself_and_blocks_the_database() {

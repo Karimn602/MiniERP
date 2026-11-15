@@ -122,7 +122,7 @@ export const barcodesRepo = {
   /**
    * Deactivate a barcode and, if it was the primary, promote the oldest
    * survivor — as one transaction, so a product never ends up with barcodes
-   * and no primary. The last barcode cannot be removed.
+   * and no primary. A barcode is optional, so the last one may be removed.
    *
    * Takes the product id as well as the barcode id because the command scopes
    * every statement by both; the old signature derived the product with a

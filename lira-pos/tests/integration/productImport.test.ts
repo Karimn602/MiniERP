@@ -255,10 +255,11 @@ describe("the existing import constraints are untouched", () => {
     expect(row.errors.join(" ")).toMatch(/vat rate/i);
   });
 
-  it("still requires a barcode on a stocked product", async () => {
+  // V1.1 (founder report A1): a barcode is optional, stocked or not.
+  it("imports a stocked product with no barcode", async () => {
     const [row] = await validate([menuRow({ barcode: "" })]);
-    expect(row.status).toBe("error");
-    expect(row.errors.join(" ")).toMatch(/barcode/i);
+    expect(row.errors.join(" ")).not.toMatch(/barcode/i);
+    expect(row.status).not.toBe("error");
   });
 
   it("still refuses a SKU repeated inside the file", async () => {

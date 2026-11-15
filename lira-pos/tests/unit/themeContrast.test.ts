@@ -546,7 +546,7 @@ const COMBOS: Combo[] = [
     file: "components/pos/OrderRail.tsx",
     // The `opacity-90` this row used to carry is the defect; its absence from
     // the className is what this proof pins.
-    proof: 'justify-between gap-3 text-[11px]">',
+    proof: 'justify-between gap-3 text-[11px] squat:hidden">',
     fg: "brand-fg",
     bg: "brand",
     px: 11,

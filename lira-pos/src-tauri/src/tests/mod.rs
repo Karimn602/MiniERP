@@ -47,3 +47,5 @@ mod auth_session;
 mod startup_gate;
 mod user_admin;
 mod audit_vocabulary;
+mod v11_operator_controls;
+mod stress;

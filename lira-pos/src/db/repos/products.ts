@@ -93,6 +93,8 @@ interface ProductRow {
   costing_method: string | null;
   standard_cost_excl_vat_microcents: number | null;
   standard_cost_set_at: string | null;
+  show_on_register?: number;
+  allow_negative_stock?: number;
   created_at: string;
   updated_at: string;
 }
@@ -186,6 +188,10 @@ export type ProductSaveArgs = {
    * migration 020's trigger refuses the row regardless of caller.
    */
   standardCostExclVatMicrocents?: number | null;
+  /** V1.1: offered at the Register. Omitted: keep (update) / yes (create). */
+  showOnRegister?: boolean;
+  /** V1.1: owner-only negative-stock policy. Omitted: keep / no. */
+  allowNegativeStock?: boolean;
   baseUomCode: string;
   saleUomCode: string;
   saleFactor: Factor;
@@ -230,6 +236,10 @@ function rowToProduct(r: ProductRow): Product {
     costingMethod: normalizeCostingMethod(r.costing_method),
     standardCostExclVatMicrocents: r.standard_cost_excl_vat_microcents ?? null,
     standardCostSetAt: r.standard_cost_set_at ?? null,
+    // `?? 1` / `?? 0`: a row from a database before migration 025 has no such
+    // key, and those are the values every product had then.
+    showOnRegister: (r.show_on_register ?? 1) === 1,
+    allowNegativeStock: (r.allow_negative_stock ?? 0) === 1,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -425,6 +435,27 @@ export const productsRepo = {
     return rows[0]?.n ?? 0;
   },
 
+  /**
+   * V1.1: the owner states the unit cost of a STOCKED item (per base unit,
+   * VAT-exclusive, microcents). A revaluation of the pool, recorded with its
+   * reason in `product_valuation_audit`; nothing posted is restated. Owner
+   * only — the backend refuses anybody else.
+   */
+  async revalueCost(args: {
+    productId: string;
+    storeId: string;
+    newCostExclVatMicrocents: number;
+    reason: string;
+  }): Promise<{
+    auditId: string;
+    previousCostExclVatMicrocents: number;
+    newCostExclVatMicrocents: number;
+    newCostInclVatMicrocents: number;
+    quantityOnHand: number;
+  }> {
+    return invoke("revalue_product_cost", { payload: args });
+  },
+
   async nextAutoSku(storeId: string): Promise<string> {
     const rows = await query<{ n: number }>(
       `SELECT MAX(CAST(SUBSTR(sku, 6) AS INTEGER)) AS n
@@ -493,6 +524,8 @@ export const productsRepo = {
           // edit by a caller that predates this field.
           costingMethod: args.costingMethod ?? null,
           standardCostExclVatMicrocents: args.standardCostExclVatMicrocents ?? null,
+          showOnRegister: args.showOnRegister ?? null,
+          allowNegativeStock: args.allowNegativeStock ?? null,
           baseUomCode: args.baseUomCode,
           saleUomCode: args.saleUomCode,
           saleFactorNum: args.saleFactor.num,

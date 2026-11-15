@@ -787,10 +787,11 @@ async fn a_restocked_return_blends_the_original_cost_into_the_average() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restock_into_a_still_negative_pool_adds_quantity_without_inventing_an_average() {
     let db = shop().await;
+    // V1.1: overselling is the item's own owner policy, not a request flag.
+    db.exec(&format!("UPDATE products SET allow_negative_stock = 1 WHERE id = '{P_COFFEE}'")).await;
     let lines = vec![coffee(130)];
     let total = lines_total(&lines);
-    let mut payload = sale_payload(lines, vec![cash_usd(total)]);
-    payload.allow_negative_inventory = true;
+    let payload = sale_payload(lines, vec![cash_usd(total)]);
     let sale = post_sale_ok(&db, payload).await;
     let item = sale_item_id(&db, &sale, P_COFFEE).await;
     assert_eq!(quantity_on_hand(&db, P_COFFEE).await, -30);

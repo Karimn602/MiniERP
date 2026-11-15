@@ -6,8 +6,8 @@ import { LanguageSwitcher } from "./LanguageSwitcher";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import { SandboxBanner } from "./SandboxBanner";
 import { SessionBadge } from "./SessionBadge";
+import { AboutButton } from "./AboutDialog";
 import { IS_SANDBOX } from "../lib/appMode";
-import { useOnline } from "../lib/network";
 import { canSee } from "../lib/permissions";
 import { useActiveUser } from "../state/session";
 import { useLowStockCount } from "../state/lowStockBadge";
@@ -59,7 +59,6 @@ function NavGroupLabel({ children }: { children: ReactNode }) {
 }
 
 export function AppShell() {
-  const online = useOnline();
   const lowCount = useLowStockCount();
   const { t } = useTranslation();
 
@@ -183,8 +182,9 @@ export function AppShell() {
             <NavLink to="/exchange-rate" icon={icons.rate}>{t("nav.exchangeRate")}</NavLink>
           )}
           {show("manager") && (
-            <NavLink to="/manager" icon={icons.manager} disabled={!online}>
-              {t("nav.managerDashboard")} {online ? "" : "🔒"}
+            // V1.1: the dashboard reads the local database; it needs no network.
+            <NavLink to="/manager" icon={icons.manager}>
+              {t("nav.managerDashboard")}
             </NavLink>
           )}
           {show("users") && (
@@ -194,7 +194,7 @@ export function AppShell() {
         </nav>
 
         <div className="flex items-center justify-between border-t border-rail-line px-1 pt-3 text-[10px] text-rail-muted">
-          <span className="font-semibold tracking-tight">v0.1.0</span>
+          <AboutButton />
           <LanguageSwitcher />
         </div>
       </aside>

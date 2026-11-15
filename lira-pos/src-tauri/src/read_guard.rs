@@ -271,6 +271,9 @@ const CASHIER_PROTECTED_TABLES: &[&str] = &[
     "recipes",
     "recipe_components",
     "sale_item_recipe_costs",
+    // V1.1 (migration 025): owner revaluations and the negative-stock policy
+    // log. Every revaluation row is a stated unit cost.
+    "product_valuation_audit",
     "accounts",
     "journal_entries",
     "journal_lines",

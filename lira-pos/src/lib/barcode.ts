@@ -133,12 +133,11 @@ export function productFormBarcodeError(
   // separately, with their own validation at the point of entry.
   if (mode === "edit") return null;
 
-  // A stocked product must be scannable to be sold at the till. A service has
-  // nothing to scan.
-  if (!isService && !code) return "required";
-
-  // An empty box is a product with no barcode, which is allowed for a service
-  // and already refused above for goods.
+  // V1.1: a barcode is OPTIONAL for every item. A stocked ingredient or a
+  // menu item with no barcode is found by name or SKU, at the Register, in
+  // Purchases and in the recipe editor. The parameter stays for call-site
+  // compatibility.
+  void isService;
   if (!code) return null;
 
   return failsEan13Checksum(code) ? "badEan13" : null;
