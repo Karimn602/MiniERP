@@ -346,7 +346,10 @@ describe("items kept off the Register", () => {
     const meat = { ...burger(0), id: "p-meat", name: "Meat", sku: "MEAT", showOnRegister: false };
     listEnriched.mockResolvedValue([burger(), meat]);
     await renderRegister();
-    expect(screen.queryAllByText("Double Burger").length).toBeGreaterThan(0);
+    // Wait for the menu to load before asserting what is NOT on it: the
+    // product list resolves asynchronously, and a synchronous query here
+    // failed about one run in six on b004cb6 itself.
+    expect((await screen.findAllByText("Double Burger")).length).toBeGreaterThan(0);
     expect(screen.queryByText("Meat")).toBeNull();
   });
 });

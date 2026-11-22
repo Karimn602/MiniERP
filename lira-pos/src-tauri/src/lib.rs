@@ -1,6 +1,7 @@
 // src-tauri/src/lib.rs
 use tauri_plugin_sql::{Migration, MigrationKind};
 
+mod about;
 mod admin;
 mod auth;
 mod authz;
@@ -481,6 +482,8 @@ pub fn run() {
             users::users_save,
             users::users_set_active,
             users::users_set_credential,
+            // V1.1.1 - About dialog: opens ONE fixed address (about.rs).
+            about::open_developer_profile,
         ])
         .setup(|app| {
             // MANDATORY DATABASE VALIDATION, AND IT FAILS CLOSED.
