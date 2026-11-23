@@ -10,6 +10,7 @@ import {
 import { vatRatesRepo } from "../db/repos/vatRates";
 import { uomsRepo } from "../db/repos/uoms";
 import { ProductImportDialog } from "../components/ProductImportDialog";
+import { OfficialMenuDialog } from "../components/OfficialMenuDialog";
 import type {
   ProductWithUoms,
   VatRate,
@@ -205,6 +206,8 @@ export default function Products() {
   /** `SaveProductCost` is owner-only; a manager edits the menu but not what it
    *  costs. See the note on the Costing section below. */
   const mayChangeCost = canDo(useActiveUser()?.role, "productCost");
+  /** `ApplyOfficialMenu` is owner-only too: loading the menu decides its tax treatment. */
+  const mayLoadOfficialMenu = canDo(useActiveUser()?.role, "officialMenu");
 
   const [products, setProducts] = useState<ProductWithUoms[]>([]);
   const [vatRates, setVatRates] = useState<VatRate[]>([]);
@@ -229,6 +232,7 @@ export default function Products() {
     new Map(),
   );
   const [showImport, setShowImport] = useState(false);
+  const [showOfficialMenu, setShowOfficialMenu] = useState(false);
   /**
    * Are RETIRED products listed too?
    *
@@ -660,6 +664,15 @@ export default function Products() {
               />
               {t("products.showInactive")}
             </label>
+            {mayLoadOfficialMenu && (
+              <Button
+                variant="secondary"
+                data-testid="open-official-menu"
+                onClick={() => setShowOfficialMenu(true)}
+              >
+                {t("officialMenu.open")}
+              </Button>
+            )}
             <Button variant="secondary" onClick={() => setShowImport(true)}>
               {t("products.importProducts")}
             </Button>
@@ -1500,6 +1513,15 @@ export default function Products() {
         </div>
       )}
       </div>
+
+      {showOfficialMenu && mayLoadOfficialMenu && storeId && (
+        <OfficialMenuDialog
+          storeId={storeId}
+          vatRates={vatRates}
+          onClose={() => setShowOfficialMenu(false)}
+          onApplied={() => void reload()}
+        />
+      )}
 
       {showImport && storeId && (
         <ProductImportDialog

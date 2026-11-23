@@ -95,6 +95,9 @@ pub(crate) enum Operation {
     RecipeDraft,
     RecipeActivate,
     RecipeRetire,
+    /// Loading Greaz's bundled official menu (`official_menu.rs`): a one-time
+    /// write of the whole catalogue plus a tax-treatment decision. Owner only.
+    ApplyOfficialMenu,
 
     // --- buying side ----------------------------------------------------
     PostPurchase,
@@ -139,6 +142,7 @@ impl Operation {
             Operation::RecipeDraft => "save_recipe_draft",
             Operation::RecipeActivate => "activate_recipe",
             Operation::RecipeRetire => "retire_recipe",
+            Operation::ApplyOfficialMenu => "official_menu.apply",
             Operation::PostPurchase => "post_purchase",
             Operation::SupplierPayment => "post_supplier_payment",
             Operation::SupplierSave => "supplier_save",
@@ -161,6 +165,7 @@ impl Operation {
     pub(crate) fn refusal(self, role: Role) -> String {
         let who = match self {
             Operation::SaveProductCost
+            | Operation::ApplyOfficialMenu
             | Operation::UserAdmin
             | Operation::ResetAnotherCredential => "the owner",
             _ => "a manager or the owner",
@@ -181,6 +186,7 @@ impl Operation {
             Operation::RecipeDraft | Operation::RecipeActivate | Operation::RecipeRetire => {
                 "change a recipe"
             }
+            Operation::ApplyOfficialMenu => "load the official menu",
             Operation::PostPurchase => "enter a supplier delivery",
             Operation::SupplierPayment => "pay a supplier",
             Operation::SupplierSave => "change a supplier",
@@ -316,6 +322,10 @@ pub(crate) fn permits(role: Role, operation: Operation) -> bool {
 
         (Manager, RecipeDraft | RecipeActivate | RecipeRetire) => true,
         (Cashier, RecipeDraft | RecipeActivate | RecipeRetire) => false,
+
+        // Loading the whole official menu decides the tax treatment of every
+        // item on it, so it is the owner's alone, like a cost.
+        (Manager | Cashier, ApplyOfficialMenu) => false,
 
         // --- buying side ------------------------------------------------
         (Manager, PostPurchase) => true,
@@ -676,6 +686,7 @@ pub(crate) const ALL_OPERATIONS: &[Operation] = &[
     Operation::RecipeDraft,
     Operation::RecipeActivate,
     Operation::RecipeRetire,
+    Operation::ApplyOfficialMenu,
     Operation::PostPurchase,
     Operation::SupplierPayment,
     Operation::SupplierSave,

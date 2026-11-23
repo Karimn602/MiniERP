@@ -8,6 +8,7 @@ mod authz;
 mod catalog;
 mod cost;
 mod db_init;
+mod official_menu;
 mod posting;
 mod read_api;
 mod read_guard;
@@ -452,6 +453,9 @@ pub fn run() {
             recipes::save_recipe_draft,
             recipes::activate_recipe,
             recipes::retire_recipe,
+            // Greaz's bundled official menu: owner-only preview and one-time apply.
+            official_menu::official_menu_preview,
+            official_menu::official_menu_apply,
             // Gate 2A — the renderer's only database access, read-only by
             // construction (`read_api`), plus the master-data writes that used
             // to be direct `execute()` calls from TypeScript (`admin`).

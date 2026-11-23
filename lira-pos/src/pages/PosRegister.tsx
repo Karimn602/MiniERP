@@ -63,6 +63,11 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { ProductPicker } from "../components/ProductPicker";
 import { MenuTile } from "../components/pos/MenuTile";
 import { MenuPane, MenuChip } from "../components/pos/MenuPane";
+import { MenuChoiceDialog } from "../components/pos/MenuChoiceDialog";
+import { OfficialMenuPrompt } from "../components/pos/OfficialMenuPrompt";
+import { choiceGroupsForSku, type MenuChoiceGroup } from "../lib/officialMenu";
+import { useActiveUser } from "../state/session";
+import { canDo } from "../lib/permissions";
 import {
   AmountLine,
   CartLineRow,
@@ -361,6 +366,8 @@ function lineMathFor(product: ProductWithUoms, uom: ProductUom, qty: number): Sa
 
 export default function PosRegister() {
   const { storeId, userId, hydrated } = useActiveContext();
+  /** The official-menu prompt is the owner's (`ApplyOfficialMenu`). */
+  const mayLoadOfficialMenu = canDo(useActiveUser()?.role, "officialMenu");
   const { t } = useTranslation();
 
   // ----- Multi-cart state (loaded once from localStorage) -----
@@ -1046,13 +1053,26 @@ export default function PosRegister() {
     const raw = scanInput.trim();
     if (!raw || !storeId) return;
     setScanError(null);
+    // The lookup is asynchronous and a cart id outlives its order (a cleared
+    // cart is the next customer under the same id). So the scan belongs to the
+    // cart AND the order that were active when it was made, and is dropped if
+    // either has moved on by the time the answer arrives — otherwise an item
+    // scanned for one customer lands on the next one's bill (Codex review
+    // round 3). `cartGeneration` is what `clearCart` advances.
+    const scannedFor = { cartId: activeCartId, generation: cartGeneration(activeCartId) };
     try {
       const hit: BarcodeScanResult | null = await productsRepo.findByScan(storeId, raw);
+      if (
+        activeCartIdRef.current !== scannedFor.cartId ||
+        cartGeneration(scannedFor.cartId) !== scannedFor.generation
+      ) {
+        return;
+      }
       if (!hit) {
         setScanError(t("pos.errNoProductForBarcode", { barcode: raw }));
         return;
       }
-      addProductToCart(hit.product, hit.resolvedUom, {
+      requestAdd(hit.product, hit.resolvedUom, {
         barcode: hit.matchedBarcode.barcode,
         barcodeType: hit.matchedBarcode.barcodeType,
       });
@@ -1065,7 +1085,7 @@ export default function PosRegister() {
 
   // ----- Add a product via the search picker -----
   function handlePick(product: ProductWithUoms) {
-    addProductToCart(product, product.defaultSaleUom, null);
+    requestAdd(product, product.defaultSaleUom, null);
     focusScanInput();
   }
 
@@ -1078,7 +1098,64 @@ export default function PosRegister() {
    * increments instead of stacking duplicate rows.
    */
   function handleTileClick(product: ProductWithUoms) {
-    addProductToCart(product, product.defaultSaleUom, null);
+    requestAdd(product, product.defaultSaleUom, null);
+  }
+
+  /**
+   * An item the menu sells with a free sauce or dip choice (Dipper Chicken,
+   * Chicken Loaded Fries, Greaz Box — `lib/officialMenu.ts`) is not added
+   * until the choice is made; the answer becomes the line's kitchen note.
+   * Everything else, and anything that is going to be refused anyway, goes
+   * straight to `addProductToCart`.
+   */
+  const [pendingChoice, setPendingChoiceState] = useState<{
+    /** The cart the item was picked for. It joins THAT cart or none. */
+    cartId: string;
+    product: ProductWithUoms;
+    uom: ProductUom;
+    scanned: { barcode: string; barcodeType: string } | null;
+    groups: MenuChoiceGroup[];
+  } | null>(null);
+  /**
+   * Synchronous twin of `pendingChoice`, read by Post and by F5/F6.
+   *
+   * An item awaiting its choice is NOT in the cart yet, so posting while the
+   * dialog is open would settle the order without it — and the item, confirmed
+   * afterwards, would land in the next customer's cart (Codex review, P0). So
+   * nothing posts while a choice is open, and a choice is discarded if its cart
+   * is no longer the active one when it is confirmed.
+   */
+  const choiceOpenRef = useRef(false);
+  /** The cart an open choice belongs to, so clearing that cart cancels it. */
+  const choiceCartRef = useRef<string | null>(null);
+  function setPendingChoice(next: typeof pendingChoice) {
+    choiceOpenRef.current = next !== null;
+    choiceCartRef.current = next?.cartId ?? null;
+    setPendingChoiceState(next);
+  }
+  // Switching carts abandons an unanswered choice.
+  useEffect(() => {
+    if (choiceOpenRef.current) setPendingChoice(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCartId]);
+
+  function requestAdd(
+    product: ProductWithUoms,
+    uom: ProductUom,
+    scanned: { barcode: string; barcodeType: string } | null,
+  ) {
+    const groups = choiceGroupsForSku(product.sku);
+    // A cart that is posting or holds an unresolved attempt takes no new line
+    // (`setLines` refuses it), so no choice is asked for it either: a choice
+    // opened mid-post would outlive the sale and join the NEXT order, because
+    // a cleared cart keeps its id (Codex review round 2, P0).
+    const cartFrozen =
+      lockedCartIdsRef.current.has(activeCartId) || postingCartIdRef.current === activeCartId;
+    if (groups.length > 0 && !cartFrozen && product.isActive && product.showOnRegister !== false) {
+      setPendingChoice({ cartId: activeCartId, product, uom, scanned, groups });
+      return;
+    }
+    addProductToCart(product, uom, scanned);
   }
 
   /** Chips above the grid. See `deriveMenuGroups` for why these are not
@@ -1111,6 +1188,8 @@ export default function PosRegister() {
     product: ProductWithUoms,
     uom: ProductUom,
     scanned: { barcode: string; barcodeType: string } | null,
+    /** A kitchen instruction the line starts with — a menu choice. */
+    note: string | null = null,
   ) {
     setSubmitError(null);
     if (!product.isActive) {
@@ -1145,7 +1224,7 @@ export default function PosRegister() {
         (l) =>
           l.product.id === product.id &&
           l.uom.id === uom.id &&
-          kitchenNotesMerge(l.kitchenNote, null),
+          kitchenNotesMerge(l.kitchenNote, note),
       );
       if (existingIdx >= 0) {
         const next = prev.slice();
@@ -1189,6 +1268,7 @@ export default function PosRegister() {
         barcodeUsed: scanned?.barcode ?? null,
         barcodeType: scanned?.barcodeType ?? null,
         math,
+        ...(note !== null ? { kitchenNote: note } : {}),
       };
       return [...prev, line];
     });
@@ -1266,6 +1346,14 @@ export default function PosRegister() {
   // reconcile to the sale that exists; retiring it here would ring the same
   // basket up a second time. The button is disabled in that window too — this
   // check covers every other path to the same function.
+  /** How many times each cart has been cleared: one per finished order. */
+  const cartGenerationsRef = useRef(new Map<string, number>());
+  function cartGeneration(cartId: string): number {
+    return cartGenerationsRef.current.get(cartId) ?? 0;
+  }
+  const activeCartIdRef = useRef(activeCartId);
+  activeCartIdRef.current = activeCartId;
+
   function clearCart(cartId: string) {
     // IN-FLIGHT is the one state this must refuse. `submitAttempt` calls this
     // itself on a committed sale, so the guard cannot be "is there an attempt"
@@ -1278,6 +1366,10 @@ export default function PosRegister() {
     // The Clear and Close buttons are disabled in that window too; this covers
     // every other path to the same function.
     if (postingCartIdRef.current === cartId) return;
+    // A cleared cart is the next customer: an unanswered choice for the last
+    // one must not become theirs.
+    if (choiceCartRef.current === cartId) setPendingChoice(null);
+    cartGenerationsRef.current.set(cartId, cartGeneration(cartId) + 1);
     checkoutsRef.current?.retire(cartId);
     // Clearing a cart retires its attempt intentionally — a committed sale, or
     // a checkout the cashier discarded — so the mirror is allowed to drop it.
@@ -1807,6 +1899,8 @@ export default function PosRegister() {
   //      recognises one and returns the sale that exists.
   // Only the second is authoritative; the first just keeps the UI honest.
   async function handlePost() {
+    // An item is waiting for its sauce or dips; it is not in the cart yet.
+    if (choiceOpenRef.current) return;
     const gate = gateRef.current!;
     if (!gate.tryEnter()) return;
     try {
@@ -2203,6 +2297,7 @@ export default function PosRegister() {
 
   function exactCashShortcut(currency: "USD" | "LBP") {
     if (receiptOpenRef.current || submitting || pendingShortcutRef.current) return;
+    if (choiceOpenRef.current) return;
     setSubmitError(null);
     if (canReplayFrozenAttempt || driverCollect) {
       if (canPost) void handlePost();
@@ -2741,6 +2836,27 @@ export default function PosRegister() {
             </>
           }
         >
+          {/* First run: the owner is offered Greaz's official menu until it
+              is loaded. Nobody else sees this. */}
+          <OfficialMenuPrompt
+            storeId={storeId}
+            isOwner={mayLoadOfficialMenu}
+            onMenuChanged={() => void reloadMenu()}
+          />
+          {pendingChoice && (
+            <MenuChoiceDialog
+              itemName={pendingChoice.product.name}
+              groups={pendingChoice.groups}
+              onCancel={() => setPendingChoice(null)}
+              onConfirm={(note) => {
+                const c = pendingChoice;
+                setPendingChoice(null);
+                // Only into the cart it was picked for.
+                if (c.cartId === activeCartId) addProductToCart(c.product, c.uom, c.scanned, note);
+              }}
+            />
+          )}
+
           {/* Collapsed secondary input row */}
           {barcodeOpen && (
             <div className="mt-3 space-y-2.5 rounded-chip border border-line bg-paper p-3">

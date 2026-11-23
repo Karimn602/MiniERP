@@ -236,7 +236,7 @@ fn a_cashier_cannot_refund_reprice_adjust_or_set_the_rate() {
     // WP-B1's argument. And staff administration, because a manager who can
     // reset a cashier's passphrase can sign in as that cashier, which would
     // undo the attribution this whole gate exists to make trustworthy.
-    for op in [SaveProductCost, UserAdmin, ResetAnotherCredential, ReadAuthAudit] {
+    for op in [SaveProductCost, ApplyOfficialMenu, UserAdmin, ResetAnotherCredential, ReadAuthAudit] {
         assert!(
             !authz::permits(Role::Manager, op),
             "{op:?} must be the owner's alone"

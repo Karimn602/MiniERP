@@ -1,4 +1,15 @@
-# Greaz POS — menu categories, and why the register has none
+# Greaz POS — menu categories
+
+> **Current state (official-menu integration, 2026-11).** Everything below this
+> box is history: migration 013 added `products.category` and `products.icon`,
+> and the Register shows one chip per section in `lib/menuCategories.ts`
+> order. That order is now the printed Greaz menu's — Burgers, Wraps, Fries,
+> Appetizers, (Sides), Combos, Drinks, Dessert, Add-ons, Combo upgrades —
+> because the bundled official menu (`docs/OFFICIAL-MENU.md`) uses those
+> sections. `sides` is kept for products filed there before the official menu
+> existed. Items within a section are listed alphabetically. On a 1366x768
+> window the chip row wraps onto a second line; at the compact (`squat`)
+> height it scrolls sideways instead.
 
 Status: **known limitation, deliberately not fixed in the appearance work.**
 

@@ -1,0 +1,483 @@
+{
+  "schema_label": "greaz_menu_reference_v1",
+  "source": "User-supplied Greaz printed menu photo, 2026-11-22",
+  "intended_use": "Source reference for implementing a versioned idempotent first-run/default catalog seeder; NOT a directly importable Greaz database file",
+  "currency": "USD",
+  "retail_price_tax_treatment": "Unconfirmed (do not assume VAT inclusive/exclusive or tax rate)",
+  "categories": [
+    {
+      "name": "Burgers",
+      "icon_suggestion": "🍔",
+      "note": "All in potato buns"
+    },
+    {
+      "name": "Wraps",
+      "icon_suggestion": "🌯",
+      "note": "All in tortilla wrap"
+    },
+    {
+      "name": "Fries",
+      "icon_suggestion": "🍟",
+      "note": ""
+    },
+    {
+      "name": "Appetizers",
+      "icon_suggestion": "🍗",
+      "note": ""
+    },
+    {
+      "name": "Combos",
+      "icon_suggestion": "🍱",
+      "note": ""
+    },
+    {
+      "name": "Drinks",
+      "icon_suggestion": "🥤",
+      "note": ""
+    },
+    {
+      "name": "Dessert",
+      "icon_suggestion": "🍨",
+      "note": "Ice Cream Burger marked SOON — do not enable for sale"
+    },
+    {
+      "name": "Add-ons",
+      "icon_suggestion": "➕",
+      "note": "Surcharges, not ingredients"
+    },
+    {
+      "name": "Combo Upgrades",
+      "icon_suggestion": "➕",
+      "note": "Surcharges for eligible orders; confirm eligibility"
+    }
+  ],
+  "items": [
+    {
+      "sku": "GRZ-BUR-001",
+      "category": "Burgers",
+      "name": "Double Smash",
+      "price_usd_cents": 700,
+      "description": "150g beef, 2 red cheddar slices, caramelized onion, iceberg lettuce, dill pickles & Greaz sauce",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍔"
+    },
+    {
+      "sku": "GRZ-BUR-002",
+      "category": "Burgers",
+      "name": "Triple Smash",
+      "price_usd_cents": 900,
+      "description": "225g beef, 3 red cheddar slices, caramelized onion, iceberg lettuce, dill pickles & Greaz sauce",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍔"
+    },
+    {
+      "sku": "GRZ-BUR-003",
+      "category": "Burgers",
+      "name": "OG Chicken",
+      "price_usd_cents": 700,
+      "description": "Fried chicken, cheddar, lettuce, dill pickles & OG sauce",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍔"
+    },
+    {
+      "sku": "GRZ-BUR-004",
+      "category": "Burgers",
+      "name": "Dipper Chicken",
+      "price_usd_cents": 700,
+      "description": "Fried chicken in buffalo or BBQ, cheddar, iceberg lettuce, dill pickles, honey mustard & ranch",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍔",
+      "choice_group_ids": [
+        "dipper_sauce"
+      ]
+    },
+    {
+      "sku": "GRZ-BUR-005",
+      "category": "Burgers",
+      "name": "Smushroom",
+      "price_usd_cents": 850,
+      "description": "Double beef smash, Swiss cheese, mushrooms, crispy onion, rocca & ranch",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍔"
+    },
+    {
+      "sku": "GRZ-BUR-006",
+      "category": "Burgers",
+      "name": "Triple Smushroom",
+      "price_usd_cents": 1050,
+      "description": "225g beef, Swiss cheese, mushrooms, crispy onion, rocca & ranch",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍔"
+    },
+    {
+      "sku": "GRZ-BUR-007",
+      "category": "Burgers",
+      "name": "Chicken Smushroom",
+      "price_usd_cents": 850,
+      "description": "Fried chicken, Swiss cheese, mushrooms, crispy onion, rocca & ranch",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍔"
+    },
+    {
+      "sku": "GRZ-WRP-001",
+      "category": "Wraps",
+      "name": "Boneless",
+      "price_usd_cents": 700,
+      "description": "Fried chicken, mozzarella, cheddar, chip sticks, BBQ, honey mustard & ranch",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🌯"
+    },
+    {
+      "sku": "GRZ-WRP-002",
+      "category": "Wraps",
+      "name": "OG Chicken",
+      "price_usd_cents": 700,
+      "description": "Fried chicken strips, mozzarella, cheddar, lettuce & OG sauce",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🌯"
+    },
+    {
+      "sku": "GRZ-WRP-003",
+      "category": "Wraps",
+      "name": "Twister",
+      "price_usd_cents": 850,
+      "description": "Fried chicken strips, cheddar, mozzarella patty, rocca, chip sticks, honey mustard & ranch",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🌯"
+    },
+    {
+      "sku": "GRZ-WRP-004",
+      "category": "Wraps",
+      "name": "OG Grilled Chicken",
+      "price_usd_cents": 700,
+      "description": "Grilled chicken, honey mustard, ranch, iceberg lettuce & chips",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🌯"
+    },
+    {
+      "sku": "GRZ-FRY-001",
+      "category": "Fries",
+      "name": "Fries (ketchup)",
+      "price_usd_cents": 300,
+      "description": "Fries served with ketchup",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍟"
+    },
+    {
+      "sku": "GRZ-FRY-002",
+      "category": "Fries",
+      "name": "Curly Fries",
+      "price_usd_cents": 450,
+      "description": "",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍟"
+    },
+    {
+      "sku": "GRZ-FRY-003",
+      "category": "Fries",
+      "name": "Bacon Fries",
+      "price_usd_cents": 600,
+      "description": "Beef bacon, caramelized onion, cheddar & Greaz sauce",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍟"
+    },
+    {
+      "sku": "GRZ-FRY-004",
+      "category": "Fries",
+      "name": "Chilli Cheese Fries",
+      "price_usd_cents": 600,
+      "description": "Chilli beef, mozzarella, cheddar & ranch",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍟"
+    },
+    {
+      "sku": "GRZ-FRY-005",
+      "category": "Fries",
+      "name": "Chicken Loaded Fries",
+      "price_usd_cents": 600,
+      "description": "Fried chicken, cheddar, BBQ or buffalo sauce, ranch & honey mustard",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍟",
+      "choice_group_ids": [
+        "loaded_fries_sauce"
+      ]
+    },
+    {
+      "sku": "GRZ-FRY-006",
+      "category": "Fries",
+      "name": "OG Loaded Fries",
+      "price_usd_cents": 600,
+      "description": "Fried chicken, cheddar & OG sauce",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍟"
+    },
+    {
+      "sku": "GRZ-APP-001",
+      "category": "Appetizers",
+      "name": "Onion Rings (7 pcs)",
+      "price_usd_cents": 500,
+      "description": "7 pieces",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🧅"
+    },
+    {
+      "sku": "GRZ-APP-002",
+      "category": "Appetizers",
+      "name": "Cheese Balls (6 pcs)",
+      "price_usd_cents": 500,
+      "description": "6 pieces",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🧀"
+    },
+    {
+      "sku": "GRZ-APP-003",
+      "category": "Appetizers",
+      "name": "Wings (7 pcs)",
+      "price_usd_cents": 550,
+      "description": "7 pieces",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍗"
+    },
+    {
+      "sku": "GRZ-APP-004",
+      "category": "Appetizers",
+      "name": "Chicken Tenders (4 pcs)",
+      "price_usd_cents": 650,
+      "description": "4 pieces",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍗"
+    },
+    {
+      "sku": "GRZ-APP-005",
+      "category": "Appetizers",
+      "name": "Mozzarella Bricks (3 pcs)",
+      "price_usd_cents": 600,
+      "description": "3 pieces",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🧀"
+    },
+    {
+      "sku": "GRZ-CMB-001",
+      "category": "Combos",
+      "name": "Chicken Strips Combo",
+      "price_usd_cents": 900,
+      "description": "5 strips, French fries & OG sauce",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍗"
+    },
+    {
+      "sku": "GRZ-CMB-002",
+      "category": "Combos",
+      "name": "Greaz Box",
+      "price_usd_cents": 1600,
+      "description": "4 onion rings, 4 cheese balls, 5 wings, 3 chicken strips & curly fries. Includes 3 dips of your choice.",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍱",
+      "choice_group_ids": [
+        "greaz_box_dips"
+      ]
+    },
+    {
+      "sku": "GRZ-DRK-001",
+      "category": "Drinks",
+      "name": "Soft Drink",
+      "price_usd_cents": 100,
+      "description": "Flavor not specified on printed menu",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🥤"
+    },
+    {
+      "sku": "GRZ-DRK-002",
+      "category": "Drinks",
+      "name": "Water",
+      "price_usd_cents": 50,
+      "description": "",
+      "status": "active",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "💧"
+    },
+    {
+      "sku": "GRZ-DES-001",
+      "category": "Dessert",
+      "name": "Ice Cream Burger",
+      "price_usd_cents": 650,
+      "description": "Choco bun, vanilla ice cream, Nutella & KitKat",
+      "status": "coming_soon",
+      "kind": "menu",
+      "barcode": null,
+      "icon_suggestion": "🍨"
+    },
+    {
+      "sku": "GRZ-ADD-001",
+      "category": "Add-ons",
+      "name": "Beef Bacon Add-on",
+      "price_usd_cents": 200,
+      "description": "Menu add-on; also advertised for fries",
+      "status": "active",
+      "kind": "add_on",
+      "barcode": null,
+      "icon_suggestion": "🥓"
+    },
+    {
+      "sku": "GRZ-ADD-002",
+      "category": "Add-ons",
+      "name": "Mozzarella Patty Add-on",
+      "price_usd_cents": 200,
+      "description": "Menu add-on",
+      "status": "active",
+      "kind": "add_on",
+      "barcode": null,
+      "icon_suggestion": "🧀"
+    },
+    {
+      "sku": "GRZ-ADD-003",
+      "category": "Add-ons",
+      "name": "Red Cheddar Slice (1 pc)",
+      "price_usd_cents": 50,
+      "description": "Menu add-on, one slice",
+      "status": "active",
+      "kind": "add_on",
+      "barcode": null,
+      "icon_suggestion": "🧀"
+    },
+    {
+      "sku": "GRZ-ADD-004",
+      "category": "Add-ons",
+      "name": "Swiss Cheese (1 pc)",
+      "price_usd_cents": 50,
+      "description": "Menu add-on, one slice",
+      "status": "active",
+      "kind": "add_on",
+      "barcode": null,
+      "icon_suggestion": "🧀"
+    },
+    {
+      "sku": "GRZ-UPG-001",
+      "category": "Combo Upgrades",
+      "name": "Fries + Soft Drink Upgrade",
+      "price_usd_cents": 300,
+      "description": "Add-on price to upgrade an eligible item; eligibility requires restaurant confirmation",
+      "status": "active",
+      "kind": "upgrade",
+      "barcode": null,
+      "icon_suggestion": "🍟"
+    },
+    {
+      "sku": "GRZ-UPG-002",
+      "category": "Combo Upgrades",
+      "name": "Curly Fries + Soft Drink Upgrade",
+      "price_usd_cents": 450,
+      "description": "Add-on price to upgrade an eligible item; eligibility requires restaurant confirmation",
+      "status": "active",
+      "kind": "upgrade",
+      "barcode": null,
+      "icon_suggestion": "🍟"
+    }
+  ],
+  "choice_groups": [
+    {
+      "id": "dipper_sauce",
+      "label": "Dipper Chicken sauce",
+      "options": [
+        "Buffalo",
+        "BBQ"
+      ],
+      "selection_count": 1,
+      "price_usd_cents": 0
+    },
+    {
+      "id": "loaded_fries_sauce",
+      "label": "Chicken Loaded Fries sauce",
+      "options": [
+        "BBQ",
+        "Buffalo"
+      ],
+      "selection_count": 1,
+      "price_usd_cents": 0
+    },
+    {
+      "id": "greaz_box_dips",
+      "label": "Greaz Box dips",
+      "options": [
+        "Honey mustard",
+        "Buffalo",
+        "BBQ"
+      ],
+      "selection_count": 3,
+      "repeat_allowed": "not specified",
+      "price_usd_cents": 0
+    }
+  ],
+  "import_rules": {
+    "do_not_seed_ingredients_as_sellable_products": true,
+    "do_not_seed_unverified_inventory_quantities": true,
+    "do_not_seed_ingredient_costs_or_published_recipes": true,
+    "unique_sku": true,
+    "barcode_optional": true,
+    "dessert_coming_soon_disabled": true,
+    "fresh_install": "seed once transactionally on first store setup, following authentic owner enrollment",
+    "existing_install": "owner-only import preview/explicit apply; create missing SKUs only, never overwrite existing prices, VAT, records or sales without explicit acceptance",
+    "no_duplicate_on_restart": true,
+    "training_production_separate": true,
+    "modifier_fallback": "If no safe native modifiers exist, expose add-ons/upgrades as explicitly charged sale items or defer activation with operator note; do not invent support or silently drop charges."
+  },
+  "needs_owner_confirmation": [
+    "Whether listed USD customer-facing prices include VAT, and each item tax category/rate",
+    "Whether combo upgrades apply to Burgers only or also Wraps and other items",
+    "Whether dips can repeat in Greaz Box and if other appetizers include complimentary dips",
+    "Whether add-ons apply to all products or only selected lines",
+    "Soft-drink flavors and their stock-tracking policy",
+    "Whether any other items are temporarily unavailable, beyond the dessert marked SOON"
+  ]
+}

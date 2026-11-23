@@ -50,15 +50,26 @@ export const UNCATEGORIZED_ID = "uncategorized";
 
 /**
  * The sections, in menu order — which is the order a customer reads a menu
- * board, not alphabetical. Mains first, then the things added to them, then
- * drinks.
+ * board, not alphabetical.
+ *
+ * The order is the printed Greaz menu's (`src/catalog/greaz-menu-v1.json`):
+ * Burgers, Wraps, Fries, Appetizers, Combos, Drinks, Dessert, then the two
+ * kinds of paid extra. `sides` predates the official menu (the WP-3 design
+ * fixture used it) and is kept so a product already filed there still groups
+ * under its own chip rather than falling into "Other"; it sits with the other
+ * small plates.
  */
 export const MENU_CATEGORIES: readonly MenuCategory[] = [
   { id: "burgers", labelKey: "menuCategory.burgers", fallbackIcon: "🍔" },
   { id: "wraps", labelKey: "menuCategory.wraps", fallbackIcon: "🌯" },
+  { id: "fries", labelKey: "menuCategory.fries", fallbackIcon: "🍟" },
+  { id: "appetizers", labelKey: "menuCategory.appetizers", fallbackIcon: "🍗" },
   { id: "sides", labelKey: "menuCategory.sides", fallbackIcon: "🍟" },
-  { id: "addons", labelKey: "menuCategory.addons", fallbackIcon: "➕" },
+  { id: "combos", labelKey: "menuCategory.combos", fallbackIcon: "🍱" },
   { id: "drinks", labelKey: "menuCategory.drinks", fallbackIcon: "🥤" },
+  { id: "dessert", labelKey: "menuCategory.dessert", fallbackIcon: "🍨" },
+  { id: "addons", labelKey: "menuCategory.addons", fallbackIcon: "➕" },
+  { id: "upgrades", labelKey: "menuCategory.upgrades", fallbackIcon: "⬆️" },
   { id: UNCATEGORIZED_ID, labelKey: "menuCategory.uncategorized", fallbackIcon: "🍽️" },
 ] as const;
 

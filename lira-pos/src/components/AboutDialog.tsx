@@ -18,7 +18,7 @@ import { useTranslation } from "../lib/i18n";
  * as a button, not an `<a href>`: a link inside the WebView would navigate
  * the till itself (or a new WebView window) instead of the browser.
  */
-export const APP_VERSION = "1.1.1";
+export const APP_VERSION = "1.2.0";
 export const DEVELOPER_NAME = "Omar Najjar";
 export const DEVELOPER_TAGLINE = "Software Engineering & Business Solutions";
 export const DEVELOPER_PROFILE_URL = "https://www.linkedin.com/in/omar-s-najjar-1b7994259/";

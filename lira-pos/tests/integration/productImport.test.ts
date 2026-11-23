@@ -130,7 +130,10 @@ describe("the template", () => {
     // not a section you may assign, and offering it would make "deliberately
     // uncategorised" and "section named Other" two different stored values
     // meaning the same thing.
-    expect(importableCategoryIds()).toEqual(["burgers", "wraps", "sides", "addons", "drinks"]);
+    expect(importableCategoryIds()).toEqual([
+      "burgers", "wraps", "fries", "appetizers", "sides", "combos",
+      "drinks", "dessert", "addons", "upgrades",
+    ]);
     expect(importableCategoryIds()).not.toContain("uncategorized");
   });
 });

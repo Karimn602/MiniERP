@@ -28,7 +28,7 @@ function openDialog() {
       <AboutButton />
     </I18nProvider>,
   );
-  fireEvent.click(screen.getByRole("button", { name: /^v1\.1\.1/ }));
+  fireEvent.click(screen.getByRole("button", { name: /^v1\.2\.0/ }));
   return screen.getByRole("dialog");
 }
 

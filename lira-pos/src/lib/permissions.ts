@@ -168,7 +168,9 @@ export type Capability =
   /** `DriverLedgerAdjustment` — write a driver's balance up or down by hand. */
   | "driverLedgerAdjustment"
   /** `SaveProductCost` — what an item costs. Owner only; see the note in `authz.rs`. */
-  | "productCost";
+  | "productCost"
+  /** `ApplyOfficialMenu` — load Greaz's bundled official menu. Owner only. */
+  | "officialMenu";
 
 const CAPABILITIES: Record<Capability, readonly Role[]> = {
   readShiftHistory: SUPERVISORY,
@@ -176,6 +178,7 @@ const CAPABILITIES: Record<Capability, readonly Role[]> = {
   driverAdmin: SUPERVISORY,
   driverLedgerAdjustment: SUPERVISORY,
   productCost: OWNER_ONLY,
+  officialMenu: OWNER_ONLY,
 };
 
 /** Whether a role may use a capability inside a screen it has been offered. */
@@ -195,6 +198,7 @@ export const CAPABILITY_OPERATIONS: Record<Capability, string> = {
   driverAdmin: "DriverSave",
   driverLedgerAdjustment: "DriverLedgerAdjustment",
   productCost: "SaveProductCost",
+  officialMenu: "ApplyOfficialMenu",
 };
 
 /** Whether a role is offered a screen. A missing role (no session) is offered
