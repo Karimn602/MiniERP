@@ -2765,7 +2765,11 @@ async fn a_reset_nobody_proves_still_ends_the_locked_session() {
 /// which no automated run in this repository creates.
 #[test]
 fn the_fatal_startup_dialog_is_wired_to_the_windowless_path_only() {
-    let src = include_str!("../lib.rs");
+    // Normalised: a checkout with `core.autocrlf=true` (a clean release
+    // worktree on Windows) has CRLF here, and the assertions below are about
+    // the code, not its line endings.
+    let src = include_str!("../lib.rs").replace("\r\n", "\n");
+    let src = src.as_str();
 
     assert_eq!(
         src.matches("show_fatal_startup_dialog(").count(),
